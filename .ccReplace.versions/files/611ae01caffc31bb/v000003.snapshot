@@ -1,0 +1,799 @@
+// EngineSubsystemInit.cpp — Terrain preset configuration and per-frame uniform
+// buffer updates extracted from Engine.cpp.
+// Contains: applyStartupTerrainPreset(), updateLightingUniforms(),
+//           updateCameraUniforms(), updateAOUniforms(), updateClusterData().
+
+#include "core/engine/Engine.h"
+#include "rendering/lighting/AOSettings.h"
+#include "world/config/WorldConfig.h"
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
+
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/gtc/matrix_transform.hpp>
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Startup terrain preset helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const char* Engine::getStartupTerrainPresetName() const {
+    switch (m_startupTerrainPreset) {
+        case StartupTerrainPreset::PerfVoxel4Lod20:
+            return "voxel4x20";
+        case StartupTerrainPreset::PerfVoxel20DccmFar:
+            return "hybrid2";
+        case StartupTerrainPreset::Default:
+        default:
+            return "default";
+    }
+}
+
+const char* Engine::getStartupTerrainPresetSummary() const {
+    switch (m_startupTerrainPreset) {
+        case StartupTerrainPreset::PerfVoxel4Lod20:
+            return "LOD0-3 voxel, 20 rings each";
+        case StartupTerrainPreset::PerfVoxel20DccmFar:
+            return "LOD0 voxel 0-20, LOD1 DCCM far";
+        case StartupTerrainPreset::Default:
+        default:
+            return "Current world defaults";
+    }
+}
+
+void Engine::applyStartupTerrainPreset() {
+    ChunkManager* chunkManager = m_world.getChunkManager();
+    if (!chunkManager) {
+        return;
+    }
+
+    if (m_startupTerrainPreset == StartupTerrainPreset::Default) {
+        m_anyLODUsesVoxel = m_world.anyLODUsesType(TerrainType::Voxel);
+        m_anyLODUsesDCCM = m_world.anyLODUsesType(TerrainType::DCCM);
+        return;
+    }
+
+    std::cout << "[Engine] Applying startup terrain preset '" << getStartupTerrainPresetName()
+              << "' (" << getStartupTerrainPresetSummary() << ")" << std::endl;
+
+    chunkManager->setLODEnabled(true);
+    chunkManager->setRenderDistanceRings(80);
+
+    switch (m_startupTerrainPreset) {
+        case StartupTerrainPreset::PerfVoxel4Lod20:
+            chunkManager->setLODRingThresholds(20, 40, 60, 80);
+            m_world.setTerrainTypesForStartup({
+                TerrainType::Voxel,
+                TerrainType::Voxel,
+                TerrainType::Voxel,
+                TerrainType::Voxel,
+                TerrainType::Voxel
+            });
+            break;
+        case StartupTerrainPreset::PerfVoxel20DccmFar:
+            chunkManager->setLODRingThresholds(std::vector<int>{20});
+            if (m_world.getDCCMTerrainLoader() == nullptr) {
+                std::cout << "[Engine] WARNING: hybrid2 preset requested but no DCCM terrain is loaded. "
+                             "Falling back to voxel terrain for all LODs." << std::endl;
+                m_world.setTerrainTypesForStartup({
+                    TerrainType::Voxel,
+                    TerrainType::Voxel,
+                    TerrainType::Voxel,
+                    TerrainType::Voxel,
+                    TerrainType::Voxel
+                });
+            } else {
+                m_world.setTerrainTypesForStartup({
+                    TerrainType::Voxel,
+                    TerrainType::DCCM,
+                    TerrainType::DCCM,
+                    TerrainType::DCCM,
+                    TerrainType::DCCM
+                });
+            }
+            break;
+        case StartupTerrainPreset::Default:
+        default:
+            break;
+    }
+
+    m_anyLODUsesVoxel = m_world.anyLODUsesType(TerrainType::Voxel);
+    m_anyLODUsesDCCM = m_world.anyLODUsesType(TerrainType::DCCM);
+
+    const auto thresholds = chunkManager->getLODRingThresholds();
+    std::cout << "[Engine] Terrain preset ready: renderDistance=" << chunkManager->getRenderDistanceRings()
+              << " rings, thresholds=[" << thresholds[0] << ", " << thresholds[1]
+              << ", " << thresholds[2] << ", " << thresholds[3] << "]" << std::endl;
+
+    if (m_perfMode && chunkManager->isPaused()) {
+        chunkManager->setPaused(false);
+        std::cout << "[Engine] Performance mode auto-started chunk generation" << std::endl;
+    }
+}
+
+void Engine::startChunkGeneration() {
+    ChunkManager* chunkManager = m_world.getChunkManager();
+    if (!chunkManager) {
+        return;
+    }
+
+    if (chunkManager->isPaused()) {
+        chunkManager->setPaused(false);
+        std::cout << "[Engine] Terrain generation started" << std::endl;
+    }
+}
+
+namespace {
+constexpr uint32_t kMaterialOverlayInitialCapacity = 1u << 16;
+constexpr uint32_t kMaterialOverlayMaxCapacity = 1u << 24;
+
+uint32_t nextPow2u32(uint32_t v) {
+    if (v <= 1u) return 1u;
+    --v;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v + 1u;
+}
+
+uint32_t chooseMaterialOverlayCapacity(size_t activeCells) {
+    if (activeCells == 0u) {
+        return kMaterialOverlayInitialCapacity;
+    }
+
+    // Keep open addressing below roughly 70% load. This keeps the fragment
+    // shader's probe count stable without reserving memory for the whole world.
+    const size_t wanted = std::max<size_t>(
+        kMaterialOverlayInitialCapacity,
+        (activeCells * 10u + 6u) / 7u);
+    const size_t clamped = std::min<size_t>(wanted, kMaterialOverlayMaxCapacity);
+    return nextPow2u32(static_cast<uint32_t>(clamped));
+}
+
+inline uint32_t hashMaterialOverlayKey(int32_t x, int32_t y, int32_t z, uint32_t face) {
+    uint32_t h = static_cast<uint32_t>(x) * 0x9E3779B9u;
+    h ^= static_cast<uint32_t>(y) * 0x85EBCA6Bu;
+    h ^= static_cast<uint32_t>(z) * 0xC2B2AE35u;
+    h ^= (face & 0x7u) * 0x27D4EB2Du;
+    h ^= h >> 16;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15;
+    return h;
+}
+} // namespace
+
+namespace {
+constexpr uint32_t kMaterialOverlayLiveStampCapacity = 64u;
+constexpr uint32_t kMaterialOverlayLiveStampCellStride = 3u;
+constexpr uint32_t kMaterialOverlayLiveStampCellCapacity =
+    kMaterialOverlayLiveStampCapacity * kMaterialOverlayLiveStampCellStride;
+
+uint32_t materialOverlayFloatBitsU32(float value) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+int32_t materialOverlayFloatBitsI32(float value) {
+    uint32_t bits = materialOverlayFloatBitsU32(value);
+    return static_cast<int32_t>(bits);
+}
+} // namespace
+
+void Engine::createMaterialOverlayBuffers() {
+    for (size_t i = 0; i < m_materialOverlayBuffers.size(); ++i) {
+        if (i < m_materialOverlayMapped.size() && m_materialOverlayMapped[i]) {
+            vkUnmapMemory(m_device, m_materialOverlayBuffersMemory[i]);
+        }
+        if (m_materialOverlayBuffers[i] != VK_NULL_HANDLE) {
+            vkDestroyBuffer(m_device, m_materialOverlayBuffers[i], nullptr);
+        }
+        if (m_materialOverlayBuffersMemory[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(m_device, m_materialOverlayBuffersMemory[i], nullptr);
+        }
+    }
+
+    const uint32_t imageCount = static_cast<uint32_t>(m_swapchainImages.size());
+    m_materialOverlayBuffers.assign(imageCount, VK_NULL_HANDLE);
+    m_materialOverlayBuffersMemory.assign(imageCount, VK_NULL_HANDLE);
+    m_materialOverlayMapped.assign(imageCount, nullptr);
+    m_materialOverlayImageDirty.assign(imageCount, 1u);
+    m_materialOverlayImageDirtySlots.clear();
+    m_materialOverlayImageDirtySlots.resize(imageCount);
+
+    m_materialOverlayCapacity = nextPow2u32(std::max(
+        m_materialOverlayCapacity,
+        kMaterialOverlayInitialCapacity));
+    m_materialOverlayTable.assign(m_materialOverlayCapacity, MaterialOverlayCellGPU{});
+    m_materialOverlayCount = 0;
+    m_materialOverlayMaxProbe = 0;
+    m_materialOverlayLastGeneration = 0;
+    m_materialOverlayNeedsRebuild = true;
+
+    // Binding 10 keeps the old GLSL shape:
+    //   header + MaterialOverlayCell cells[]
+    //
+    // The first fixed cells[] range is now reserved for a bounded live-stamp
+    // overlay. The old sparse hash table starts after that prefix. This avoids
+    // changing descriptor layouts while giving texture paint a one-frame visual
+    // path independent of chunk remesh/upload/swap.
+    m_materialOverlayBufferSize =
+        sizeof(MaterialOverlayHeaderGPU) +
+        static_cast<VkDeviceSize>(
+            kMaterialOverlayLiveStampCellCapacity + m_materialOverlayCapacity) *
+            sizeof(MaterialOverlayCellGPU);
+
+    for (uint32_t i = 0; i < imageCount; ++i) {
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = m_materialOverlayBufferSize;
+        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (vkCreateBuffer(m_device, &bufferInfo, nullptr, &m_materialOverlayBuffers[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create material overlay buffer");
+        }
+
+        VkMemoryRequirements memReq{};
+        vkGetBufferMemoryRequirements(m_device, m_materialOverlayBuffers[i], &memReq);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReq.size;
+        allocInfo.memoryTypeIndex = VulkanHelpers::findMemoryType(
+            m_physicalDevice,
+            memReq.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        if (vkAllocateMemory(m_device, &allocInfo, nullptr, &m_materialOverlayBuffersMemory[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate material overlay buffer memory");
+        }
+
+        vkBindBufferMemory(m_device, m_materialOverlayBuffers[i], m_materialOverlayBuffersMemory[i], 0);
+
+        void* mapped = nullptr;
+        if (vkMapMemory(m_device, m_materialOverlayBuffersMemory[i], 0, m_materialOverlayBufferSize, 0, &mapped) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to map material overlay buffer");
+        }
+        m_materialOverlayMapped[i] = mapped;
+        std::memset(mapped, 0, static_cast<size_t>(m_materialOverlayBufferSize));
+    }
+}
+
+void Engine::refreshMaterialOverlayDescriptors() {
+    if (m_descriptorSets.empty()) {
+        return;
+    }
+
+    const uint32_t imageCount = static_cast<uint32_t>(m_descriptorSets.size());
+    for (uint32_t i = 0; i < imageCount; ++i) {
+        if (i >= m_materialOverlayBuffers.size() ||
+            m_materialOverlayBuffers[i] == VK_NULL_HANDLE) {
+            continue;
+        }
+
+        VkDescriptorBufferInfo materialOverlayInfo{};
+        materialOverlayInfo.buffer = m_materialOverlayBuffers[i];
+        materialOverlayInfo.offset = 0;
+        materialOverlayInfo.range = m_materialOverlayBufferSize;
+
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = m_descriptorSets[i];
+        write.dstBinding = 10;
+        write.dstArrayElement = 0;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.descriptorCount = 1;
+        write.pBufferInfo = &materialOverlayInfo;
+
+        vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+    }
+}
+
+void Engine::ensureMaterialOverlayCapacity(size_t activeLOD0Cells) {
+    const uint32_t wantedCapacity = chooseMaterialOverlayCapacity(activeLOD0Cells);
+    if (m_materialOverlayCapacity >= wantedCapacity &&
+        !m_materialOverlayBuffers.empty()) {
+        return;
+    }
+
+    vkDeviceWaitIdle(m_device);
+    m_materialOverlayCapacity = wantedCapacity;
+    createMaterialOverlayBuffers();
+    refreshMaterialOverlayDescriptors();
+    m_materialOverlayNeedsRebuild = true;
+    m_materialOverlayLastGeneration = 0;
+}
+
+void Engine::syncMaterialOverlayForImage(uint32_t imageIndex) {
+    if (imageIndex >= m_materialOverlayMapped.size() || m_materialOverlayMapped[imageIndex] == nullptr) {
+        return;
+    }
+
+    auto& textureStore = m_world.getTextureMaterialStore();
+    const auto textureStats = textureStore.getStats();
+    ensureMaterialOverlayCapacity(textureStats.cellsByLOD[0]);
+
+    if (imageIndex >= m_materialOverlayMapped.size() || m_materialOverlayMapped[imageIndex] == nullptr) {
+        return;
+    }
+
+    const size_t generation = textureStore.getGeneration();
+    const bool genChanged = (generation != m_materialOverlayLastGeneration);
+
+    if (m_materialOverlayNeedsRebuild || genChanged) {
+        // Try the delta path first. consumeDirtyGPUCells flips requiresFullUpload
+        // when the store has buffered a clear, an unbounded write, or hit its
+        // delta cap — in those cases we fall back to a full rebuild.
+        std::vector<TextureOverlay::TextureOverlayStore::GPUCell> deltas;
+        bool requiresFullUpload = false;
+        const size_t deltaBudget = static_cast<size_t>(m_materialOverlayCapacity);
+        textureStore.consumeDirtyGPUCells(deltas, deltaBudget, requiresFullUpload);
+
+        const bool doFullRebuild = m_materialOverlayNeedsRebuild || requiresFullUpload;
+        const uint16_t pixelsPerVoxel = textureStore.getLODConfig(0).pixelsPerVoxel;
+        const uint32_t mask = m_materialOverlayCapacity - 1u;
+
+        auto sameOverlayKey = [](const MaterialOverlayCellGPU& cell,
+                                 int32_t x, int32_t y, int32_t z, uint32_t face) {
+            return cell.x == x &&
+                   cell.y == y &&
+                   cell.z == z &&
+                   (cell.face & 0x7u) == (face & 0x7u);
+        };
+
+        auto probeDistanceForSlot = [&](uint32_t slotIndex,
+                                        const MaterialOverlayCellGPU& cell) -> uint32_t {
+            const uint32_t ideal = hashMaterialOverlayKey(
+                cell.x, cell.y, cell.z, cell.face & 0x7u) & mask;
+            return (slotIndex - ideal) & mask;
+        };
+
+        auto recordChangedSlot = [](std::vector<uint32_t>* changedSlots, uint32_t slot) {
+            if (changedSlots) {
+                changedSlots->push_back(slot);
+            }
+        };
+
+
+        auto setChunkMaterialOverlayHint = [&](const glm::ivec3& chunkCoord, bool hasOverlay) {
+            if (!m_gpuCulling.isReady()) {
+                return;
+            }
+
+            const entt::entity entity = m_world.findChunk(chunkCoord);
+            if (entity == entt::null) {
+                return;
+            }
+
+            std::shared_lock regLock(m_world.registryMutex());
+            const auto& registry = m_world.getRegistry();
+            if (!registry.valid(entity)) {
+                return;
+            }
+
+            auto applyHandle = [&](const MeshHandle& handle) {
+                if (handle.gpuCullingSlot != UINT32_MAX) {
+                    m_gpuCulling.setSlotMaterialOverlayHint(handle.gpuCullingSlot, hasOverlay);
+                }
+            };
+
+            if (registry.all_of<MeshHandle>(entity)) {
+                applyHandle(registry.get<MeshHandle>(entity));
+            }
+            if (registry.all_of<PendingMeshHandle>(entity)) {
+                applyHandle(registry.get<PendingMeshHandle>(entity).handle);
+            }
+        };
+
+        auto updateChunkHintFromGPUCell = [&](const TextureOverlay::TextureOverlayStore::GPUCell& cell,
+                                              bool hasOverlay) {
+            if ((cell.face & 0x7u) != 7u) {
+                return;
+            }
+            setChunkMaterialOverlayHint(glm::ivec3(cell.x, cell.y, cell.z), hasOverlay);
+        };
+
+        // Robin Hood open-addressing insert/update.
+        //
+        // Why this matters:
+        //   The old table used ordinary linear probing. At ~80% load the table
+        //   produced very long clusters (diagnostics showed maxProbe ~276).
+        //   cube.frag had a small fixed probe cap, so some painted voxels were
+        //   never found. Removing the cap alone would make every miss extremely
+        //   expensive on the GPU.
+        //
+        // Robin Hood hashing keeps probe lengths much flatter and lets the
+        // shader use the resident-probe < search-probe early-out rule. This
+        // makes missing entries cheap and keeps painted entries findable.
+        auto applyCell = [&](int32_t x, int32_t y, int32_t z,
+                             uint32_t face, uint32_t material,
+                             std::vector<uint32_t>* changedSlots = nullptr) -> uint32_t {
+            if (m_materialOverlayCapacity == 0u) {
+                return UINT32_MAX;
+            }
+
+            const uint32_t faceKey = face & 0x7u;
+            uint32_t idx = hashMaterialOverlayKey(x, y, z, faceKey) & mask;
+
+            // If the table is full, allow updates to existing keys but refuse
+            // new inserts. This avoids corrupting the table with a failed
+            // Robin Hood insertion that has already swapped entries.
+            if (m_materialOverlayCount >= m_materialOverlayCapacity) {
+                uint32_t probe = 0u;
+                while (probe < m_materialOverlayCapacity) {
+                    MaterialOverlayCellGPU& slot = m_materialOverlayTable[idx];
+
+                    if (slot.material == 0u) {
+                        return UINT32_MAX;
+                    }
+
+                    if (sameOverlayKey(slot, x, y, z, faceKey)) {
+                        slot.material = material;
+                        if (probe > m_materialOverlayMaxProbe) {
+                            m_materialOverlayMaxProbe = probe;
+                        }
+                        recordChangedSlot(changedSlots, idx);
+                        return idx;
+                    }
+
+                    const uint32_t residentProbe = probeDistanceForSlot(idx, slot);
+                    if (residentProbe < probe) {
+                        return UINT32_MAX;
+                    }
+
+                    idx = (idx + 1u) & mask;
+                    ++probe;
+                }
+                return UINT32_MAX;
+            }
+
+            MaterialOverlayCellGPU incoming{};
+            incoming.x = x;
+            incoming.y = y;
+            incoming.z = z;
+            incoming.face = faceKey;
+            incoming.material = material;
+
+            uint32_t probe = 0u;
+            while (probe < m_materialOverlayCapacity) {
+                if (probe > m_materialOverlayMaxProbe) {
+                    m_materialOverlayMaxProbe = probe;
+                }
+
+                MaterialOverlayCellGPU& slot = m_materialOverlayTable[idx];
+
+                if (slot.material == 0u) {
+                    slot = incoming;
+                    ++m_materialOverlayCount;
+                    recordChangedSlot(changedSlots, idx);
+                    return idx;
+                }
+
+                if (sameOverlayKey(slot, incoming.x, incoming.y, incoming.z, incoming.face)) {
+                    slot.material = incoming.material;
+                    recordChangedSlot(changedSlots, idx);
+                    return idx;
+                }
+
+                const uint32_t residentProbe = probeDistanceForSlot(idx, slot);
+
+                if (residentProbe < probe) {
+                    const MaterialOverlayCellGPU displaced = slot;
+                    slot = incoming;
+                    incoming = displaced;
+                    recordChangedSlot(changedSlots, idx);
+
+                    // The displaced resident had residentProbe at this slot.
+                    // After advancing to the next slot, its probe distance is
+                    // residentProbe + 1.
+                    probe = residentProbe;
+                }
+
+                idx = (idx + 1u) & mask;
+                ++probe;
+            }
+
+            return UINT32_MAX;
+        };
+
+        if (doFullRebuild) {
+            std::fill(m_materialOverlayTable.begin(), m_materialOverlayTable.end(), MaterialOverlayCellGPU{});
+            m_materialOverlayCount = 0;
+            m_materialOverlayMaxProbe = 0;
+
+            std::vector<TextureOverlay::TextureOverlayStore::GPUCell> cells;
+            textureStore.exportGPUCellsForLOD(
+                0,
+                cells,
+                static_cast<size_t>(m_materialOverlayCapacity));
+
+            // Phase 2: rebuild per-culling-slot material-overlay hints from the
+            // exported painted-chunk sentinel cells. This makes unpainted chunks
+            // skip cube.frag overlay hash probing entirely in GPU-culling mode.
+            m_gpuCulling.clearAllMaterialOverlayHints();
+            for (const auto& cell : cells) {
+                updateChunkHintFromGPUCell(cell, true);
+            }
+
+            for (const auto& cell : cells) {
+                if (m_materialOverlayCount >= m_materialOverlayCapacity) break;
+                const uint8_t type = static_cast<uint8_t>(cell.packed & 0x3u);
+                const uint8_t variant = static_cast<uint8_t>((cell.packed >> 2) & 0x7u);
+                const uint8_t edge = static_cast<uint8_t>((cell.packed >> 5) & 0x3u);
+                const uint32_t material = VertexPacking::packMaterial(type, variant, edge, pixelsPerVoxel);
+                applyCell(cell.x, cell.y, cell.z, cell.face & 0x7u, material, nullptr);
+            }
+
+            // Full rebuild supersedes any queued per-image deltas.
+            std::fill(m_materialOverlayImageDirty.begin(), m_materialOverlayImageDirty.end(), 1u);
+            for (auto& q : m_materialOverlayImageDirtySlots) q.clear();
+        } else {
+            // Apply deltas in place. Robin Hood insertion may move multiple
+            // already-existing slots, so every changed slot must be queued for
+            // every swapchain image. Queueing only the final inserted slot would
+            // make random painted cells disappear on images that did not receive
+            // the displaced entries.
+            std::vector<uint32_t> changedSlots;
+            changedSlots.reserve(std::min<size_t>(deltas.size() * 4u, 65536u));
+
+            for (const auto& cell : deltas) {
+                const uint8_t type = static_cast<uint8_t>(cell.packed & 0x3u);
+                const uint8_t variant = static_cast<uint8_t>((cell.packed >> 2) & 0x7u);
+                const uint8_t edge = static_cast<uint8_t>((cell.packed >> 5) & 0x3u);
+                const uint32_t material = VertexPacking::packMaterial(type, variant, edge, pixelsPerVoxel);
+                applyCell(cell.x, cell.y, cell.z, cell.face & 0x7u, material, &changedSlots);
+                updateChunkHintFromGPUCell(cell, true);
+            }
+
+            for (uint32_t slot : changedSlots) {
+                if (slot >= m_materialOverlayCapacity) continue;
+                for (size_t i = 0; i < m_materialOverlayImageDirtySlots.size(); ++i) {
+                    if (m_materialOverlayImageDirty[i]) continue;
+                    m_materialOverlayImageDirtySlots[i].push_back(slot);
+                }
+            }
+
+            // If a per-image queue grows past a fraction of the table, promote
+            // that image to a full re-upload — the partial-copy cost crosses
+            // over the full-memcpy cost around capacity/16.
+            const size_t promoteThreshold = std::max<size_t>(
+                static_cast<size_t>(m_materialOverlayCapacity) / 16u, 1024u);
+            for (size_t i = 0; i < m_materialOverlayImageDirtySlots.size(); ++i) {
+                if (m_materialOverlayImageDirtySlots[i].size() > promoteThreshold) {
+                    m_materialOverlayImageDirty[i] = 1u;
+                    m_materialOverlayImageDirtySlots[i].clear();
+                }
+            }
+        }
+
+        m_materialOverlayLastGeneration = generation;
+        m_materialOverlayNeedsRebuild = false;
+    }
+
+    uint8_t* base = static_cast<uint8_t*>(m_materialOverlayMapped[imageIndex]);
+    auto* header = reinterpret_cast<MaterialOverlayHeaderGPU*>(base);
+    auto* dstCells = reinterpret_cast<MaterialOverlayCellGPU*>(base + sizeof(MaterialOverlayHeaderGPU));
+
+    if (m_materialOverlayImageDirty[imageIndex]) {
+        header->capacityMask = m_materialOverlayCapacity - 1u;
+        header->count = m_materialOverlayCount;
+        header->maxProbe = m_materialOverlayMaxProbe;
+        header->_pad = 0;
+        std::memcpy(
+            dstCells,
+            m_materialOverlayTable.data(),
+            static_cast<size_t>(m_materialOverlayCapacity) * sizeof(MaterialOverlayCellGPU));
+        m_materialOverlayImageDirty[imageIndex] = 0u;
+        m_materialOverlayImageDirtySlots[imageIndex].clear();
+        return;
+    }
+
+    auto& q = m_materialOverlayImageDirtySlots[imageIndex];
+    if (q.empty()) return;
+
+    // Header reflects count/maxProbe — keep it current after delta inserts.
+    header->capacityMask = m_materialOverlayCapacity - 1u;
+    header->count = m_materialOverlayCount;
+    header->maxProbe = m_materialOverlayMaxProbe;
+    header->_pad = 0;
+
+    for (uint32_t slot : q) {
+        if (slot >= m_materialOverlayCapacity) continue;
+        dstCells[slot] = m_materialOverlayTable[slot];
+    }
+    q.clear();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Per-frame uniform buffer updates
+// ═══════════════════════════════════════════════════════════════════════════════
+
+void Engine::updateLightingUniforms(uint32_t currentImage,
+                                    const std::vector<PointLight>& transientLights,
+                                    const std::vector<glm::vec4>& transientPulseData) {
+    // Gather per-light preset indices from placed objects.
+    std::vector<uint32_t> lightPresetIndex(m_lighting.activePointLights, 0u);
+    for (const auto& [objId, obj] : m_objectManager.getAllObjects()) {
+        if (obj.type == PlacedObjectType::LightOrb &&
+                   obj.light.lightIndex < lightPresetIndex.size()) {
+            lightPresetIndex[obj.light.lightIndex] = obj.light.pulsePresetIndex;
+        }
+    }
+
+    auto& gpuData = *m_lightingStaging;
+    std::memset(&gpuData, 0, sizeof(LightingSettings::GPULightingData));
+    // Always use the smooth lighting direction from LightingSettings — never
+    // the shadow system's quantized/clamped sun direction.  The shadow
+    // system's sunDir (with its 1° quantum snap and 13° elevation floor) is
+    // published only through shadow.sunDirTexelSize.xyz for receiver-push
+    // alignment; feeding it into lighting.sunDirection causes ndotl to jump
+    // in discrete steps whenever realtime celestials are active.
+    const glm::vec3 directionalLightDir = m_lighting.currentLight.direction;
+    gpuData.sunDirection = glm::vec4(glm::normalize(directionalLightDir), m_lighting.currentLight.intensity);
+    gpuData.sunColor = glm::vec4(m_lighting.currentLight.color, m_lighting.currentLight.ambientStrength);
+    gpuData.skyColor = glm::vec4(m_lighting.currentSkyColor, m_lighting.fogDensity);
+    gpuData.time = m_lighting.totalTime;
+
+    const uint32_t baseLightCount = std::min(
+        m_lighting.activePointLights,
+        static_cast<uint32_t>(m_lighting.pointLights.size()));
+    const uint32_t transientCount = static_cast<uint32_t>(transientLights.size());
+    const uint32_t combinedCount = baseLightCount + transientCount;
+    const uint32_t maxLights = std::min<uint32_t>(MAX_SHADER_LIGHTS, MAX_POINT_LIGHTS);
+
+    std::vector<PointLight> resolvedLights;
+    std::vector<glm::vec4> resolvedPulse;
+    resolvedLights.reserve(maxLights);
+    resolvedPulse.reserve(maxLights);
+
+    auto appendResolvedLight = [&](const PointLight& light,
+                                   const glm::vec4& pulseData) {
+        if (resolvedLights.size() >= maxLights) {
+            return;
+        }
+        resolvedLights.push_back(light);
+        resolvedPulse.push_back(pulseData);
+    };
+
+    auto computeBasePulseData = [&](uint32_t baseIndex) -> glm::vec4 {
+        const auto& preset = m_pulsePresets.getPreset(
+            baseIndex < lightPresetIndex.size() ? lightPresetIndex[baseIndex] : 0u);
+        const float speed = preset.speed;
+        const float strength = preset.strength;
+        const float sharpness = preset.sharpness;
+        const float flickerAmount = preset.flickerAmount;
+        const float flickerSpeed = preset.flickerSpeed;
+
+        const float breathCycle = std::sin(m_lighting.totalTime * speed) * 0.5f + 0.5f;
+        const float quantized = std::floor(breathCycle * 8.0f) / 8.0f;
+        const float square = breathCycle > 0.5f ? 1.0f : 0.0f;
+        const float pulse = glm::mix(quantized, square, sharpness);
+        const float pulseStrength = glm::clamp(pulse * strength, 0.0f, 1.0f);
+        const float breathScale = 1.0f + pulseStrength * 0.45f;
+        return glm::vec4(pulseStrength, breathScale, flickerAmount, flickerSpeed);
+    };
+
+    auto appendCombinedBySource = [&](uint32_t sourceIndex) {
+        if (sourceIndex >= combinedCount) {
+            return;
+        }
+        if (sourceIndex < baseLightCount) {
+            appendResolvedLight(
+                m_lighting.pointLights[sourceIndex],
+                computeBasePulseData(sourceIndex));
+            return;
+        }
+
+        const uint32_t transientIndex = sourceIndex - baseLightCount;
+        if (transientIndex >= transientLights.size()) {
+            return;
+        }
+        const glm::vec4 pulse = (transientIndex < transientPulseData.size())
+            ? transientPulseData[transientIndex]
+            : glm::vec4(0.0f);
+        appendResolvedLight(
+            transientLights[transientIndex],
+            pulse);
+    };
+
+    const auto& remap = m_shadowSystem.getActiveLightRemap();
+    if (m_shadowSystem.isReady()) {
+        for (uint32_t slot = 0; slot < remap.size() && resolvedLights.size() < maxLights; ++slot) {
+            appendCombinedBySource(remap[slot]);
+        }
+    } else {
+        for (uint32_t i = 0; i < baseLightCount && resolvedLights.size() < maxLights; ++i) {
+            appendResolvedLight(m_lighting.pointLights[i], computeBasePulseData(i));
+        }
+        for (uint32_t i = 0; i < transientCount && resolvedLights.size() < maxLights; ++i) {
+            const glm::vec4 pulse = (i < transientPulseData.size())
+                ? transientPulseData[i]
+                : glm::vec4(0.0f);
+            appendResolvedLight(transientLights[i], pulse);
+        }
+    }
+
+    gpuData.numPointLights = static_cast<uint32_t>(resolvedLights.size());
+    for (uint32_t i = 0; i < gpuData.numPointLights; ++i) {
+        const PointLight& src = resolvedLights[i];
+        gpuData.pointLights[i].positionRadius = glm::vec4(src.position, src.radius);
+        gpuData.pointLights[i].colorIntensity = glm::vec4(src.color, src.intensity);
+        gpuData.lightPulseData[i] = resolvedPulse[i];
+    }
+
+    memcpy(m_lightingMapped[currentImage], &gpuData, sizeof(LightingSettings::GPULightingData));
+}
+
+void Engine::updateCameraUniforms(uint32_t currentImage) {
+    struct CameraData {
+        glm::vec3 cameraPos;
+        float time;  // Synced with light glow animation
+    } cameraData;
+    
+    cameraData.cameraPos = m_camera.getState().position;
+    cameraData.time = static_cast<float>(glfwGetTime());
+    
+    memcpy(m_cameraMapped[currentImage], &cameraData, sizeof(CameraData));
+}
+
+void Engine::updateAOUniforms(uint32_t currentImage) {
+    const AOSettings& aoSettings = m_world.getDebugOverlay().getAOSettings();
+    auto gpuData = aoSettings.getGPUData();
+    memcpy(m_aoMapped[currentImage], &gpuData, sizeof(AOSettings::GPUAOData));
+}
+
+void Engine::updateClusterData(uint32_t currentImage,
+                               const glm::mat4& viewCameraRel,
+                               const glm::mat4& proj,
+                               const VkRect2D& gameplayRect) {
+    // Extract light positions and radii from the staging buffer (already
+    // filled by updateLightingUniforms) so the cluster system sees the
+    // same resolved, remapped light order the fragment shader will use.
+    const auto& gpu = *m_lightingStaging;
+    const uint32_t nLights = std::min(gpu.numPointLights, 32u);
+
+    glm::vec3 positions[32];
+    float     radii[32];
+    for (uint32_t i = 0; i < nLights; ++i) {
+        positions[i] = glm::vec3(gpu.pointLights[i].positionRadius);
+        radii[i]     = gpu.pointLights[i].positionRadius.w;
+    }
+
+    const CameraState& cam = m_camera.getState();
+    uint32_t targetWidth = m_swapchainExtent.width;
+    uint32_t targetHeight = m_swapchainExtent.height;
+    float viewportOffsetX = static_cast<float>(gameplayRect.offset.x);
+    float viewportOffsetY = static_cast<float>(gameplayRect.offset.y);
+    float viewportWidth = static_cast<float>(gameplayRect.extent.width);
+    float viewportHeight = static_cast<float>(gameplayRect.extent.height);
+
+    if (m_gameplaySeparated && m_gameplayWindow && m_gameplayWindow->isOpen()) {
+        const VkExtent2D detachedExtent = m_gameplayWindow->getExtent();
+        targetWidth = detachedExtent.width;
+        targetHeight = detachedExtent.height;
+        viewportOffsetX = 0.0f;
+        viewportOffsetY = 0.0f;
+        viewportWidth = static_cast<float>(detachedExtent.width);
+        viewportHeight = static_cast<float>(detachedExtent.height);
+    }
+
+    m_clusteredLighting.update(
+        currentImage,
+        viewCameraRel,
+        proj,
+        cam.position,
+        targetWidth,
+        targetHeight,
+        viewportOffsetX,
+        viewportOffsetY,
+        viewportWidth,
+        viewportHeight,
+        positions,
+        radii,
+        nLights);
+}

@@ -1,0 +1,13 @@
+{
+  "ProjectRoot": "..",
+  "OutputRoot": ".",
+  "DefaultPatchFile": "patch.txt",
+  "ShowPreflightStatistics": true,
+  "ShowFileDetails": true,
+  "ShowCreatedRemovedLists": true,
+  "ShowDirectoryPrefixes": true,
+  "ConfirmationStage": true,
+  "RepeatInvalidInput": false,
+  "VersionCacheEnabled": true,
+  "VersionCacheRoot": ".ccReplace.versions"
+}

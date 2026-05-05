@@ -1,0 +1,286 @@
+{
+    "Files":  [
+                  {
+                      "Path":  "shaders/terrain/cube.frag",
+                      "FullPath":  "D:\\projects\\vulkanas\\shaders\\terrain\\cube.frag",
+                      "Key":  "c8be980eadeddfda",
+                      "CurrentVersion":  8,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-04T21:21:19.4476848Z",
+                                           "Snapshot":  "files\\c8be980eadeddfda\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-04T21:21:19.4675185Z",
+                                           "Snapshot":  "files\\c8be980eadeddfda\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-04T21:21:19.5156575Z",
+                                           "Snapshot":  "files\\c8be980eadeddfda\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-04T21:21:19.5677803Z",
+                                           "Snapshot":  "files\\c8be980eadeddfda\\v000004.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-04T21:21:19.6197447Z",
+                                           "Snapshot":  "files\\c8be980eadeddfda\\v000005.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-04T21:21:19.6959424Z",
+                                           "Snapshot":  "files\\c8be980eadeddfda\\v000006.snapshot",
+                                           "Reason":  "applied insert_before_function"
+                                       },
+                                       {
+                                           "Version":  7,
+                                           "Timestamp":  "2026-05-04T21:21:19.7754798Z",
+                                           "Snapshot":  "files\\c8be980eadeddfda\\v000007.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  8,
+                                           "Timestamp":  "2026-05-05T21:00:39.7432485Z",
+                                           "Snapshot":  "files\\c8be980eadeddfda\\v000008.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ccReplace.ps1",
+                      "FullPath":  "D:\\projects\\vulkanas\\ccReplace.ps1",
+                      "Key":  "1c67f748a6a2f278",
+                      "CurrentVersion":  17,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-04T21:28:32.9456781Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-04T21:28:32.9626055Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-04T21:28:33.4511848Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-04T21:28:33.9537130Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000004.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-04T21:28:34.4618241Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000005.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-04T21:28:35.0117418Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000006.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  7,
+                                           "Timestamp":  "2026-05-04T21:28:35.5763647Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000007.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  8,
+                                           "Timestamp":  "2026-05-04T21:35:34.2927437Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000008.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  9,
+                                           "Timestamp":  "2026-05-04T21:35:34.7841290Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000009.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  10,
+                                           "Timestamp":  "2026-05-04T21:35:35.3234609Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000010.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  11,
+                                           "Timestamp":  "2026-05-04T21:35:35.8634199Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000011.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  12,
+                                           "Timestamp":  "2026-05-04T21:35:36.1741233Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000012.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  13,
+                                           "Timestamp":  "2026-05-04T21:38:32.1941650Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000013.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  14,
+                                           "Timestamp":  "2026-05-04T21:38:32.6773120Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000014.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  15,
+                                           "Timestamp":  "2026-05-04T21:38:33.2218758Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000015.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  16,
+                                           "Timestamp":  "2026-05-04T21:38:33.8050679Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000016.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  17,
+                                           "Timestamp":  "2026-05-04T21:38:34.1015174Z",
+                                           "Snapshot":  "files\\1c67f748a6a2f278\\v000017.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "contextcontrol/ccReplace.ps1",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ccReplace.ps1",
+                      "Key":  "45bcc4c2d1e137d5",
+                      "CurrentVersion":  6,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-04T21:45:25.1970304Z",
+                                           "Snapshot":  "files\\45bcc4c2d1e137d5\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-04T21:45:25.2175462Z",
+                                           "Snapshot":  "files\\45bcc4c2d1e137d5\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-04T21:45:25.7179748Z",
+                                           "Snapshot":  "files\\45bcc4c2d1e137d5\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-04T21:45:26.2860252Z",
+                                           "Snapshot":  "files\\45bcc4c2d1e137d5\\v000004.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-04T21:45:26.8719616Z",
+                                           "Snapshot":  "files\\45bcc4c2d1e137d5\\v000005.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-04T21:45:27.2305639Z",
+                                           "Snapshot":  "files\\45bcc4c2d1e137d5\\v000006.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/world/edit/TextureOverlayStore.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\edit\\TextureOverlayStore.h",
+                      "Key":  "a16596fb446d43e3",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-05T21:00:39.4643044Z",
+                                           "Snapshot":  "files\\a16596fb446d43e3\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-05T21:00:39.4777478Z",
+                                           "Snapshot":  "files\\a16596fb446d43e3\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/TextureOverlayStore.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\TextureOverlayStore.cpp",
+                      "Key":  "b7ce26efdbfc487f",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-05T21:00:39.4907818Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-05T21:00:39.5028061Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000002.snapshot",
+                                           "Reason":  "applied insert_after_function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/EngineSubsystemInit.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\EngineSubsystemInit.cpp",
+                      "Key":  "611ae01caffc31bb",
+                      "CurrentVersion":  4,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-05T21:00:39.5153414Z",
+                                           "Snapshot":  "files\\611ae01caffc31bb\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-05T21:00:39.5283811Z",
+                                           "Snapshot":  "files\\611ae01caffc31bb\\v000002.snapshot",
+                                           "Reason":  "applied insert_before_function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-05T21:00:39.6041272Z",
+                                           "Snapshot":  "files\\611ae01caffc31bb\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-05T21:00:39.7305795Z",
+                                           "Snapshot":  "files\\611ae01caffc31bb\\v000004.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  }
+              ]
+}
