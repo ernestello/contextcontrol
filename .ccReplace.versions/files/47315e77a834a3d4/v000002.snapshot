@@ -1,0 +1,662 @@
+#pragma once
+
+#include <vulkan/vulkan.h>
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <vector>
+#include <array>
+#include <memory>
+#include <unordered_map>
+#include <string>
+#include "core/engine/EngineTypes.h"
+#include "vulkan/VulkanContext.h"
+#include "vulkan/Buffers.h"
+#include "vulkan/Swapchain.h"
+#include "vulkan/Pipeline.h"
+#include "vulkan/Sync.h"
+#include "rendering/common/Renderer.h"
+#include "vulkan/FrameGraph.h"
+#include "input/InputManager.h"
+#include "core/EngineImGui.h"
+#include "input/CameraController.h"
+#include "core/TimeManager.h"
+#include "ui/cursor/CursorManager.h"
+#include "rendering/common/Mesh.h"
+#include "vulkan/UploadArena.h"
+#include "vulkan/BufferSuballocator.h"
+#include "rendering/common/VulkanHelpers.h"
+#include "rendering/sky/CloudSystem.h"
+#include "rendering/sky/CelestialSystem.h"
+#include "rendering/lighting/LightGlowSystem.h"
+#include "rendering/lighting/ShadowSystem.h"
+#include "rendering/lighting/ClusteredLightingSystem.h"
+#include "rendering/sky/StarSystem.h"
+#include "rendering/sky/SkySystem.h"
+#include "rendering/culling/GPUCullingSystem.h"
+#include "rendering/culling/HiZPyramid.h"
+#include "rendering/tjunctionfix/TJunctionFixSystem.h"
+#include "rendering/postprocess/RetroPixelPassSystem.h"
+#include "rendering/hotreload/ShaderHotReloadService.h"
+#include "rendering/common/ParallelCommandRecorder.h"
+#include "ui/debug_menu/world/MinimapCullingReadback.h"
+#include "world/World.h"
+#include "rendering/lighting/LightingSettings.h"
+#include "rendering/lighting/AOSettings.h"
+#include "rendering/lighting/LightPulsePreset.h"
+#include "core/GameplayWindow.h"
+#include "world/config/ObjectManager.h"
+#include "physics/PhysicsWorld.h"
+#include "player/PlayerController.h"
+#include "player/PlayerCamera.h"
+
+class Engine {
+public:
+    Engine(int width = 800,
+           int height = 600,
+           const char* title = "Vulkan Engine",
+           bool gameplayOnlyMode = false,
+           bool perfMode = false,
+           StartupTerrainPreset startupTerrainPreset = StartupTerrainPreset::Default);
+    ~Engine();
+
+    void run();
+
+    void saveSettings();
+    void loadSettings();
+    void resetSettings();
+
+    // Phase E1 instrumentation: inspect currently scheduled frame passes
+    const std::vector<FramePassDescriptor>& getFramePassDescriptors() const { return m_framePassDescriptors; }
+
+private:
+    void initWindow();
+    void initVulkan();
+    void mainLoop();
+    void cleanup();
+
+    // Vulkan setup helpers
+    void createInstance();
+    void setupDebugMessenger(); // GPT_CHANGE: Debug utilities setup
+    void pickPhysicalDevice();
+    void createLogicalDevice();
+    void createSurface();
+    void createSwapchain();
+    void createImageViews();
+    void createRenderPass();
+    void createPipelineCache(); // GPT_CHANGE: Pipeline cache for faster subsequent builds
+    void createGraphicsPipeline();
+    void createFramebuffers();
+    void createCommandPool();
+    void createCommandBuffers();
+    void createSyncObjects();
+    void createTimestampQueryPool();
+    void destroyTimestampQueryPool();
+    void createDescriptorSetLayout();
+    void createVertexBuffer();
+    void createIndexBuffer();
+    void createUniformBuffers();
+    void createDescriptorPool();
+    void createDescriptorSets();
+    void refreshShadowDescriptorsForImage(uint32_t imageIndex);
+    void bindGpuVisibleOriginsToSlot1();  // Phase D: one-time write of binding 1 array element 1
+    void createDepthResources(); // GPT_CHANGE: Added depth buffer creation
+    void createIndirectBuffer(); // PHASE B7: Indirect draw buffer
+    void recreateSwapchain(); // GPT_CHANGE: Swapchain recreation for resize/out-of-date
+    void cleanupSwapchain(); // GPT_CHANGE: Helper to cleanup swapchain-dependent resources
+    void buildFramePassDescriptors(); // Phase E1: derive render pass descriptors
+    void compileFrameGraph(); // Phase E2: build per-frame graph
+    void prepareFramePassBarriers(const FrameGraphCompiledPass& pass,
+                                  uint32_t imageIndex,
+                                  std::vector<VkImageMemoryBarrier2>& imageBarriers,
+                                  std::vector<VkBufferMemoryBarrier2>& bufferBarriers);
+    void finalizeFramePassResources(const FrameGraphCompiledPass& pass);
+    void recordVoxelOpaquePass(VkCommandBuffer cmd, uint32_t imageIndex, uint32_t currentFrame, const glm::mat4& view, const glm::mat4& proj, const VkRect2D& gameplayRect, bool useDepthPrepass);
+
+    // Rendering helpers
+    void drawFrame();
+    void recordCommandBuffer(uint32_t imageIndex, uint32_t frameIndex, const glm::mat4& view, const glm::mat4& proj, const VkRect2D& gameplayRect);
+    void collectTimestampResults(uint32_t imageIndex);
+
+    // ── EngineDepthPrePass.cpp ──────────────────────────────────────────
+    // Records initial GPU frustum/temporal-HiZ culling into cmd.
+    // Sets useCurrentFrameHiZ=true when the same-frame depth prepass path is taken.
+    void recordInitialGPUCulling(VkCommandBuffer cmd, uint32_t imageIndex,
+                                  const glm::mat4& viewProj,
+                                  float viewportOffsetX, float viewportOffsetY,
+                                  float viewportScaleX, float viewportScaleY,
+                                  bool temporalHiZViable,
+                                  bool& usedTemporalHiZ,
+                                  float& cpuMs);
+    // Records depth pre-pass render pass, Hi-Z pyramid build, and second (occluded) cull.
+    void recordDepthPrePassAndHiZ(VkCommandBuffer cmd, uint32_t imageIndex,
+                                   const glm::mat4& viewProj,
+                                   const VkRect2D& gameplayRect,
+                                   float& cpuPrepassMs, float& cpuHiZMs, float& cpuFinalMs);
+    // Records temporal Hi-Z pyramid build from end-of-frame depth (non prepass path).
+    void recordPostRenderHiZBuild(VkCommandBuffer cmd);
+
+    // ── EngineShadowPass.cpp ────────────────────────────────────────────
+    // Selects active shadow-casting lights and records shadow render passes into cmd.
+    void recordShadowRenderPasses(VkCommandBuffer cmd, uint32_t imageIndex);
+    // Updates shadow system for the frame (light budget selection).
+    void updateShadowsForFrame(uint32_t imageIndex,
+                                const std::vector<PointLight>& transientLights,
+                                const glm::vec3& camPos, const glm::vec3& camFront);
+
+    // ── EngineGameplayRendering.cpp ─────────────────────────────────────
+    // Records the ImGui-only render pass for the main swapchain when gameplay is separated.
+    void recordGameplayWindowUIPass(VkCommandBuffer cmd, uint32_t imageIndex);
+    // Polls gameplay window events and acquires its next image.
+    // Returns false when caller (drawFrame) should early-return (window was closed).
+    bool pollAndPrepareGameplayWindow();
+    // Renders ImGui/tool overlay into the gameplay window framebuffer (separated mode).
+    void recordGameplayOverlayFrame(bool gameplayOverlayRequested);
+    // Runs the full ImGui frame + tool-update phase for a drawFrame call.
+    void runImGuiFrameAndTools(bool gameplayDetached,
+                               int gameplayViewportW, int gameplayViewportH,
+                               float gameplayViewportOffsetX, float gameplayViewportOffsetY,
+                               bool gameplayStatsStripVisible,
+                               std::vector<PointLight>& outTransientLights,
+                               std::vector<glm::vec4>& outTransientPulseData);
+    
+    // GPU culling helpers
+    void toggleGPUCulling();  // Toggle between CPU and GPU culling
+    void beginGModeGeometryDiffCapture(bool beforeGpuMode, bool afterGpuMode);
+    void updateGModeGeometryDiffCapture();
+    void updateCpuVisibleChunkSnapshot(const glm::vec4* chunkOrigins, uint32_t count);
+    void updateGpuVisibleChunkSnapshot();
+    std::vector<GPUCullingSystem::GModeGeometryDiffRecord> buildGModeGeometryDiffRecords(
+        const std::vector<glm::ivec3>& beforeVisible,
+        const std::vector<glm::ivec3>& afterVisible) const;
+
+    void toggleFullscreen();
+    void setGameplaySeparated(bool separate);
+    void startChunkGeneration();
+    void initDebugWiring();  // Debug UI wiring (extracted from initVulkan)
+    void initShaderHotReload();
+    void registerShaderUsageManifest();
+    void processShaderHotReload();
+    void rebuildCullingShaders();
+    void rebuildShadowSystem();
+    void applyStartupTerrainPreset();
+    void updatePerfOverlayStats(const InGameDebug::DebugInfo::CPUBreakdown& breakdown);
+    void recordFrameBottleneckSample(const InGameDebug::DebugInfo::CPUBreakdown& breakdown);
+    std::string generateFrameBottleneckReport() const;
+    void renderPerfOverlay(float gameplayViewportOffsetX,
+                           float gameplayViewportOffsetY,
+                           int gameplayViewportW,
+                           int gameplayViewportH);
+    bool shouldSamplePerfOverlayDrawCount() const;
+    void syncGameplayTJunctionFix(bool forceRecreate = false);
+    void syncGameplayPixelPass(bool forceRecreate = false);
+    void syncHiZTarget(bool forceRecreate = false);
+    const char* getStartupTerrainPresetName() const;
+    const char* getStartupTerrainPresetSummary() const;
+
+    // Vulkan setup methods now delegate to EngineVulkanSetup namespace
+
+private:
+    int m_width;
+    int m_height;
+    const char* m_title;
+    GLFWwindow* m_window;
+
+    VkInstance m_instance{VK_NULL_HANDLE};
+    VkDebugUtilsMessengerEXT m_debugMessenger{VK_NULL_HANDLE}; // GPT_CHANGE: Debug messenger
+    VkPhysicalDevice m_physicalDevice{VK_NULL_HANDLE};
+    VkPhysicalDeviceProperties m_deviceProperties{};
+    VulkanContext::DeviceCapabilities m_deviceCapabilities{};
+    VkDevice m_device{VK_NULL_HANDLE};
+    VkQueue m_graphicsQueue{VK_NULL_HANDLE};
+    VkQueue m_presentQueue{VK_NULL_HANDLE};
+    VkSurfaceKHR m_surface{VK_NULL_HANDLE};
+    VkSwapchainKHR m_swapchain{VK_NULL_HANDLE};
+    std::vector<VkImage> m_swapchainImages;
+    VkFormat m_swapchainImageFormat;
+    VkExtent2D m_swapchainExtent{};
+    std::vector<VkImageView> m_swapchainImageViews;
+    VkRenderPass m_renderPass{VK_NULL_HANDLE};
+    VkRenderPass m_renderPassDepthPrepass{VK_NULL_HANDLE};
+    VkRenderPass m_renderPassDepthLoad{VK_NULL_HANDLE};
+    VkRenderPass m_uiRenderPass{VK_NULL_HANDLE};  // UI-only pass with LOAD_OP_LOAD for SVO overlay
+    
+    VkPipelineLayout m_pipelineLayout{VK_NULL_HANDLE};
+    VkPipeline m_graphicsPipeline{VK_NULL_HANDLE};
+    VkPipeline m_graphicsPipelineDepthLoad{VK_NULL_HANDLE};
+    VkPipeline m_depthPrePassPipeline{VK_NULL_HANDLE};
+    VkPipelineCache m_pipelineCache{VK_NULL_HANDLE}; // GPT_CHANGE: Pipeline cache for faster builds
+    
+    // DCCM terrain pipeline (same descriptor set layout, different shaders)
+    VkPipeline m_dccmPipeline{VK_NULL_HANDLE};
+    VkPipelineLayout m_dccmPipelineLayout{VK_NULL_HANDLE};
+    VkPipeline m_dccmPipelineDepthLoad{VK_NULL_HANDLE};
+    // Per-LOD terrain type: true = any LOD uses that type (computed from World config)
+    bool m_anyLODUsesVoxel = true;
+    bool m_anyLODUsesDCCM = false;
+    std::vector<VkFramebuffer> m_swapchainFramebuffers;
+    VkCommandPool m_commandPool{VK_NULL_HANDLE};
+    std::vector<VkCommandBuffer> m_commandBuffers; // Per-swapchain-image command buffers
+    ParallelCommandRecorder m_parallelRecorder; // Per-slot secondary command pools/buffers for parallel recording
+    std::vector<VkFence> m_imageInFlight; // GPT_CHANGE: Track which fence is using each swapchain image
+
+    // GPT_CHANGE: Per-frame synchronization (3 frames in flight)
+    static constexpr int MAX_FRAMES_IN_FLIGHT = 3;
+    std::vector<PerFrame> m_frames;
+    size_t m_currentFrame = 0;
+
+    // GPT_CHANGE: Small allocator members
+    std::array<UploadArena, MAX_FRAMES_IN_FLIGHT> m_uploadArenas;
+    BufferSuballocator m_vbAllocator;
+    BufferSuballocator m_ibAllocator;
+    ResourceUploader m_uploader;
+    
+    // C3.2: Per-frame upload command buffers for batched transfers (no CPU wait)
+    std::array<VkCommandBuffer, MAX_FRAMES_IN_FLIGHT> m_uploadCmds;
+    
+    // C3.2: Timeline semaphore for GPU-side upload ordering
+    VkSemaphore m_uploadTimeline{VK_NULL_HANDLE};
+    uint64_t m_uploadTimelineValue = 0;
+    // Truly signaled (CPU-visible) value — used by world.update for
+    // processSoloPendingSwaps where we MUST know the GPU has actually finished.
+    uint64_t m_frameVisibleUploadTimelineValue = 0;
+    // "Will be signaled by the time the graphics CB executes on GPU" value.
+    // Equals this frame's batchValue. Used for cull dispatch / CPU draw gating
+    // because the graphics submit waits on m_uploadTimeline at m_uploadTimelineValue,
+    // so all currently-recorded slot writes are safe to read by execute time.
+    // Using lastSignaled here caused a 1-frame post-edit invisibility flicker
+    // under GPU culling (G mode): the slot's gpuReadyValue=batchValue was higher
+    // than the lagging lastSignaled, so frustum_filter.comp culled the chunk.
+    // CPU rendering didn't flicker because the OLD MeshHandle stayed live until
+    // processSoloPendingSwaps swapped it.
+    uint64_t m_frameCullingTimelineValue = 0;
+
+    // Hi-Z timeline semaphore for GPU-side Hi-Z build ordering
+    VkSemaphore m_hiZTimeline{VK_NULL_HANDLE};
+    uint64_t m_hiZTimelineValue = 0;
+    
+    // Cached Vulkan extension function pointer (resolved once in initVulkan)
+    PFN_vkGetSemaphoreCounterValueKHR m_vkGetSemaphoreCounterValueKHR{nullptr};
+
+    // GPU timing instrumentation
+    VkQueryPool m_timestampQueryPool{VK_NULL_HANDLE};
+    float m_timestampPeriod = 0.0f; // nanoseconds per tick
+    double m_lastGpuFrameMs = 0.0;
+    double m_lastUncappedFps = 0.0;
+    double m_lastActualFrameMs = 0.0;
+    double m_lastScreenFrameMs = 0.0;
+    double m_lastGameplayPresentTimestamp = 0.0;
+    double m_lastCpuFrameMs = 0.0;
+    double m_lastCpuWorkMs = 0.0;
+    
+    // drawFrame sub-timers (VSync hiding inside renderMs)
+    float m_presentWaitMs = 0.0f;  // vkAcquireNextImageKHR + per-image vkWaitForFences
+    float m_cmdRecordMs = 0.0f;    // command recording + ImGui + uniforms
+    float m_imguiMs = 0.0f;        // ImGui frame + debug overlay
+    float m_imguiInterfaceMs = 0.0f;
+    float m_imguiVramMs = 0.0f;
+    float m_imguiCloudMs = 0.0f;
+    float m_imguiMinimapMs = 0.0f;
+    float m_imguiPerfMs = 0.0f;
+    float m_imguiToolMs = 0.0f;
+    float m_imguiEndFrameMs = 0.0f;
+    bool  m_imguiFrameActive = false; // Whether ImGui frame was begun this frame
+    bool  m_gameplayOverlayFrameActive = false;
+
+    // Culling GPU timing (updated per frame from timestamp queries)
+    // Query indices per image:
+    // 0=frameStart, 1=afterInitialCull,
+    // 2=depthPrepassStart, 3=depthPrepassEnd, 4=afterHiZBuild, 5=afterFinalCull,
+    // 6=skyStarsStart, 7=skyStarsEnd,
+    // 8=voxelTerrainStart, 9=voxelTerrainEnd,
+    // 10=dccmTerrainEnd, 11=postTerrainEnd,
+    // 12=celestialCloudGlowStart, 13=celestialCloudGlowEnd,
+    // 14=postProcessStart, 15=postProcessEnd,
+    // 16=frameEnd
+    static constexpr uint32_t TIMESTAMPS_PER_IMAGE = 17;
+    double m_cullingDispatchMs = 0.0;
+    double m_cullingTotalMs = 0.0;
+    double m_terrainLightingMs = 0.0;
+    double m_gpuSkyStarsMs = 0.0;
+    double m_gpuVoxelTerrainMs = 0.0;
+    double m_gpuDccmTerrainMs = 0.0;
+    double m_gpuPostTerrainMs = 0.0;
+    double m_gpuCelestialCloudGlowMs = 0.0;
+    double m_gpuPostProcessMs = 0.0;
+    double m_gpuInitialCullMs = 0.0;
+    double m_gpuDepthPrepassMs = 0.0;
+    double m_gpuHiZBuildMs = 0.0;
+    double m_gpuFinalCullMs = 0.0;
+    double m_gpuHiZIncrementalMs = 0.0;
+    bool m_lastCollectedCurrentFrameHiZ = false;
+    bool m_lastCollectedTemporalHiZ = false;
+    std::vector<HiZPyramid::DiagnosticsMode> m_hiZTimingModeByImage;
+    float m_cpuInitialCullRecordMs = 0.0f;
+    float m_cpuDepthPrepassRecordMs = 0.0f;
+    float m_cpuHiZBuildRecordMs = 0.0f;
+    float m_cpuFinalCullRecordMs = 0.0f;
+    float m_cpuHiZIncrementalRecordMs = 0.0f;
+
+    // GPT_CHANGE: Cube buffer slices instead of raw buffers
+    BufferSlice m_cubeVB;
+    BufferSlice m_cubeIB;
+    
+    // PHASE B7: Multi-Draw Indirect buffer
+    static constexpr uint32_t MAX_INDIRECT_DRAWS = 65536;
+    VkBuffer m_indirectBuffer{VK_NULL_HANDLE};
+    VkDeviceMemory m_indirectMemory{VK_NULL_HANDLE};
+    uint32_t m_indirectDrawCount = 0;  // Actual number of draws this frame
+    
+    // Chunk origins storage buffer (for chunk-relative vertices)
+    VkBuffer m_chunkOriginsBuffer{VK_NULL_HANDLE};
+    VkDeviceMemory m_chunkOriginsMemory{VK_NULL_HANDLE};
+
+    // Geometry
+    Mesh m_cubeMesh;
+    
+    // World and ECS
+    World m_world;
+    
+    // Physics and player systems
+    Physics::PhysicsWorld m_physics;
+    Player::PlayerController m_player;
+    Player::PlayerCamera m_playerCamera;
+    
+    // Input and camera controllers (de-godified from Engine.cpp)
+    EngineInput m_input;
+    CameraController m_camera;
+    
+    // ImGui system
+    EngineImGui m_imgui;
+
+    // OS cursor image and hotspot configuration
+    CursorManager m_cursorManager;
+    
+    // Cloud rendering system
+    CloudSystem m_cloudSystem;
+    
+    // Celestial rendering system (sun and moon)
+    CelestialSystem m_celestialSystem;
+    
+    // Light glow rendering system (point light halos)
+    LightGlowSystem m_lightGlowSystem;
+    
+    // Realtime point-light shadow system (terrain + placed cube casters)
+    ShadowSystem m_shadowSystem;
+    
+    // Object manager (tracks all placed objects by chunk)
+    ObjectManager m_objectManager;
+    
+    // Light pulse preset library (built-in + user presets)
+    LightPulsePresetLibrary m_pulsePresets;
+    
+    // Star field rendering system (pixelated twinkling stars)
+    StarSystem m_starSystem;
+    
+    // Sky gradient rendering system (Sega-style pixel art sky)
+    SkySystem m_skySystem;
+    
+    // GPU-driven frustum culling system (replaces CPU gatherDrawCommands when enabled)
+    GPUCullingSystem m_gpuCulling;
+    bool m_gpuCullingEnabled = true;  // Toggle between CPU/GPU culling (default GPU)
+    uint32_t m_gpuCullingChunkCount = 0;  // Number of chunks uploaded for GPU culling
+    
+    // Hi-Z depth pyramid for occlusion culling
+    HiZPyramid m_hiZPyramid;
+    glm::mat4 m_prevViewProj{0.0f};  // Previous frame's viewProj for Hi-Z reprojection
+    glm::vec3 m_prevHiZCameraPos{0.0f};
+    glm::vec3 m_prevHiZCameraFront{0.0f, 0.0f, -1.0f};
+    glm::vec4 m_prevHiZViewportUvTransform{0.0f};
+    bool m_prevHiZFrameValid{false};
+    float m_lastFrameRotationDeg = 0.0f;
+    float m_lastFrameTranslation = 0.0f;
+    
+    // T-junction crack fix system (post-process to fix greedy meshing artifacts)
+    TJunctionFixSystem m_tjunctionFix;
+    TJunctionFixSystem m_gameplayTJunctionFix;
+
+    // Retro pixel pass system (post-process pixelation)
+    RetroPixelPassSystem m_pixelPass;
+    RetroPixelPassSystem m_gameplayPixelPass;
+    uint64_t m_gameplayPixelPassSwapchainGeneration = 0;
+
+    // Runtime shader editing + hot reload
+    ShaderHotReloadService m_shaderHotReload;
+    
+    // Minimap culling readback (debug feature for visualizing GPU culling results)
+    MinimapCullingReadback m_minimapReadback;
+
+    // Last known visible chunk snapshots per culling mode (sorted, unique).
+    std::vector<glm::ivec3> m_lastCpuVisibleChunks;
+    std::vector<glm::ivec3> m_lastGpuVisibleChunks;
+    uint64_t m_lastCpuVisibleSerial{0};
+    uint64_t m_lastGpuVisibleSerial{0};
+
+    struct GModeGeometryDiffCaptureState {
+        bool active = false;
+        bool beforeGpuMode = false;
+        bool afterGpuMode = false;
+        uint64_t toggleSerial = 0;
+        uint64_t targetAfterSerial = 0;
+        uint32_t timeoutFrames = 0;
+        std::vector<glm::ivec3> beforeVisible;
+    };
+    GModeGeometryDiffCaptureState m_gModeGeometryDiffCapture;
+    uint64_t m_gModeGeometryToggleSerial{0};
+    
+    // Physics body IDs for placed cubes (objectId -> Jolt BodyID)
+    // Enables raycasting against placed cubes for stacking
+    std::unordered_map<uint32_t, JPH::BodyID> m_cubePhysicsBodies;
+    uint64_t m_lastTerrainBoxRevisionSynced{0};
+    
+    // Uniform buffers
+    std::vector<VkBuffer> m_uniformBuffers;
+    std::vector<VkDeviceMemory> m_uniformBuffersMemory;
+    std::vector<void*> m_uniformMapped; // GPT_CHANGE: Persistent mapped pointers for UBOs
+    
+    // Lighting system buffers (SSBO)
+    std::vector<VkBuffer> m_lightingBuffers;
+    std::vector<VkDeviceMemory> m_lightingBuffersMemory;
+    std::vector<void*> m_lightingMapped;
+    std::unique_ptr<LightingSettings::GPULightingData> m_lightingStaging;  // Heap staging to avoid 200KB stack alloc
+    
+    // Clustered lighting (per-tile light bitmasks)
+    ClusteredLightingSystem m_clusteredLighting;
+    
+    // Camera data buffers
+    std::vector<VkBuffer> m_cameraBuffers;
+    std::vector<VkDeviceMemory> m_cameraBuffersMemory;
+    std::vector<void*> m_cameraMapped;
+    
+    // AO settings buffers
+    std::vector<VkBuffer> m_aoBuffers;
+    std::vector<VkDeviceMemory> m_aoBuffersMemory;
+    std::vector<void*> m_aoMapped;
+
+    // Sparse texture-material overlay. Texture paint is shader data keyed by
+    // world voxel face, so material edits do not remesh terrain or affect
+    // shadow-casting geometry.
+    struct MaterialOverlayHeaderGPU {
+        uint32_t capacityMask{0};
+        uint32_t count{0};
+        uint32_t maxProbe{0};
+        uint32_t _pad{0};
+    };
+    struct MaterialOverlayCellGPU {
+        int32_t x{0};
+        int32_t y{0};
+        int32_t z{0};
+        uint32_t face{0};
+        uint32_t material{0};
+    };
+    static_assert(sizeof(MaterialOverlayCellGPU) == 20, "MaterialOverlayCellGPU must match GLSL std430 layout");
+    std::vector<VkBuffer> m_materialOverlayBuffers;
+    std::vector<VkDeviceMemory> m_materialOverlayBuffersMemory;
+    std::vector<void*> m_materialOverlayMapped;
+    VkDeviceSize m_materialOverlayBufferSize{0};
+    std::vector<MaterialOverlayCellGPU> m_materialOverlayTable;
+    uint32_t m_materialOverlayCapacity{0};
+    uint32_t m_materialOverlayCount{0};
+    uint32_t m_materialOverlayMaxProbe{0};
+    size_t m_materialOverlayLastGeneration{0};
+    bool m_materialOverlayNeedsRebuild{true};
+    std::vector<uint8_t> m_materialOverlayImageDirty;
+    // Per-image queue of slot indices changed since each image was last synced.
+    // dirty=1 (full re-upload) supersedes any queued slots for that image.
+    std::vector<std::vector<uint32_t>> m_materialOverlayImageDirtySlots;
+
+    VkDescriptorSetLayout m_descriptorSetLayout{VK_NULL_HANDLE};
+    VkDescriptorPool m_descriptorPool{VK_NULL_HANDLE};
+    std::vector<VkDescriptorSet> m_descriptorSets;
+
+    // GPT_CHANGE: Depth buffer resources
+    VkImage m_depthImage{VK_NULL_HANDLE};
+    VkDeviceMemory m_depthMemory{VK_NULL_HANDLE};
+    VkImageView m_depthView{VK_NULL_HANDLE};
+    VkFormat m_depthFormat{VK_FORMAT_D32_SFLOAT};
+
+    bool m_framebufferResized = false;
+
+    // Phase E1: cached frame pass descriptors (instrumentation only)
+    std::vector<FramePassDescriptor> m_framePassDescriptors;
+    FrameGraph m_frameGraph;
+    std::vector<FrameGraphCompiledPass> m_compiledFramePasses;
+    VkImageLayout m_frameGraphColorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageLayout m_frameGraphDepthLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    // FPS tracking
+    static constexpr double FPS_LOG_INTERVAL_SECONDS = 5.0;  // Log every 5 seconds
+    double m_lastFpsTime = 0.0;
+    int m_frameCount = 0;
+    double m_lastStatsPrintTime = 0.0;
+    size_t m_statsFrameCount = 0;
+    size_t m_statsUploadBytesAccum = 0;
+    
+    // Fullscreen state
+    bool m_isFullscreen = true;
+    bool m_gameplayOnlyMode = false;
+    bool m_perfMode = false;
+    StartupTerrainPreset m_startupTerrainPreset = StartupTerrainPreset::Default;
+    bool m_vsyncEnabled = false;  // VSync OFF by default — uncapped FPS
+    int m_lastMonitorHz = 0;     // Track monitor changes for swapchain recreation
+    int m_windowedWidth = 1920;
+    int m_windowedHeight = 1080;
+    int m_windowedPosX = 100;
+    int m_windowedPosY = 100;
+
+    // Detached gameplay window (second OS window mirroring 3D scene)
+    std::unique_ptr<GameplayWindow> m_gameplayWindow;
+    uint64_t m_gameplayWindowSwapchainGeneration = 0;
+    bool m_gameplayWindowAcquired = false; // True when this frame acquired a gameplay image
+    bool m_gameplaySeparated = false;      // Exposed to RenderSettingsWindow for button disabling
+
+    bool m_perfOverlayEnabled = false;
+    static constexpr uint32_t PERF_OVERLAY_DRAWCOUNT_SAMPLE_INTERVAL = 12;
+    InGameDebug::DebugInfo::CPUBreakdown m_lastPerfBreakdown{};
+    float m_perfOverlayAvgFps = 0.0f;
+    float m_perfOverlayAvgFrameMs = 0.0f;
+    float m_perfOverlayAvgCpuWorkMs = 0.0f;
+    float m_perfOverlayAvgWorldMs = 0.0f;
+    float m_perfOverlayAvgRenderMs = 0.0f;
+    float m_perfOverlayAvgCullingMs = 0.0f;
+    uint32_t m_perfOverlayVisibleChunks = 0;
+    uint32_t m_perfOverlayTotalChunks = 0;
+
+    struct FrameBottleneckSample {
+        uint32_t frame{0};
+        float totalFrameMs{0.0f};
+        float cpuWorkMs{0.0f};
+        float gpuFrameMs{0.0f};
+        float glfwPollMs{0.0f};
+        float fenceWaitMs{0.0f};
+        float presentWaitMs{0.0f};
+        float readbackMs{0.0f};
+        float uploadSetupMs{0.0f};
+        float worldUpdateMs{0.0f};
+        float chunkLoadingMs{0.0f};
+        float meshingMs{0.0f};
+        float uploadMs{0.0f};
+        float collisionMs{0.0f};
+        float finalizeMs{0.0f};
+        float cullingCpuMs{0.0f};
+        float uploadSubmitMs{0.0f};
+        float renderMs{0.0f};
+        float imguiMs{0.0f};
+        float imguiInterfaceMs{0.0f};
+        float imguiVramMs{0.0f};
+        float imguiCloudMs{0.0f};
+        float imguiMinimapMs{0.0f};
+        float imguiPerfMs{0.0f};
+        float imguiToolMs{0.0f};
+        float imguiEndFrameMs{0.0f};
+        float toolsPanelTotalMs{0.0f};
+        float toolsCursorMs{0.0f};
+        float toolsTerrainMs{0.0f};
+        float toolsTextureMs{0.0f};
+        float cmdRecordMs{0.0f};
+        float otherMs{0.0f};
+        float gpuInitialCullMs{0.0f};
+        float gpuCullingTotalMs{0.0f};
+        float gpuTerrainMs{0.0f};
+        float gpuSkyStarsMs{0.0f};
+        float gpuVoxelTerrainMs{0.0f};
+        float gpuDccmTerrainMs{0.0f};
+        float gpuPostTerrainMs{0.0f};
+        float gpuCelestialCloudGlowMs{0.0f};
+        float gpuPostProcessMs{0.0f};
+        float gpuPointShadowMs{0.0f};
+        float gpuSunShadowMs{0.0f};
+        float sunCpuTotalMs{0.0f};
+        float sunCpuGatherMs{0.0f};
+        float sunCpuHashMs{0.0f};
+        float sunCpuCommandMs{0.0f};
+        uint32_t activeCullingSlots{0};
+        uint32_t visibleDraws{0};
+        uint32_t frustumPassed{0};
+        uint32_t chunksReady{0};
+        uint32_t hiZOccluded{0};
+        uint32_t selectedShadowLights{0};
+        uint32_t eligibleShadowLights{0};
+        uint32_t sunDrawCalls{0};
+        uint32_t sunAcceptedChunks{0};
+        uint32_t sunCandidateChunks{0};
+        uint32_t sunRenderCacheMissMask{0};
+        uint32_t sunGatherCacheMissMask{0};
+        uint64_t meshTopologyRevision{0};
+        bool gpuCullingEnabled{false};
+        bool gpuCullingReady{false};
+        bool sunRenderCacheHit{false};
+        bool sunGatherCacheHit{false};
+    };
+    static constexpr size_t FRAME_BOTTLENECK_HISTORY = 1200;
+    std::array<FrameBottleneckSample, FRAME_BOTTLENECK_HISTORY> m_frameBottleneckHistory{};
+    size_t m_frameBottleneckWriteIdx = 0;
+    size_t m_frameBottleneckCount = 0;
+    
+    // Time system (authoritative source for game time)
+    TimeManager m_timeManager;
+    
+    // Lighting system (uses TimeManager for day/night cycle)
+    LightingSettings m_lighting;
+    
+    uint32_t m_frameCounter{0};
+    
+    // Helper methods for lighting
+    void createLightingBuffers();
+    void createClusterBuffers();
+    void createCameraBuffers();
+    void createAOBuffers();
+    void createMaterialOverlayBuffers();
+    void ensureMaterialOverlayCapacity(size_t activeLOD0Cells);
+    void refreshMaterialOverlayDescriptors();
+    void syncMaterialOverlayForImage(uint32_t imageIndex);
+    void updateLightingUniforms(uint32_t currentImage,
+                                const std::vector<PointLight>& transientLights,
+                                const std::vector<glm::vec4>& transientPulseData);
+    void updateCameraUniforms(uint32_t currentImage);
+    void updateAOUniforms(uint32_t currentImage);
+    void updateClusterData(uint32_t currentImage,
+                           const glm::mat4& viewCameraRel,
+                           const glm::mat4& proj,
+                           const VkRect2D& gameplayRect);
+    // ... more members will be in Engine.cpp
+};

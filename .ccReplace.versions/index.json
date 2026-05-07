@@ -258,7 +258,7 @@
                       "Path":  "src/world/edit/TextureOverlayStore.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\TextureOverlayStore.cpp",
                       "Key":  "b7ce26efdbfc487f",
-                      "CurrentVersion":  2,
+                      "CurrentVersion":  3,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -271,6 +271,12 @@
                                            "Timestamp":  "2026-05-05T21:00:39.5028061Z",
                                            "Snapshot":  "files\\b7ce26efdbfc487f\\v000002.snapshot",
                                            "Reason":  "applied insert_after_function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-07T17:23:48.0125826Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000003.snapshot",
+                                           "Reason":  "applied function"
                                        }
                                    ]
                   },
@@ -854,6 +860,32 @@
                                            "Version":  3,
                                            "Timestamp":  "2026-05-07T13:15:16.2748967Z",
                                            "Snapshot":  "files\\a4f1539a715ca9be\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/ui/debug_menu/world/TexturePaintTool.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\TexturePaintTool.cpp",
+                      "Key":  "984185f35b3d3aa4",
+                      "CurrentVersion":  3,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-07T17:23:47.7735073Z",
+                                           "Snapshot":  "files\\984185f35b3d3aa4\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-07T17:23:47.8203809Z",
+                                           "Snapshot":  "files\\984185f35b3d3aa4\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-07T17:23:47.9941950Z",
+                                           "Snapshot":  "files\\984185f35b3d3aa4\\v000003.snapshot",
                                            "Reason":  "applied function"
                                        }
                                    ]

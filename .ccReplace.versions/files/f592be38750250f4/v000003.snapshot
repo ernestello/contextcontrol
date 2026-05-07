@@ -1,0 +1,563 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// shadow_sampling.glsl — Shadow resolve, sun shadow, point shadow PCF,
+//                        retro dithered point shadow with grid-sampled edges.
+//
+// Requires: dither_utils.glsl (bayerDither8x8, hash12, bandBlendHeldNoiseCell,
+//           bandBlendNoiseCell, snapGridCenterOffset, faceCell, buildFaceTangents)
+// Requires: UBO/SSBO bindings for shadow, lighting, sunShadowMap, pointShadowMaps
+// ═══════════════════════════════════════════════════════════════════════════
+#ifndef SHADOW_SAMPLING_GLSL
+#define SHADOW_SAMPLING_GLSL
+
+float resolveBinaryShadowFromNeighborhood5(float v0,
+                                           float v1,
+                                           float v2,
+                                           float v3,
+                                           float v4) {
+    // Majority-cleanup keeps pixel-art silhouettes coherent by filling
+    // tiny holes and removing one-pixel outliers before soft blending.
+    float litVotes =
+        step(0.5, v0) +
+        step(0.5, v1) +
+        step(0.5, v2) +
+        step(0.5, v3) +
+        step(0.5, v4);
+    float centerLit = step(0.5, v0);
+    if (litVotes <= 1.0) return 0.0;
+    if (litVotes >= 4.0) return 1.0;
+    if (centerLit < 0.5 && litVotes >= 3.0) return 1.0;
+    if (centerLit > 0.5 && litVotes <= 2.0) return 0.0;
+
+    float visibility = v0 * 0.5 + (v1 + v2 + v3 + v4) * 0.125;
+    float voteVisibility = litVotes / 5.0;
+    float blended = mix(visibility, voteVisibility, 0.45);
+    return smoothstep(0.30, 0.70, blended);
+}
+
+vec3 snapShadowLookupPos(vec3 worldPos) {
+    return snapGridCenterOffset(worldPos, LIGHT_GRID_CELL_SIZE, LIGHT_GRID_PHASE_OFFSET_CELLS);
+}
+
+uint getSunCascadeCount() {
+    return uint(clamp(shadow.shadowConfig2.x + 0.5, 1.0, 6.0));
+}
+
+float getSunCascadeBlendFraction() {
+    return clamp(shadow.shadowConfig2.y, 0.0, 0.45);
+}
+
+uint chooseSunCascade(float horizontalDistance) {
+    uint count = getSunCascadeCount();
+    for (uint i = 0u; i < count; ++i) {
+        if (horizontalDistance <= shadow.sunCascadeParams[i].x) {
+            return i;
+        }
+    }
+    return count - 1u;
+}
+
+bool sunCascadeSampleParams(vec3 sampleWorldPos,
+                            uint cascadeIndex,
+                            out vec2 uv,
+                            out float depth) {
+    vec4 clip = shadow.sunLightVP[cascadeIndex] * vec4(sampleWorldPos, 1.0);
+    vec3 ndc = clip.xyz / clip.w;
+    uv = ndc.xy * 0.5 + 0.5;
+    depth = ndc.z;
+
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 ||
+        depth > 1.0 || depth < 0.0) {
+        return false;
+    }
+    return true;
+}
+
+uint chooseSunCascadeForSample(vec3 sampleWorldPos, float horizontalDistance) {
+    uint count = getSunCascadeCount();
+    uint cascade = chooseSunCascade(horizontalDistance);
+    for (uint step = 0u; step < count; ++step) {
+        uint c = min(cascade + step, count - 1u);
+        vec2 uv;
+        float depth;
+        if (sunCascadeSampleParams(sampleWorldPos, c, uv, depth)) {
+            return c;
+        }
+        if (c == count - 1u) {
+            break;
+        }
+    }
+    return count - 1u;
+}
+
+float sampleSunShadowCascade(vec3 sampleWorldPos, uint cascadeIndex, bool snapUv) {
+    vec2 uv;
+    float depth;
+    if (!sunCascadeSampleParams(sampleWorldPos, cascadeIndex, uv, depth)) {
+        return 1.0;
+    }
+
+    // Per-cascade snap gate: snapping UV to texel center defeats hardware
+    // PCF and exposes the cascade's world-space texel directly on the
+    // receiver. That's intentional for the HD ring (texel ≈ 0.0156 m ≤
+    // light-grid cell) where it produces crisp pixel-art shadow edges.
+    // For far cascades at high cascadeScale the texel grows to >1 m —
+    // snapping there causes the chaotic outlines and triangle staircase
+    // artifacts. Fall back to natural PCF on those cascades for a clean
+    // smoothed silhouette that doesn't change shape with cascade count
+    // or scale.
+    float cascadeTexelMeters = shadow.sunCascadeParams[cascadeIndex].y;
+    bool fineEnoughToSnap = cascadeTexelMeters <= LIGHT_GRID_CELL_SIZE * 1.5;
+    if (snapUv && fineEnoughToSnap) {
+        float mapSize = max(shadow.shadowConfig.z, 1.0);
+        uv = (floor(uv * mapSize) + 0.5) / mapSize;
+    }
+
+    return texture(sunShadowMap, vec4(uv, float(cascadeIndex), depth));
+}
+
+float sampleSunShadowAt(vec3 sampleWorldPos) {
+    float horizontalDistance = length(sampleWorldPos.xz - camera.cameraPos.xz);
+    uint cascade = chooseSunCascadeForSample(sampleWorldPos, horizontalDistance);
+    float vis = sampleSunShadowCascade(sampleWorldPos, cascade, true);
+
+    uint count = getSunCascadeCount();
+    if (cascade + 1u < count) {
+        float blendFrac = getSunCascadeBlendFraction();
+        float cascadeRadius = shadow.sunCascadeParams[cascade].x;
+        float blendStart = cascadeRadius * (1.0 - blendFrac);
+        if (horizontalDistance > blendStart) {
+            vec4 farClip = shadow.sunLightVP[cascade + 1u] * vec4(sampleWorldPos, 1.0);
+            vec3 farNdc = farClip.xyz / farClip.w;
+            bool farValid =
+                farNdc.x >= -1.0 && farNdc.x <= 1.0 &&
+                farNdc.y >= -1.0 && farNdc.y <= 1.0 &&
+                farNdc.z >= 0.0 && farNdc.z <= 1.0;
+            if (farValid) {
+                float denom = max(cascadeRadius - blendStart, 0.0001);
+                float t = clamp((horizontalDistance - blendStart) / denom, 0.0, 1.0);
+                float farVis = sampleSunShadowCascade(sampleWorldPos, cascade + 1u, true);
+                vis = mix(vis, farVis, t);
+            }
+        }
+    }
+    return vis;
+}
+
+float sampleSunShadowAtNoSnap(vec3 sampleWorldPos) {
+    float horizontalDistance = length(sampleWorldPos.xz - camera.cameraPos.xz);
+    uint cascade = chooseSunCascadeForSample(sampleWorldPos, horizontalDistance);
+    float vis = sampleSunShadowCascade(sampleWorldPos, cascade, false);
+
+    uint count = getSunCascadeCount();
+    if (cascade + 1u < count) {
+        float blendFrac = getSunCascadeBlendFraction();
+        float cascadeRadius = shadow.sunCascadeParams[cascade].x;
+        float blendStart = cascadeRadius * (1.0 - blendFrac);
+        if (horizontalDistance > blendStart) {
+            vec4 farClip = shadow.sunLightVP[cascade + 1u] * vec4(sampleWorldPos, 1.0);
+            vec3 farNdc = farClip.xyz / farClip.w;
+            bool farValid =
+                farNdc.x >= -1.0 && farNdc.x <= 1.0 &&
+                farNdc.y >= -1.0 && farNdc.y <= 1.0 &&
+                farNdc.z >= 0.0 && farNdc.z <= 1.0;
+            if (farValid) {
+                float denom = max(cascadeRadius - blendStart, 0.0001);
+                float t = clamp((horizontalDistance - blendStart) / denom, 0.0, 1.0);
+                float farVis = sampleSunShadowCascade(sampleWorldPos, cascade + 1u, false);
+                vis = mix(vis, farVis, t);
+            }
+        }
+    }
+    return vis;
+}
+
+// Face-aware cell-center snap for pixel-art shadow edges.
+// Vertical faces (±X, ±Z): snap only the horizontal in-plane axis.
+//   Y is left continuous so the backface fade dither can snap it
+//   independently at the finer dither-cell resolution.  The shadow
+//   lookup for vertical faces uses sampleSunShadowAtNoSnap() which
+//   does not re-snap UV, so Y remaining un-snapped here is safe.
+// Horizontal faces (±Y): snap both X and Z (neither affects shadow depth).
+vec3 snapToFaceCell(vec3 pos, uint face) {
+    float g = LIGHT_GRID_CELL_SIZE;
+    vec3 s = pos;
+    if (face <= 1u) {       // ±X face: snap Z only (Y changes shadow depth)
+        s.z = (floor(pos.z / g + 0.01) + 0.5) * g;
+    } else if (face <= 3u) { // ±Y face: snap X, Z
+        s.x = (floor(pos.x / g + 0.01) + 0.5) * g;
+        s.z = (floor(pos.z / g + 0.01) + 0.5) * g;
+    } else {                // ±Z face: snap X only (Y changes shadow depth)
+        s.x = (floor(pos.x / g + 0.01) + 0.5) * g;
+    }
+    return s;
+}
+
+float sampleSunShadow(vec3 worldPos, vec3 worldNormal) {
+    if (shadow.shadowConfig.x <= 0.0) return 1.0;
+
+    vec3 normalN = normalize(worldNormal);
+    vec3 sunDir = shadow.sunDirTexelSize.xyz;
+    float ndotl = dot(normalN, -sunDir);
+
+    // ── Smooth backface terminator fade ───────────────────────────────
+    // Do this BEFORE any cascade/matrix work. Backfacing terrain is common
+    // and the old path still paid chooseSunCascadeForSample() before it could
+    // return 0.0. This keeps the same fade thresholds/output, just avoids the
+    // receiver-side cascade resolve when the result is already known.
+    const float kFadeStart = -0.08;
+    const float kFadeEnd   =  0.16;
+    float backfaceFade = smoothstep(kFadeStart, kFadeEnd, ndotl);
+    if (backfaceFade <= 0.0) return 0.0;
+
+    // Derive dominant face from normal (used for cell snap).
+    uint derivedFace;
+    vec3 an = abs(normalN);
+    if (an.x >= an.y && an.x >= an.z) derivedFace = (normalN.x > 0.0) ? 0u : 1u;
+    else if (an.y >= an.x && an.y >= an.z) derivedFace = (normalN.y > 0.0) ? 2u : 3u;
+    else derivedFace = (normalN.z > 0.0) ? 4u : 5u;
+
+    bool isVerticalFace = (derivedFace <= 1u || derivedFace >= 4u);
+
+    // ── Vertical-face cast-shadow fade ──────────────────────────────
+    // Same result as before, but computed before cascade selection. When the
+    // sun grazes a vertical face, the old path often did matrix work and a
+    // depth-compare only to multiply the result by ~0.
+    float castFade = 1.0;
+    if (isVerticalFace) {
+        float sunFaceCos = abs(dot(sunDir, normalN));
+        castFade = smoothstep(0.05, 0.16, sunFaceCos);
+        if (castFade <= 0.0) return 0.0;
+    }
+
+    // Fast receiver-side coverage reject.
+    // cube.frag fades sun shadows to fully lit at shadow.diagConfig.z
+    // (DirectionalShadowConfig::shadowAreaRadius). If this pixel is already
+    // outside that radius, the old path eventually became rawShadow=1.0 after
+    // the caller's fade, but only after cascade selection, VP transforms, and a
+    // depth-compare. Keep the final visual result and skip all shadow-map work.
+    vec2 horizontalDelta = worldPos.xz - camera.cameraPos.xz;
+    float horizontalDistanceSq = dot(horizontalDelta, horizontalDelta);
+    float sunAreaRadius = shadow.diagConfig.z;
+    if (sunAreaRadius > 0.0) {
+        float sunAreaRadiusSq = sunAreaRadius * sunAreaRadius;
+        if (horizontalDistanceSq >= sunAreaRadiusSq) {
+            return 1.0;
+        }
+    }
+
+    // Outside all directional-shadow coverage, the old path eventually fell
+    // through to lit cascade samples. Preserve the face-angle fade while
+    // skipping all VP transforms and depth-comparison work.
+    float maxCastRadius = shadow.shadowConfig2.z;
+    if (maxCastRadius > 0.0 && horizontalDistanceSq > maxCastRadius * maxCastRadius) {
+        return backfaceFade * castFade;
+    }
+
+    float horizontalDistance = sqrt(horizontalDistanceSq);
+
+    // This cascade index is used only for receiver bias / texel footprint.
+    // The actual depth lookup below still calls sampleSunShadowAt*(), which
+    // performs the full validity-aware cascade choice. Avoiding
+    // chooseSunCascadeForSample() here removes one redundant per-fragment
+    // cascade matrix loop from every sun-shadowed terrain pixel.
+    uint activeCascade = chooseSunCascade(horizontalDistance);
+
+    // Push receiver along the SURFACE NORMAL toward the light, not along
+    // -sunDir. The sun-direction push at low elevation is almost entirely
+    // horizontal — it walks the sample point into adjacent geometry
+    // ("shadow under wall" at the base of vertical objects) and shifts
+    // the silhouette with azimuth ("shadow detaches" / "shape changes").
+    // Normal-direction push is purely along the receiver face, so the
+    // sample stays anchored to the same contact point regardless of
+    // sun direction — silhouettes are stable as the sun rotates.
+    float g = LIGHT_GRID_CELL_SIZE;
+    float cascadeTexel = shadow.sunCascadeParams[activeCascade].y;
+    uint cascadeCount = getSunCascadeCount();
+    if (activeCascade + 1u < cascadeCount) {
+        float blendFrac = getSunCascadeBlendFraction();
+        float cascadeRadius = shadow.sunCascadeParams[activeCascade].x;
+        float blendStart = cascadeRadius * (1.0 - blendFrac);
+        if (horizontalDistance > blendStart) {
+            cascadeTexel = max(cascadeTexel, shadow.sunCascadeParams[activeCascade + 1u].y);
+        }
+    }
+    float baseTexel = shadow.sunCascadeParams[0].y;
+    float biasTexel = min(max(baseTexel, cascadeTexel * 0.25), baseTexel * 2.0);
+    // Slope factor 1/max(ndotl, 0.1) bounded; only used to grow the
+    // normal push at grazing angles where one shadow texel covers more
+    // depth difference along the surface tangent.
+    float slope = clamp(1.0 / max(ndotl, 0.1), 1.0, 4.0);
+    float pushAlongNormal = max(g, biasTexel * 0.85) * slope;
+
+    if (isVerticalFace) {
+        // Vertical faces: snap the in-plane horizontal axis AND Y to the
+        // cell grid. Y must be snapped because the shadow UV is
+        //   (worldX + Y*shearX, worldZ + Y*shearZ)
+        // i.e. Y appears in BOTH UV components via the shear projection.
+        // Leaving Y continuous lets fragments inside a single wall cell
+        // sweep ~g*|shear| texels of shadow space, so the cell fills only
+        // partially and the silhouette goes jagged. Snapping Y collapses
+        // the whole wall-cell to one (u,v) lookup -> one binary shadow
+        // result per cell, matching top-face behaviour. No UV snap inside
+        // the texture lookup (we already snapped in world space).
+        float gCell = LIGHT_GRID_CELL_SIZE;
+        vec3 snapped = snapToFaceCell(worldPos, derivedFace);
+        snapped.y = (floor(worldPos.y / gCell + 0.01) + 0.5) * gCell;
+        vec3 pushed  = snapped + normalN * pushAlongNormal;
+        return sampleSunShadowAtNoSnap(pushed) * backfaceFade * castFade;
+    }
+
+    // Horizontal faces: NO world-cell snap (would cause moiré with the
+    // sheared shadow texel grid). Push purely along normal so silhouettes
+    // don't shift with sun azimuth.
+    vec3 samplePos = worldPos + normalN * pushAlongNormal;
+    return sampleSunShadowAt(samplePos) * backfaceFade;
+}
+
+float sampleSunShadow(vec3 worldPos) {
+    return sampleSunShadow(worldPos, vec3(0.0, 1.0, 0.0));
+}
+
+// ── Sun shadow debug visualization ──────────────────────────────────
+// diagConfig.y selects the debug mode:
+//   1 = shadow UV (snapped texel coordinates as RG)
+//   2 = binary shadow value (0=dark, 1=lit)
+//   3 = texel grid lines (white = texel boundary)
+//   4 = depth value visualized
+//   5 = cascade ID (per-cascade tint on terrain)
+// Returns vec4(0) when debug is off.
+
+// Fixed per-cascade tint palette. MUST match the C++ side palette in
+// DirectionalShadowWindow::renderCascadeOverlay so the in-world wireframe
+// box and the on-terrain tint use the SAME color for the same cascade.
+vec3 cascadeDebugColor(uint cascadeIndex) {
+    if (cascadeIndex == 0u) return vec3(1.00, 0.25, 0.25); // red
+    if (cascadeIndex == 1u) return vec3(1.00, 0.65, 0.20); // orange
+    if (cascadeIndex == 2u) return vec3(1.00, 1.00, 0.30); // yellow
+    if (cascadeIndex == 3u) return vec3(0.30, 1.00, 0.40); // green
+    if (cascadeIndex == 4u) return vec3(0.30, 0.85, 1.00); // cyan
+    return vec3(1.00, 0.40, 1.00);                          // magenta (>=5)
+}
+
+vec4 debugSunShadow(vec3 worldPos, vec3 worldNormal) {
+    float debugMode = shadow.diagConfig.y;
+    if (debugMode < 0.5) return vec4(0.0);
+
+    vec3 normalN = normalize(worldNormal);
+    vec3 sunDir  = shadow.sunDirTexelSize.xyz;
+
+    // Derive face the same way as sampleSunShadow.
+    uint face;
+    vec3 an = abs(normalN);
+    if (an.x >= an.y && an.x >= an.z) face = (normalN.x > 0.0) ? 0u : 1u;
+    else if (an.y >= an.x && an.y >= an.z) face = (normalN.y > 0.0) ? 2u : 3u;
+    else face = (normalN.z > 0.0) ? 4u : 5u;
+    bool isVerticalFace = (face <= 1u || face >= 4u);
+
+    // For UV / depth visualisation we need the EXACT same sample point as
+    // gameplay's sampleSunShadow() — otherwise the texel grid view will
+    // disagree with the actual shadow (different push direction +
+    // missing Y-snap on vertical faces would make the visualization
+    // appear shifted and cells partially filled).
+    //
+    // Replicate the gameplay snap: snap face-plane cell, plus snap Y on
+    // vertical faces (Y appears in shadow UV via shear projection).
+    float gCell = LIGHT_GRID_CELL_SIZE;
+    vec3 snapped = snapToFaceCell(worldPos, face);
+    if (isVerticalFace) {
+        snapped.y = (floor(worldPos.y / gCell + 0.01) + 0.5) * gCell;
+    }
+    // Push along surface normal (matches sampleSunShadow); use a small
+    // fixed cell-sized push — debug only needs to clear receiver depth.
+    vec3 samplePos = snapped + normalN * gCell;
+
+    float horizontalDistance = length(samplePos.xz - camera.cameraPos.xz);
+    uint cascade = chooseSunCascade(horizontalDistance);
+    vec4 clip = shadow.sunLightVP[cascade] * vec4(samplePos, 1.0);
+    vec3 ndc = clip.xyz / clip.w;
+    vec2 uv = ndc.xy * 0.5 + 0.5;
+    float depth = ndc.z;
+
+    int mode = int(debugMode + 0.5);
+
+    // Mode 1: Shadow UV as color (R=U, G=V).
+    if (mode == 1) {
+        return vec4(fract(uv * 16.0), 0.0, 1.0);
+    }
+
+    // Mode 2: Binary shadow value — go through gameplay path so the
+    // debug view is bit-identical to in-game shadow on every face.
+    if (mode == 2) {
+        float val = sampleSunShadow(worldPos, worldNormal);
+        return vec4(vec3(val), 1.0);
+    }
+
+    // Mode 3: Face-cell grid overlay with the gameplay shadow value.
+    // Calling sampleSunShadow() (not sampleSunShadowAt(samplePos)) makes
+    // the per-cell fill identical to gameplay — the cells now fully fill
+    // and the silhouette matches the in-game shadow exactly.
+    if (mode == 3) {
+        vec2 fc = faceCell(worldPos, face);
+        vec2 cellPos = fc / LIGHT_GRID_CELL_SIZE;
+        vec2 f = fract(cellPos);
+        vec2 nearEdge = min(f, 1.0 - f);
+        float grid = (nearEdge.x < 0.06 || nearEdge.y < 0.06) ? 1.0 : 0.0;
+        float shadowVal = sampleSunShadow(worldPos, worldNormal);
+        return vec4(mix(vec3(shadowVal * 0.4), vec3(1.0), grid), 1.0);
+    }
+
+    // Mode 4: Depth value visualized.
+    if (mode == 4) {
+        return vec4(fract(depth * 100.0), fract(depth * 1000.0), depth, 1.0);
+    }
+
+    // Mode 5: Cascade ID — tint the terrain by which cascade it samples.
+    // Modulated by a quick sun-facing diffuse so 3D shape stays readable.
+    if (mode == 5) {
+        vec3 tint = cascadeDebugColor(cascade);
+        float diffuse = max(dot(normalN, -sunDir), 0.0);
+        float lit = mix(0.55, 1.0, diffuse);
+        return vec4(tint * lit, 1.0);
+    }
+
+    return vec4(1.0, 0.0, 1.0, 1.0); // magenta = unknown mode
+}
+
+float samplePointShadowPCF(vec3 dirN, uint lightIndex, float compareDepth, float mapSize) {
+    vec3 up = (abs(dirN.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
+    vec3 tangent = normalize(cross(up, dirN));
+    vec3 bitangent = cross(dirN, tangent);
+
+    // Smaller kernel: keeps retro hard edges but cuts heavy depth-compare cost.
+    float angleStep = 2.0 / mapSize;
+    float radius = angleStep * 1.25;
+    const vec2 pcfOffsets[4] = vec2[](
+        vec2( 1.0,  0.0),
+        vec2(-1.0,  0.0),
+        vec2( 0.0,  1.0),
+        vec2( 0.0, -1.0)
+    );
+
+    float sum = texture(pointShadowMaps, vec4(dirN, float(lightIndex)), compareDepth);
+    for (int i = 0; i < 4; ++i) {
+        vec2 o = pcfOffsets[i] * radius;
+        vec3 sampleDir = normalize(dirN + tangent * o.x + bitangent * o.y);
+        sum += texture(pointShadowMaps, vec4(sampleDir, float(lightIndex)), compareDepth);
+    }
+    return sum / 5.0;
+}
+
+float samplePointShadowSingle(vec3 dirN, uint lightIndex, float compareDepth) {
+    return texture(pointShadowMaps, vec4(dirN, float(lightIndex)), compareDepth);
+}
+
+float samplePointShadowAt(vec3 sampleWorldPos,
+                          vec3 worldNormalN,
+                          vec3 lightPos,
+                          uint lightIndex,
+                          float farPlane,
+                          float mapSize,
+                          bool usePCF) {
+    vec3 dir = sampleWorldPos - lightPos;
+    float distSq = dot(dir, dir);
+    float farPlaneSq = farPlane * farPlane;
+    if (distSq <= 0.00000001 || distSq >= farPlaneSq) return 1.0;
+
+    float invDist = inversesqrt(distSq);
+    float dist = distSq * invDist;
+    vec3 dirN = dir * invDist;
+
+    // World-space receiver bias derived from cubemap texel footprint.
+    // Prevents lit-edge acne where contact seams quantize to the occluder depth.
+    float ndotl = max(dot(worldNormalN, -dirN), 0.0);
+    float slope = 1.0 - ndotl;
+    float dist01 = clamp(dist / farPlane, 0.0, 1.0);
+    float texelWorld = farPlane / max(mapSize, 1.0);
+    const float SHADOW_LOOKUP_GRID = LIGHT_GRID_CELL_SIZE;
+
+    // Extra bias for grazing angles (slope~1) to prevent self-shadowing
+    // on vertical faces while still catching cast shadows from other objects.
+    float worldBias = texelWorld * (1.15 + slope * 3.50);
+    worldBias = max(worldBias, SHADOW_LOOKUP_GRID * 0.12);
+    worldBias += SHADOW_LOOKUP_GRID * 0.03 * (1.0 - dist01);
+
+    float compareDepth = clamp((dist - worldBias) / farPlane, 0.0, 1.0);
+    return usePCF
+        ? samplePointShadowPCF(dirN, lightIndex, compareDepth, mapSize)
+        : samplePointShadowSingle(dirN, lightIndex, compareDepth);
+}
+
+// Retro dithered shadow: sample a small cell footprint for raw coverage,
+// then resolve to binary (fully lit or fully dark) per pixel-cell using
+// the same Bayer + noise pattern as light band transitions.
+// Shadow edges become scattered retro pixels that merge with light bands.
+float samplePointShadow(vec3 worldPos, vec3 worldNormal, uint lightIndex) {
+    vec3 lightPos = lighting.pointLights[lightIndex].positionRadius.xyz;
+    float farPlane = shadow.pointShadowInfo[lightIndex].y;
+
+    if (farPlane < 0.01) return 1.0;
+    float mapSize = max(shadow.shadowConfig.w, 1.0);
+    vec3 normalN = normalize(worldNormal);
+    bool verticalFace = (abs(normalN.y) < 0.5);
+
+    const float SHADOW_LOOKUP_GRID = LIGHT_GRID_CELL_SIZE;
+
+    // --- Sample center + 4 cardinal neighbors for raw coverage ---
+    vec3 snapped = snapShadowLookupPos(worldPos);
+    float receiverPush = verticalFace
+        ? SHADOW_LOOKUP_GRID * 1.55
+        : SHADOW_LOOKUP_GRID * 0.22;
+    float kernelRadius = verticalFace
+        ? SHADOW_LOOKUP_GRID * 0.78
+        : SHADOW_LOOKUP_GRID * 0.74;
+
+    vec3 center = verticalFace
+        ? snapped + normalN * receiverPush
+        : snapShadowLookupPos(worldPos + normalN * receiverPush);
+    if (verticalFace) {
+        center.y = snapped.y + SHADOW_LOOKUP_GRID * 0.35;
+    }
+
+    vec3 t1, t2;
+    buildFaceTangents(normalN, t1, t2);
+
+    float v0 = samplePointShadowAt(center, normalN, lightPos, lightIndex, farPlane, mapSize, false);
+    float v1 = samplePointShadowAt(center + t1 * kernelRadius, normalN, lightPos, lightIndex, farPlane, mapSize, false);
+    float v2 = samplePointShadowAt(center - t1 * kernelRadius, normalN, lightPos, lightIndex, farPlane, mapSize, false);
+    float v3 = samplePointShadowAt(center + t2 * kernelRadius, normalN, lightPos, lightIndex, farPlane, mapSize, false);
+    float v4 = samplePointShadowAt(center - t2 * kernelRadius, normalN, lightPos, lightIndex, farPlane, mapSize, false);
+
+    // Majority cleanup removes one-cell strays before we quantize the edge.
+    float coverage = resolveBinaryShadowFromNeighborhood5(v0, v1, v2, v3, v4);
+
+    // Fully lit or fully shadowed: no dithering needed
+    if (coverage >= 0.96) return 1.0;
+    if (coverage <= 0.04) return 0.0;
+
+    // --- Shadow edge: dither to binary using same pattern as band transitions ---
+    // Derive face axis from normal for faceCell projection
+    uint derivedFace;
+    vec3 an = abs(normalN);
+    if (an.x >= an.y && an.x >= an.z) derivedFace = (normalN.x > 0.0) ? 0u : 1u;
+    else if (an.y >= an.x && an.y >= an.z) derivedFace = (normalN.y > 0.0) ? 2u : 3u;
+    else derivedFace = (normalN.z > 0.0) ? 4u : 5u;
+
+    vec3 pixWorld = snapGridCenterOffset(
+        worldPos, LIGHT_GRID_CELL_SIZE, LIGHT_GRID_PHASE_OFFSET_CELLS);
+    vec2 cellCoord = floor(
+        faceCell(pixWorld, derivedFace) / LIGHT_GRID_CELL_SIZE + 0.01);
+
+    // Bayer 8x8 ordered dither (same grid as band transitions)
+    vec2 orderedCell = mod(mod(cellCoord, 8.0) + 8.0, 8.0);
+    float ordered = bayerDither8x8(orderedCell);
+
+    // Static pattern only: stable retro shadow pixels without time-varying
+    // shimmer or stray cells popping outside the true silhouette.
+    float staticNoise = hash12(cellCoord + vec2(37.7, 53.1));
+    float pattern = clamp(ordered * 0.82 + staticNoise * 0.18, 0.0, 1.0);
+
+    float edgeCoverage = smoothstep(0.18, 0.82, coverage);
+    return (edgeCoverage > pattern) ? 1.0 : 0.0;
+}
+
+#endif // SHADOW_SAMPLING_GLSL
