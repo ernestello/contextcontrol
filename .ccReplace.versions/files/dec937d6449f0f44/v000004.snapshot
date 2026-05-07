@@ -209,29 +209,7 @@ function Resolve-CcSharedProjectRoot {
         $root = [string]$Settings.ProjectRoot
     }
 
-    $resolvedRoot = Resolve-CcSharedPathRelativeToScript $root
-
-    # Context Control is designed to live at:
-    #   <project-root>/contextcontrol/
-    # If an old settings file says ProjectRoot="." or the tool is launched from
-    # inside contextcontrol/, do not export the tool folder as the project. Promote
-    # the project root to the parent engine folder automatically.
-    $leaf = Split-Path -Leaf $resolvedRoot
-    if ($leaf -ieq "contextcontrol") {
-        $hasContextControlScripts =
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccDir.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "cc.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccReplace.ps1"))
-
-        if ($hasContextControlScripts) {
-            $parent = Split-Path -Parent $resolvedRoot
-            if (-not [string]::IsNullOrWhiteSpace($parent)) {
-                return [System.IO.Path]::GetFullPath($parent)
-            }
-        }
-    }
-
-    return $resolvedRoot
+    return Resolve-CcSharedPathRelativeToScript $root
 }
 
 function Resolve-CcSharedOutputRoot {
@@ -484,26 +462,6 @@ function Detect-Profile {
     return "generic"
 }
 
-$script:CcSharedSettings = Read-CcSharedSettings
-$script:CcProjectRoot = Resolve-CcSharedProjectRoot $script:CcSharedSettings
-$script:CcOutputRoot = Resolve-CcSharedOutputRoot $script:CcSharedSettings
-
-if (-not (Test-Path -LiteralPath $script:CcProjectRoot)) {
-    throw "Configured ProjectRoot does not exist: $script:CcProjectRoot. Change it in contextcontrol/.ccReplace.settings.json or ccReplace Settings option 11."
-}
-
-if (-not (Test-Path -LiteralPath $script:CcOutputRoot)) {
-    New-Item -ItemType Directory -Path $script:CcOutputRoot | Out-Null
-}
-
-# Project-tree scanning is relative to the configured project root.
-# The markdown export is written to the configured Context Control output folder.
-Set-Location -LiteralPath $script:CcProjectRoot
-
-Write-Host "Project root: $script:CcProjectRoot" -ForegroundColor DarkGray
-Write-Host "Output folder: $script:CcOutputRoot" -ForegroundColor DarkGray
-
-
 $ResolvedProfile = Detect-Profile
 
 function Is-ExcludedItem($Item) {
@@ -512,13 +470,6 @@ function Is-ExcludedItem($Item) {
     }
 
     if ($Item.PSIsContainer) {
-        # Context Control is an engine-root tool folder, not engine source.
-        # DIR exports should map the actual project and never recurse into the
-        # contextcontrol working/cache/scripts folder.
-        if ($Item.Name -ieq "contextcontrol") {
-            return $true
-        }
-
         return $ExcludeDirs -contains $Item.Name
     }
 

@@ -124,161 +124,14 @@ function Get-OutputText {
     return $text
 }
 
-function New-CcSharedDefaultSettings {
-    return [pscustomobject]@{
-        ProjectRoot = ".."
-        OutputRoot = "."
-    }
-}
-
-function Get-CcSharedScriptDirectory {
-    if ($PSScriptRoot -ne "") {
-        return $PSScriptRoot
-    }
-
-    return (Get-Location).Path
-}
-
-function Get-CcSharedSettingsPath {
-    return (Join-Path (Get-CcSharedScriptDirectory) ".ccReplace.settings.json")
-}
-
-function Merge-CcSharedSettings {
-    param($Loaded)
-
-    $settings = New-CcSharedDefaultSettings
-
-    if ($null -eq $Loaded) {
-        return $settings
-    }
-
-    foreach ($prop in $settings.PSObject.Properties.Name) {
-        if ($Loaded.PSObject.Properties.Name -contains $prop) {
-            $settings.$prop = $Loaded.$prop
-        }
-    }
-
-    return $settings
-}
-
-function Read-CcSharedSettings {
-    $path = Get-CcSharedSettingsPath
-
-    if (-not (Test-Path -LiteralPath $path)) {
-        return New-CcSharedDefaultSettings
-    }
-
-    try {
-        $json = Get-Content -LiteralPath $path -Raw
-        if ([string]::IsNullOrWhiteSpace($json)) {
-            return New-CcSharedDefaultSettings
-        }
-
-        return Merge-CcSharedSettings ($json | ConvertFrom-Json)
-    }
-    catch {
-        Write-Host "Context Control settings could not be read, using defaults: $($_.Exception.Message)" -ForegroundColor Yellow
-        return New-CcSharedDefaultSettings
-    }
-}
-
-function Resolve-CcSharedPathRelativeToScript {
-    param([string]$PathText)
-
-    if ([string]::IsNullOrWhiteSpace($PathText)) {
-        return (Get-CcSharedScriptDirectory)
-    }
-
-    $clean = $PathText.Trim()
-    $clean = $clean -replace '/', [System.IO.Path]::DirectorySeparatorChar
-
-    if ([System.IO.Path]::IsPathRooted($clean)) {
-        return [System.IO.Path]::GetFullPath($clean)
-    }
-
-    return [System.IO.Path]::GetFullPath((Join-Path (Get-CcSharedScriptDirectory) $clean))
-}
-
-function Resolve-CcSharedProjectRoot {
-    param($Settings)
-
-    $root = ".."
-    if ($null -ne $Settings -and
-        ($Settings.PSObject.Properties.Name -contains "ProjectRoot") -and
-        -not [string]::IsNullOrWhiteSpace([string]$Settings.ProjectRoot)) {
-        $root = [string]$Settings.ProjectRoot
-    }
-
-    $resolvedRoot = Resolve-CcSharedPathRelativeToScript $root
-
-    # Context Control is designed to live at:
-    #   <project-root>/contextcontrol/
-    # If an old settings file says ProjectRoot="." or the tool is launched from
-    # inside contextcontrol/, do not export the tool folder as the project. Promote
-    # the project root to the parent engine folder automatically.
-    $leaf = Split-Path -Leaf $resolvedRoot
-    if ($leaf -ieq "contextcontrol") {
-        $hasContextControlScripts =
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccDir.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "cc.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccReplace.ps1"))
-
-        if ($hasContextControlScripts) {
-            $parent = Split-Path -Parent $resolvedRoot
-            if (-not [string]::IsNullOrWhiteSpace($parent)) {
-                return [System.IO.Path]::GetFullPath($parent)
-            }
-        }
-    }
-
-    return $resolvedRoot
-}
-
-function Resolve-CcSharedOutputRoot {
-    param($Settings)
-
-    $root = "."
-    if ($null -ne $Settings -and
-        ($Settings.PSObject.Properties.Name -contains "OutputRoot") -and
-        -not [string]::IsNullOrWhiteSpace([string]$Settings.OutputRoot)) {
-        $root = [string]$Settings.OutputRoot
-    }
-
-    return Resolve-CcSharedPathRelativeToScript $root
-}
-
-function Resolve-CcSharedOutputPath {
-    param(
-        [string]$PathText,
-        $Settings = $null
-    )
-
-    if ([string]::IsNullOrWhiteSpace($PathText)) {
-        throw "Missing output path."
-    }
-
-    $clean = $PathText.Trim()
-    $clean = $clean -replace '/', [System.IO.Path]::DirectorySeparatorChar
-
-    if ([System.IO.Path]::IsPathRooted($clean)) {
-        return [System.IO.Path]::GetFullPath($clean)
-    }
-
-    if ($null -eq $Settings) {
-        $Settings = Read-CcSharedSettings
-    }
-
-    return [System.IO.Path]::GetFullPath((Join-Path (Resolve-CcSharedOutputRoot $Settings) $clean))
-}
-
 function Save-OutputFile {
     param([string]$Path)
 
-    $fullPath = Resolve-CcSharedOutputPath $Path $script:CcSharedSettings
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
     $dir = [System.IO.Path]::GetDirectoryName($fullPath)
 
     if ([string]::IsNullOrWhiteSpace($dir)) {
-        $dir = Resolve-CcSharedOutputRoot $script:CcSharedSettings
+        $dir = (Get-Location).Path
     }
 
     if (-not (Test-Path -LiteralPath $dir)) {
@@ -484,26 +337,6 @@ function Detect-Profile {
     return "generic"
 }
 
-$script:CcSharedSettings = Read-CcSharedSettings
-$script:CcProjectRoot = Resolve-CcSharedProjectRoot $script:CcSharedSettings
-$script:CcOutputRoot = Resolve-CcSharedOutputRoot $script:CcSharedSettings
-
-if (-not (Test-Path -LiteralPath $script:CcProjectRoot)) {
-    throw "Configured ProjectRoot does not exist: $script:CcProjectRoot. Change it in contextcontrol/.ccReplace.settings.json or ccReplace Settings option 11."
-}
-
-if (-not (Test-Path -LiteralPath $script:CcOutputRoot)) {
-    New-Item -ItemType Directory -Path $script:CcOutputRoot | Out-Null
-}
-
-# Project-tree scanning is relative to the configured project root.
-# The markdown export is written to the configured Context Control output folder.
-Set-Location -LiteralPath $script:CcProjectRoot
-
-Write-Host "Project root: $script:CcProjectRoot" -ForegroundColor DarkGray
-Write-Host "Output folder: $script:CcOutputRoot" -ForegroundColor DarkGray
-
-
 $ResolvedProfile = Detect-Profile
 
 function Is-ExcludedItem($Item) {
@@ -512,13 +345,6 @@ function Is-ExcludedItem($Item) {
     }
 
     if ($Item.PSIsContainer) {
-        # Context Control is an engine-root tool folder, not engine source.
-        # DIR exports should map the actual project and never recurse into the
-        # contextcontrol working/cache/scripts folder.
-        if ($Item.Name -ieq "contextcontrol") {
-            return $true
-        }
-
         return $ExcludeDirs -contains $Item.Name
     }
 
@@ -639,13 +465,13 @@ else {
 Add-Line "END"
 Add-Line "$Fence3"
 Add-Line ""
-Add-Line "Function/discovery examples accepted by upgraded cc.ps1:"
+Add-Line "Function examples accepted by upgraded cc.ps1:"
 Add-Line ""
 Add-Line "$Fence3`text"
 Add-Line "FUNCTION src/world/World.cpp :: World::markTextureMaterialsDirty"
 Add-Line "FUNCTION src/world/World*.cpp :: World::beginTerrainEditVisualTracking"
 Add-Line "FUNC: beginTerrainEditVisualTracking"
-Add-Line "FIND: TerrainEditDiag"
+Add-Line "SYMBOL: TerrainEditDiag"
 Add-Line "END"
 Add-Line "$Fence3"
 Add-Line ""
@@ -655,8 +481,7 @@ Add-Line "- Prefer narrow subsystem files/functions over giant exports."
 Add-Line "- Function syntax must be exactly: FUNCTION src/path/File.cpp :: SymbolName."
 Add-Line "- Wildcard FUNCTION paths are supported for split implementation families, e.g. FUNCTION src/world/World*.cpp :: World::foo, but prefer exact files when known."
 Add-Line "- Use FUNC: SymbolName only when the owning file is unknown and you want cc.ps1 to search and extract function bodies."
-Add-Line "- Do not request SYMBOL:. It is disabled because whole-file symbol export causes token explosions."
-Add-Line "- Use FIND: TextToLocate only for cheap discovery; it lists matching files and occurrence previews without exporting source bodies."
+Add-Line "- Use SYMBOL: SymbolName only for non-function declarations/types/constants because it exports whole matching files."
 Add-Line "- cc.ps1 now auto-adds matching headers for .cpp files and direct GLSL #include files, so do not list obvious duplicates unless the specific header/include is central to the change."
 Add-Line "- Include CMakeLists.txt only when adding/removing C++ source files or build config."
 Add-Line "- Never request build/, vcpkg_installed/, vendor/external/third_party/, generated caches, binaries, or unrelated modules."

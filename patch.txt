@@ -1,1017 +1,505 @@
 BEGIN CC-REPLACE
-FILE: include/world/edit/TextureOverlayStore.h
-MODE: whole_file
----
-#pragma once
-
-// GPT-DESC: Declares sparse texture material storage and deferred/live surface paint stamps.
-
-#include <array>
-#include <atomic>
-#include <cstdint>
-#include <memory>
-#include <shared_mutex>
-#include <unordered_map>
-#include <vector>
-
-#include <glm/glm.hpp>
-
-#include "world/WorldTypes.h"
-#include "world/config/WorldConfig.h"
-
-namespace TextureOverlay {
-
-// ---------------------------------------------------------------------------
-// Texture material types and per-voxel storage
-// ---------------------------------------------------------------------------
-
-enum class TextureType : uint8_t {
-    Grass = 0,
-    Mud = 1,
-    Dirt = 2,
-    Sand = 3,
-    COUNT = 4
-};
-
-// Transition edge style used for material boundaries.
-// Stored in VoxelTextureData::edgeMask (2 bits).
-enum class TransitionEdgeStyle : uint8_t {
-    None = 0,
-    Leafy = 1,
-    Sloppy = 2,
-    Grainy = 3
-};
-
-enum class SurfaceBrushShape : uint8_t {
-    Disc = 0,
-    Rect = 1
-};
-
-inline const char* textureTypeName(TextureType t) {
-    switch (t) {
-        case TextureType::Grass: return "grass";
-        case TextureType::Mud:   return "mud";
-        case TextureType::Dirt:  return "dirt";
-        case TextureType::Sand:  return "sand";
-        default: return "?";
-    }
-}
-
-// Per-voxel texture assignment.  Packed into 1 byte:
-//   bit 0..1  textureType (4 types)
-//   bit 2..4  variant (8 variants — we only need 5 in practice)
-//   bit 5..6  edgeMask (2 bits, reserved for transition flags)
-//   bit 7     valid flag (1 = painted, 0 = empty)
-//
-// The valid flag is essential: without it, "Grass + variant 0" would collide
-// with "empty" (both packed=0).  It's the only way to clear a cell back to
-// its un-painted state via the same packed byte.
-struct VoxelTextureData {
-    uint8_t packed{0};
-    uint8_t face{3}; // 0..5, same face IDs as the terrain vertex format.
-
-    constexpr VoxelTextureData() = default;
-    VoxelTextureData(TextureType type,
-                     uint8_t variant,
-                     uint8_t edgeMask = 0,
-                     uint8_t faceId = 3) {
-        packed = static_cast<uint8_t>(
-            0x80u |  // valid flag
-            (static_cast<uint32_t>(type) & 0x3u) |
-            ((variant & 0x7u) << 2) |
-            ((edgeMask & 0x3u) << 5));
-        face = static_cast<uint8_t>(faceId % 6u);
-    }
-
-    TextureType getType() const {
-        return static_cast<TextureType>(packed & 0x3u);
-    }
-    uint8_t getVariant() const {
-        return static_cast<uint8_t>((packed >> 2) & 0x7u);
-    }
-    uint8_t getEdgeMask() const {
-        return static_cast<uint8_t>((packed >> 5) & 0x3u);
-    }
-    uint8_t getFace() const { return face; }
-    bool isEmpty() const { return (packed & 0x80u) == 0; }
-
-    VoxelTextureData withEdgeMask(uint8_t edgeMask) const {
-        if (isEmpty()) return *this;
-        VoxelTextureData out = *this;
-        out.packed = static_cast<uint8_t>(
-            (out.packed & ~0x60u) | ((edgeMask & 0x3u) << 5));
-        return out;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Per-LOD resolution config
-//
-// Each LOD level has its own pixels-per-voxel-face value. Selectable from
-// 2,4,8,...,1024. The terrain shader uses this to quantize procedural pixel
-// detail on a face emitted for that LOD.
-// ---------------------------------------------------------------------------
-
-struct LODTextureConfig {
-    // Texels per voxel face edge.  Must be a power of two >= 2 and <= 1024.
-    // Default cascade: LOD 0 = 16 px, LOD 1 = 8 px, LOD 2 = 4 px, LOD 3 = 2 px
-    uint16_t pixelsPerVoxel{4};
-    // If false, no painting is authored at this LOD.
-    bool enabled{true};
-};
-
-// ---------------------------------------------------------------------------
-// Sparse storage primitives
-// ---------------------------------------------------------------------------
-
-// 8x8x8 brick of texture cells (matches the edit-overlay brick size).
-struct TextureBrick {
-    static constexpr int SIZE = 8;
-    static constexpr int CELLS = SIZE * SIZE * SIZE;
-
-    std::array<VoxelTextureData, CELLS> cells{};
-    uint32_t activeCount{0};
-
-    static int toIndex(int lx, int ly, int lz) {
-        return lx + ly * SIZE + lz * SIZE * SIZE;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Sparse, per-LOD voxel-face material store
-//
-// LOD storage:
-//   - One independent BrickMap per LOD level (4 levels).
-//   - Coordinates within each LOD's BrickMap are voxel coords *at that LOD*.
-//     i.e. an LOD-1 voxel coordinate = lod0Coord >> 1, LOD-2 = lod0Coord >> 2.
-//
-// Paint operations take the LOD level explicitly so the brush can target the
-// LOD that the hit chunk is currently rendered at, and the radius scales
-// naturally (the stored cell footprint at LOD-N is 1/(2^N) of the LOD-0
-// footprint for the same world distance).
-// ---------------------------------------------------------------------------
-
-class TextureOverlayStore {
-public:
-    struct SurfaceFaceStamp {
-        glm::ivec3 lodCoord{0};
-        uint8_t face{3};
-    };
-
-    // Deferred surface brush command. This is the interactive O(1) authoring path:
-    // one huge brush stroke stores one stamp and affected chunks are rebaked later.
-    // The mesher resolves stamps through getSurfaceTexture() while emitting real
-    // terrain faces, so the click path never expands radius^2 faces.
-    struct SurfacePaintStamp {
-        glm::vec3 centerVoxelLod0{0.0f};
-        glm::ivec3 bboxMinLod0{0};
-        glm::ivec3 bboxMaxLod0{0};
-        int radiusVoxelsLod0{1};
-        SurfaceBrushShape shape{SurfaceBrushShape::Disc};
-        TextureType type{TextureType::Grass};
-        uint8_t variant{0};
-        uint8_t sourceFace{255};
-        uint32_t order{0};
-    };
-
-    struct GPUCell {
-        int32_t x{0};
-        int32_t y{0};
-        int32_t z{0};
-        uint32_t lod{0};
-        uint32_t packed{0};
-        uint32_t face{3};
-    };
-
-    static constexpr int LOD_COUNT = MAX_LOD_LEVELS;
-    static constexpr int RES_OPTION_COUNT = 10;
-    static const uint16_t RES_OPTIONS[RES_OPTION_COUNT];   // {2,4,8,...,1024}
-    static const char*   RES_OPTION_LABELS[RES_OPTION_COUNT];
-
-    TextureOverlayStore();
-
-    // -------- Per-LOD configuration --------
-    void setLODConfig(int lod, const LODTextureConfig& cfg);
-    LODTextureConfig getLODConfig(int lod) const;
-
-    // -------- Single-cell access (LOD-aware) --------
-    // 'lodCoord' is in voxel coords at the requested LOD level.
-    void setTexture(const glm::ivec3& lodCoord, int lod, VoxelTextureData data);
-    VoxelTextureData getTexture(const glm::ivec3& lodCoord, int lod) const;
-    VoxelTextureData getSurfaceTexture(const glm::ivec3& lodCoord,
-                                       int lod,
-                                       uint8_t face) const;
-    bool hasSurfaceTexturesInBox(const glm::ivec3& minLodCoord,
-                                 const glm::ivec3& maxExclusiveLodCoord,
-                                 int lod) const;
-    void clearTexture(const glm::ivec3& lodCoord, int lod);
-
-    // -------- Brush paint operations --------
-    // 'centerLod0' is the world-voxel center *at LOD-0*; the paint operation
-    // automatically converts to the target LOD's resolution.
-    // 'radiusVoxelsLod0' is the brush radius in LOD-0 voxels.
-    // Returns the number of LOD cells written.
-    int paintSphere(const glm::ivec3& centerLod0,
-                    int radiusVoxelsLod0,
-                    int lod,
-                    TextureType type,
-                    uint8_t variant);
-    int paintBox(const glm::ivec3& minLod0,
-                 const glm::ivec3& maxLod0,
-                 int lod,
-                 TextureType type,
-                 uint8_t variant);
-
-    // Fast surface stamps for texture painting. They write only the face plane
-    // under the cursor instead of filling a 3D volume.
-    int paintFaceDisc(const glm::ivec3& centerLod0,
-                      int radiusVoxelsLod0,
-                      int normalAxis,
-                      int lod,
-                      TextureType type,
-                      uint8_t variant,
-                      uint8_t face,
-                      int maxCells = 300000);
-    int paintFaceRect(const glm::ivec3& centerLod0,
-                      int radiusVoxelsLod0,
-                      int normalAxis,
-                      int lod,
-                      TextureType type,
-                      uint8_t variant,
-                      uint8_t face,
-                      int maxCells = 300000);
-    int paintSurfaceFaces(const std::vector<SurfaceFaceStamp>& faces,
-                          int lod,
-                          TextureType type,
-                          uint8_t variant);
-
-    // Theoretical-minimum interactive brush path. Stores one deferred stamp
-    // instead of expanding the brush into per-face cells. Returned value is
-    // the monotonically increasing stamp order, or 0 if the stamp was rejected.
-    uint32_t appendSurfacePaintStamp(const glm::vec3& centerWorld,
-                                     int radiusVoxelsLod0,
-                                     SurfaceBrushShape shape,
-                                     TextureType type,
-                                     uint8_t variant,
-                                     uint8_t sourceFace = 255);
-    size_t getSurfacePaintStampCount() const;
-
-    // Copy newest deferred paint stamps for the bounded live GPU overlay.
-    // Returned stamps stay chronological; the shader scans newest-first.
-    size_t exportLiveSurfacePaintStamps(std::vector<SurfacePaintStamp>& out,
-                                        size_t maxStamps) const;
-
-    int clearSphere(const glm::ivec3& centerLod0,
-                    int radiusVoxelsLod0,
-                    int lod);
-    int clearBox(const glm::ivec3& minLod0,
-                 const glm::ivec3& maxLod0,
-                 int lod);
-
-    // Cascade a paint from sourceLod to all coarser LODs (sourceLod+1..MAX).
-    // Useful when the user paints at LOD 0 and wants the texture to show up
-    // when the chunk later transitions to a coarser LOD.  Returns total cells
-    // written across all cascaded LODs.
-    int cascadeToCoarserLODs(const glm::ivec3& centerLod0,
-                             int radiusVoxelsLod0,
-                             int sourceLod,
-                             TextureType type,
-                             uint8_t variant);
-    int cascadeFaceToCoarserLODs(const glm::ivec3& centerLod0,
-                                 int radiusVoxelsLod0,
-                                 int normalAxis,
-                                 int sourceLod,
-                                 SurfaceBrushShape shape,
-                                 TextureType type,
-                                 uint8_t variant,
-                                 uint8_t face,
-                                 int maxCellsPerLOD = 300000);
-
-    // -------- Stats / state --------
-    struct Stats {
-        size_t bricksByLOD[LOD_COUNT]{};
-        size_t cellsByLOD[LOD_COUNT]{};
-        size_t totalBricks{0};
-        size_t totalCells{0};
-        size_t surfaceStampCount{0};
-        size_t generation{0};
-    };
-    Stats getStats() const;
-    size_t exportGPUCells(std::vector<GPUCell>& out, size_t maxCells) const;
-    size_t exportGPUCellsForLOD(int lod, std::vector<GPUCell>& out, size_t maxCells) const;
-    size_t consumeDirtyGPUCells(std::vector<GPUCell>& out,
-                                size_t maxCells,
-                                bool& requiresFullUpload);
-    bool isEmpty() const;
-    void clear();
-    void clearLOD(int lod);
-
-    // Monotonically incremented every write — used by mesher caches.
-    size_t getGeneration() const {
-        return m_generation.load(std::memory_order_acquire);
-    }
-
-    // -------- Persistence (binary) --------
-    bool saveToFile(const char* path) const;
-    bool loadFromFile(const char* path);
-
-    // -------- LOD/coordinate helpers --------
-    static glm::ivec3 lod0ToLOD(const glm::ivec3& lod0Coord, int lod) {
-        const int shift = lod;
-        // Arithmetic shift handles negative coords correctly for power-of-two
-        // downsampling — equivalent to floor(coord / 2^lod) for negatives too.
-        return glm::ivec3(lod0Coord.x >> shift,
-                          lod0Coord.y >> shift,
-                          lod0Coord.z >> shift);
-    }
-    static glm::ivec3 lodToLOD0(const glm::ivec3& lodCoord, int lod) {
-        return glm::ivec3(lodCoord.x << lod,
-                          lodCoord.y << lod,
-                          lodCoord.z << lod);
-    }
-
-private:
-    struct BrickKey {
-        int32_t bx, by, bz;
-        bool operator==(const BrickKey& o) const noexcept {
-            return bx == o.bx && by == o.by && bz == o.bz;
-        }
-    };
-    struct BrickKeyHash {
-        size_t operator()(const BrickKey& k) const noexcept {
-            // splitmix-style mix; cheap and good distribution
-            uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(k.bx)) * 73856093ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(k.by)) * 19349663ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(k.bz)) * 83492791ull;
-            h ^= h >> 33;
-            return static_cast<size_t>(h);
-        }
-    };
-    using BrickMap = std::unordered_map<BrickKey,
-                                        std::unique_ptr<TextureBrick>,
-                                        BrickKeyHash>;
-
-    static BrickKey voxelToBrick(const glm::ivec3& v);
-    static glm::ivec3 voxelLocalInBrick(const glm::ivec3& v);
-    static glm::ivec3 encodeFaceCoord(const glm::ivec3& voxelCoord, uint8_t face);
-    static glm::ivec3 decodeFaceCoord(const glm::ivec3& storageCoord, uint8_t& face);
-
-    TextureBrick* getOrCreateBrickLocked(BrickMap& map, int lod, BrickKey key);
-    TextureBrick* getBrickLocked(BrickMap& map, BrickKey key);
-    const TextureBrick* getBrickLocked(const BrickMap& map, BrickKey key) const;
-
-    void writeCellLocked(BrickMap& map, int lod, BrickKey key,
-                         const glm::ivec3& local,
-                         VoxelTextureData data);
-
-    static uint8_t classifyTransitionEdge(TextureType a,
-                                          TextureType b,
-                                          const glm::ivec3& lodCoord);
-    static uint8_t mergeEdgeStyle(uint8_t lhs, uint8_t rhs);
-    void recordDirtyGPUCellLocked(int lod,
-                                  const glm::ivec3& lodCoord,
-                                  VoxelTextureData data);
-    void requestFullGPUUploadLocked();
-    void refreshTransitionEdgesAroundCellLocked(BrickMap& map,
-                                                int lod,
-                                                const glm::ivec3& lodCoord);
-    void refreshTransitionEdgesAroundFaceLocked(BrickMap& map,
-                                                int lod,
-                                                const glm::ivec3& lodCoord,
-                                                uint8_t face);
-
-    struct SurfacePaintChunkHash {
-        size_t operator()(const glm::ivec3& v) const noexcept {
-            uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(v.x)) * 73856093ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.y)) * 19349663ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.z)) * 83492791ull;
-            h ^= h >> 33;
-            return static_cast<size_t>(h);
-        }
-    };
-    void indexSurfacePaintStampLocked(uint32_t stampIndex);
-    VoxelTextureData sampleSurfacePaintStampsLocked(const glm::ivec3& lodCoord,
-                                                    int lod,
-                                                    uint8_t face) const;
-    static bool surfaceStampTouchesBox(const SurfacePaintStamp& stamp,
-                                       const glm::ivec3& minLod0,
-                                       const glm::ivec3& maxLod0);
-
-    bool isLodValid(int lod) const { return lod >= 0 && lod < LOD_COUNT; }
-
-    // One BrickMap per LOD.  Indices 0..MAX_LOD_LEVEL.
-    std::array<BrickMap, LOD_COUNT> m_lodMaps;
-    std::array<size_t, LOD_COUNT> m_brickCountsByLOD{};
-    std::array<size_t, LOD_COUNT> m_cellCountsByLOD{};
-
-    std::array<LODTextureConfig, LOD_COUNT> m_lodConfigs;
-
-    mutable std::shared_mutex m_mutex;
-    std::atomic<size_t> m_generation{0};
-
-    // Deferred brush stamps indexed by affected native chunk. The stamp vector
-    // is append-only between clears, so chunk index entries can store stable
-    // integer indices. Newest stamp wins during mesher material sampling.
-    std::vector<SurfacePaintStamp> m_surfacePaintStamps;
-    std::unordered_map<glm::ivec3, std::vector<uint32_t>, SurfacePaintChunkHash>
-        m_surfacePaintStampChunkIndex;
-    uint32_t m_nextSurfacePaintStampOrder{1};
-
-    // Dirty LOD0 face cells consumed by the terrain material overlay SSBO.
-    // Full-upload mode is used for clears/config changes and delta overflow.
-    std::vector<GPUCell> m_dirtyGPUCells;
-    bool m_dirtyGPUFullUpload{false};
-};
-
-} // namespace TextureOverlay
-
-
+MODE: replace_region
+FILE: src/core/engine/EngineCommandBuffer.cpp
+FIND:
+    using clock = std::chrono::high_resolution_clock;
+    float cpuInitialCullRecordMs = 0.0f;
+REPLACE:
+    using clock = std::chrono::high_resolution_clock;
+    float cpuInitialCullRecordMs = 0.0f;
+    float cpuDepthPrepassRecordMs = 0.0f;
+    float cpuHiZBuildRecordMs = 0.0f;
+    float cpuFinalCullRecordMs = 0.0f;
 END CC-REPLACE
 
 BEGIN CC-REPLACE
-FILE: src/world/edit/TextureOverlayStore.cpp
-MODE: insert_after_function
-NAME: TextureOverlayStore::getSurfacePaintStampCount
----
-size_t TextureOverlayStore::exportLiveSurfacePaintStamps(
-    std::vector<SurfacePaintStamp>& out,
-    size_t maxStamps) const {
-    out.clear();
-    if (maxStamps == 0u) {
-        return 0u;
+MODE: replace_region
+FILE: src/core/engine/EngineCommandBuffer.cpp
+FIND:
+    // Check temporal Hi-Z availability — uses the previous frame's pyramid.
+    // Do NOT gate this on camera/player motion anymore: that caused the visible
+    // draw set to oscillate between frustum-only and Hi-Z during normal movement.
+    // Motion/edit safety now lives in the culling shader: motion frames disable
+    // the prev-visible skip and test a conservative union of previous/current
+    // projected AABB rectangles against the previous pyramid.
+    bool temporalHiZViable = false;
+    bool usedTemporalHiZ = false;
+    // Always compute camera delta for diagnostics (even when temporal isn't checked)
+    {
+        const float frontDot = std::clamp(glm::dot(currentCameraFront, m_prevHiZCameraFront), -1.0f, 1.0f);
+        m_lastFrameRotationDeg = glm::degrees(std::acos(frontDot));
+        m_lastFrameTranslation = glm::length(currentCameraPos - m_prevHiZCameraPos);
+    }
+    if (m_gpuCullingEnabled && m_gpuCulling.isReady() && m_hiZPyramid.isReady() && m_prevHiZFrameValid) {
+        const glm::vec4 viewportDelta = glm::abs(viewportUvTransform - m_prevHiZViewportUvTransform);
+        const float maxViewportDelta = std::max(
+            std::max(viewportDelta.x, viewportDelta.y),
+            std::max(viewportDelta.z, viewportDelta.w));
+        const bool pyramidMatchesTarget =
+            m_hiZPyramid.getWidth() == expectedHiZW &&
+            m_hiZPyramid.getHeight() == expectedHiZH &&
+            m_hiZPyramid.getMipLevels() > 0u;
+
+        // Viewport/target changes invalidate the previous pyramid mapping, but
+        // camera motion does not. The shader makes motion conservative; keeping
+        // Hi-Z enabled avoids the frame-to-frame all-drawn/occluded flicker.
+        temporalHiZViable = pyramidMatchesTarget && maxViewportDelta <= viewportEpsilon;
+    }
+REPLACE:
+    // Check temporal Hi-Z availability — uses the previous frame's pyramid.
+    // Stable frames keep the cheap temporal path. Fast rotation/horizon-wide
+    // views switch to a bounded same-frame path: frustum prepass -> current Hi-Z
+    // build -> final cull. This avoids trusting a previous-frame pyramid when
+    // temporal divergence is exactly where the corruption spikes appear.
+    bool temporalHiZViable = false;
+    bool usedTemporalHiZ = false;
+    {
+        const float frontDot = std::clamp(glm::dot(currentCameraFront, m_prevHiZCameraFront), -1.0f, 1.0f);
+        m_lastFrameRotationDeg = glm::degrees(std::acos(frontDot));
+        m_lastFrameTranslation = glm::length(currentCameraPos - m_prevHiZCameraPos);
+    }
+    if (m_gpuCullingEnabled && m_gpuCulling.isReady() && m_hiZPyramid.isReady() && m_prevHiZFrameValid) {
+        const glm::vec4 viewportDelta = glm::abs(viewportUvTransform - m_prevHiZViewportUvTransform);
+        const float maxViewportDelta = std::max(
+            std::max(viewportDelta.x, viewportDelta.y),
+            std::max(viewportDelta.z, viewportDelta.w));
+        const bool pyramidMatchesTarget =
+            m_hiZPyramid.getWidth() == expectedHiZW &&
+            m_hiZPyramid.getHeight() == expectedHiZH &&
+            m_hiZPyramid.getMipLevels() > 0u;
+
+        temporalHiZViable = pyramidMatchesTarget && maxViewportDelta <= viewportEpsilon;
     }
 
-    std::shared_lock lock(m_mutex);
-    const size_t total = m_surfacePaintStamps.size();
-    const size_t count = std::min(total, maxStamps);
-    const size_t first = total - count;
-
-    out.reserve(count);
-    for (size_t i = first; i < total; ++i) {
-        out.push_back(m_surfacePaintStamps[i]);
-    }
-    return out.size();
-}
+    constexpr float sameFrameRotationDeg = 0.85f;
+    constexpr float sameFrameHorizonRotationDeg = 0.25f;
+    constexpr float sameFrameTranslationMeters = 0.75f;
+    const bool horizonWideView = currentCameraFront.y > -0.30f;
+    const bool temporalDivergenceRisk =
+        (m_lastFrameRotationDeg > sameFrameRotationDeg) ||
+        (m_lastFrameTranslation > sameFrameTranslationMeters) ||
+        (horizonWideView && m_lastFrameRotationDeg > sameFrameHorizonRotationDeg);
+    const bool previousPyramidMappingUnsafe = m_prevHiZFrameValid && !temporalHiZViable;
+    const bool sameFrameHiZSupported =
+        m_gpuCullingEnabled &&
+        m_gpuCulling.isReady() &&
+        m_hiZPyramid.isReady() &&
+        m_indirectDrawCount == UINT32_MAX &&
+        m_depthPrePassPipeline != VK_NULL_HANDLE &&
+        m_renderPassDepthPrepass != VK_NULL_HANDLE &&
+        m_renderPassDepthLoad != VK_NULL_HANDLE &&
+        viewportScaleX > 0.0f && viewportScaleY > 0.0f;
+    const bool useCurrentFrameHiZ =
+        sameFrameHiZSupported &&
+        (previousPyramidMappingUnsafe || (temporalHiZViable && temporalDivergenceRisk));
 END CC-REPLACE
 
 BEGIN CC-REPLACE
-FILE: src/core/engine/EngineSubsystemInit.cpp
-MODE: insert_before_function
-NAME: Engine::createMaterialOverlayBuffers
----
-namespace {
-constexpr uint32_t kMaterialOverlayLiveStampCapacity = 64u;
-constexpr uint32_t kMaterialOverlayLiveStampCellStride = 3u;
-constexpr uint32_t kMaterialOverlayLiveStampCellCapacity =
-    kMaterialOverlayLiveStampCapacity * kMaterialOverlayLiveStampCellStride;
-
-uint32_t materialOverlayFloatBitsU32(float value) {
-    uint32_t bits = 0u;
-    std::memcpy(&bits, &value, sizeof(bits));
-    return bits;
-}
-
-int32_t materialOverlayFloatBitsI32(float value) {
-    uint32_t bits = materialOverlayFloatBitsU32(value);
-    return static_cast<int32_t>(bits);
-}
-} // namespace
-
+MODE: replace_region
+FILE: src/core/engine/EngineCommandBuffer.cpp
+FIND:
+    // ── Initial GPU frustum + occlusion culling ───────────────────────────
+    // Temporal Hi-Z or frustum-only. Post-render pyramid rebuild ensures
+    // temporal data is always fresh for the next frame.
+    recordInitialGPUCulling(cmd, imageIndex, viewProj,
+                            viewportOffsetX, viewportOffsetY, viewportScaleX, viewportScaleY,
+                            temporalHiZViable,
+                            usedTemporalHiZ,
+                            cpuInitialCullRecordMs);
+REPLACE:
+    // ── Initial GPU frustum + occlusion culling ───────────────────────────
+    // Stable frames use temporal Hi-Z. Same-frame fallback frames intentionally
+    // start frustum-only so the depth prepass has a complete current candidate set.
+    recordInitialGPUCulling(cmd, imageIndex, viewProj,
+                            viewportOffsetX, viewportOffsetY, viewportScaleX, viewportScaleY,
+                            temporalHiZViable && !useCurrentFrameHiZ,
+                            usedTemporalHiZ,
+                            cpuInitialCullRecordMs);
 END CC-REPLACE
 
 BEGIN CC-REPLACE
-FILE: src/core/engine/EngineSubsystemInit.cpp
-MODE: function
-NAME: Engine::createMaterialOverlayBuffers
----
-void Engine::createMaterialOverlayBuffers() {
-    for (size_t i = 0; i < m_materialOverlayBuffers.size(); ++i) {
-        if (i < m_materialOverlayMapped.size() && m_materialOverlayMapped[i]) {
-            vkUnmapMemory(m_device, m_materialOverlayBuffersMemory[i]);
-        }
-        if (m_materialOverlayBuffers[i] != VK_NULL_HANDLE) {
-            vkDestroyBuffer(m_device, m_materialOverlayBuffers[i], nullptr);
-        }
-        if (m_materialOverlayBuffersMemory[i] != VK_NULL_HANDLE) {
-            vkFreeMemory(m_device, m_materialOverlayBuffersMemory[i], nullptr);
+MODE: replace_region
+FILE: src/core/engine/EngineCommandBuffer.cpp
+FIND:
+    // Write dummy timestamps for the removed same-frame Hi-Z slots (prepass/build/finalCull)
+    if (m_timestampQueryPool != VK_NULL_HANDLE) {
+        for (uint32_t query = 2; query <= 5; ++query) {
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_timestampQueryPool, timestampBase + query);
         }
     }
 
-    const uint32_t imageCount = static_cast<uint32_t>(m_swapchainImages.size());
-    m_materialOverlayBuffers.assign(imageCount, VK_NULL_HANDLE);
-    m_materialOverlayBuffersMemory.assign(imageCount, VK_NULL_HANDLE);
-    m_materialOverlayMapped.assign(imageCount, nullptr);
-    m_materialOverlayImageDirty.assign(imageCount, 1u);
-    m_materialOverlayImageDirtySlots.clear();
-    m_materialOverlayImageDirtySlots.resize(imageCount);
-
-    m_materialOverlayCapacity = nextPow2u32(std::max(
-        m_materialOverlayCapacity,
-        kMaterialOverlayInitialCapacity));
-    m_materialOverlayTable.assign(m_materialOverlayCapacity, MaterialOverlayCellGPU{});
-    m_materialOverlayCount = 0;
-    m_materialOverlayMaxProbe = 0;
-    m_materialOverlayLastGeneration = 0;
-    m_materialOverlayNeedsRebuild = true;
-
-    // Binding 10 keeps the old GLSL shape:
-    //   header + MaterialOverlayCell cells[]
-    //
-    // The first fixed cells[] range is now reserved for a bounded live-stamp
-    // overlay. The old sparse hash table starts after that prefix. This avoids
-    // changing descriptor layouts while giving texture paint a one-frame visual
-    // path independent of chunk remesh/upload/swap.
-    m_materialOverlayBufferSize =
-        sizeof(MaterialOverlayHeaderGPU) +
-        static_cast<VkDeviceSize>(
-            kMaterialOverlayLiveStampCellCapacity + m_materialOverlayCapacity) *
-            sizeof(MaterialOverlayCellGPU);
-
-    for (uint32_t i = 0; i < imageCount; ++i) {
-        VkBufferCreateInfo bufferInfo{};
-        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-        bufferInfo.size = m_materialOverlayBufferSize;
-        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-        if (vkCreateBuffer(m_device, &bufferInfo, nullptr, &m_materialOverlayBuffers[i]) != VK_SUCCESS) {
-            throw std::runtime_error("Failed to create material overlay buffer");
-        }
-
-        VkMemoryRequirements memReq{};
-        vkGetBufferMemoryRequirements(m_device, m_materialOverlayBuffers[i], &memReq);
-
-        VkMemoryAllocateInfo allocInfo{};
-        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocInfo.allocationSize = memReq.size;
-        allocInfo.memoryTypeIndex = VulkanHelpers::findMemoryType(
-            m_physicalDevice,
-            memReq.memoryTypeBits,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        if (vkAllocateMemory(m_device, &allocInfo, nullptr, &m_materialOverlayBuffersMemory[i]) != VK_SUCCESS) {
-            throw std::runtime_error("Failed to allocate material overlay buffer memory");
-        }
-
-        vkBindBufferMemory(m_device, m_materialOverlayBuffers[i], m_materialOverlayBuffersMemory[i], 0);
-
-        void* mapped = nullptr;
-        if (vkMapMemory(m_device, m_materialOverlayBuffersMemory[i], 0, m_materialOverlayBufferSize, 0, &mapped) != VK_SUCCESS) {
-            throw std::runtime_error("Failed to map material overlay buffer");
-        }
-        m_materialOverlayMapped[i] = mapped;
-        std::memset(mapped, 0, static_cast<size_t>(m_materialOverlayBufferSize));
+    if (imageIndex < m_hiZTimingModeByImage.size()) {
+        m_hiZTimingModeByImage[imageIndex] =
+            usedTemporalHiZ ? HiZPyramid::DiagnosticsMode::TemporalHiZ
+                            : HiZPyramid::DiagnosticsMode::FrustumOnly;
     }
-}
+REPLACE:
+    if (useCurrentFrameHiZ) {
+        recordDepthPrePassAndHiZ(cmd, imageIndex, viewProj, gameplayRect,
+                                 cpuDepthPrepassRecordMs,
+                                 cpuHiZBuildRecordMs,
+                                 cpuFinalCullRecordMs);
+    } else if (m_timestampQueryPool != VK_NULL_HANDLE) {
+        for (uint32_t query = 2; query <= 5; ++query) {
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_timestampQueryPool, timestampBase + query);
+        }
+    }
+
+    if (imageIndex < m_hiZTimingModeByImage.size()) {
+        m_hiZTimingModeByImage[imageIndex] =
+            useCurrentFrameHiZ ? HiZPyramid::DiagnosticsMode::SameFrameHiZ
+            : (usedTemporalHiZ ? HiZPyramid::DiagnosticsMode::TemporalHiZ
+                               : HiZPyramid::DiagnosticsMode::FrustumOnly);
+    }
 END CC-REPLACE
 
 BEGIN CC-REPLACE
-FILE: src/core/engine/EngineSubsystemInit.cpp
-MODE: function
-NAME: Engine::syncMaterialOverlayForImage
----
-void Engine::syncMaterialOverlayForImage(uint32_t imageIndex) {
-    if (imageIndex >= m_materialOverlayMapped.size() || m_materialOverlayMapped[imageIndex] == nullptr) {
+MODE: replace_region
+FILE: src/core/engine/EngineCommandBuffer.cpp
+FIND:
+                recordVoxelOpaquePass(cmd, imageIndex, static_cast<uint32_t>(m_currentFrame), view, proj, gameplayRect, false);
+REPLACE:
+                recordVoxelOpaquePass(cmd, imageIndex, static_cast<uint32_t>(m_currentFrame), view, proj, gameplayRect, useCurrentFrameHiZ);
+END CC-REPLACE
+
+BEGIN CC-REPLACE
+MODE: replace_region
+FILE: src/core/engine/EngineCommandBuffer.cpp
+FIND:
+        recordVoxelOpaquePass(cmd, imageIndex, static_cast<uint32_t>(m_currentFrame), view, proj, gameplayRect, false);
+REPLACE:
+        recordVoxelOpaquePass(cmd, imageIndex, static_cast<uint32_t>(m_currentFrame), view, proj, gameplayRect, useCurrentFrameHiZ);
+END CC-REPLACE
+
+BEGIN CC-REPLACE
+MODE: replace_region
+FILE: src/core/engine/EngineCommandBuffer.cpp
+FIND:
+    renderPassInfo.renderPass = m_renderPass;
+REPLACE:
+    renderPassInfo.renderPass = useCurrentFrameHiZ ? m_renderPassDepthLoad : m_renderPass;
+END CC-REPLACE
+
+BEGIN CC-REPLACE
+MODE: replace_region
+FILE: src/core/engine/EngineCommandBuffer.cpp
+FIND:
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_graphicsPipeline);
+REPLACE:
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          useCurrentFrameHiZ ? m_graphicsPipelineDepthLoad : m_graphicsPipeline);
+END CC-REPLACE
+
+BEGIN CC-REPLACE
+MODE: replace_region
+FILE: src/core/engine/EngineCommandBuffer.cpp
+FIND:
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_dccmPipeline);
+REPLACE:
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                          useCurrentFrameHiZ && m_dccmPipelineDepthLoad ? m_dccmPipelineDepthLoad : m_dccmPipeline);
+END CC-REPLACE
+
+BEGIN CC-REPLACE
+MODE: replace_region
+FILE: src/core/engine/EngineCommandBuffer.cpp
+FIND:
+    m_cpuInitialCullRecordMs = cpuInitialCullRecordMs;
+    m_cpuDepthPrepassRecordMs = 0.0f;
+    m_cpuHiZBuildRecordMs = 0.0f;
+    m_cpuFinalCullRecordMs = 0.0f;
+    m_cpuHiZIncrementalRecordMs = 0.0f;
+REPLACE:
+    m_cpuInitialCullRecordMs = cpuInitialCullRecordMs;
+    m_cpuDepthPrepassRecordMs = cpuDepthPrepassRecordMs;
+    m_cpuHiZBuildRecordMs = cpuHiZBuildRecordMs;
+    m_cpuFinalCullRecordMs = cpuFinalCullRecordMs;
+    m_cpuHiZIncrementalRecordMs = 0.0f;
+END CC-REPLACE
+
+BEGIN CC-REPLACE
+MODE: replace_region
+FILE: src/core/engine/EngineDepthPrePass.cpp
+FIND:
+void Engine::recordPostRenderHiZBuild(VkCommandBuffer cmd) {
+REPLACE:
+void Engine::recordDepthPrePassAndHiZ(VkCommandBuffer cmd, uint32_t imageIndex,
+                                      const glm::mat4& viewProj,
+                                      const VkRect2D& gameplayRect,
+                                      float& cpuPrepassMs,
+                                      float& cpuHiZMs,
+                                      float& cpuFinalMs) {
+    using clock = std::chrono::high_resolution_clock;
+    const uint32_t timestampBase = imageIndex * TIMESTAMPS_PER_IMAGE;
+    cpuPrepassMs = 0.0f;
+    cpuHiZMs = 0.0f;
+    cpuFinalMs = 0.0f;
+
+    const auto writeDummySameFrameTimestamps = [&]() {
+        if (m_timestampQueryPool == VK_NULL_HANDLE) {
+            return;
+        }
+        for (uint32_t query = 2; query <= 5; ++query) {
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                m_timestampQueryPool, timestampBase + query);
+        }
+    };
+
+    if (!m_gpuCullingEnabled || !m_gpuCulling.isReady() || !m_hiZPyramid.isReady() ||
+        m_depthPrePassPipeline == VK_NULL_HANDLE) {
+        writeDummySameFrameTimestamps();
         return;
     }
 
-    auto& textureStore = m_world.getTextureMaterialStore();
-    const auto textureStats = textureStore.getStats();
-    ensureMaterialOverlayCapacity(textureStats.cellsByLOD[0]);
-
-    if (imageIndex >= m_materialOverlayMapped.size() || m_materialOverlayMapped[imageIndex] == nullptr) {
+    const bool isSeparated = m_gameplaySeparated
+                          && m_gameplayWindow && m_gameplayWindow->isOpen()
+                          && m_gameplayWindowAcquired;
+    const uint32_t framebufferIndex = isSeparated
+        ? m_gameplayWindow->getCurrentImageIndex()
+        : imageIndex;
+    const VkExtent2D targetExtent = isSeparated
+        ? m_gameplayWindow->getExtent()
+        : m_swapchainExtent;
+    if (targetExtent.width == 0 || targetExtent.height == 0) {
+        writeDummySameFrameTimestamps();
         return;
     }
 
-    std::vector<TextureOverlay::TextureOverlayStore::SurfacePaintStamp> liveStamps;
-    textureStore.exportLiveSurfacePaintStamps(
-        liveStamps,
-        static_cast<size_t>(kMaterialOverlayLiveStampCapacity));
+    VkRect2D gameplayScissor = isSeparated
+        ? VkRect2D{{0, 0}, targetExtent}
+        : gameplayRect;
+    if (gameplayScissor.extent.width == 0 || gameplayScissor.extent.height == 0) {
+        gameplayScissor = VkRect2D{{0, 0}, targetExtent};
+    }
 
-    const size_t generation = textureStore.getGeneration();
-    const bool genChanged = (generation != m_materialOverlayLastGeneration);
+    TJunctionFixSystem* activeTJunctionFix =
+        isSeparated
+            ? (m_gameplayTJunctionFix.isReady() ? &m_gameplayTJunctionFix : nullptr)
+            : &m_tjunctionFix;
+    RetroPixelPassSystem* activePixelPass =
+        isSeparated
+            ? (m_gameplayPixelPass.isReady() ? &m_gameplayPixelPass : nullptr)
+            : &m_pixelPass;
+    const bool usePixelPass =
+        activePixelPass && activePixelPass->isReady() && activePixelPass->getSettings().enabled;
+    const bool useTJunction =
+        activeTJunctionFix && activeTJunctionFix->isEnabled() && activeTJunctionFix->isReady() && !usePixelPass;
 
-    if (m_materialOverlayNeedsRebuild || genChanged) {
-        // Try the delta path first. consumeDirtyGPUCells flips requiresFullUpload
-        // when the store has buffered a clear, an unbounded write, or hit its
-        // delta cap — in those cases we fall back to a full rebuild.
-        std::vector<TextureOverlay::TextureOverlayStore::GPUCell> deltas;
-        bool requiresFullUpload = false;
-        const size_t deltaBudget = static_cast<size_t>(m_materialOverlayCapacity);
-        textureStore.consumeDirtyGPUCells(deltas, deltaBudget, requiresFullUpload);
+    VkRenderPass depthPrepassRenderPass = m_renderPassDepthPrepass;
+    VkFramebuffer depthPrepassFramebuffer = VK_NULL_HANDLE;
+    VkImage depthImg = VK_NULL_HANDLE;
+    VkImageView depthView = VK_NULL_HANDLE;
 
-        const bool doFullRebuild = m_materialOverlayNeedsRebuild || requiresFullUpload;
-        const uint16_t pixelsPerVoxel = textureStore.getLODConfig(0).pixelsPerVoxel;
-        const uint32_t mask = m_materialOverlayCapacity - 1u;
-
-        auto sameOverlayKey = [](const MaterialOverlayCellGPU& cell,
-                                 int32_t x, int32_t y, int32_t z, uint32_t face) {
-            return cell.x == x &&
-                   cell.y == y &&
-                   cell.z == z &&
-                   (cell.face & 0x7u) == (face & 0x7u);
-        };
-
-        auto probeDistanceForSlot = [&](uint32_t slotIndex,
-                                        const MaterialOverlayCellGPU& cell) -> uint32_t {
-            const uint32_t ideal = hashMaterialOverlayKey(
-                cell.x, cell.y, cell.z, cell.face & 0x7u) & mask;
-            return (slotIndex - ideal) & mask;
-        };
-
-        auto recordChangedSlot = [](std::vector<uint32_t>* changedSlots, uint32_t slot) {
-            if (changedSlots) {
-                changedSlots->push_back(slot);
-            }
-        };
-
-        auto setChunkMaterialOverlayHint = [&](const glm::ivec3& chunkCoord, bool hasOverlay) {
-            if (!m_gpuCulling.isReady()) {
-                return;
-            }
-
-            const entt::entity entity = m_world.findChunk(chunkCoord);
-            if (entity == entt::null) {
-                return;
-            }
-
-            std::shared_lock regLock(m_world.registryMutex());
-            const auto& registry = m_world.getRegistry();
-            if (!registry.valid(entity)) {
-                return;
-            }
-
-            auto applyHandle = [&](const MeshHandle& handle) {
-                if (handle.gpuCullingSlot != UINT32_MAX) {
-                    m_gpuCulling.setSlotMaterialOverlayHint(handle.gpuCullingSlot, hasOverlay);
-                }
-            };
-
-            if (registry.all_of<MeshHandle>(entity)) {
-                applyHandle(registry.get<MeshHandle>(entity));
-            }
-            if (registry.all_of<PendingMeshHandle>(entity)) {
-                applyHandle(registry.get<PendingMeshHandle>(entity).handle);
-            }
-        };
-
-        auto updateChunkHintFromGPUCell = [&](const TextureOverlay::TextureOverlayStore::GPUCell& cell,
-                                              bool hasOverlay) {
-            if ((cell.face & 0x7u) != 7u) {
-                return;
-            }
-            setChunkMaterialOverlayHint(glm::ivec3(cell.x, cell.y, cell.z), hasOverlay);
-        };
-
-        auto applyCell = [&](int32_t x, int32_t y, int32_t z,
-                             uint32_t face, uint32_t material,
-                             std::vector<uint32_t>* changedSlots = nullptr) -> uint32_t {
-            if (m_materialOverlayCapacity == 0u) {
-                return UINT32_MAX;
-            }
-
-            const uint32_t faceKey = face & 0x7u;
-            uint32_t idx = hashMaterialOverlayKey(x, y, z, faceKey) & mask;
-
-            if (m_materialOverlayCount >= m_materialOverlayCapacity) {
-                uint32_t probe = 0u;
-                while (probe < m_materialOverlayCapacity) {
-                    MaterialOverlayCellGPU& slot = m_materialOverlayTable[idx];
-
-                    if (slot.material == 0u) {
-                        return UINT32_MAX;
-                    }
-
-                    if (sameOverlayKey(slot, x, y, z, faceKey)) {
-                        slot.material = material;
-                        if (probe > m_materialOverlayMaxProbe) {
-                            m_materialOverlayMaxProbe = probe;
-                        }
-                        recordChangedSlot(changedSlots, idx);
-                        return idx;
-                    }
-
-                    const uint32_t residentProbe = probeDistanceForSlot(idx, slot);
-                    if (residentProbe < probe) {
-                        return UINT32_MAX;
-                    }
-
-                    idx = (idx + 1u) & mask;
-                    ++probe;
-                }
-                return UINT32_MAX;
-            }
-
-            MaterialOverlayCellGPU incoming{};
-            incoming.x = x;
-            incoming.y = y;
-            incoming.z = z;
-            incoming.face = faceKey;
-            incoming.material = material;
-
-            uint32_t probe = 0u;
-            while (probe < m_materialOverlayCapacity) {
-                if (probe > m_materialOverlayMaxProbe) {
-                    m_materialOverlayMaxProbe = probe;
-                }
-
-                MaterialOverlayCellGPU& slot = m_materialOverlayTable[idx];
-
-                if (slot.material == 0u) {
-                    slot = incoming;
-                    ++m_materialOverlayCount;
-                    recordChangedSlot(changedSlots, idx);
-                    return idx;
-                }
-
-                if (sameOverlayKey(slot, incoming.x, incoming.y, incoming.z, incoming.face)) {
-                    slot.material = incoming.material;
-                    recordChangedSlot(changedSlots, idx);
-                    return idx;
-                }
-
-                const uint32_t residentProbe = probeDistanceForSlot(idx, slot);
-
-                if (residentProbe < probe) {
-                    const MaterialOverlayCellGPU displaced = slot;
-                    slot = incoming;
-                    incoming = displaced;
-                    recordChangedSlot(changedSlots, idx);
-                    probe = residentProbe;
-                }
-
-                idx = (idx + 1u) & mask;
-                ++probe;
-            }
-
-            return UINT32_MAX;
-        };
-
-        if (doFullRebuild) {
-            std::fill(m_materialOverlayTable.begin(), m_materialOverlayTable.end(), MaterialOverlayCellGPU{});
-            m_materialOverlayCount = 0;
-            m_materialOverlayMaxProbe = 0;
-
-            std::vector<TextureOverlay::TextureOverlayStore::GPUCell> cells;
-            textureStore.exportGPUCellsForLOD(
-                0,
-                cells,
-                static_cast<size_t>(m_materialOverlayCapacity));
-
-            m_gpuCulling.clearAllMaterialOverlayHints();
-            for (const auto& cell : cells) {
-                updateChunkHintFromGPUCell(cell, true);
-            }
-
-            for (const auto& cell : cells) {
-                if (m_materialOverlayCount >= m_materialOverlayCapacity) break;
-                const uint8_t type = static_cast<uint8_t>(cell.packed & 0x3u);
-                const uint8_t variant = static_cast<uint8_t>((cell.packed >> 2) & 0x7u);
-                const uint8_t edge = static_cast<uint8_t>((cell.packed >> 5) & 0x3u);
-                const uint32_t material = VertexPacking::packMaterial(type, variant, edge, pixelsPerVoxel);
-                applyCell(cell.x, cell.y, cell.z, cell.face & 0x7u, material, nullptr);
-            }
-
-            std::fill(m_materialOverlayImageDirty.begin(), m_materialOverlayImageDirty.end(), 1u);
-            for (auto& q : m_materialOverlayImageDirtySlots) q.clear();
-        } else {
-            std::vector<uint32_t> changedSlots;
-            changedSlots.reserve(std::min<size_t>(deltas.size() * 4u, 65536u));
-
-            for (const auto& cell : deltas) {
-                const uint8_t type = static_cast<uint8_t>(cell.packed & 0x3u);
-                const uint8_t variant = static_cast<uint8_t>((cell.packed >> 2) & 0x7u);
-                const uint8_t edge = static_cast<uint8_t>((cell.packed >> 5) & 0x3u);
-                const uint32_t material = VertexPacking::packMaterial(type, variant, edge, pixelsPerVoxel);
-                applyCell(cell.x, cell.y, cell.z, cell.face & 0x7u, material, &changedSlots);
-                updateChunkHintFromGPUCell(cell, true);
-            }
-
-            for (uint32_t slot : changedSlots) {
-                if (slot >= m_materialOverlayCapacity) continue;
-                for (size_t i = 0; i < m_materialOverlayImageDirtySlots.size(); ++i) {
-                    if (m_materialOverlayImageDirty[i]) continue;
-                    m_materialOverlayImageDirtySlots[i].push_back(slot);
-                }
-            }
-
-            const size_t promoteThreshold = std::max<size_t>(
-                static_cast<size_t>(m_materialOverlayCapacity) / 16u, 1024u);
-            for (size_t i = 0; i < m_materialOverlayImageDirtySlots.size(); ++i) {
-                if (m_materialOverlayImageDirtySlots[i].size() > promoteThreshold) {
-                    m_materialOverlayImageDirty[i] = 1u;
-                    m_materialOverlayImageDirtySlots[i].clear();
-                }
-            }
+    if (usePixelPass) {
+        depthPrepassRenderPass = activePixelPass->getOffscreenDepthPrepassRenderPass();
+        depthPrepassFramebuffer = activePixelPass->getOffscreenFramebuffer(framebufferIndex);
+        depthImg = activePixelPass->getOffscreenDepthImage();
+        depthView = activePixelPass->getOffscreenDepthView();
+    } else if (useTJunction) {
+        depthPrepassRenderPass = activeTJunctionFix->getOffscreenDepthPrepassRenderPass();
+        depthPrepassFramebuffer = activeTJunctionFix->getOffscreenFramebuffer(framebufferIndex);
+        depthImg = activeTJunctionFix->getOffscreenDepthImage();
+        depthView = activeTJunctionFix->getOffscreenDepthView();
+    } else if (isSeparated) {
+        const auto& framebuffers = m_gameplayWindow->getFramebuffers();
+        if (framebufferIndex < framebuffers.size()) {
+            depthPrepassFramebuffer = framebuffers[framebufferIndex];
         }
-
-        m_materialOverlayLastGeneration = generation;
-        m_materialOverlayNeedsRebuild = false;
+        depthImg = m_gameplayWindow->getDepthImage();
+        depthView = m_gameplayWindow->getDepthView();
+    } else {
+        if (imageIndex < m_swapchainFramebuffers.size()) {
+            depthPrepassFramebuffer = m_swapchainFramebuffers[imageIndex];
+        }
+        depthImg = m_depthImage;
+        depthView = m_depthView;
     }
 
-    uint8_t* base = static_cast<uint8_t*>(m_materialOverlayMapped[imageIndex]);
-    auto* header = reinterpret_cast<MaterialOverlayHeaderGPU*>(base);
-    auto* rawCells = reinterpret_cast<MaterialOverlayCellGPU*>(base + sizeof(MaterialOverlayHeaderGPU));
-    auto* liveCells = rawCells;
-    auto* dstCells = rawCells + kMaterialOverlayLiveStampCellCapacity;
-
-    header->capacityMask = m_materialOverlayCapacity - 1u;
-    header->count = m_materialOverlayCount;
-    header->maxProbe = m_materialOverlayMaxProbe;
-    header->_pad = static_cast<uint32_t>(std::min<size_t>(
-        liveStamps.size(),
-        static_cast<size_t>(kMaterialOverlayLiveStampCapacity)));
-
-    std::memset(
-        liveCells,
-        0,
-        static_cast<size_t>(kMaterialOverlayLiveStampCellCapacity) * sizeof(MaterialOverlayCellGPU));
-
-    for (uint32_t i = 0; i < header->_pad; ++i) {
-        const auto& stamp = liveStamps[i];
-        const uint32_t baseCell = i * kMaterialOverlayLiveStampCellStride;
-
-        liveCells[baseCell + 0].x = materialOverlayFloatBitsI32(stamp.centerVoxelLod0.x);
-        liveCells[baseCell + 0].y = materialOverlayFloatBitsI32(stamp.centerVoxelLod0.y);
-        liveCells[baseCell + 0].z = materialOverlayFloatBitsI32(stamp.centerVoxelLod0.z);
-        liveCells[baseCell + 0].face = materialOverlayFloatBitsU32(
-            static_cast<float>(std::max(1, stamp.radiusVoxelsLod0)));
-        liveCells[baseCell + 0].material = stamp.order;
-
-        liveCells[baseCell + 1].x = stamp.bboxMinLod0.x;
-        liveCells[baseCell + 1].y = stamp.bboxMinLod0.y;
-        liveCells[baseCell + 1].z = stamp.bboxMinLod0.z;
-        liveCells[baseCell + 1].face = static_cast<uint32_t>(stamp.shape);
-        liveCells[baseCell + 1].material = static_cast<uint32_t>(stamp.sourceFace);
-
-        liveCells[baseCell + 2].x = stamp.bboxMaxLod0.x;
-        liveCells[baseCell + 2].y = stamp.bboxMaxLod0.y;
-        liveCells[baseCell + 2].z = stamp.bboxMaxLod0.z;
-        liveCells[baseCell + 2].face = static_cast<uint32_t>(stamp.type);
-        liveCells[baseCell + 2].material = static_cast<uint32_t>(stamp.variant & 0x7u);
-    }
-
-    if (m_materialOverlayImageDirty[imageIndex]) {
-        std::memcpy(
-            dstCells,
-            m_materialOverlayTable.data(),
-            static_cast<size_t>(m_materialOverlayCapacity) * sizeof(MaterialOverlayCellGPU));
-        m_materialOverlayImageDirty[imageIndex] = 0u;
-        m_materialOverlayImageDirtySlots[imageIndex].clear();
+    if (depthPrepassRenderPass == VK_NULL_HANDLE || depthPrepassFramebuffer == VK_NULL_HANDLE ||
+        depthImg == VK_NULL_HANDLE || depthView == VK_NULL_HANDLE) {
+        writeDummySameFrameTimestamps();
         return;
     }
 
-    auto& q = m_materialOverlayImageDirtySlots[imageIndex];
-    if (q.empty()) return;
-
-    for (uint32_t slot : q) {
-        if (slot >= m_materialOverlayCapacity) continue;
-        dstCells[slot] = m_materialOverlayTable[slot];
+    const auto prepassStart = clock::now();
+    if (m_timestampQueryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            m_timestampQueryPool, timestampBase + 2);
     }
-    q.clear();
+
+    VkRenderPassBeginInfo prepassInfo{};
+    prepassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    prepassInfo.renderPass = depthPrepassRenderPass;
+    prepassInfo.framebuffer = depthPrepassFramebuffer;
+    prepassInfo.renderArea.offset = {0, 0};
+    prepassInfo.renderArea.extent = targetExtent;
+
+    std::array<VkClearValue, 2> clearValues{};
+    clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    clearValues[1].depthStencil = {0.0f, 0};
+    prepassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
+    prepassInfo.pClearValues = clearValues.data();
+
+    vkCmdBeginRenderPass(cmd, &prepassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport viewport{};
+    viewport.x = static_cast<float>(gameplayScissor.offset.x);
+    viewport.y = static_cast<float>(gameplayScissor.offset.y + static_cast<int32_t>(gameplayScissor.extent.height));
+    viewport.width = static_cast<float>(gameplayScissor.extent.width);
+    viewport.height = -static_cast<float>(gameplayScissor.extent.height);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+    vkCmdSetViewport(cmd, 0, 1, &viewport);
+    vkCmdSetScissor(cmd, 0, 1, &gameplayScissor);
+
+    VkBuffer pooledVB = m_vbAllocator.getPrimaryBuffer();
+    VkBuffer pooledIB = m_ibAllocator.getPrimaryBuffer();
+    VkDeviceSize vbOffset = 0;
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_depthPrePassPipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_pipelineLayout,
+                            0, 1, &m_descriptorSets[imageIndex], 0, nullptr);
+    const uint32_t originsIndex = 1u;
+    vkCmdPushConstants(cmd, m_pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                       0, sizeof(uint32_t), &originsIndex);
+    vkCmdBindVertexBuffers(cmd, 0, 1, &pooledVB, &vbOffset);
+    vkCmdBindIndexBuffer(cmd, pooledIB, 0, VK_INDEX_TYPE_UINT16);
+    vkCmdDrawIndexedIndirectCount(
+        cmd,
+        m_gpuCulling.getVisibleDrawsBuffer(), 0,
+        m_gpuCulling.getDrawCountBuffer(), 0,
+        m_gpuCulling.getMaxDraws(),
+        sizeof(VkDrawIndexedIndirectCommand));
+
+    vkCmdEndRenderPass(cmd);
+
+    if (m_timestampQueryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                            m_timestampQueryPool, timestampBase + 3);
+    }
+    cpuPrepassMs = std::chrono::duration<float, std::milli>(clock::now() - prepassStart).count();
+
+    const auto hiZStart = clock::now();
+    m_hiZPyramid.updateDepthSource(depthView);
+
+    VkImageMemoryBarrier2 depthToSample{};
+    depthToSample.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    depthToSample.srcStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    depthToSample.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    depthToSample.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    depthToSample.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    depthToSample.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthToSample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    depthToSample.image = depthImg;
+    depthToSample.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depthToSample.subresourceRange.baseMipLevel = 0;
+    depthToSample.subresourceRange.levelCount = 1;
+    depthToSample.subresourceRange.baseArrayLayer = 0;
+    depthToSample.subresourceRange.layerCount = 1;
+
+    VkDependencyInfo depthToSampleDep{};
+    depthToSampleDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    depthToSampleDep.imageMemoryBarrierCount = 1;
+    depthToSampleDep.pImageMemoryBarriers = &depthToSample;
+    vkCmdPipelineBarrier2(cmd, &depthToSampleDep);
+
+    m_hiZPyramid.recordBuildPyramid(cmd);
+
+    VkImageMemoryBarrier2 pyramidFlush{};
+    pyramidFlush.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    pyramidFlush.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    pyramidFlush.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    pyramidFlush.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    pyramidFlush.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    pyramidFlush.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    pyramidFlush.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    pyramidFlush.image = m_hiZPyramid.getImage();
+    pyramidFlush.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    pyramidFlush.subresourceRange.baseMipLevel = 0;
+    pyramidFlush.subresourceRange.levelCount = VK_REMAINING_MIP_LEVELS;
+    pyramidFlush.subresourceRange.baseArrayLayer = 0;
+    pyramidFlush.subresourceRange.layerCount = 1;
+
+    VkImageMemoryBarrier2 depthRestore{};
+    depthRestore.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    depthRestore.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    depthRestore.srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    depthRestore.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    depthRestore.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    depthRestore.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    depthRestore.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    depthRestore.image = depthImg;
+    depthRestore.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    depthRestore.subresourceRange.baseMipLevel = 0;
+    depthRestore.subresourceRange.levelCount = 1;
+    depthRestore.subresourceRange.baseArrayLayer = 0;
+    depthRestore.subresourceRange.layerCount = 1;
+
+    std::array<VkImageMemoryBarrier2, 2> postBuildBarriers = {pyramidFlush, depthRestore};
+    VkDependencyInfo postBuildDep{};
+    postBuildDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    postBuildDep.imageMemoryBarrierCount = static_cast<uint32_t>(postBuildBarriers.size());
+    postBuildDep.pImageMemoryBarriers = postBuildBarriers.data();
+    vkCmdPipelineBarrier2(cmd, &postBuildDep);
+
+    if (m_timestampQueryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            m_timestampQueryPool, timestampBase + 4);
+    }
+    cpuHiZMs = std::chrono::duration<float, std::milli>(clock::now() - hiZStart).count();
+
+    const auto finalCullStart = clock::now();
+    if (!m_perfMode) {
+        m_gpuCulling.recordClearDebugStats(cmd);
+        m_gpuCulling.recordClearHiZBlinkLog(cmd);
+    }
+
+    const float invTargetW = 1.0f / static_cast<float>(targetExtent.width);
+    const float invTargetH = 1.0f / static_cast<float>(targetExtent.height);
+    const float viewportOffsetX = isSeparated ? 0.0f : static_cast<float>(gameplayScissor.offset.x) * invTargetW;
+    const float viewportOffsetY = isSeparated ? 0.0f : static_cast<float>(gameplayScissor.offset.y) * invTargetH;
+    const float viewportScaleX = isSeparated ? 1.0f : static_cast<float>(gameplayScissor.extent.width) * invTargetW;
+    const float viewportScaleY = isSeparated ? 1.0f : static_cast<float>(gameplayScissor.extent.height) * invTargetH;
+
+    m_gpuCulling.recordCulling(cmd, viewProj, m_frameCullingTimelineValue, m_gpuCullingChunkCount,
+                               m_hiZPyramid.getWidth(), m_hiZPyramid.getHeight(), m_hiZPyramid.getMipLevels(),
+                               viewProj,
+                               viewportOffsetX, viewportOffsetY, viewportScaleX, viewportScaleY,
+                               viewportOffsetX, viewportOffsetY, viewportScaleX, viewportScaleY,
+                               !m_perfMode, true);
+
+    if (m_timestampQueryPool != VK_NULL_HANDLE) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                            m_timestampQueryPool, timestampBase + 5);
+    }
+
+    const bool samplePerfDrawCount = shouldSamplePerfOverlayDrawCount();
+    const bool captureDrawCountSample = samplePerfDrawCount;
+    const bool captureDebugReadbacks = !m_perfMode;
+    const bool captureMinimapReadback = !m_perfMode && m_minimapReadback.isEnabled();
+    if (captureDrawCountSample || captureDebugReadbacks || captureMinimapReadback) {
+        m_gpuCulling.recordReadbackBarrier(cmd);
+    }
+    if (captureDrawCountSample) {
+        m_gpuCulling.recordDrawCountReadback(cmd);
+    }
+    if (captureDebugReadbacks) {
+        m_gpuCulling.recordDebugStatsReadback(cmd);
+        m_gpuCulling.recordHiZBlinkLogReadback(cmd);
+        if (captureMinimapReadback) {
+            m_minimapReadback.recordReadback(cmd, static_cast<uint32_t>(m_currentFrame),
+                                             m_gpuCulling.getVisibleOriginsBuffer(),
+                                             m_gpuCulling.getDrawCountBuffer());
+        }
+    }
+
+    m_gpuCulling.recordBarriersBeforeDraw(cmd);
+    m_frameGraphColorLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    m_frameGraphDepthLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    cpuFinalMs = std::chrono::duration<float, std::milli>(clock::now() - finalCullStart).count();
 }
-END CC-REPLACE
 
-BEGIN CC-REPLACE
-FILE: shaders/terrain/cube.frag
-MODE: function
-NAME: lookupMaterialOverlay
----
-uint lookupMaterialOverlay(vec3 worldPos, vec3 normal, uint face, uint fallbackMaterial) {
-    const uint MATERIAL_OVERLAY_CHUNK_HINT_BIT = 0x40000000u;
-    const uint MATERIAL_PACKED_BIT = 0x80000000u;
-    const uint MATERIAL_LIVE_STAMP_CAPACITY = 64u;
-    const uint MATERIAL_LIVE_STAMP_CELL_STRIDE = 3u;
-    const uint MATERIAL_LIVE_STAMP_CELL_CAPACITY =
-        MATERIAL_LIVE_STAMP_CAPACITY * MATERIAL_LIVE_STAMP_CELL_STRIDE;
-
-    uint cleanFallbackMaterial = fallbackMaterial & ~MATERIAL_OVERLAY_CHUNK_HINT_BIT;
-
-    uint baselineMaterial = cleanFallbackMaterial;
-    if ((baselineMaterial & MATERIAL_PACKED_BIT) == 0u) {
-        uint type = (face == 3u) ? 0u : 2u;
-
-        float h = worldPos.y;
-        float biomeNoise = hash12(floor(worldPos.xz * 0.0625));
-        if (face == 3u) {
-            if (h < 5.0) {
-                type = 3u;
-            } else if (biomeNoise > 0.82) {
-                type = 1u;
-            }
-        }
-
-        uint variant = uint(hash12(floor(worldPos.xz * 0.25) + vec2(float(face) * 13.0, 71.0)) * 8.0) & 0x7u;
-        uint edge = 0u;
-        uint resLog2 = 4u;
-        baselineMaterial = MATERIAL_PACKED_BIT | type | (variant << 2u) | (edge << 5u) | (resLog2 << 7u);
-    }
-
-    // Instant texture-brush path:
-    //
-    // Binding 10 still has the old layout, but cells[] now begins with a tiny
-    // fixed live-stamp prefix. Each big brush click uploads one compact stamp;
-    // the shader tests newest stamps first, then falls back to baked material.
-    const uint liveStampCount = min(materialOverlay._pad, MATERIAL_LIVE_STAMP_CAPACITY);
-    if (liveStampCount > 0u) {
-        ivec3 voxel = ivec3(floor(worldPos * 4.0 - normal * 0.01));
-
-        const uint queryFace = face & 0x7u;
-        const uint queryAxis = queryFace / 2u;
-        const float querySign = ((queryFace & 1u) != 0u) ? 1.0 : -1.0;
-
-        vec3 faceCenter = vec3(voxel) + vec3(0.5);
-        faceCenter[int(queryAxis)] += querySign * 0.5;
-
-        for (uint reverseIdx = 0u; reverseIdx < liveStampCount; ++reverseIdx) {
-            const uint stampIdx = liveStampCount - 1u - reverseIdx;
-            const uint cellBase = stampIdx * MATERIAL_LIVE_STAMP_CELL_STRIDE;
-
-            MaterialOverlayCell c0 = materialOverlay.cells[cellBase + 0u];
-            MaterialOverlayCell c1 = materialOverlay.cells[cellBase + 1u];
-            MaterialOverlayCell c2 = materialOverlay.cells[cellBase + 2u];
-
-            ivec3 bboxMin = ivec3(c1.x, c1.y, c1.z);
-            ivec3 bboxMax = ivec3(c2.x, c2.y, c2.z);
-            if (voxel.x < bboxMin.x || voxel.y < bboxMin.y || voxel.z < bboxMin.z ||
-                voxel.x > bboxMax.x || voxel.y > bboxMax.y || voxel.z > bboxMax.z) {
-                continue;
-            }
-
-            vec3 center = vec3(
-                intBitsToFloat(c0.x),
-                intBitsToFloat(c0.y),
-                intBitsToFloat(c0.z));
-            float radius = uintBitsToFloat(c0.face) + 1.0;
-
-            vec3 d = faceCenter - center;
-            bool inside = false;
-            if ((c1.face & 0xFFu) == 0u) {
-                inside = dot(d, d) <= radius * radius;
-            } else {
-                inside = abs(d.x) <= radius &&
-                         abs(d.y) <= radius &&
-                         abs(d.z) <= radius;
-            }
-
-            if (!inside) {
-                continue;
-            }
-
-            uint type = c2.face & 0x3u;
-            uint variantSeed = c2.material & 0x7u;
-            uint variant = (variantSeed + (hashMaterialOverlayKey(voxel, queryFace) & 0x7u)) & 0x7u;
-            uint edge = 0u;
-            uint resLog2 = 4u;
-            return MATERIAL_PACKED_BIT | type | (variant << 2u) | (edge << 5u) | (resLog2 << 7u);
-        }
-    }
-
-    if (materialOverlay.count == 0u || materialOverlay.capacityMask == 0u) {
-        return baselineMaterial;
-    }
-
-    uint capacity = materialOverlay.capacityMask + 1u;
-
-    if ((materialOverlay.count * 4u) > (capacity * 3u)) {
-        return baselineMaterial;
-    }
-
-    if ((fallbackMaterial & MATERIAL_OVERLAY_CHUNK_HINT_BIT) == 0u) {
-        return baselineMaterial;
-    }
-
-    const uint probeLimit = min(materialOverlay.maxProbe, 8u);
-
-    ivec3 voxel = ivec3(floor(worldPos * 4.0 - normal * 0.01));
-    uint idx = hashMaterialOverlayKey(voxel, face) & materialOverlay.capacityMask;
-
-    for (uint probe = 0u; probe <= probeLimit; ++probe) {
-        MaterialOverlayCell cell =
-            materialOverlay.cells[MATERIAL_LIVE_STAMP_CELL_CAPACITY + idx];
-
-        if (cell.material == 0u) {
-            return baselineMaterial;
-        }
-
-        if (cell.x == voxel.x &&
-            cell.y == voxel.y &&
-            cell.z == voxel.z &&
-            (cell.face & 0x7u) == (face & 0x7u)) {
-            return cell.material;
-        }
-
-        uint residentIdeal = hashMaterialOverlayKey(
-            ivec3(cell.x, cell.y, cell.z),
-            cell.face & 0x7u) & materialOverlay.capacityMask;
-        uint residentProbe = (idx - residentIdeal) & materialOverlay.capacityMask;
-        if (residentProbe < probe) {
-            return baselineMaterial;
-        }
-
-        idx = (idx + 1u) & materialOverlay.capacityMask;
-    }
-
-    return baselineMaterial;
-}
+void Engine::recordPostRenderHiZBuild(VkCommandBuffer cmd) {
 END CC-REPLACE

@@ -1,0 +1,88 @@
+// EngineTimestamps.cpp - Timestamp query pool management and per-frame GPU timing collection
+// Contains: collectTimestampResults
+
+#include "core/engine/Engine.h"
+#include <cstdint>
+
+// GPT_CHANGE: Refactored drawFrame with clear per-frame synchronization flow
+void Engine::collectTimestampResults(uint32_t imageIndex) {
+    if (m_timestampQueryPool == VK_NULL_HANDLE) {
+        return;
+    }
+
+    if (imageIndex >= m_swapchainImages.size()) {
+        return;
+    }
+
+    // Query layout per image:
+    // 0=frameStart, 1=afterInitialCull, 2=depthPrepassStart, 3=depthPrepassEnd,
+    // 4=afterHiZBuild, 5=afterFinalCull, 6=terrainStart, 7=terrainEnd, 8=frameEnd
+    uint32_t queryBase = imageIndex * TIMESTAMPS_PER_IMAGE;
+
+    // Never block the CPU for timing data. A blocking timestamp query can turn
+    // cheap GPU work into a 10ms+ CPU readback stall. WITH_AVAILABILITY gives us
+    // one availability word per query; if any query is not ready, keep the last
+    // published timing values and try again on a later frame.
+    uint64_t queryData[TIMESTAMPS_PER_IMAGE * 2] = {};
+    VkResult res = vkGetQueryPoolResults(
+        m_device,
+        m_timestampQueryPool,
+        queryBase,
+        TIMESTAMPS_PER_IMAGE,
+        sizeof(queryData),
+        queryData,
+        sizeof(uint64_t) * 2,
+        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+
+    if (res != VK_SUCCESS && res != VK_NOT_READY) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < TIMESTAMPS_PER_IMAGE; ++i) {
+        if (queryData[i * 2 + 1] == 0u) {
+            return;
+        }
+    }
+
+    uint64_t timestamps[TIMESTAMPS_PER_IMAGE] = {};
+    for (uint32_t i = 0; i < TIMESTAMPS_PER_IMAGE; ++i) {
+        timestamps[i] = queryData[i * 2];
+    }
+
+    // Convert timestamp deltas to milliseconds
+    auto ticksToMs = [this](uint64_t start, uint64_t end) -> double {
+        if (end > start && m_timestampPeriod > 0.0f) {
+            return static_cast<double>(end - start) * static_cast<double>(m_timestampPeriod) / 1'000'000.0;
+        }
+        return 0.0;
+    };
+
+    // Total frame time (start to end)
+    if (timestamps[8] > timestamps[0]) {
+        m_lastGpuFrameMs = ticksToMs(timestamps[0], timestamps[8]);
+        m_lastUncappedFps = m_lastGpuFrameMs > 0.0 ? 1000.0 / m_lastGpuFrameMs : 0.0;
+    }
+
+    HiZPyramid::DiagnosticsMode submittedMode = HiZPyramid::DiagnosticsMode::FrustumOnly;
+    if (imageIndex < m_hiZTimingModeByImage.size()) {
+        submittedMode = m_hiZTimingModeByImage[imageIndex];
+    }
+    m_lastCollectedCurrentFrameHiZ = false;
+    m_lastCollectedTemporalHiZ = (submittedMode == HiZPyramid::DiagnosticsMode::TemporalHiZ);
+
+    m_gpuInitialCullMs = ticksToMs(timestamps[0], timestamps[1]);
+    m_gpuDepthPrepassMs = 0.0;
+    m_gpuHiZBuildMs = 0.0;
+    m_gpuFinalCullMs = 0.0;
+    m_gpuHiZIncrementalMs = 0.0;
+
+    // Culling dispatch time shown in the generic debug UI keeps the first pass,
+    // while total culling reflects the whole submitted culling workload.
+    m_cullingDispatchMs = m_gpuInitialCullMs;
+    m_cullingTotalMs = m_gpuInitialCullMs + m_gpuFinalCullMs;
+
+    // Main lit terrain timing.
+    m_terrainLightingMs = ticksToMs(timestamps[6], timestamps[7]);
+    m_shadowSystem.setFrameGpuPassCosts(
+        static_cast<float>(m_terrainLightingMs));
+}

@@ -1,0 +1,253 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+#define LOCAL_SIZE_X 64
+layout(local_size_x = LOCAL_SIZE_X, local_size_y = 1, local_size_z = 1) in;
+
+#define MAX_SUBCHUNKS 64
+
+struct SubChunkDraw {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+struct ChunkDrawData {
+    SubChunkDraw draws[MAX_SUBCHUNKS];
+    vec4 aabbMin;
+    vec4 aabbMax;
+    vec4 origin;
+    uint subChunkCount;
+    uint hiZGraceTimeline;
+    uint _pad1;
+    uint _pad2;
+};
+
+layout(push_constant) uniform PushConstants {
+    mat4 viewProj;
+    uint totalDraws;
+    uint currentTimeline;
+    uint hiZEnabled;
+    uint debugEnabled;
+    vec4 hiZPyramidInfo;
+    vec4 viewportUvTransform;
+    mat4 prevViewProj;
+    uvec4 temporalInfo;     // x = temporalCoherenceEnabled, y = motionFrame
+} pc;
+
+layout(set = 0, binding = 0) readonly buffer AllDraws {
+    ChunkDrawData chunks[];
+} allDraws;
+
+layout(set = 0, binding = 4) buffer DebugStats {
+    uint stats[16];
+} debugStats;
+
+layout(set = 0, binding = 6) readonly buffer ActiveChunkIndices {
+    uint indices[];
+} activeChunkIndices;
+
+layout(set = 0, binding = 7) buffer FrustumPassedIndices {
+    uint indices[];
+} frustumPassedIndices;
+
+layout(set = 0, binding = 8) buffer FrustumPassedCount {
+    uint count;
+} frustumPassedCount;
+
+// Phase A — persistent visibility mask (one bit per chunk slot).
+// We CLEAR the bit on every fail path here so a chunk that just left view (or got
+// freed) doesn't keep its "visible" status and bypass Hi-Z when it re-enters.
+// We do NOT set the bit here — only the Hi-Z stage decides true visibility.
+layout(set = 0, binding = 11) buffer PrevVisibleMask {
+    uint bits[];
+} prevVisibleMask;
+
+void clearPrevVisibleBit(uint chunkIdx) {
+    uint word = chunkIdx >> 5u;
+    uint mask = ~(1u << (chunkIdx & 31u));
+    atomicAnd(prevVisibleMask.bits[word], mask);
+}
+
+bool frustumCull(vec3 aabbMin, vec3 aabbMax) {
+    // Robust viewport-matched frustum test.
+    // The old path used raw homogeneous side tests only. That is fine for simple
+    // in-front AABBs, but it becomes visually misleading around low camera angles
+    // and near/behind-camera straddling chunks, where clip.w changes sign and the
+    // apparent culling cone no longer lines up with the actual viewport.
+    const float CLIP_W_EPS = 0.0001;
+
+    vec4 clips[8];
+
+    bool outsideLeft = true;
+    bool outsideRight = true;
+    bool outsideBottom = true;
+    bool outsideTop = true;
+    bool outsideNear = true;
+
+    for (int i = 0; i < 8; ++i) {
+        vec3 corner = vec3(
+            ((i & 1) != 0) ? aabbMax.x : aabbMin.x,
+            ((i & 2) != 0) ? aabbMax.y : aabbMin.y,
+            ((i & 4) != 0) ? aabbMax.z : aabbMin.z);
+
+        vec4 clip = pc.viewProj * vec4(corner, 1.0);
+        clips[i] = clip;
+
+        outsideLeft   = outsideLeft   && (clip.x < -clip.w);
+        outsideRight  = outsideRight  && (clip.x >  clip.w);
+        outsideBottom = outsideBottom && (clip.y < -clip.w);
+        outsideTop    = outsideTop    && (clip.y >  clip.w);
+        // Vulkan clip depth is 0..w. With the reversed-Z infinite projection,
+        // z > w means the whole AABB is in front of the near plane.
+        outsideNear   = outsideNear   && (clip.z >  clip.w);
+    }
+
+    if (outsideLeft || outsideRight || outsideBottom || outsideTop || outsideNear) {
+        return true;
+    }
+
+    // Secondary projected-rect check in the exact same viewport UV space used by
+    // Hi-Z. This makes the GPU frustum candidate cone match the screen/depth
+    // viewport instead of assuming an implicit full-swapchain viewport.
+    vec2 viewportA = pc.viewportUvTransform.xy;
+    vec2 viewportB = pc.viewportUvTransform.xy + pc.viewportUvTransform.zw;
+    vec2 viewportMin = min(viewportA, viewportB);
+    vec2 viewportMax = max(viewportA, viewportB);
+
+    float minU =  1.0 / 0.0;
+    float minV =  1.0 / 0.0;
+    float maxU = -1.0 / 0.0;
+    float maxV = -1.0 / 0.0;
+    uint projectedCount = 0u;
+
+    for (int i = 0; i < 8; ++i) {
+        vec4 clip = clips[i];
+        if (clip.w <= CLIP_W_EPS || clip.z > clip.w) {
+            continue;
+        }
+
+        vec3 ndc = clip.xyz / clip.w;
+        vec2 localUv = vec2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
+        vec2 depthUv = pc.viewportUvTransform.xy + localUv * pc.viewportUvTransform.zw;
+        minU = min(minU, depthUv.x);
+        maxU = max(maxU, depthUv.x);
+        minV = min(minV, depthUv.y);
+        maxV = max(maxV, depthUv.y);
+        projectedCount++;
+    }
+
+    // Add edge intersections against clip.w=epsilon and the reversed-Z near plane
+    // (clip.z == clip.w). These prevent AABBs crossing the camera/near plane from
+    // collapsing the projected rectangle into a wrong cone shape.
+    for (int i = 0; i < 8; ++i) {
+        for (int axis = 0; axis < 3; ++axis) {
+            int j = i ^ (1 << axis);
+            if (j <= i) {
+                continue;
+            }
+
+            vec4 a = clips[i];
+            vec4 b = clips[j];
+
+            float denomW = b.w - a.w;
+            if (abs(denomW) > 1e-8) {
+                float t = (CLIP_W_EPS - a.w) / denomW;
+                if (t > 0.0 && t < 1.0) {
+                    vec4 clip = mix(a, b, t);
+                    if (clip.w > CLIP_W_EPS && clip.z <= clip.w) {
+                        vec3 ndc = clip.xyz / clip.w;
+                        vec2 localUv = vec2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
+                        vec2 depthUv = pc.viewportUvTransform.xy + localUv * pc.viewportUvTransform.zw;
+                        minU = min(minU, depthUv.x);
+                        maxU = max(maxU, depthUv.x);
+                        minV = min(minV, depthUv.y);
+                        maxV = max(maxV, depthUv.y);
+                        projectedCount++;
+                    }
+                }
+            }
+
+            float nearA = a.w - a.z;
+            float nearB = b.w - b.z;
+            float denomNear = nearB - nearA;
+            if (abs(denomNear) > 1e-8) {
+                float t = -nearA / denomNear;
+                if (t > 0.0 && t < 1.0) {
+                    vec4 clip = mix(a, b, t);
+                    if (clip.w > CLIP_W_EPS) {
+                        vec3 ndc = clip.xyz / clip.w;
+                        vec2 localUv = vec2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
+                        vec2 depthUv = pc.viewportUvTransform.xy + localUv * pc.viewportUvTransform.zw;
+                        minU = min(minU, depthUv.x);
+                        maxU = max(maxU, depthUv.x);
+                        minV = min(minV, depthUv.y);
+                        maxV = max(maxV, depthUv.y);
+                        projectedCount++;
+                    }
+                }
+            }
+        }
+    }
+
+    if (projectedCount == 0u) {
+        // The homogeneous plane tests above already proved it is not fully outside.
+        // Keep it visible rather than risking a false reject.
+        return false;
+    }
+
+    const float VIEWPORT_PAD_U = 0.0005;
+    const float VIEWPORT_PAD_V = 0.0005;
+    return maxU < (viewportMin.x - VIEWPORT_PAD_U) ||
+           minU > (viewportMax.x + VIEWPORT_PAD_U) ||
+           maxV < (viewportMin.y - VIEWPORT_PAD_V) ||
+           minV > (viewportMax.y + VIEWPORT_PAD_V);
+}
+
+void main() {
+    uint activeIdx = gl_GlobalInvocationID.x;
+    if (activeIdx >= pc.totalDraws) {
+        return;
+    }
+
+    uint chunkIdx = activeChunkIndices.indices[activeIdx];
+    uint subChunkCount = min(allDraws.chunks[chunkIdx].subChunkCount, uint(MAX_SUBCHUNKS));
+
+    if (subChunkCount == 0u) {
+        clearPrevVisibleBit(chunkIdx);
+        if (pc.debugEnabled != 0u) {
+            atomicAdd(debugStats.stats[5], 1);  // zeroSubchunks++
+        }
+        return;
+    }
+
+    uint gpuReadyValue = floatBitsToUint(allDraws.chunks[chunkIdx].origin.w);
+    if (gpuReadyValue > pc.currentTimeline) {
+        clearPrevVisibleBit(chunkIdx);
+        if (pc.debugEnabled != 0u) {
+            atomicAdd(debugStats.stats[6], 1);  // notReady++
+        }
+        return;
+    }
+    if (pc.debugEnabled != 0u) {
+        atomicAdd(debugStats.stats[1], 1);  // chunksReady++
+    }
+
+    vec3 aabbMin = allDraws.chunks[chunkIdx].aabbMin.xyz;
+    vec3 aabbMax = allDraws.chunks[chunkIdx].aabbMax.xyz;
+    if (frustumCull(aabbMin, aabbMax)) {
+        clearPrevVisibleBit(chunkIdx);
+        return;
+    }
+
+    if (pc.debugEnabled != 0u) {
+        atomicAdd(debugStats.stats[2], 1);  // frustumPassed++
+    }
+    uint outIdx = atomicAdd(frustumPassedCount.count, 1);
+    frustumPassedIndices.indices[outIdx] = chunkIdx;
+}

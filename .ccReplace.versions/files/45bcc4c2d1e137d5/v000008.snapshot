@@ -1211,30 +1211,7 @@ function Resolve-CcProjectRoot {
         $root = [string]$Settings.ProjectRoot
     }
 
-    $resolvedRoot = Resolve-CcPathRelativeToScript $root
-
-    # Context Control is designed to live at:
-    #   <project-root>/contextcontrol/
-    # If an old settings file says ProjectRoot="." or the tool is launched from
-    # inside contextcontrol/, patch targets should still resolve from the parent
-    # project root. This keeps FILE: contextcontrol/ccDir.ps1 and engine paths
-    # working consistently.
-    $leaf = Split-Path -Leaf $resolvedRoot
-    if ($leaf -ieq "contextcontrol") {
-        $hasContextControlScripts =
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccDir.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "cc.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccReplace.ps1"))
-
-        if ($hasContextControlScripts) {
-            $parent = Split-Path -Parent $resolvedRoot
-            if (-not [string]::IsNullOrWhiteSpace($parent)) {
-                return [System.IO.Path]::GetFullPath($parent)
-            }
-        }
-    }
-
-    return $resolvedRoot
+    return Resolve-CcPathRelativeToScript $root
 }
 
 function Resolve-CcOutputRoot {
@@ -3297,17 +3274,11 @@ function Invoke-CcPipelineCommand {
     if ($clean -ieq "GO") {
         Write-Host ""
         Write-Host "GO patch mode." -ForegroundColor Cyan
-        Write-Host "Paste raw BEGIN CC-REPLACE blocks into this terminal." -ForegroundColor DarkGray
+        Write-Host "Uses raw BEGIN/END CC-REPLACE blocks exactly like patch.txt." -ForegroundColor DarkGray
+        Write-Host "Preferred flow: copy patch text, type GO, review the normal preflight." -ForegroundColor DarkGray
         Write-Host "This uses the same preflight and confirmation stage as patch.txt." -ForegroundColor DarkGray
-        Write-Host "Clipboard auto-load is disabled; GO will not read or apply clipboard text by itself." -ForegroundColor DarkGray
 
-        if (Get-Command Read-CcGoManualPatchText -ErrorAction SilentlyContinue) {
-            $patchText = Read-CcGoManualPatchText
-        }
-        else {
-            $patchText = Read-PasteInputText
-        }
-
+        $patchText = Read-CcGoPatchText
         if ([string]::IsNullOrWhiteSpace($patchText)) {
             Write-Host "No GO patch text." -ForegroundColor Yellow
             return $true

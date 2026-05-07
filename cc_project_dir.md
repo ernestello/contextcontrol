@@ -20,13 +20,13 @@ shaders/common/shadow_sampling.glsl
 END
 ```
 
-Function examples accepted by upgraded cc.ps1:
+Function/discovery examples accepted by upgraded cc.ps1:
 
 ```	ext
 FUNCTION src/world/World.cpp :: World::markTextureMaterialsDirty
 FUNCTION src/world/World*.cpp :: World::beginTerrainEditVisualTracking
 FUNC: beginTerrainEditVisualTracking
-SYMBOL: TerrainEditDiag
+FIND: TerrainEditDiag
 END
 ```
 
@@ -36,7 +36,8 @@ Map-stage reminders:
 - Function syntax must be exactly: FUNCTION src/path/File.cpp :: SymbolName.
 - Wildcard FUNCTION paths are supported for split implementation families, e.g. FUNCTION src/world/World*.cpp :: World::foo, but prefer exact files when known.
 - Use FUNC: SymbolName only when the owning file is unknown and you want cc.ps1 to search and extract function bodies.
-- Use SYMBOL: SymbolName only for non-function declarations/types/constants because it exports whole matching files.
+- Do not request SYMBOL:. It is disabled because whole-file symbol export causes token explosions.
+- Use FIND: TextToLocate only for cheap discovery; it lists matching files and occurrence previews without exporting source bodies.
 - cc.ps1 now auto-adds matching headers for .cpp files and direct GLSL #include files, so do not list obvious duplicates unless the specific header/include is central to the change.
 - Include CMakeLists.txt only when adding/removing C++ source files or build config.
 - Never request build/, vcpkg_installed/, vendor/external/third_party/, generated caches, binaries, or unrelated modules.
@@ -214,6 +215,10 @@ vulkanas/
 │   ├── snapshot_20260430_122358/
 │   │   └── snapshot.meta
 │   ├── snapshot_20260430_183142/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260507_122247/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260507_131233/
 │   │   └── snapshot.meta
 │   ├── heightmap.csv
 │   └── heightmap.hbin

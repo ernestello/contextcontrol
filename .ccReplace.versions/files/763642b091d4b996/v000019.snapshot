@@ -1,0 +1,642 @@
+#version 450
+// GPT-DESC: Performs conservative frustum-passed Hi-Z occlusion and draw emission.
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : enable
+
+// Pass 2: Hi-Z occlusion + draw emission for frustum-passed candidates.
+// Workgroup size
+#define LOCAL_SIZE_X 64
+layout(local_size_x = LOCAL_SIZE_X, local_size_y = 1, local_size_z = 1) in;
+
+const float HIZ_OCCLUSION_DEPTH_EPSILON = 0.00002;
+const float HIZ_HOLE_RELATIVE_THRESHOLD = 0.20;
+const float HIZ_HOLE_ABSOLUTE_EPSILON = 0.0001;
+const float HIZ_HOLE_RECOVERY_MAX_TEXELS = 12.0;
+const float HIZ_RECT_BASE_PADDING_TEXELS = 1.0;
+const float HIZ_RECT_MOTION_PADDING_TEXELS = 2.0;
+
+// Constants - must match C++ side
+#define MAX_SUBCHUNKS 64
+// Must match GPU_CULLING_MAX_DRAWS / MAX_INDIRECT_DRAWS on C++ side.
+#define MAX_VISIBLE_DRAWS 65536
+
+// SubChunkDraw - matches C++ struct (32 bytes)
+struct SubChunkDraw {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+// ChunkDrawData - matches C++ struct (576 bytes)
+struct ChunkDrawData {
+    SubChunkDraw draws[MAX_SUBCHUNKS];
+    vec4 aabbMin;                        // 16 bytes
+    vec4 aabbMax;                        // 16 bytes
+    vec4 origin;                         // 16 bytes (xyz = origin, w = gpuReadyValue as float bits)
+    uint subChunkCount;                  // 4 bytes
+    // Hi-Z grace: skip occlusion test while currentTimeline < hiZGraceTimeline.
+    // Topology edits get a short grace window; initial loads and LOD swaps are
+    // immediately occludable.
+    uint hiZGraceTimeline;
+    uint _pad1;
+    uint _pad2;
+};
+
+// VkDrawIndexedIndirectCommand - matches Vulkan struct (20 bytes, but we use 32 for alignment)
+struct DrawCommand {
+    uint indexCount;
+    uint instanceCount;
+    uint firstIndex;
+    int  vertexOffset;
+    uint firstInstance;
+};
+
+// Push constants - must match C++ CullPushConstants (192 bytes)
+layout(push_constant) uniform PushConstants {
+    mat4 viewProj;          // 64 bytes  (offset 0)   - current frame VP
+    uint totalDraws;        // 4 bytes   (offset 64)
+    uint currentTimeline;   // 4 bytes   (offset 68)
+    uint hiZEnabled;        // 4 bytes   (offset 72)  - 1 = Hi-Z occlusion active
+    uint debugEnabled;      // 4 bytes   (offset 76)  - 1 = write debug stats
+    vec4 hiZPyramidInfo;    // 16 bytes  (offset 80)  - x=width, y=height, z=mips
+    vec4 viewportUvTransform; // 16 bytes (offset 96)  - current x=offU,y=offV,z=scaleU,w=scaleV
+    mat4 prevViewProj;      // 64 bytes  (offset 112) - previous frame's VP for Hi-Z
+    uvec4 temporalInfo;     // 16 bytes  (offset 176) - x=temporalCoherenceEnabled, y=motionFrame
+    vec4 prevViewportUvTransform; // 16 bytes (offset 192) - previous x=offU,y=offV,z=scaleU,w=scaleV
+} pc;
+
+// Descriptor set bindings
+layout(set = 0, binding = 0) readonly buffer AllDraws {
+    ChunkDrawData chunks[];
+} allDraws;
+
+layout(set = 0, binding = 1) writeonly buffer VisibleDraws {
+    DrawCommand commands[];
+} visibleDraws;
+
+layout(set = 0, binding = 2) buffer DrawCount {
+    uint count;
+} drawCount;
+
+layout(set = 0, binding = 3) writeonly buffer VisibleOrigins {
+    vec4 origins[];
+} visibleOrigins;
+
+// Debug stats for culling analysis (binding 4)
+// [0] = chunks processed (passed bounds check) [derived on CPU]
+// [1] = chunks ready (has subchunks + timeline passed)
+// [2] = frustum passed (visible on screen)
+// [3] = total threads dispatched (debug) [derived on CPU]
+// [4] = threads that failed bounds check (debug) [derived on CPU]
+// [5] = chunks with zero subchunks (debug)
+// [6] = chunks not ready (timeline) (debug)
+// [7] = chunks occluded by Hi-Z (debug)
+// [8] = chunks that entered Hi-Z test (debug) [derived on CPU]
+// [9] = chunks that bailed due to near-plane crossing (debug)
+// [10] = chunks where pyramidDepth > 0.0 (pyramid has data)
+// [11] = chunks where pyramidDepth == 0.0 (pyramid empty/sky)
+// [15] = visible draw commands emitted
+layout(set = 0, binding = 4) buffer DebugStats {
+    uint stats[16];
+} debugStats;
+
+// Hi-Z depth pyramid (binding 5) - min-reduction sampler
+layout(set = 0, binding = 5) uniform sampler2D hiZPyramid;
+
+// Frustum-pass compact candidate list (binding 7) + count (binding 8)
+layout(set = 0, binding = 7) readonly buffer FrustumPassedIndices {
+    uint indices[];
+} frustumPassedIndices;
+
+layout(set = 0, binding = 8) readonly buffer FrustumPassedCount {
+    uint count;
+} frustumPassedCount;
+
+// Hi-Z blink log (binding 9): per-frame ring buffer the shader writes one entry to
+// every time it culls a chunk via Hi-Z. CPU drains it after the frame and surfaces it
+// in the Hi-Z debug window. Capacity must match HIZ_BLINK_LOG_GPU_CAPACITY (C++).
+#define HIZ_BLINK_LOG_GPU_CAPACITY 1024u
+// Only log occlusion events for chunks whose grace window expired recently.
+// Chunks with a grace delta of 400+ are legitimate stable occlusions, not bugs.
+// Raise this if you want to capture older chunks too.
+#define HIZ_BLINK_LOG_GRACE_THRESHOLD 64u
+struct HiZBlinkEvent {
+    uint  chunkIdx;
+    uint  currentTimeline;
+    uint  hiZGraceTimeline;
+    uint  subChunkCount;
+    float chunkOriginX;
+    float chunkOriginY;
+    float chunkOriginZ;
+    float nearestDepth;
+    float pyramidDepth;
+    float mipLevel;
+    uint  _pad0;
+    uint  _pad1;
+};
+layout(set = 0, binding = 9) buffer HiZBlinkLog {
+    uint count;       // atomic write index
+    uint dropped;     // events past capacity
+    uint _pad0;
+    uint _pad1;
+    HiZBlinkEvent events[];
+} hiZBlinkLog;
+
+// Phase A — persistent visibility mask (one bit per chunk slot).
+// Set by this shader when a chunk passes Hi-Z (or temporally skips it).
+// Cleared by frustum_filter when the chunk fails frustum/notReady, or by this
+// shader when Hi-Z occludes. CPU wipes the entire buffer every N frames so
+// chunks that became occluded eventually get re-tested.
+layout(set = 0, binding = 11) buffer PrevVisibleMask {
+    uint bits[];
+} prevVisibleMask;
+
+bool prevVisibleBitSet(uint chunkIdx) {
+    uint word = chunkIdx >> 5u;
+    uint bit  = 1u << (chunkIdx & 31u);
+    return (prevVisibleMask.bits[word] & bit) != 0u;
+}
+
+void setPrevVisibleBit(uint chunkIdx) {
+    uint word = chunkIdx >> 5u;
+    uint bit  = 1u << (chunkIdx & 31u);
+    atomicOr(prevVisibleMask.bits[word], bit);
+}
+
+void clearPrevVisibleBit(uint chunkIdx) {
+    uint word = chunkIdx >> 5u;
+    uint mask = ~(1u << (chunkIdx & 31u));
+    atomicAnd(prevVisibleMask.bits[word], mask);
+}
+
+// Track whether sampled pyramid data looked valid (debug only).
+void recordPyramidDepthDebug(float pyramidDepth) {
+    if (pc.debugEnabled == 0u) return;
+    if (pyramidDepth > 0.0) {
+        atomicAdd(debugStats.stats[10], 1);  // pyramidNonZero++
+    } else {
+        atomicAdd(debugStats.stats[11], 1);  // pyramidAllZero++
+    }
+}
+
+void accumulatePyramidDepth(float depth,
+                            inout uint nonZeroCount,
+                            inout float minNonZero,
+                            inout float maxNonZero) {
+    if (depth <= 0.0) {
+        return;
+    }
+    nonZeroCount++;
+    minNonZero = min(minNonZero, depth);
+    maxNonZero = max(maxNonZero, depth);
+}
+
+bool coherentPyramidDepths(uint nonZeroCount, float minNonZero, float maxNonZero) {
+    return nonZeroCount >= 3u &&
+           maxNonZero > 0.0 &&
+           (maxNonZero - minNonZero) <= max(maxNonZero * HIZ_HOLE_RELATIVE_THRESHOLD,
+                                            HIZ_HOLE_ABSOLUTE_EPSILON);
+}
+
+vec4 viewportBounds(vec4 viewportTransform) {
+    return vec4(
+        viewportTransform.x,
+        viewportTransform.y,
+        viewportTransform.x + viewportTransform.z,
+        viewportTransform.y + viewportTransform.w);
+}
+
+bool projectAabbToUvRect(mat4 viewProj,
+                         vec4 viewportTransform,
+                         vec3 aabbMin,
+                         vec3 aabbMax,
+                         out vec4 uvRect,
+                         out float nearestDepth) {
+    float minX =  1.0 / 0.0;  // +inf
+    float minY =  1.0 / 0.0;
+    float maxX = -1.0 / 0.0;  // -inf
+    float maxY = -1.0 / 0.0;
+    nearestDepth = 0.0;        // far in reversed-Z
+
+    for (int i = 0; i < 8; ++i) {
+        vec3 corner = vec3(
+            ((i & 1) != 0) ? aabbMax.x : aabbMin.x,
+            ((i & 2) != 0) ? aabbMax.y : aabbMin.y,
+            ((i & 4) != 0) ? aabbMax.z : aabbMin.z);
+
+        vec4 clip = viewProj * vec4(corner, 1.0);
+
+        // If any corner is behind the camera, conservatively keep visible.
+        if (clip.w <= 0.0) {
+            return false;
+        }
+
+        vec3 ndc = clip.xyz / clip.w;
+
+        minX = min(minX, ndc.x);
+        maxX = max(maxX, ndc.x);
+        minY = min(minY, ndc.y);
+        maxY = max(maxY, ndc.y);
+        nearestDepth = max(nearestDepth, ndc.z);
+    }
+
+    // If the AABB was entirely outside this projection, the previous-frame
+    // pyramid has no reliable coverage for it. Draw instead of manufacturing
+    // a clamped edge rect that can over/under-cull while rotating.
+    if (maxX < -1.0 || minX > 1.0 || maxY < -1.0 || minY > 1.0) {
+        return false;
+    }
+
+    // Convert NDC to UV space [0, 1].
+    // NDC x,y are in [-1, 1].
+    // The main pipeline uses a Y-flipped viewport (y=height, height=-height)
+    // which maps NDC Y=+1 → pixel row 0 (top) and NDC Y=-1 → pixel row H (bottom).
+    // Texture UV (0,0) is texel (0,0) = top-left = NDC Y=+1.
+    // Therefore:  uvY = (-ndcY) * 0.5 + 0.5   (negate Y before mapping)
+    float localMinX = clamp( minX * 0.5 + 0.5, 0.0, 1.0);
+    float localMaxX = clamp( maxX * 0.5 + 0.5, 0.0, 1.0);
+    // Note: -maxY becomes the min UV, and -minY becomes the max UV
+    float localMinY = clamp(-maxY * 0.5 + 0.5, 0.0, 1.0);
+    float localMaxY = clamp(-minY * 0.5 + 0.5, 0.0, 1.0);
+
+    // Map local UVs into the actual gameplay viewport region in the full
+    // depth texture. This is required when rendering uses a sub-viewport
+    // (editor layout, split panes, etc).
+    uvRect = vec4(
+        clamp(viewportTransform.x + localMinX * viewportTransform.z, 0.0, 1.0),
+        clamp(viewportTransform.y + localMinY * viewportTransform.w, 0.0, 1.0),
+        clamp(viewportTransform.x + localMaxX * viewportTransform.z, 0.0, 1.0),
+        clamp(viewportTransform.y + localMaxY * viewportTransform.w, 0.0, 1.0));
+    return uvRect.x < uvRect.z && uvRect.y < uvRect.w;
+}
+
+// Hi-Z occlusion culling test
+// Projects the AABB to screen space, selects a mip level where the rect
+// fits in ~2x2 texels, and compares against the depth pyramid.
+// Returns true if the chunk is FULLY OCCLUDED (should be culled).
+//
+// Reversed-Z:  near=1.0, far=0.0
+// Min-reduction sampler returns the farthest (smallest) depth in a region.
+// If the chunk's nearest depth is smaller than the pyramid's farthest depth
+// in that region, the chunk is behind everything and fully occluded.
+//
+// Out params expose the values used for the test so the caller can log them
+// to the Hi-Z blink log when an occlusion event triggers.
+bool hiZOcclude(vec3 aabbMin, vec3 aabbMax,
+                out float outNearestDepth,
+                out float outPyramidDepth,
+                out float outMipLevel) {
+    outNearestDepth = 0.0;
+    outPyramidDepth = 0.0;
+    outMipLevel = 0.0;
+
+    const bool temporalSafetyFrame = (pc.temporalInfo.y != 0u);
+    bool projectedMotion = false;
+
+    vec4 prevRect;
+    float prevNearest = 0.0;
+    if (!projectAabbToUvRect(pc.prevViewProj, pc.prevViewportUvTransform,
+                            aabbMin, aabbMax, prevRect, prevNearest)) {
+        if (pc.debugEnabled != 0u) {
+            atomicAdd(debugStats.stats[9], 1);  // hiZNearPlaneFail++
+        }
+        return false;
+    }
+
+    // The pyramid was built from the previous frame, so the actual occlusion
+    // sample must stay in previous-frame projection space. The current-frame
+    // projection is only a safety signal: when it diverges too far, draw.
+    vec4 cullRect = prevRect;
+    float nearestDepth = prevNearest;
+
+    if (temporalSafetyFrame) {
+        vec4 currentRect;
+        float currentNearest = 0.0;
+        if (!projectAabbToUvRect(pc.viewProj, pc.viewportUvTransform,
+                                aabbMin, aabbMax, currentRect, currentNearest)) {
+            if (pc.debugEnabled != 0u) {
+                atomicAdd(debugStats.stats[9], 1);  // hiZNearPlaneFail++
+            }
+            return false;
+        }
+
+        float uvEpsU = 0.5 / max(pc.hiZPyramidInfo.x, 1.0);
+        float uvEpsV = 0.5 / max(pc.hiZPyramidInfo.y, 1.0);
+        projectedMotion =
+            abs(prevRect.x - currentRect.x) > uvEpsU ||
+            abs(prevRect.z - currentRect.z) > uvEpsU ||
+            abs(prevRect.y - currentRect.y) > uvEpsV ||
+            abs(prevRect.w - currentRect.w) > uvEpsV ||
+            abs(prevNearest - currentNearest) > HIZ_OCCLUSION_DEPTH_EPSILON;
+
+        if (projectedMotion) {
+            float overlapMinX = max(prevRect.x, currentRect.x);
+            float overlapMinY = max(prevRect.y, currentRect.y);
+            float overlapMaxX = min(prevRect.z, currentRect.z);
+            float overlapMaxY = min(prevRect.w, currentRect.w);
+            float overlapW = max(overlapMaxX - overlapMinX, 0.0);
+            float overlapH = max(overlapMaxY - overlapMinY, 0.0);
+            float overlapArea = overlapW * overlapH;
+            float prevArea = max((prevRect.z - prevRect.x) * (prevRect.w - prevRect.y), 1e-6);
+            float currentArea = max((currentRect.z - currentRect.x) * (currentRect.w - currentRect.y), 1e-6);
+
+            // Large screen-space divergence means previous-frame depth cannot
+            // prove this frame's visibility. Keep a bounded fallback, but avoid
+            // throwing away stable occluders for ordinary yaw/player motion.
+            const float minMotionOverlap = 0.20;
+            if (overlapArea / prevArea < minMotionOverlap ||
+                overlapArea / currentArea < minMotionOverlap) {
+                return false;
+            }
+
+            // Reversed-Z: larger depth is nearer. Use the nearer estimate so
+            // motion can only reduce culling, not hide newly exposed geometry.
+            nearestDepth = max(prevNearest, currentNearest);
+        }
+    }
+
+    float uvMinX = cullRect.x;
+    float uvMinY = cullRect.y;
+    float uvMaxX = cullRect.z;
+    float uvMaxY = cullRect.w;
+
+    // The pyramid is only valid inside the previous gameplay viewport. Do not
+    // let screen-edge padding spill into editor UI/clear-depth pixels.
+    vec4 prevViewport = viewportBounds(pc.prevViewportUvTransform);
+    float viewportMinX = clamp(min(prevViewport.x, prevViewport.z), 0.0, 1.0);
+    float viewportMinY = clamp(min(prevViewport.y, prevViewport.w), 0.0, 1.0);
+    float viewportMaxX = clamp(max(prevViewport.x, prevViewport.z), 0.0, 1.0);
+    float viewportMaxY = clamp(max(prevViewport.y, prevViewport.w), 0.0, 1.0);
+    if (viewportMaxX <= viewportMinX || viewportMaxY <= viewportMinY) {
+        return false;
+    }
+
+    float viewportEpsU = 0.5 / max(pc.hiZPyramidInfo.x, 1.0);
+    float viewportEpsV = 0.5 / max(pc.hiZPyramidInfo.y, 1.0);
+    if (uvMinX < viewportMinX - viewportEpsU || uvMaxX > viewportMaxX + viewportEpsU ||
+        uvMinY < viewportMinY - viewportEpsV || uvMaxY > viewportMaxY + viewportEpsV) {
+        return false;
+    }
+
+    float padTexels = HIZ_RECT_BASE_PADDING_TEXELS +
+                      (projectedMotion ? HIZ_RECT_MOTION_PADDING_TEXELS : 0.0);
+    float padU = padTexels / max(pc.hiZPyramidInfo.x, 1.0);
+    float padV = padTexels / max(pc.hiZPyramidInfo.y, 1.0);
+    uvMinX = clamp(uvMinX - padU, viewportMinX, viewportMaxX);
+    uvMaxX = clamp(uvMaxX + padU, viewportMinX, viewportMaxX);
+    uvMinY = clamp(uvMinY - padV, viewportMinY, viewportMaxY);
+    uvMaxY = clamp(uvMaxY + padV, viewportMinY, viewportMaxY);
+
+    if (uvMinX >= uvMaxX || uvMinY >= uvMaxY) {
+        return false;
+    }
+
+    // Select a mip where the projected rect is small, then fetch exact mip
+    // texels inside the rect. Using textureLod with a linear min-reduction
+    // sampler at UV corners also reads neighboring texels outside the rect;
+    // during camera motion those neighbors often include sky/clear depth and
+    // make otherwise stable occluders leak.
+    float rectWidth  = (uvMaxX - uvMinX) * pc.hiZPyramidInfo.x;
+    float rectHeight = (uvMaxY - uvMinY) * pc.hiZPyramidInfo.y;
+    float maxDim = max(rectWidth, rectHeight);
+    uint maxDimInt = uint(max(maxDim, 1.0));
+    int mipInt = findMSB(int(maxDimInt));
+    int maxMip = max(int(pc.hiZPyramidInfo.z) - 1, 0);
+    mipInt = clamp(mipInt, 0, maxMip);
+    float mipLevel = float(mipInt);
+    outMipLevel = mipLevel;
+
+    float mipDiv = exp2(mipLevel);
+    ivec2 mipSize = max(ivec2(floor(pc.hiZPyramidInfo.xy / mipDiv)), ivec2(1));
+    vec2 mipSizeF = vec2(mipSize);
+    vec2 rectMinUv = vec2(uvMinX, uvMinY);
+    vec2 rectMaxUv = vec2(uvMaxX, uvMaxY);
+    const float texelCoordEpsilon = 0.00001;
+
+    ivec2 texelMin = clamp(ivec2(floor(rectMinUv * mipSizeF)),
+                           ivec2(0), mipSize - ivec2(1));
+    ivec2 texelMax = clamp(ivec2(floor(rectMaxUv * mipSizeF - vec2(texelCoordEpsilon))),
+                           ivec2(0), mipSize - ivec2(1));
+    texelMax = max(texelMax, texelMin);
+
+    uint sampleCount = 0u;
+    uint nonZeroCount = 0u;
+    float minNonZero = 1.0;
+    float maxNonZero = 0.0;
+    for (int y = texelMin.y; y <= texelMax.y; ++y) {
+        for (int x = texelMin.x; x <= texelMax.x; ++x) {
+            float depth = texelFetch(hiZPyramid, ivec2(x, y), mipInt).r;
+            sampleCount++;
+            accumulatePyramidDepth(depth, nonZeroCount, minNonZero, maxNonZero);
+        }
+    }
+
+    float pyramidDepth = 0.0;
+    if (nonZeroCount == sampleCount) {
+        pyramidDepth = minNonZero;
+    } else if (projectedMotion &&
+               nonZeroCount > 0u &&
+               sampleCount <= 9u &&
+               nonZeroCount + 1u >= sampleCount) {
+        // Permit one isolated empty texel during motion only when the tighter
+        // center sample agrees. This recovers tiny depth-pyramid holes without
+        // accepting broad sky/clear-depth regions.
+        int confirmMipInt = max(mipInt - 1, 0);
+        float confirmMipDiv = exp2(float(confirmMipInt));
+        ivec2 confirmMipSize = max(ivec2(floor(pc.hiZPyramidInfo.xy / confirmMipDiv)), ivec2(1));
+        vec2 confirmMipSizeF = vec2(confirmMipSize);
+        vec2 centerUv = 0.5 * (rectMinUv + rectMaxUv);
+        ivec2 centerTexel = clamp(ivec2(floor(centerUv * confirmMipSizeF)),
+                                  ivec2(0), confirmMipSize - ivec2(1));
+        float centerDepth = texelFetch(hiZPyramid, centerTexel, confirmMipInt).r;
+        if (centerDepth <= 0.0) {
+            recordPyramidDepthDebug(nonZeroCount > 0u ? minNonZero : 0.0);
+            return false;
+        }
+        accumulatePyramidDepth(centerDepth, nonZeroCount, minNonZero, maxNonZero);
+        if (!coherentPyramidDepths(nonZeroCount, minNonZero, maxNonZero)) {
+            recordPyramidDepthDebug(nonZeroCount > 0u ? minNonZero : 0.0);
+            return false;
+        }
+        pyramidDepth = minNonZero;
+    } else if (!projectedMotion &&
+               nonZeroCount > 0u &&
+               maxDim <= HIZ_HOLE_RECOVERY_MAX_TEXELS) {
+        int confirmMipInt = max(mipInt - 1, 0);
+        float confirmMipDiv = exp2(float(confirmMipInt));
+        ivec2 confirmMipSize = max(ivec2(floor(pc.hiZPyramidInfo.xy / confirmMipDiv)), ivec2(1));
+        vec2 confirmMipSizeF = vec2(confirmMipSize);
+        vec2 centerUv = 0.5 * (rectMinUv + rectMaxUv);
+        ivec2 centerTexel = clamp(ivec2(floor(centerUv * confirmMipSizeF)),
+                                  ivec2(0), confirmMipSize - ivec2(1));
+        float centerDepth = texelFetch(hiZPyramid, centerTexel, confirmMipInt).r;
+        accumulatePyramidDepth(centerDepth, nonZeroCount, minNonZero, maxNonZero);
+        if (!coherentPyramidDepths(nonZeroCount, minNonZero, maxNonZero)) {
+            recordPyramidDepthDebug(nonZeroCount > 0u ? minNonZero : 0.0);
+            return false;
+        }
+        pyramidDepth = minNonZero;
+    } else {
+        recordPyramidDepthDebug(nonZeroCount > 0u ? minNonZero : 0.0);
+        return false;
+    }
+
+    recordPyramidDepthDebug(pyramidDepth);
+    outNearestDepth = nearestDepth;
+    outPyramidDepth = pyramidDepth;
+    return nearestDepth < (pyramidDepth - HIZ_OCCLUSION_DEPTH_EPSILON);
+}
+
+bool reserveVisibleDraws(uint requested, out uint outBase) {
+    outBase = 0u;
+    if (requested == 0u) {
+        return false;
+    }
+
+    uint observed = atomicAdd(drawCount.count, 0u);
+    for (;;) {
+        if (observed >= MAX_VISIBLE_DRAWS) {
+            return false;
+        }
+
+        uint available = MAX_VISIBLE_DRAWS - observed;
+        if (requested > available) {
+            return false;
+        }
+
+        uint desired = observed + requested;
+        uint old = atomicCompSwap(drawCount.count, observed, desired);
+        if (old == observed) {
+            outBase = observed;
+            return true;
+        }
+        observed = old;
+    }
+}
+
+void main() {
+    uint candidateIdx = gl_GlobalInvocationID.x;
+
+    // Bounds check
+    if (candidateIdx >= frustumPassedCount.count) {
+        return;
+    }
+
+    uint chunkIdx = frustumPassedIndices.indices[candidateIdx];
+
+    uint subChunkCount = allDraws.chunks[chunkIdx].subChunkCount;
+    subChunkCount = min(subChunkCount, uint(MAX_SUBCHUNKS));
+
+    // Get world-space AABB
+    vec3 aabbMin = allDraws.chunks[chunkIdx].aabbMin.xyz;
+    vec3 aabbMax = allDraws.chunks[chunkIdx].aabbMax.xyz;
+
+    // Hi-Z occlusion culling - skip chunks fully hidden behind other geometry.
+    // Only run if Hi-Z pyramid is bound, enabled, AND the chunk is past its grace window.
+    // Grace prevents the death-spiral: a freshly uploaded/edited chunk would otherwise
+    // be tested against a previous-frame pyramid built before the chunk was visible,
+    // wrongly classifying it as occluded by the background that showed through; it would
+    // then never be drawn, the pyramid would never see it, and the chunk would stay
+    // invisible forever.
+    uint hiZGraceTimeline = allDraws.chunks[chunkIdx].hiZGraceTimeline;
+    bool pastGrace = (pc.currentTimeline >= hiZGraceTimeline);
+
+    // Phase A - temporal-coherence Hi-Z skip.
+    // Only reuse the persistent previous-visible bit on stable temporal frames.
+    // During camera/edit/viewport/projection motion, previously-visible chunks must
+    // not bypass Hi-Z because stale reuse scales leaks with frustum candidate count.
+    bool temporalSkip = (pc.temporalInfo.x != 0u) &&
+                        (pc.temporalInfo.y == 0u) &&
+                        pastGrace &&
+                        prevVisibleBitSet(chunkIdx);
+
+    bool hiZActive = (pc.hiZEnabled != 0u) && pastGrace && !temporalSkip;
+    if (hiZActive) {
+        float occNearest = 0.0;
+        float occPyramid = 0.0;
+        float occMip = 0.0;
+        if (hiZOcclude(aabbMin, aabbMax, occNearest, occPyramid, occMip)) {
+            clearPrevVisibleBit(chunkIdx);
+            if (pc.debugEnabled != 0u) {
+                atomicAdd(debugStats.stats[7], 1);  // hiZOccluded++
+                uint slot = atomicAdd(hiZBlinkLog.count, 1u);
+                if (slot < HIZ_BLINK_LOG_GPU_CAPACITY) {
+                    vec3 origin = allDraws.chunks[chunkIdx].origin.xyz;
+                    hiZBlinkLog.events[slot].chunkIdx         = chunkIdx;
+                    hiZBlinkLog.events[slot].currentTimeline  = pc.currentTimeline;
+                    hiZBlinkLog.events[slot].hiZGraceTimeline = hiZGraceTimeline;
+                    hiZBlinkLog.events[slot].subChunkCount    = subChunkCount;
+                    hiZBlinkLog.events[slot].chunkOriginX     = origin.x;
+                    hiZBlinkLog.events[slot].chunkOriginY     = origin.y;
+                    hiZBlinkLog.events[slot].chunkOriginZ     = origin.z;
+                    hiZBlinkLog.events[slot].nearestDepth     = occNearest;
+                    hiZBlinkLog.events[slot].pyramidDepth     = occPyramid;
+                    hiZBlinkLog.events[slot].mipLevel         = occMip;
+                } else {
+                    atomicAdd(hiZBlinkLog.dropped, 1u);
+                }
+            }
+            return;  // Culled by occlusion - chunk is behind other geometry
+        }
+    }
+
+    // Visible - mark only stable frames for the next frame's temporal-skip path.
+    // Unsafe motion/edit frames may have drawn conservative fallback candidates,
+    // so they must not seed the persistent previous-visible mask.
+    if (pc.temporalInfo.y == 0u) {
+        setPrevVisibleBit(chunkIdx);
+    } else {
+        clearPrevVisibleBit(chunkIdx);
+    }
+
+    // Count valid subchunk draws first so we reserve output slots once.
+    uint validDrawCount = 0u;
+    for (uint i = 0u; i < subChunkCount; ++i) {
+        if (allDraws.chunks[chunkIdx].draws[i].indexCount != 0u) {
+            validDrawCount++;
+        }
+    }
+    if (validDrawCount == 0u) {
+        return;
+    }
+
+    // Reserve a contiguous block without ever letting the indirect draw count
+    // exceed the command/origin buffers consumed by the draw pass.
+    uint outBase = 0u;
+    if (!reserveVisibleDraws(validDrawCount, outBase)) {
+        return;
+    }
+
+    if (pc.debugEnabled != 0u) {
+        atomicAdd(debugStats.stats[15], validDrawCount);  // visibleDraws += valid draws
+    }
+
+    // Chunk is visible - emit all its subchunk draw commands.
+    vec3 origin = allDraws.chunks[chunkIdx].origin.xyz;
+    uint emitOffset = 0u;
+    for (uint i = 0u; i < subChunkCount; ++i) {
+        SubChunkDraw draw = allDraws.chunks[chunkIdx].draws[i];
+
+        // Skip empty draws
+        if (draw.indexCount == 0u) {
+            continue;
+        }
+
+        uint outIdx = outBase + emitOffset;
+        emitOffset++;
+
+        // Write draw command
+        visibleDraws.commands[outIdx].indexCount = draw.indexCount;
+        visibleDraws.commands[outIdx].instanceCount = draw.instanceCount;
+        visibleDraws.commands[outIdx].firstIndex = draw.firstIndex;
+        visibleDraws.commands[outIdx].vertexOffset = draw.vertexOffset;
+        visibleDraws.commands[outIdx].firstInstance = outIdx;  // Use output index for origin lookup
+
+        // Write origin for this draw
+        visibleOrigins.origins[outIdx] = vec4(origin, 0.0);
+    }
+}

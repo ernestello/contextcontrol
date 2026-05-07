@@ -329,29 +329,7 @@ function Resolve-CcSharedProjectRoot {
         $root = [string]$Settings.ProjectRoot
     }
 
-    $resolvedRoot = Resolve-CcSharedPathRelativeToScript $root
-
-    # Context Control is designed to live at:
-    #   <project-root>/contextcontrol/
-    # If an old settings file says ProjectRoot="." or the tool is launched from
-    # inside contextcontrol/, do not treat the tool folder as the codebase. Promote
-    # source exports/searches to the parent engine folder automatically.
-    $leaf = Split-Path -Leaf $resolvedRoot
-    if ($leaf -ieq "contextcontrol") {
-        $hasContextControlScripts =
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccDir.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "cc.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccReplace.ps1"))
-
-        if ($hasContextControlScripts) {
-            $parent = Split-Path -Parent $resolvedRoot
-            if (-not [string]::IsNullOrWhiteSpace($parent)) {
-                return [System.IO.Path]::GetFullPath($parent)
-            }
-        }
-    }
-
-    return $resolvedRoot
+    return Resolve-CcSharedPathRelativeToScript $root
 }
 
 function Resolve-CcSharedOutputRoot {
@@ -394,11 +372,11 @@ function Resolve-CcSharedOutputPath {
 function Save-OutputFile {
     param([string]$Path)
 
-    $fullPath = Resolve-CcSharedOutputPath $Path $script:CcSharedSettings
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
     $dir = [System.IO.Path]::GetDirectoryName($fullPath)
 
     if ([string]::IsNullOrWhiteSpace($dir)) {
-        $dir = Resolve-CcSharedOutputRoot $script:CcSharedSettings
+        $dir = (Get-Location).Path
     }
 
     if (-not (Test-Path -LiteralPath $dir)) {
@@ -2207,27 +2185,6 @@ function Add-ScopedFunctionRequestReport {
         Add-Line ""
     }
 }
-
-$script:CcSharedSettings = Read-CcSharedSettings
-$script:CcProjectRoot = Resolve-CcSharedProjectRoot $script:CcSharedSettings
-$script:CcOutputRoot = Resolve-CcSharedOutputRoot $script:CcSharedSettings
-
-if (-not (Test-Path -LiteralPath $script:CcProjectRoot)) {
-    throw "Configured ProjectRoot does not exist: $script:CcProjectRoot. Change it in contextcontrol/.ccReplace.settings.json or ccReplace Settings option 11."
-}
-
-if (-not (Test-Path -LiteralPath $script:CcOutputRoot)) {
-    New-Item -ItemType Directory -Path $script:CcOutputRoot | Out-Null
-}
-
-# Export/search paths are relative to the configured project root.
-# Output files are still written to the configured Context Control output folder.
-Set-Location -LiteralPath $script:CcProjectRoot
-$script:OutputFileForFilters = Resolve-CcSharedOutputPath $OutputFile $script:CcSharedSettings
-
-Write-Host "Project root: $script:CcProjectRoot" -ForegroundColor DarkGray
-Write-Host "Output folder: $script:CcOutputRoot" -ForegroundColor DarkGray
-
 
 Write-Host ""
 Write-Host "Paste file/folder paths, one per line."

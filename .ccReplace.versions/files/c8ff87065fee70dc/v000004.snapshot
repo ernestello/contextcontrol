@@ -1,4 +1,4 @@
-# CC-DESC: Exports selected project files, function bodies, and FIND discovery reports for Context Control.
+# CC-DESC: Exports selected project files and FUNC symbol matches for Context Control.
 # cc.ps1
 
 param(
@@ -28,7 +28,7 @@ $TextExtensions = @(
     ".cs", ".ts", ".js", ".html", ".css"
 )
 
-# Files searched by FUNC:/FIND:.
+# Files searched by FUNC:/SYMBOL:.
 # Intentional: excludes .md and normal .txt so generated Context Control exports do not recursively match.
 $CodeSearchExtensions = @(
     ".h", ".hh", ".hpp", ".hxx", ".inl",
@@ -244,161 +244,14 @@ function Get-OutputText {
     return $text
 }
 
-function New-CcSharedDefaultSettings {
-    return [pscustomobject]@{
-        ProjectRoot = ".."
-        OutputRoot = "."
-    }
-}
-
-function Get-CcSharedScriptDirectory {
-    if ($PSScriptRoot -ne "") {
-        return $PSScriptRoot
-    }
-
-    return (Get-Location).Path
-}
-
-function Get-CcSharedSettingsPath {
-    return (Join-Path (Get-CcSharedScriptDirectory) ".ccReplace.settings.json")
-}
-
-function Merge-CcSharedSettings {
-    param($Loaded)
-
-    $settings = New-CcSharedDefaultSettings
-
-    if ($null -eq $Loaded) {
-        return $settings
-    }
-
-    foreach ($prop in $settings.PSObject.Properties.Name) {
-        if ($Loaded.PSObject.Properties.Name -contains $prop) {
-            $settings.$prop = $Loaded.$prop
-        }
-    }
-
-    return $settings
-}
-
-function Read-CcSharedSettings {
-    $path = Get-CcSharedSettingsPath
-
-    if (-not (Test-Path -LiteralPath $path)) {
-        return New-CcSharedDefaultSettings
-    }
-
-    try {
-        $json = Get-Content -LiteralPath $path -Raw
-        if ([string]::IsNullOrWhiteSpace($json)) {
-            return New-CcSharedDefaultSettings
-        }
-
-        return Merge-CcSharedSettings ($json | ConvertFrom-Json)
-    }
-    catch {
-        Write-Host "Context Control settings could not be read, using defaults: $($_.Exception.Message)" -ForegroundColor Yellow
-        return New-CcSharedDefaultSettings
-    }
-}
-
-function Resolve-CcSharedPathRelativeToScript {
-    param([string]$PathText)
-
-    if ([string]::IsNullOrWhiteSpace($PathText)) {
-        return (Get-CcSharedScriptDirectory)
-    }
-
-    $clean = $PathText.Trim()
-    $clean = $clean -replace '/', [System.IO.Path]::DirectorySeparatorChar
-
-    if ([System.IO.Path]::IsPathRooted($clean)) {
-        return [System.IO.Path]::GetFullPath($clean)
-    }
-
-    return [System.IO.Path]::GetFullPath((Join-Path (Get-CcSharedScriptDirectory) $clean))
-}
-
-function Resolve-CcSharedProjectRoot {
-    param($Settings)
-
-    $root = ".."
-    if ($null -ne $Settings -and
-        ($Settings.PSObject.Properties.Name -contains "ProjectRoot") -and
-        -not [string]::IsNullOrWhiteSpace([string]$Settings.ProjectRoot)) {
-        $root = [string]$Settings.ProjectRoot
-    }
-
-    $resolvedRoot = Resolve-CcSharedPathRelativeToScript $root
-
-    # Context Control is designed to live at:
-    #   <project-root>/contextcontrol/
-    # If an old settings file says ProjectRoot="." or the tool is launched from
-    # inside contextcontrol/, do not treat the tool folder as the codebase. Promote
-    # source exports/searches to the parent engine folder automatically.
-    $leaf = Split-Path -Leaf $resolvedRoot
-    if ($leaf -ieq "contextcontrol") {
-        $hasContextControlScripts =
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccDir.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "cc.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccReplace.ps1"))
-
-        if ($hasContextControlScripts) {
-            $parent = Split-Path -Parent $resolvedRoot
-            if (-not [string]::IsNullOrWhiteSpace($parent)) {
-                return [System.IO.Path]::GetFullPath($parent)
-            }
-        }
-    }
-
-    return $resolvedRoot
-}
-
-function Resolve-CcSharedOutputRoot {
-    param($Settings)
-
-    $root = "."
-    if ($null -ne $Settings -and
-        ($Settings.PSObject.Properties.Name -contains "OutputRoot") -and
-        -not [string]::IsNullOrWhiteSpace([string]$Settings.OutputRoot)) {
-        $root = [string]$Settings.OutputRoot
-    }
-
-    return Resolve-CcSharedPathRelativeToScript $root
-}
-
-function Resolve-CcSharedOutputPath {
-    param(
-        [string]$PathText,
-        $Settings = $null
-    )
-
-    if ([string]::IsNullOrWhiteSpace($PathText)) {
-        throw "Missing output path."
-    }
-
-    $clean = $PathText.Trim()
-    $clean = $clean -replace '/', [System.IO.Path]::DirectorySeparatorChar
-
-    if ([System.IO.Path]::IsPathRooted($clean)) {
-        return [System.IO.Path]::GetFullPath($clean)
-    }
-
-    if ($null -eq $Settings) {
-        $Settings = Read-CcSharedSettings
-    }
-
-    return [System.IO.Path]::GetFullPath((Join-Path (Resolve-CcSharedOutputRoot $Settings) $clean))
-}
-
 function Save-OutputFile {
     param([string]$Path)
 
-    $fullPath = Resolve-CcSharedOutputPath $Path $script:CcSharedSettings
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
     $dir = [System.IO.Path]::GetDirectoryName($fullPath)
 
     if ([string]::IsNullOrWhiteSpace($dir)) {
-        $dir = Resolve-CcSharedOutputRoot $script:CcSharedSettings
+        $dir = (Get-Location).Path
     }
 
     if (-not (Test-Path -LiteralPath $dir)) {
@@ -737,7 +590,7 @@ function Is-TextSearchCandidate {
     $name = [System.IO.Path]::GetFileName($File.Name).ToLowerInvariant()
     $ext = [System.IO.Path]::GetExtension($File.Name).ToLowerInvariant()
 
-    # FUNC:/FIND: search should only scan real programming/project source files.
+    # FUNC:/SYMBOL: search should only scan real programming/project source files.
     # Do not let previous Context Control exports or analysis markdown recursively match
     # function names and bloat the next export.
     if ($name -like "cc_code_export*.md" -or
@@ -1830,15 +1683,10 @@ function Add-RawSymbolOccurrencePreview {
     }
 
     $escaped = [regex]::Escape($symbolText)
-    if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($symbolText)) {
-        $escaped = $escaped -replace '\\\*', '.*'
-        $escaped = $escaped -replace '\\\?', '.'
-    }
-
     $hitCount = 0
 
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ([regex]::IsMatch([string]$lines[$i], $escaped, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) {
+        if ([string]$lines[$i] -match $escaped) {
             $lineNo = $i + 1
             $text = ([string]$lines[$i]).Trim()
             if ($text.Length -gt 220) {
@@ -1860,8 +1708,6 @@ function Add-FunctionBodyBlocksFromFile {
 
     $symbolText = if ($null -eq $Symbol) { "" } else { $Symbol.Trim() }
     $leafName = Get-FunctionLeafName $symbolText
-    $symbolHasWildcard = [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($symbolText)
-    $leafHasWildcard = [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($leafName)
 
     if ($leafName -eq "") {
         if ($ReportNoMatch) {
@@ -1895,14 +1741,7 @@ function Add-FunctionBodyBlocksFromFile {
     }
 
     $ranges = @(Find-HashableFunctionRanges $Path $lines 100000)
-
-    if ($leafHasWildcard) {
-        $leafPattern = New-Object System.Management.Automation.WildcardPattern($leafName, ([System.Management.Automation.WildcardOptions]::IgnoreCase))
-        $leafMatches = @($ranges | Where-Object { $leafPattern.IsMatch($_.Name) })
-    }
-    else {
-        $leafMatches = @($ranges | Where-Object { $_.Name -eq $leafName })
-    }
+    $leafMatches = @($ranges | Where-Object { $_.Name -eq $leafName })
 
     if ($leafMatches.Count -eq 0) {
         if ($ReportNoMatch) {
@@ -1934,7 +1773,7 @@ function Add-FunctionBodyBlocksFromFile {
     $selected = New-Object System.Collections.Generic.List[object]
     $scopeWasExact = $true
 
-    if ($symbolText.Contains("::") -or $symbolHasWildcard) {
+    if ($symbolText.Contains("::")) {
         foreach ($range in $leafMatches) {
             $blockText = (($lines[$range.Start..($range.End - 1)]) -join "`n")
             if (Test-FunctionBlockMatchesScopedSymbol $blockText $symbolText) {
@@ -2051,7 +1890,7 @@ function Add-FunctionSearchExport {
         }
         else {
             Add-Line "Raw symbol matches were found, but no brace-delimited function bodies were isolated."
-            Add-Line "Use FIND: $symbol to discover exact matching files, then request the specific file/path you actually need."
+            Add-Line "Use SYMBOL: $symbol to export whole matching files, or request the exact file if this is a declaration/macro/template edge case."
             Add-Line ""
             Add-Line "Raw matched files:"
             foreach ($path in $rawMatches) {
@@ -2064,28 +1903,28 @@ function Add-FunctionSearchExport {
     Write-Host "  Function bodies exported: $bodyMatches"
 }
 
-function Add-FindSearchExport {
-    param([string]$Pattern)
+function Add-SymbolSearchExport {
+    param([string]$Symbol)
 
-    $patternText = if ($null -eq $Pattern) { "" } else { $Pattern.Trim() }
+    $symbol = $Symbol.Trim()
 
-    if ($patternText -eq "") {
+    if ($symbol -eq "") {
         return
     }
 
-    # De-duplicate repeated FIND: input lines.
-    if ($null -eq $script:FindSearchKeys) {
-        $script:FindSearchKeys = @{}
+    # De-duplicate repeated SYMBOL: input lines.
+    if ($null -eq $script:SymbolSearchKeys) {
+        $script:SymbolSearchKeys = @{}
     }
 
-    $patternKey = $patternText.ToLowerInvariant()
-    if ($script:FindSearchKeys.ContainsKey($patternKey)) {
-        Write-Host "Skipping duplicate file discovery search: $patternText"
+    $symbolKey = $symbol.ToLowerInvariant()
+    if ($script:SymbolSearchKeys.ContainsKey($symbolKey)) {
+        Write-Host "Skipping duplicate symbol search: $symbol"
         return
     }
-    $script:FindSearchKeys[$patternKey] = $true
+    $script:SymbolSearchKeys[$symbolKey] = $true
 
-    Write-Host "Discovering matching files: $patternText"
+    Write-Host "Searching symbol/files: $symbol"
 
     $candidates = @(Get-SearchCandidateFiles)
     Write-Host "  Candidate text files: $($candidates.Count)"
@@ -2093,38 +1932,32 @@ function Add-FindSearchExport {
     $matches = New-Object System.Collections.Generic.List[string]
 
     foreach ($file in $candidates) {
-        if (Test-FileContainsSymbol $file.FullName $patternText) {
+        if (Test-FileContainsSymbol $file.FullName $symbol) {
             $matches.Add($file.FullName)
         }
     }
 
     Add-Line ""
-    Add-Line "## FIND: $patternText"
+    Add-Line "## FOUND SYMBOL: $symbol"
     Add-Line ""
 
     if ($matches.Count -eq 0) {
-        Add-Line "No matching code file found for: $patternText"
+        Add-Line "No matching code file found for symbol: $symbol"
         Add-Line ""
         Write-Host "  Found: 0"
         return
     }
 
-    Add-Line "Matched code files only; file contents were not exported."
-    Add-Line "Request exact paths or FUNCTION exports from this list in the next cc.ps1 run."
-    Add-Line ""
     Add-Line "Matched code files:"
     foreach ($path in $matches) {
         Add-Line "- $(Get-RelativeDisplayPath $path)"
     }
 
-    Add-Line ""
-    Add-Line "Occurrence preview:"
-    foreach ($path in $matches) {
-        Add-RawSymbolOccurrencePreview -Path $path -Symbol $patternText -MaxHits 4
-    }
-    Add-Line ""
-
     Write-Host "  Found: $($matches.Count)"
+
+    foreach ($path in $matches) {
+        Add-FileBlockOnce -Path $path -QuietDuplicate
+    }
 }
 
 function Add-ScopedFunctionRequestReport {
@@ -2198,7 +2031,7 @@ function Add-ScopedFunctionRequestReport {
                 Add-Line "- $(Get-RelativeDisplayPath $path)"
             }
             Add-Line ""
-            Add-Line "This usually means the request hit declarations, macros, generated wrappers, or a parser edge case. Use FIND: $symbolText to discover exact matching files, then request the specific file/path you actually need."
+            Add-Line "This usually means the request hit declarations, macros, generated wrappers, or a parser edge case. Use SYMBOL: $symbolText to export whole matching files if needed."
         }
         else {
             Add-Line "No raw symbol occurrences found either. The function name or path pattern is probably wrong."
@@ -2208,34 +2041,12 @@ function Add-ScopedFunctionRequestReport {
     }
 }
 
-$script:CcSharedSettings = Read-CcSharedSettings
-$script:CcProjectRoot = Resolve-CcSharedProjectRoot $script:CcSharedSettings
-$script:CcOutputRoot = Resolve-CcSharedOutputRoot $script:CcSharedSettings
-
-if (-not (Test-Path -LiteralPath $script:CcProjectRoot)) {
-    throw "Configured ProjectRoot does not exist: $script:CcProjectRoot. Change it in contextcontrol/.ccReplace.settings.json or ccReplace Settings option 11."
-}
-
-if (-not (Test-Path -LiteralPath $script:CcOutputRoot)) {
-    New-Item -ItemType Directory -Path $script:CcOutputRoot | Out-Null
-}
-
-# Export/search paths are relative to the configured project root.
-# Output files are still written to the configured Context Control output folder.
-Set-Location -LiteralPath $script:CcProjectRoot
-$script:OutputFileForFilters = Resolve-CcSharedOutputPath $OutputFile $script:CcSharedSettings
-
-Write-Host "Project root: $script:CcProjectRoot" -ForegroundColor DarkGray
-Write-Host "Output folder: $script:CcOutputRoot" -ForegroundColor DarkGray
-
-
 Write-Host ""
 Write-Host "Paste file/folder paths, one per line."
 Write-Host "Use FUNCTION src/path/File.cpp :: name to extract a specific function body."
 Write-Host "FUNCTION paths may use wildcards, e.g. FUNCTION src/world/World*.cpp :: World::foo."
 Write-Host "Use FUNC: name to search all code files and extract matching function bodies."
-Write-Host "Use FIND: text to list matching files and line previews without exporting file contents."
-Write-Host "SYMBOL: is disabled because it exported whole matching files and caused token explosions."
+Write-Host "Use SYMBOL: name to search all code files and export whole matching files for declarations/types/constants."
 Write-Host "Auto-adds matching headers for .cpp and direct GLSL #includes for shaders."
 Write-Host "Optional: run with -HashHints to emit compact HASH values for safer patches."
 Write-Host "Finish by pressing Enter on an empty line, or type END."
@@ -2243,7 +2054,7 @@ Write-Host ""
 
 $InputPaths = @()
 $InputFunctions = @()
-$InputFindSearches = @()
+$InputSymbolSearches = @()
 $InputScopedFunctions = @()
 
 while ($true) {
@@ -2267,7 +2078,7 @@ while ($true) {
     # FUNCTION src/path/File.cpp :: FunctionName
     # FUNCTION paths may include wildcards for split implementation files:
     # FUNCTION src/world/World*.cpp :: World::beginTerrainEditVisualTracking
-    if ($clean -match '(?i)^\s*(FUNC|FUNCTION|FIND|SYMBOL)\s+(.+?)\s+::\s*(.+?)\s*$') {
+    if ($clean -match '(?i)^\s*(FUNC|FUNCTION|SYMBOL)\s+(.+?)\s+::\s*(.+?)\s*$') {
         $requestKind = $Matches[1].Trim().ToUpperInvariant()
         $requestPath = $Matches[2].Trim()
         $requestSymbol = $Matches[3].Trim()
@@ -2276,12 +2087,8 @@ while ($true) {
             throw "Malformed function request: '$clean'. Use: FUNCTION src/path/File.cpp :: SymbolName"
         }
 
-        if ($requestKind -eq "FIND") {
-            throw "Malformed FIND request: '$clean'. Use FIND: TextToLocate for discovery, or FUNCTION src/path/File.cpp :: SymbolName for body extraction."
-        }
-
         if ($requestKind -eq "SYMBOL") {
-            throw "SYMBOL: is disabled because it exported whole matching files and caused token explosions. Use FIND: TextToLocate for discovery, or request an exact path/FUNCTION export."
+            throw "Malformed SYMBOL request: '$clean'. Use SYMBOL: SymbolName for whole-file symbol search, or FUNCTION src/path/File.cpp :: SymbolName for body extraction."
         }
 
         $InputScopedFunctions += [pscustomobject]@{
@@ -2296,17 +2103,13 @@ while ($true) {
 
     # Global search syntax:
     # FUNCTION: FunctionName / FUNC: FunctionName -> extract function bodies.
-    # FIND: TextToLocate -> list matching files and line previews only.
-    # SYMBOL: is intentionally disabled because whole-file symbol search causes token explosions.
-    if ($clean -match '(?i)^\s*(FUNC|FUNCTION|FIND|SYMBOL)\s*:\s*(.+?)\s*$') {
+    # SYMBOL: SymbolName -> export whole matching files for declarations/types/constants.
+    if ($clean -match '(?i)^\s*(FUNC|FUNCTION|SYMBOL)\s*:\s*(.+?)\s*$') {
         $requestKind = $Matches[1].Trim().ToUpperInvariant()
         $requestSymbol = $Matches[2].Trim()
 
-        if ($requestKind -eq "FIND") {
-            $InputFindSearches += $requestSymbol
-        }
-        elseif ($requestKind -eq "SYMBOL") {
-            throw "SYMBOL: is disabled because it exported whole matching files and caused token explosions. Use FIND: $requestSymbol for discovery, or request an exact path/FUNCTION export."
+        if ($requestKind -eq "SYMBOL") {
+            $InputSymbolSearches += $requestSymbol
         }
         else {
             $InputFunctions += $requestSymbol
@@ -2315,14 +2118,14 @@ while ($true) {
     }
 
     # Hard guard: never silently treat malformed FUNCTION/SYMBOL lines as file paths.
-    if ($clean -match '(?i)^\s*(FUNC|FUNCTION|FIND|SYMBOL)\b') {
-        throw "Malformed request: '$clean'. Use exact file paths, FIND: TextToLocate, FUNCTION: SymbolName, or FUNCTION src/path/File.cpp :: SymbolName."
+    if ($clean -match '(?i)^\s*(FUNC|FUNCTION|SYMBOL)\b') {
+        throw "Malformed function/symbol request: '$clean'. Use either 'FUNCTION: SymbolName' or 'FUNCTION src/path/File.cpp :: SymbolName'."
     }
 
     $InputPaths += $clean
 }
 
-if ($InputPaths.Count -eq 0 -and $InputFunctions.Count -eq 0 -and $InputFindSearches.Count -eq 0 -and $InputScopedFunctions.Count -eq 0) {
+if ($InputPaths.Count -eq 0 -and $InputFunctions.Count -eq 0 -and $InputSymbolSearches.Count -eq 0 -and $InputScopedFunctions.Count -eq 0) {
     Write-Host "No paths or functions entered. Export cancelled."
     exit
 }
@@ -2344,9 +2147,8 @@ Add-Line "- Spend reasoning on the requested code fix, not tool mechanics."
 Add-Line "- Prefer a single patch.txt containing raw BEGIN CC-REPLACE blocks. Inline only if tiny."
 Add-Line "- Keep the existing architecture and modular ownership boundaries."
 Add-Line "- Use MODE: insert_include for include-only edits."
-Add-Line "- FIND: reports are discovery only; they never include source bodies. Request exact files/functions after discovery."
 Add-Line "- If this export contains Hash hints, copy the matching HASH: value into function/replace_region patch headers. If no hash hint is present, omit HASH:."
-Add-Line "- If critical context is missing, ask only for exact paths, FUNCTION exports, or FIND discovery queries, one per line, ending with END."
+Add-Line "- If critical context is missing, ask only for the exact missing files/functions, one path per line, ending with END."
 Add-Line ""
 Add-Line "Default CMake build, when applicable: cmake --build build --config Release -j"
 Add-Line ""
@@ -2362,8 +2164,8 @@ foreach ($symbol in $InputFunctions) {
     Add-FunctionSearchExport $symbol
 }
 
-foreach ($pattern in $InputFindSearches) {
-    Add-FindSearchExport $pattern
+foreach ($symbol in $InputSymbolSearches) {
+    Add-SymbolSearchExport $symbol
 }
 
 $SavedOutputFile = Save-OutputFile $OutputFile

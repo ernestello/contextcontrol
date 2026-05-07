@@ -512,13 +512,6 @@ function Is-ExcludedItem($Item) {
     }
 
     if ($Item.PSIsContainer) {
-        # Context Control is an engine-root tool folder, not engine source.
-        # DIR exports should map the actual project and never recurse into the
-        # contextcontrol working/cache/scripts folder.
-        if ($Item.Name -ieq "contextcontrol") {
-            return $true
-        }
-
         return $ExcludeDirs -contains $Item.Name
     }
 

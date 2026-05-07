@@ -1,0 +1,426 @@
+#include "rendering/culling/HiZPyramid.h"
+#include "rendering/common/VulkanHelpers.h"
+#include <imgui.h>
+#include <imgui_impl_vulkan.h>
+#include <stdexcept>
+#include <iostream>
+#include <fstream>
+#include <cstring>
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <sstream>
+#include <iomanip>
+
+// Push constants for the depth reduce compute shader
+struct DepthReducePushConstants {
+    uint32_t imageWidth;   // Mip N width
+    uint32_t imageHeight;  // Mip N height
+    uint32_t levelMask;    // Bits 0..3 = write mip N+1..N+4
+    uint32_t _pad0;
+};
+static_assert(sizeof(DepthReducePushConstants) == 16, "DepthReducePushConstants must be 16 bytes");
+
+// ─────────────────────────────────────────────────────────────
+//  Lifecycle
+// ─────────────────────────────────────────────────────────────
+
+HiZPyramid::~HiZPyramid() {
+    cleanup();
+}
+
+void HiZPyramid::init(VkDevice device, VkPhysicalDevice physicalDevice,
+                       VkImageView depthImageView,
+                       uint32_t swapchainWidth, uint32_t swapchainHeight) {
+    if (m_initialized) {
+        cleanup();
+    }
+
+    m_device = device;
+    m_physicalDevice = physicalDevice;
+    m_depthImageView = depthImageView;
+    m_swapchainWidth = swapchainWidth;
+    m_swapchainHeight = swapchainHeight;
+
+    // Pyramid dimensions: previousPow2 ensures all reductions are at most 2x2 (conservative)
+    m_pyramidWidth = previousPow2(swapchainWidth);
+    m_pyramidHeight = previousPow2(swapchainHeight);
+    m_mipLevels = calculateMipLevels(m_pyramidWidth, m_pyramidHeight);
+
+    if (m_mipLevels > MAX_MIP_LEVELS) {
+        m_mipLevels = MAX_MIP_LEVELS;
+    }
+
+    std::cout << "[HiZPyramid] Creating depth pyramid: " << m_pyramidWidth << "x" << m_pyramidHeight
+              << " (" << m_mipLevels << " mip levels) from " << swapchainWidth << "x" << swapchainHeight
+              << " depth buffer" << std::endl;
+
+    // Create resources (order matters)
+    if (!m_pipelineCreated) {
+        createSampler();
+        createComputePipeline();
+        m_pipelineCreated = true;
+    }
+
+    createPyramidImage();
+    createMipViews();
+    createDescriptorResources();
+
+    m_initialized = true;
+    std::cout << "[HiZPyramid] ✓ Depth pyramid ready" << std::endl;
+}
+
+void HiZPyramid::cleanup() {
+    if (!m_device) return;
+
+    vkDeviceWaitIdle(m_device);
+
+    destroyPyramidImage();
+
+    // Pipeline resources (only destroyed on full cleanup, not resize)
+    if (m_reducePipeline) { vkDestroyPipeline(m_device, m_reducePipeline, nullptr); m_reducePipeline = VK_NULL_HANDLE; }
+    if (m_reducePipelineLayout) { vkDestroyPipelineLayout(m_device, m_reducePipelineLayout, nullptr); m_reducePipelineLayout = VK_NULL_HANDLE; }
+    if (m_reduceShader) { vkDestroyShaderModule(m_device, m_reduceShader, nullptr); m_reduceShader = VK_NULL_HANDLE; }
+    if (m_reduceDescriptorLayout) { vkDestroyDescriptorSetLayout(m_device, m_reduceDescriptorLayout, nullptr); m_reduceDescriptorLayout = VK_NULL_HANDLE; }
+    if (m_depthSampler) { vkDestroySampler(m_device, m_depthSampler, nullptr); m_depthSampler = VK_NULL_HANDLE; }
+    if (m_reduceSampler) { vkDestroySampler(m_device, m_reduceSampler, nullptr); m_reduceSampler = VK_NULL_HANDLE; }
+    if (m_vizSampler) { vkDestroySampler(m_device, m_vizSampler, nullptr); m_vizSampler = VK_NULL_HANDLE; }
+
+    // Remove ImGui texture registration
+    if (m_imguiTextureRegistered && m_imguiDescriptorSet) {
+        ImGui_ImplVulkan_RemoveTexture(m_imguiDescriptorSet);
+        m_imguiDescriptorSet = VK_NULL_HANDLE;
+        m_imguiTextureRegistered = false;
+    }
+
+    m_pipelineCreated = false;
+    m_initialized = false;
+}
+
+void HiZPyramid::resize(VkImageView depthImageView, uint32_t swapchainWidth, uint32_t swapchainHeight) {
+    if (!m_pipelineCreated) {
+        // First time — do full init
+        init(m_device, m_physicalDevice, depthImageView, swapchainWidth, swapchainHeight);
+        return;
+    }
+
+    m_depthImageView = depthImageView;
+    m_swapchainWidth = swapchainWidth;
+    m_swapchainHeight = swapchainHeight;
+
+    uint32_t newWidth = previousPow2(swapchainWidth);
+    uint32_t newHeight = previousPow2(swapchainHeight);
+    uint32_t newMips = calculateMipLevels(newWidth, newHeight);
+    if (newMips > MAX_MIP_LEVELS) newMips = MAX_MIP_LEVELS;
+
+    if (newWidth == m_pyramidWidth && newHeight == m_pyramidHeight) {
+        // Same size — just update the depth image view reference and rebuild descriptors
+        destroyPyramidImage();
+        m_pyramidWidth = newWidth;
+        m_pyramidHeight = newHeight;
+        m_mipLevels = newMips;
+        createPyramidImage();
+        createMipViews();
+        createDescriptorResources();
+        m_initialized = true;
+        return;
+    }
+
+    // Different size — recreate pyramid
+    destroyPyramidImage();
+    m_pyramidWidth = newWidth;
+    m_pyramidHeight = newHeight;
+    m_mipLevels = newMips;
+
+    std::cout << "[HiZPyramid] Resizing depth pyramid: " << m_pyramidWidth << "x" << m_pyramidHeight
+              << " (" << m_mipLevels << " mip levels)" << std::endl;
+
+    createPyramidImage();
+    createMipViews();
+    createDescriptorResources();
+    m_initialized = true;
+}
+
+void HiZPyramid::reloadComputeShader() {
+    if (!m_device || !m_pipelineCreated) {
+        return;
+    }
+
+    if (m_descriptorPool) {
+        vkDestroyDescriptorPool(m_device, m_descriptorPool, nullptr);
+        m_descriptorPool = VK_NULL_HANDLE;
+        for (uint32_t i = 0; i < MAX_MIP_LEVELS; ++i) {
+            m_mipDescriptorSets[i] = VK_NULL_HANDLE;
+        }
+    }
+
+    if (m_reducePipeline) { vkDestroyPipeline(m_device, m_reducePipeline, nullptr); m_reducePipeline = VK_NULL_HANDLE; }
+    if (m_reducePipelineLayout) { vkDestroyPipelineLayout(m_device, m_reducePipelineLayout, nullptr); m_reducePipelineLayout = VK_NULL_HANDLE; }
+    if (m_reduceShader) { vkDestroyShaderModule(m_device, m_reduceShader, nullptr); m_reduceShader = VK_NULL_HANDLE; }
+    if (m_reduceDescriptorLayout) { vkDestroyDescriptorSetLayout(m_device, m_reduceDescriptorLayout, nullptr); m_reduceDescriptorLayout = VK_NULL_HANDLE; }
+
+    createComputePipeline();
+    if (m_initialized) {
+        createDescriptorResources();
+    }
+
+    std::cout << "[HiZPyramid] Reloaded depth reduce compute shader" << std::endl;
+}
+
+
+// See also: HiZPyramidResources.cpp, HiZPyramidDiagnostics.cpp
+
+// ─────────────────────────────────────────────────────────────
+//  Record pyramid build commands
+// ─────────────────────────────────────────────────────────────
+
+void HiZPyramid::updateDepthSource(VkImageView newDepthView) {
+    if (!m_initialized || !newDepthView) return;
+    if (newDepthView == m_depthImageView) return;  // No change
+
+    m_depthImageView = newDepthView;
+
+    // Update mip 0's source descriptor to point to the new depth view
+    VkDescriptorImageInfo srcInfo{};
+    srcInfo.sampler = m_reduceSampler;
+    srcInfo.imageView = m_depthImageView;
+    srcInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet write{};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = m_mipDescriptorSets[0];
+    write.dstBinding = 5;
+    write.dstArrayElement = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.descriptorCount = 1;
+    write.pImageInfo = &srcInfo;
+
+    vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+}
+
+void HiZPyramid::recordBuildPyramid(VkCommandBuffer cmd) {
+    if (!m_initialized) return;
+
+    // First build after create/resize: transition image from UNDEFINED -> GENERAL.
+    if (!m_pyramidLayoutInitialized) {
+        VkImageMemoryBarrier2 barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+        barrier.srcAccessMask = VK_ACCESS_2_NONE;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.image = m_pyramidImage;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = m_mipLevels;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+        VkDependencyInfo depInfo{};
+        depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        depInfo.imageMemoryBarrierCount = 1;
+        depInfo.pImageMemoryBarriers = &barrier;
+
+        vkCmdPipelineBarrier2(cmd, &depInfo);
+
+        m_pyramidLayoutInitialized = true;
+    } else {
+        // Subsequent builds: ensure previous writes (from any earlier build in this
+        // or prior submissions) are complete and visible before overwriting.
+        // This handles cross-frame synchronization where the timeline semaphore
+        // provides execution ordering but explicit barriers are needed for memory
+        // visibility of storage image writes.
+        VkImageMemoryBarrier2 barrier{};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        barrier.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.image = m_pyramidImage;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = m_mipLevels;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+        VkDependencyInfo depInfo{};
+        depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        depInfo.imageMemoryBarrierCount = 1;
+        depInfo.pImageMemoryBarriers = &barrier;
+
+        vkCmdPipelineBarrier2(cmd, &depInfo);
+    }
+
+    // Bind the reduce pipeline once
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_reducePipeline);
+
+    // Process mip levels in batches.
+    // With a 16x16 workgroup we can reduce up to 5 levels per dispatch:
+    // 16x16 -> 8x8 -> 4x4 -> 2x2 -> 1x1.
+    uint32_t i = 0;
+    while (i < m_mipLevels) {
+        uint32_t levelWidth = std::max(1u, m_pyramidWidth >> i);
+        uint32_t levelHeight = std::max(1u, m_pyramidHeight >> i);
+        uint32_t remainingLevels = m_mipLevels - i;
+        uint32_t additionalLevels = (remainingLevels > 1u) ? std::min(4u, remainingLevels - 1u) : 0u;
+        uint32_t levelsWritten = 1u + additionalLevels;
+        uint32_t levelMask = (additionalLevels == 0u) ? 0u : ((1u << additionalLevels) - 1u);
+
+        // Bind descriptor set for this batch start level.
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_reducePipelineLayout,
+                                0, 1, &m_mipDescriptorSets[i], 0, nullptr);
+
+        // Push constants: base mip dimensions + which higher levels to emit.
+        DepthReducePushConstants pushData{};
+        pushData.imageWidth = levelWidth;
+        pushData.imageHeight = levelHeight;
+        pushData.levelMask = levelMask;
+        vkCmdPushConstants(cmd, m_reducePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(pushData), &pushData);
+
+        // Dispatch over mip N.
+        uint32_t groupsX = (levelWidth + 15) / 16;
+        uint32_t groupsY = (levelHeight + 15) / 16;
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+        i += levelsWritten;
+        if (i < m_mipLevels) {
+            // Next batch samples mip (i - 1), so make just that mip readable.
+            uint32_t sourceMipForNextBatch = i - 1u;
+
+            VkImageMemoryBarrier2 barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            barrier.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            barrier.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            barrier.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            barrier.image = m_pyramidImage;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = sourceMipForNextBatch;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.baseArrayLayer = 0;
+            barrier.subresourceRange.layerCount = 1;
+
+            VkDependencyInfo depInfo{};
+            depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            depInfo.imageMemoryBarrierCount = 1;
+            depInfo.pImageMemoryBarriers = &barrier;
+
+            vkCmdPipelineBarrier2(cmd, &depInfo);
+        }
+    }
+}
+
+void HiZPyramid::recordClear(VkCommandBuffer cmd) {
+    if (!m_initialized) return;
+
+    // Ensure the image is in GENERAL layout (it is for any frame after the
+    // first build). On the first-ever frame we may be called before any build:
+    // skip — clearing an undefined image is a no-op for our purposes since the
+    // cull shader treats undefined depth as "not occluded" via the temporal
+    // viability check.
+    if (!m_pyramidLayoutInitialized) return;
+
+    // Order any prior compute writes/reads before the transfer clear, then
+    // the clear before the next compute read. We can't predict whether the
+    // most recent access was a build (write) or a cull sample (sampled read),
+    // so cover both with srcAccessMask.
+    VkImageMemoryBarrier2 toTransfer{};
+    toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toTransfer.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    toTransfer.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    toTransfer.dstStageMask  = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+    toTransfer.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toTransfer.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toTransfer.image = m_pyramidImage;
+    toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toTransfer.subresourceRange.baseMipLevel = 0;
+    toTransfer.subresourceRange.levelCount = m_mipLevels;
+    toTransfer.subresourceRange.baseArrayLayer = 0;
+    toTransfer.subresourceRange.layerCount = 1;
+
+    VkDependencyInfo dep1{};
+    dep1.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep1.imageMemoryBarrierCount = 1;
+    dep1.pImageMemoryBarriers = &toTransfer;
+    vkCmdPipelineBarrier2(cmd, &dep1);
+
+    VkClearColorValue clearVal{};
+    clearVal.float32[0] = 0.0f;
+    clearVal.float32[1] = 0.0f;
+    clearVal.float32[2] = 0.0f;
+    clearVal.float32[3] = 0.0f;
+
+    VkImageSubresourceRange range{};
+    range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    range.baseMipLevel = 0;
+    range.levelCount = m_mipLevels;
+    range.baseArrayLayer = 0;
+    range.layerCount = 1;
+
+    vkCmdClearColorImage(cmd, m_pyramidImage, VK_IMAGE_LAYOUT_GENERAL,
+                         &clearVal, 1, &range);
+
+    VkImageMemoryBarrier2 toCompute{};
+    toCompute.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toCompute.srcStageMask  = VK_PIPELINE_STAGE_2_CLEAR_BIT;
+    toCompute.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toCompute.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+    toCompute.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    toCompute.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toCompute.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toCompute.image = m_pyramidImage;
+    toCompute.subresourceRange = range;
+
+    VkDependencyInfo dep2{};
+    dep2.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep2.imageMemoryBarrierCount = 1;
+    dep2.pImageMemoryBarriers = &toCompute;
+    vkCmdPipelineBarrier2(cmd, &dep2);
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────────────────────────
+
+uint32_t HiZPyramid::previousPow2(uint32_t v) {
+    // Round down to the largest power of 2 <= v
+    // This ensures all mip reductions are exactly 2x (conservative)
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return (v >> 1) + 1;
+}
+
+uint32_t HiZPyramid::calculateMipLevels(uint32_t width, uint32_t height) {
+    uint32_t levels = 1;
+    uint32_t dim = std::max(width, height);
+    while (dim > 1) {
+        dim >>= 1;
+        levels++;
+    }
+    return levels;
+}
+
+ImTextureID HiZPyramid::getImGuiTextureID() {
+    if (!m_initialized || !m_pyramidView || !m_vizSampler) return 0;
+
+    if (!m_imguiTextureRegistered) {
+        // Register pyramid mip 0 view with ImGui for display
+        // Use GENERAL layout since the pyramid stays in GENERAL after compute writes
+        m_imguiDescriptorSet = ImGui_ImplVulkan_AddTexture(
+            m_vizSampler, m_mipViews[0], VK_IMAGE_LAYOUT_GENERAL);
+        m_imguiTextureRegistered = true;
+    }
+
+    return (ImTextureID)m_imguiDescriptorSet;
+}
