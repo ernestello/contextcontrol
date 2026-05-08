@@ -1,0 +1,496 @@
+// GPT-DESC: Owns sparse texture-material overlay GPU buffers and per-image synchronization.
+// EngineMaterialOverlay.cpp — Texture material overlay buffer ownership and synchronization.
+
+#include "core/engine/Engine.h"
+#include "world/config/WorldConfig.h"
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <shared_mutex>
+#include <stdexcept>
+#include <vector>
+
+namespace {
+constexpr uint32_t kMaterialOverlayInitialCapacity = 1u << 16;
+constexpr uint32_t kMaterialOverlayMaxCapacity = 1u << 24;
+
+uint32_t nextPow2u32(uint32_t v) {
+    if (v <= 1u) return 1u;
+    --v;
+    v |= v >> 1;
+    v |= v >> 2;
+    v |= v >> 4;
+    v |= v >> 8;
+    v |= v >> 16;
+    return v + 1u;
+}
+
+uint32_t chooseMaterialOverlayCapacity(size_t activeCells) {
+    if (activeCells == 0u) {
+        return kMaterialOverlayInitialCapacity;
+    }
+
+    // Keep open addressing below roughly 70% load. This keeps the fragment
+    // shader's probe count stable without reserving memory for the whole world.
+    const size_t wanted = std::max<size_t>(
+        kMaterialOverlayInitialCapacity,
+        (activeCells * 10u + 6u) / 7u);
+    const size_t clamped = std::min<size_t>(wanted, kMaterialOverlayMaxCapacity);
+    return nextPow2u32(static_cast<uint32_t>(clamped));
+}
+
+inline uint32_t hashMaterialOverlayKey(int32_t x, int32_t y, int32_t z, uint32_t face) {
+    uint32_t h = static_cast<uint32_t>(x) * 0x9E3779B9u;
+    h ^= static_cast<uint32_t>(y) * 0x85EBCA6Bu;
+    h ^= static_cast<uint32_t>(z) * 0xC2B2AE35u;
+    h ^= (face & 0x7u) * 0x27D4EB2Du;
+    h ^= h >> 16;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15;
+    return h;
+}
+} // namespace
+
+namespace {
+constexpr uint32_t kMaterialOverlayLiveStampCapacity = 64u;
+constexpr uint32_t kMaterialOverlayLiveStampCellStride = 3u;
+constexpr uint32_t kMaterialOverlayLiveStampCellCapacity =
+    kMaterialOverlayLiveStampCapacity * kMaterialOverlayLiveStampCellStride;
+
+uint32_t materialOverlayFloatBitsU32(float value) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+int32_t materialOverlayFloatBitsI32(float value) {
+    uint32_t bits = materialOverlayFloatBitsU32(value);
+    return static_cast<int32_t>(bits);
+}
+} // namespace
+
+void Engine::createMaterialOverlayBuffers() {
+    for (size_t i = 0; i < m_materialOverlayBuffers.size(); ++i) {
+        if (i < m_materialOverlayMapped.size() && m_materialOverlayMapped[i]) {
+            vkUnmapMemory(m_device, m_materialOverlayBuffersMemory[i]);
+        }
+        if (m_materialOverlayBuffers[i] != VK_NULL_HANDLE) {
+            vkDestroyBuffer(m_device, m_materialOverlayBuffers[i], nullptr);
+        }
+        if (m_materialOverlayBuffersMemory[i] != VK_NULL_HANDLE) {
+            vkFreeMemory(m_device, m_materialOverlayBuffersMemory[i], nullptr);
+        }
+    }
+
+    const uint32_t imageCount = static_cast<uint32_t>(m_swapchainImages.size());
+    m_materialOverlayBuffers.assign(imageCount, VK_NULL_HANDLE);
+    m_materialOverlayBuffersMemory.assign(imageCount, VK_NULL_HANDLE);
+    m_materialOverlayMapped.assign(imageCount, nullptr);
+    m_materialOverlayImageDirty.assign(imageCount, 1u);
+    m_materialOverlayImageDirtySlots.clear();
+    m_materialOverlayImageDirtySlots.resize(imageCount);
+
+    m_materialOverlayCapacity = nextPow2u32(std::max(
+        m_materialOverlayCapacity,
+        kMaterialOverlayInitialCapacity));
+    m_materialOverlayTable.assign(m_materialOverlayCapacity, MaterialOverlayCellGPU{});
+    m_materialOverlayCount = 0;
+    m_materialOverlayMaxProbe = 0;
+    m_materialOverlayLastGeneration = 0;
+    m_materialOverlayNeedsRebuild = true;
+
+    // Binding 10 keeps the old GLSL shape:
+    //   header + MaterialOverlayCell cells[]
+    //
+    // The first fixed cells[] range is now reserved for a bounded live-stamp
+    // overlay. The old sparse hash table starts after that prefix. This avoids
+    // changing descriptor layouts while giving texture paint a one-frame visual
+    // path independent of chunk remesh/upload/swap.
+    m_materialOverlayBufferSize =
+        sizeof(MaterialOverlayHeaderGPU) +
+        static_cast<VkDeviceSize>(
+            kMaterialOverlayLiveStampCellCapacity + m_materialOverlayCapacity) *
+            sizeof(MaterialOverlayCellGPU);
+
+    for (uint32_t i = 0; i < imageCount; ++i) {
+        VkBufferCreateInfo bufferInfo{};
+        bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bufferInfo.size = m_materialOverlayBufferSize;
+        bufferInfo.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+        if (vkCreateBuffer(m_device, &bufferInfo, nullptr, &m_materialOverlayBuffers[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create material overlay buffer");
+        }
+
+        VkMemoryRequirements memReq{};
+        vkGetBufferMemoryRequirements(m_device, m_materialOverlayBuffers[i], &memReq);
+
+        VkMemoryAllocateInfo allocInfo{};
+        allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        allocInfo.allocationSize = memReq.size;
+        allocInfo.memoryTypeIndex = VulkanHelpers::findMemoryType(
+            m_physicalDevice,
+            memReq.memoryTypeBits,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+        if (vkAllocateMemory(m_device, &allocInfo, nullptr, &m_materialOverlayBuffersMemory[i]) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to allocate material overlay buffer memory");
+        }
+
+        vkBindBufferMemory(m_device, m_materialOverlayBuffers[i], m_materialOverlayBuffersMemory[i], 0);
+
+        void* mapped = nullptr;
+        if (vkMapMemory(m_device, m_materialOverlayBuffersMemory[i], 0, m_materialOverlayBufferSize, 0, &mapped) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to map material overlay buffer");
+        }
+        m_materialOverlayMapped[i] = mapped;
+        std::memset(mapped, 0, static_cast<size_t>(m_materialOverlayBufferSize));
+    }
+}
+
+void Engine::refreshMaterialOverlayDescriptors() {
+    if (m_descriptorSets.empty()) {
+        return;
+    }
+
+    const uint32_t imageCount = static_cast<uint32_t>(m_descriptorSets.size());
+    for (uint32_t i = 0; i < imageCount; ++i) {
+        if (i >= m_materialOverlayBuffers.size() ||
+            m_materialOverlayBuffers[i] == VK_NULL_HANDLE) {
+            continue;
+        }
+
+        VkDescriptorBufferInfo materialOverlayInfo{};
+        materialOverlayInfo.buffer = m_materialOverlayBuffers[i];
+        materialOverlayInfo.offset = 0;
+        materialOverlayInfo.range = m_materialOverlayBufferSize;
+
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = m_descriptorSets[i];
+        write.dstBinding = 10;
+        write.dstArrayElement = 0;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.descriptorCount = 1;
+        write.pBufferInfo = &materialOverlayInfo;
+
+        vkUpdateDescriptorSets(m_device, 1, &write, 0, nullptr);
+    }
+}
+
+void Engine::ensureMaterialOverlayCapacity(size_t activeLOD0Cells) {
+    const uint32_t wantedCapacity = chooseMaterialOverlayCapacity(activeLOD0Cells);
+    if (m_materialOverlayCapacity >= wantedCapacity &&
+        !m_materialOverlayBuffers.empty()) {
+        return;
+    }
+
+    vkDeviceWaitIdle(m_device);
+    m_materialOverlayCapacity = wantedCapacity;
+    createMaterialOverlayBuffers();
+    refreshMaterialOverlayDescriptors();
+    m_materialOverlayNeedsRebuild = true;
+    m_materialOverlayLastGeneration = 0;
+}
+
+void Engine::syncMaterialOverlayForImage(uint32_t imageIndex) {
+    if (imageIndex >= m_materialOverlayMapped.size() || m_materialOverlayMapped[imageIndex] == nullptr) {
+        return;
+    }
+
+    auto& textureStore = m_world.getTextureMaterialStore();
+    const auto textureStats = textureStore.getStats();
+    ensureMaterialOverlayCapacity(textureStats.cellsByLOD[0]);
+
+    if (imageIndex >= m_materialOverlayMapped.size() || m_materialOverlayMapped[imageIndex] == nullptr) {
+        return;
+    }
+
+    std::vector<TextureOverlay::TextureOverlayStore::SurfacePaintStamp> liveStamps;
+    textureStore.exportLiveSurfacePaintStamps(
+        liveStamps,
+        static_cast<size_t>(kMaterialOverlayLiveStampCapacity));
+
+    const size_t generation = textureStore.getGeneration();
+    const bool genChanged = (generation != m_materialOverlayLastGeneration);
+
+    if (m_materialOverlayNeedsRebuild || genChanged) {
+        // Try the delta path first. consumeDirtyGPUCells flips requiresFullUpload
+        // when the store has buffered a clear, an unbounded write, or hit its
+        // delta cap — in those cases we fall back to a full rebuild.
+        std::vector<TextureOverlay::TextureOverlayStore::GPUCell> deltas;
+        bool requiresFullUpload = false;
+        const size_t deltaBudget = static_cast<size_t>(m_materialOverlayCapacity);
+        textureStore.consumeDirtyGPUCells(deltas, deltaBudget, requiresFullUpload);
+
+        const bool doFullRebuild = m_materialOverlayNeedsRebuild || requiresFullUpload;
+        const uint16_t pixelsPerVoxel = textureStore.getLODConfig(0).pixelsPerVoxel;
+        const uint32_t mask = m_materialOverlayCapacity - 1u;
+
+        auto sameOverlayKey = [](const MaterialOverlayCellGPU& cell,
+                                 int32_t x, int32_t y, int32_t z, uint32_t face) {
+            return cell.x == x &&
+                   cell.y == y &&
+                   cell.z == z &&
+                   (cell.face & 0x7u) == (face & 0x7u);
+        };
+
+        auto probeDistanceForSlot = [&](uint32_t slotIndex,
+                                        const MaterialOverlayCellGPU& cell) -> uint32_t {
+            const uint32_t ideal = hashMaterialOverlayKey(
+                cell.x, cell.y, cell.z, cell.face & 0x7u) & mask;
+            return (slotIndex - ideal) & mask;
+        };
+
+        auto recordChangedSlot = [](std::vector<uint32_t>* changedSlots, uint32_t slot) {
+            if (changedSlots) {
+                changedSlots->push_back(slot);
+            }
+        };
+
+        auto setChunkMaterialOverlayHint = [&](const glm::ivec3& chunkCoord, bool hasOverlay) {
+            if (!m_gpuCulling.isReady()) {
+                return;
+            }
+
+            const entt::entity entity = m_world.findChunk(chunkCoord);
+            if (entity == entt::null) {
+                return;
+            }
+
+            std::shared_lock regLock(m_world.registryMutex());
+            const auto& registry = m_world.getRegistry();
+            if (!registry.valid(entity)) {
+                return;
+            }
+
+            auto applyHandle = [&](const MeshHandle& handle) {
+                if (handle.gpuCullingSlot != UINT32_MAX) {
+                    m_gpuCulling.setSlotMaterialOverlayHint(handle.gpuCullingSlot, hasOverlay);
+                }
+            };
+
+            if (registry.all_of<MeshHandle>(entity)) {
+                applyHandle(registry.get<MeshHandle>(entity));
+            }
+            if (registry.all_of<PendingMeshHandle>(entity)) {
+                applyHandle(registry.get<PendingMeshHandle>(entity).handle);
+            }
+        };
+
+        auto updateChunkHintFromGPUCell = [&](const TextureOverlay::TextureOverlayStore::GPUCell& cell,
+                                              bool hasOverlay) {
+            if ((cell.face & 0x7u) != 7u) {
+                return;
+            }
+            setChunkMaterialOverlayHint(glm::ivec3(cell.x, cell.y, cell.z), hasOverlay);
+        };
+
+        auto applyCell = [&](int32_t x, int32_t y, int32_t z,
+                             uint32_t face, uint32_t material,
+                             std::vector<uint32_t>* changedSlots = nullptr) -> uint32_t {
+            if (m_materialOverlayCapacity == 0u) {
+                return UINT32_MAX;
+            }
+
+            const uint32_t faceKey = face & 0x7u;
+            uint32_t idx = hashMaterialOverlayKey(x, y, z, faceKey) & mask;
+
+            if (m_materialOverlayCount >= m_materialOverlayCapacity) {
+                uint32_t probe = 0u;
+                while (probe < m_materialOverlayCapacity) {
+                    MaterialOverlayCellGPU& slot = m_materialOverlayTable[idx];
+
+                    if (slot.material == 0u) {
+                        return UINT32_MAX;
+                    }
+
+                    if (sameOverlayKey(slot, x, y, z, faceKey)) {
+                        slot.material = material;
+                        if (probe > m_materialOverlayMaxProbe) {
+                            m_materialOverlayMaxProbe = probe;
+                        }
+                        recordChangedSlot(changedSlots, idx);
+                        return idx;
+                    }
+
+                    const uint32_t residentProbe = probeDistanceForSlot(idx, slot);
+                    if (residentProbe < probe) {
+                        return UINT32_MAX;
+                    }
+
+                    idx = (idx + 1u) & mask;
+                    ++probe;
+                }
+                return UINT32_MAX;
+            }
+
+            MaterialOverlayCellGPU incoming{};
+            incoming.x = x;
+            incoming.y = y;
+            incoming.z = z;
+            incoming.face = faceKey;
+            incoming.material = material;
+
+            uint32_t probe = 0u;
+            while (probe < m_materialOverlayCapacity) {
+                if (probe > m_materialOverlayMaxProbe) {
+                    m_materialOverlayMaxProbe = probe;
+                }
+
+                MaterialOverlayCellGPU& slot = m_materialOverlayTable[idx];
+
+                if (slot.material == 0u) {
+                    slot = incoming;
+                    ++m_materialOverlayCount;
+                    recordChangedSlot(changedSlots, idx);
+                    return idx;
+                }
+
+                if (sameOverlayKey(slot, incoming.x, incoming.y, incoming.z, incoming.face)) {
+                    slot.material = incoming.material;
+                    recordChangedSlot(changedSlots, idx);
+                    return idx;
+                }
+
+                const uint32_t residentProbe = probeDistanceForSlot(idx, slot);
+
+                if (residentProbe < probe) {
+                    const MaterialOverlayCellGPU displaced = slot;
+                    slot = incoming;
+                    incoming = displaced;
+                    recordChangedSlot(changedSlots, idx);
+                    probe = residentProbe;
+                }
+
+                idx = (idx + 1u) & mask;
+                ++probe;
+            }
+
+            return UINT32_MAX;
+        };
+
+        if (doFullRebuild) {
+            std::fill(m_materialOverlayTable.begin(), m_materialOverlayTable.end(), MaterialOverlayCellGPU{});
+            m_materialOverlayCount = 0;
+            m_materialOverlayMaxProbe = 0;
+
+            std::vector<TextureOverlay::TextureOverlayStore::GPUCell> cells;
+            textureStore.exportGPUCellsForLOD(
+                0,
+                cells,
+                static_cast<size_t>(m_materialOverlayCapacity));
+
+            m_gpuCulling.clearAllMaterialOverlayHints();
+            for (const auto& cell : cells) {
+                updateChunkHintFromGPUCell(cell, true);
+            }
+
+            for (const auto& cell : cells) {
+                if (m_materialOverlayCount >= m_materialOverlayCapacity) break;
+                const uint8_t type = static_cast<uint8_t>(cell.packed & 0x3u);
+                const uint8_t variant = static_cast<uint8_t>((cell.packed >> 2) & 0x7u);
+                const uint8_t edge = static_cast<uint8_t>((cell.packed >> 5) & 0x3u);
+                const uint32_t material = VertexPacking::packMaterial(type, variant, edge, pixelsPerVoxel);
+                applyCell(cell.x, cell.y, cell.z, cell.face & 0x7u, material, nullptr);
+            }
+
+            std::fill(m_materialOverlayImageDirty.begin(), m_materialOverlayImageDirty.end(), 1u);
+            for (auto& q : m_materialOverlayImageDirtySlots) q.clear();
+        } else {
+            std::vector<uint32_t> changedSlots;
+            changedSlots.reserve(std::min<size_t>(deltas.size() * 4u, 65536u));
+
+            for (const auto& cell : deltas) {
+                const uint8_t type = static_cast<uint8_t>(cell.packed & 0x3u);
+                const uint8_t variant = static_cast<uint8_t>((cell.packed >> 2) & 0x7u);
+                const uint8_t edge = static_cast<uint8_t>((cell.packed >> 5) & 0x3u);
+                const uint32_t material = VertexPacking::packMaterial(type, variant, edge, pixelsPerVoxel);
+                applyCell(cell.x, cell.y, cell.z, cell.face & 0x7u, material, &changedSlots);
+                updateChunkHintFromGPUCell(cell, true);
+            }
+
+            for (uint32_t slot : changedSlots) {
+                if (slot >= m_materialOverlayCapacity) continue;
+                for (size_t i = 0; i < m_materialOverlayImageDirtySlots.size(); ++i) {
+                    if (m_materialOverlayImageDirty[i]) continue;
+                    m_materialOverlayImageDirtySlots[i].push_back(slot);
+                }
+            }
+
+            const size_t promoteThreshold = std::max<size_t>(
+                static_cast<size_t>(m_materialOverlayCapacity) / 16u, 1024u);
+            for (size_t i = 0; i < m_materialOverlayImageDirtySlots.size(); ++i) {
+                if (m_materialOverlayImageDirtySlots[i].size() > promoteThreshold) {
+                    m_materialOverlayImageDirty[i] = 1u;
+                    m_materialOverlayImageDirtySlots[i].clear();
+                }
+            }
+        }
+
+        m_materialOverlayLastGeneration = generation;
+        m_materialOverlayNeedsRebuild = false;
+    }
+
+    uint8_t* base = static_cast<uint8_t*>(m_materialOverlayMapped[imageIndex]);
+    auto* header = reinterpret_cast<MaterialOverlayHeaderGPU*>(base);
+    auto* rawCells = reinterpret_cast<MaterialOverlayCellGPU*>(base + sizeof(MaterialOverlayHeaderGPU));
+    auto* liveCells = rawCells;
+    auto* dstCells = rawCells + kMaterialOverlayLiveStampCellCapacity;
+
+    header->capacityMask = m_materialOverlayCapacity - 1u;
+    header->count = m_materialOverlayCount;
+    header->maxProbe = m_materialOverlayMaxProbe;
+    header->_pad = static_cast<uint32_t>(std::min<size_t>(
+        liveStamps.size(),
+        static_cast<size_t>(kMaterialOverlayLiveStampCapacity)));
+
+    std::memset(
+        liveCells,
+        0,
+        static_cast<size_t>(kMaterialOverlayLiveStampCellCapacity) * sizeof(MaterialOverlayCellGPU));
+
+    for (uint32_t i = 0; i < header->_pad; ++i) {
+        const auto& stamp = liveStamps[i];
+        const uint32_t baseCell = i * kMaterialOverlayLiveStampCellStride;
+
+        liveCells[baseCell + 0].x = materialOverlayFloatBitsI32(stamp.centerVoxelLod0.x);
+        liveCells[baseCell + 0].y = materialOverlayFloatBitsI32(stamp.centerVoxelLod0.y);
+        liveCells[baseCell + 0].z = materialOverlayFloatBitsI32(stamp.centerVoxelLod0.z);
+        liveCells[baseCell + 0].face = materialOverlayFloatBitsU32(
+            static_cast<float>(std::max(1, stamp.radiusVoxelsLod0)));
+        liveCells[baseCell + 0].material = stamp.order;
+
+        liveCells[baseCell + 1].x = stamp.bboxMinLod0.x;
+        liveCells[baseCell + 1].y = stamp.bboxMinLod0.y;
+        liveCells[baseCell + 1].z = stamp.bboxMinLod0.z;
+        liveCells[baseCell + 1].face = static_cast<uint32_t>(stamp.shape);
+        liveCells[baseCell + 1].material = static_cast<uint32_t>(stamp.sourceFace);
+
+        liveCells[baseCell + 2].x = stamp.bboxMaxLod0.x;
+        liveCells[baseCell + 2].y = stamp.bboxMaxLod0.y;
+        liveCells[baseCell + 2].z = stamp.bboxMaxLod0.z;
+        liveCells[baseCell + 2].face = static_cast<uint32_t>(stamp.type);
+        liveCells[baseCell + 2].material = static_cast<uint32_t>(stamp.variant & 0x7u);
+    }
+
+    if (m_materialOverlayImageDirty[imageIndex]) {
+        std::memcpy(
+            dstCells,
+            m_materialOverlayTable.data(),
+            static_cast<size_t>(m_materialOverlayCapacity) * sizeof(MaterialOverlayCellGPU));
+        m_materialOverlayImageDirty[imageIndex] = 0u;
+        m_materialOverlayImageDirtySlots[imageIndex].clear();
+        return;
+    }
+
+    auto& q = m_materialOverlayImageDirtySlots[imageIndex];
+    if (q.empty()) return;
+
+    for (uint32_t slot : q) {
+        if (slot >= m_materialOverlayCapacity) continue;
+        dstCells[slot] = m_materialOverlayTable[slot];
+    }
+    q.clear();
+}

@@ -1,0 +1,249 @@
+// GPT-DESC: Wires debug UI windows to Engine-owned runtime systems and callbacks.
+// EngineDebugWiring.cpp - Debug UI wiring extracted from Engine::initVulkan().
+
+#include "core/engine/Engine.h"
+#include "world/config/WorldConfig.h"
+#include "world/chunks/core/Chunk.h"
+#include <algorithm>
+#include <cstdlib>
+#include <iostream>
+
+void Engine::initDebugWiring() {
+    if (!m_gameplayOnlyMode) {
+        auto& ui = m_world.getDebugOverlay().getEngineInterface();
+        ui.setGameplaySeparateCallback([this](bool separate) {
+            setGameplaySeparated(separate);
+        });
+
+        ui.setGameplayFullscreenCallback([this](bool fullscreen) {
+            std::cout << "[Engine] Gameplay fullscreen mode "
+                      << (fullscreen ? "ENABLED" : "DISABLED") << std::endl;
+        });
+    }
+
+    // Hook up debug windows to engine state
+    m_world.getDebugOverlay().setLightingSettings(&m_lighting);
+    m_world.getDebugOverlay().setTimeManager(&m_timeManager);
+    m_world.getDebugOverlay().getShaderHotReloadWindow().setShaderService(&m_shaderHotReload);
+    m_world.getDebugOverlay().getCursorSettingsWindow().setCursorManager(&m_cursorManager);
+    m_world.getDebugOverlay().getRenderSettingsWindow().setIsFullscreen(&m_isFullscreen);
+    m_world.getDebugOverlay().getRenderSettingsWindow().setToggleFullscreenCallback([this]() { toggleFullscreen(); });
+    m_world.getDebugOverlay().getRenderSettingsWindow().setResetChunkGenerationCallback([this]() {
+        // Wait for all GPU work to complete before destroying resources.
+        // resetChunkGeneration frees VB/IB slices and GPU culling slots,
+        // which in-flight frames may still reference.
+        vkDeviceWaitIdle(m_device);
+        m_world.resetChunkGeneration();
+    });
+    m_world.getDebugOverlay().getRenderSettingsWindow().setApplyLODIncrementalCallback([this](int newRenderDist) {
+        // No vkDeviceWaitIdle needed: incremental LOD uses the frame-budgeted
+        // remesh pipeline which handles GPU resource replacement automatically.
+        m_world.applyLODChangesIncrementally(newRenderDist);
+    });
+    m_world.getDebugOverlay().getRenderSettingsWindow().setGPUCullingEnabled(&m_gpuCullingEnabled);
+    m_world.getDebugOverlay().getRenderSettingsWindow().setGameplaySeparated(&m_gameplaySeparated);
+    
+    // Wire up VSync toggle
+    m_world.getDebugOverlay().getRenderSettingsWindow().setVsyncEnabled(&m_vsyncEnabled);
+    m_world.getDebugOverlay().getRenderSettingsWindow().setSetVsyncCallback([this](bool enabled) {
+        m_vsyncEnabled = enabled;
+        if (m_gameplayWindow) {
+            m_gameplayWindow->setVSync(enabled);
+        }
+        std::cout << "[Engine] VSync " << (enabled ? "ON (FIFO/MAILBOX)" : "OFF (IMMEDIATE)") << std::endl;
+        recreateSwapchain();
+    });
+    
+    // Wire up per-LOD terrain type configuration
+    m_world.getDebugOverlay().getRenderSettingsWindow().setWorld(&m_world);
+    m_world.getDebugOverlay().getRenderSettingsWindow().setTerrainTypeChangedCallback([this](int lodLevel, TerrainType type) {
+        std::cout << "[Engine] LOD " << lodLevel << " terrain type changed to: " 
+                  << (type == TerrainType::DCCM ? "DCCM" : "Voxel") << std::endl;
+        m_world.setTerrainTypeForLOD(lodLevel, type);
+        // Update rendering flags
+        m_anyLODUsesVoxel = m_world.anyLODUsesType(TerrainType::Voxel);
+        m_anyLODUsesDCCM = m_world.anyLODUsesType(TerrainType::DCCM);
+    });
+    
+    // Wire up per-band data LOD override (Voxel terrain only)
+    m_world.getDebugOverlay().getRenderSettingsWindow().setDataLODChangedCallback([this](int band, int dataLOD) {
+        std::cout << "[Engine] Band " << band << " data LOD changed to: " << dataLOD << std::endl;
+        m_world.setDataLODForBand(band, dataLOD);
+    });
+    
+    // Wire ObjectManager and PulsePresetLibrary to CursorPlaceTool
+    m_world.getDebugOverlay().getCursorPlaceTool().setPulsePresetLibrary(&m_pulsePresets);
+    m_world.getDebugOverlay().getCursorPlaceTool().setObjectManager(&m_objectManager);
+    
+    // Wire ObjectManager and PulsePresetLibrary to ObjectManagerWindow
+    m_world.getDebugOverlay().getObjectManagerWindow().setObjectManager(&m_objectManager);
+    m_world.getDebugOverlay().getObjectManagerWindow().setPulsePresetLibrary(&m_pulsePresets);
+    m_world.getDebugOverlay().getObjectManagerWindow().setLightGlowSystem(&m_lightGlowSystem);
+    m_world.getDebugOverlay().getObjectManagerWindow().setShadowSystem(&m_shadowSystem);
+    m_world.getDebugOverlay().getDirectionalShadowWindow().setShadowSystem(&m_shadowSystem);
+    m_world.getDebugOverlay().getDirectionalShadowWindow().setLightingSettings(&m_lighting);
+    m_world.getDebugOverlay().getSkyEnclosureWindow().setShadowSystem(&m_shadowSystem);
+    m_shadowSystem.setTimeManager(&m_timeManager);
+    // Wire delete callback for ObjectManagerWindow
+    // When an object is deleted via the inspector, we must remove it from the
+    // actual rendering systems AND fix up indices for remaining objects.
+    m_world.getDebugOverlay().getObjectManagerWindow().setDeleteCallback(
+        [this](uint32_t objId, const PlacedObject& obj) {
+            if (obj.type == PlacedObjectType::LightOrb) {
+                uint32_t removedIdx = obj.light.lightIndex;
+                m_lighting.removePointLight(removedIdx);
+                
+                // Fix up lightIndex for all remaining light orbs
+                // (removePointLight erases from vector, shifting subsequent indices down)
+                for (auto& [id, other] : m_objectManager.getAllObjectsMutable()) {
+                    if (other.type == PlacedObjectType::LightOrb && id != objId
+                        && other.light.lightIndex > removedIdx) {
+                        other.light.lightIndex--;
+                    }
+                }
+                std::cout << "[Engine] Deleted light orb #" << objId 
+                          << " (lightIndex=" << removedIdx << ")" << std::endl;
+            }
+        }
+    );
+    
+    // Hook up controls window to input/camera/player systems
+    m_world.getDebugOverlay().getControlsWindow().setEngineInput(&m_input);
+    m_world.getDebugOverlay().getControlsWindow().setCameraController(&m_camera);
+    m_world.getDebugOverlay().getControlsWindow().setPlayerController(&m_player);
+    m_world.getDebugOverlay().getControlsWindow().setPlayerCamera(&m_playerCamera);
+    
+    // Set up light spawn callback for ChunkVramWindow (light at chunk center above terrain)
+    m_world.getDebugOverlay().getChunkVramWindow().setAddLightAtChunkCallback(
+        [this](entt::entity entity, const glm::ivec3& chunkCoord) {
+            // Calculate chunk center in world coordinates (meters)
+            float chunkCenterX = (chunkCoord.x + 0.5f) * WorldConfig::CHUNK_SIZE_M;
+            float chunkCenterZ = (chunkCoord.z + 0.5f) * WorldConfig::CHUNK_SIZE_M;
+            
+            // Get terrain height from chunk's AABB - place light exactly at terrain surface
+            float terrainHeight = 10.0f;  // Default fallback
+            if (m_world.getRegistry().valid(entity) && m_world.getRegistry().all_of<AABB>(entity)) {
+                const auto& aabb = m_world.getRegistry().get<AABB>(entity);
+                terrainHeight = aabb.max.y;  // Exactly at terrain surface (top of mesh)
+            }
+            
+            // Create a new point light at chunk center, above terrain
+            PointLight light;
+            light.position = glm::vec3(chunkCenterX, terrainHeight, chunkCenterZ);
+            light.radius = 32.0f;  // 32 meter radius to cover chunk (32m chunk size at 4 vox/m)
+            light.color = glm::vec3(1.0f, 0.9f, 0.3f);  // Warm yellow color
+            light.intensity = 2.5f;
+            
+            uint32_t lightIdx = m_lighting.addPointLight(light);
+            m_objectManager.addLightOrb(light.position, light.radius, light.intensity,
+                                        light.color, 0, lightIdx);
+            std::cout << "[Engine] Added light at chunk (" << chunkCoord.x << "," << chunkCoord.z 
+                      << ") -> world pos (" << light.position.x << ", " << light.position.y 
+                      << ", " << light.position.z << ")" << std::endl;
+        }
+    );
+    
+    // Set up light spawn callback in ChunkDebugWindow
+    m_world.getDebugOverlay().getChunkDebugWindow().setAddLightCallback(
+        [this](const glm::vec3& cameraPos) {
+            // Create a new point light at actual camera position
+            PointLight light;
+            light.position = m_camera.getState().position;  // Use camera controller position
+            light.radius = 5.0f;  // 5 meter radius
+            light.color = glm::vec3(1.0f, 0.9f, 0.3f);  // Warm yellow color
+            light.intensity = 2.0f;
+            
+            uint32_t lightIdx = m_lighting.addPointLight(light);
+            
+            // Register in ObjectManager with default lamp preset
+            m_objectManager.addLightOrb(light.position, light.radius, light.intensity,
+                                        light.color, 0, lightIdx);
+            
+            std::cout << "[Engine] Added light at (" << light.position.x << ", " 
+                      << light.position.y << ", " << light.position.z << ")" << std::endl;
+        }
+    );
+    m_world.getDebugOverlay().getChunkDebugWindow().setBottleneckReportCallback(
+        [this]() {
+            return generateFrameBottleneckReport();
+        }
+    );
+    
+    // Set up Cursor Place Tool callbacks
+    m_world.getDebugOverlay().getCursorPlaceTool().setPlaceLightCallback(
+        [this](const glm::vec3& position) {
+            PointLight light;
+            light.position = position;
+            // Use color/radius/intensity from CursorPlaceTool
+            auto& tool = m_world.getDebugOverlay().getCursorPlaceTool();
+            light.radius = tool.getLightRadius();
+            light.color = tool.getLightColor();
+            light.intensity = tool.getLightIntensity();
+            
+            uint32_t lightIdx = m_lighting.addPointLight(light);
+            
+            // Register in ObjectManager with pulse preset
+            uint32_t presetIdx = tool.getLightPulsePresetIndex();
+            m_objectManager.addLightOrb(position, light.radius, light.intensity,
+                                        light.color, presetIdx, lightIdx);
+            
+            std::cout << "[Engine] Cursor tool placed light at (" << light.position.x << ", " 
+                      << light.position.y << ", " << light.position.z 
+                      << ") preset=" << m_pulsePresets.getPreset(presetIdx).name << std::endl;
+        }
+    );
+    
+    // Wire raycast function for mouse-based placing
+    m_world.getDebugOverlay().getCursorPlaceTool().setRaycastFunc(
+        [this](const glm::vec3& origin, const glm::vec3& direction, float maxDist,
+               glm::vec3& outPos, glm::vec3& outNormal) -> bool {
+            auto result = m_physics.raycast(origin, direction, maxDist);
+            if (result.hit) {
+                outPos = result.position;
+                outNormal = result.normal;
+            }
+            return result.hit;
+        }
+    );
+
+    // Terrain edit tool uses the same world raycast path as placement.
+    m_world.getDebugOverlay().getTerrainEditTool().setRaycastFunc(
+        [this](const glm::vec3& origin, const glm::vec3& direction, float maxDist,
+               glm::vec3& outPos, glm::vec3& outNormal) -> bool {
+            auto result = m_physics.raycast(origin, direction, maxDist);
+            if (result.hit) {
+                outPos = result.position;
+                outNormal = result.normal;
+            }
+            return result.hit;
+        }
+    );
+
+    m_world.getDebugOverlay().getTerrainEditTool().setApplyEditCallback(
+        [this](const glm::vec3& minCorner, const glm::vec3& maxCorner, bool additive, float snapStep, int brushShape) {
+            if (m_world.applyTerrainBoxEdit(minCorner, maxCorner, additive, snapStep, brushShape)) {
+                std::cout << "[Engine] Terrain " << (additive ? "build" : "dig")
+                          << " edit applied to snapshot '" << m_world.getActiveSnapshotName()
+                          << "'" << std::endl;
+            } else {
+                std::cout << "[Engine] Terrain edit skipped or failed" << std::endl;
+            }
+        }
+    );
+
+    m_world.getDebugOverlay().getTerrainEditTool().setWorld(&m_world);
+
+    // Texture paint tool uses identical world-raycast path as terrain editing.
+    m_world.getDebugOverlay().getTexturePaintTool().setWorld(&m_world);
+    m_world.getDebugOverlay().getTexturePaintTool().setRaycastFunc(
+        [this](const glm::vec3& origin, const glm::vec3& direction, float maxDist,
+               glm::vec3& outPos, glm::vec3& outNormal) -> bool {
+            auto result = m_physics.raycast(origin, direction, maxDist);
+            if (result.hit) {
+                outPos = result.position;
+                outNormal = result.normal;
+            }
+            return result.hit;
+        }
+    );
+}

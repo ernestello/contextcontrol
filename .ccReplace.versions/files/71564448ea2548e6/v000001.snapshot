@@ -1,0 +1,17 @@
+// GPT-DESC: Provides Engine settings persistence entry points.
+// EngineSettingsPersistence.cpp - Save/load/reset engine settings
+// Stub implementations — settings persistence not yet implemented.
+
+#include "core/engine/Engine.h"
+
+void Engine::loadSettings() {
+    // TODO: load settings from file
+}
+
+void Engine::saveSettings() {
+    // TODO: save settings to file
+}
+
+void Engine::resetSettings() {
+    // TODO: reset settings to defaults
+}

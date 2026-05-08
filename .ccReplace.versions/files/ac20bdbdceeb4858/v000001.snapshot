@@ -1,0 +1,116 @@
+// GPT-DESC: Applies startup terrain presets and starts world chunk generation.
+// EngineSubsystemInit.cpp — Terrain preset configuration extracted from Engine.cpp.
+
+#include "core/engine/Engine.h"
+#include "world/config/WorldConfig.h"
+#include <iostream>
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Startup terrain preset helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const char* Engine::getStartupTerrainPresetName() const {
+    switch (m_startupTerrainPreset) {
+        case StartupTerrainPreset::PerfVoxel4Lod20:
+            return "voxel4x20";
+        case StartupTerrainPreset::PerfVoxel20DccmFar:
+            return "hybrid2";
+        case StartupTerrainPreset::Default:
+        default:
+            return "default";
+    }
+}
+
+const char* Engine::getStartupTerrainPresetSummary() const {
+    switch (m_startupTerrainPreset) {
+        case StartupTerrainPreset::PerfVoxel4Lod20:
+            return "LOD0-3 voxel, 20 rings each";
+        case StartupTerrainPreset::PerfVoxel20DccmFar:
+            return "LOD0 voxel 0-20, LOD1 DCCM far";
+        case StartupTerrainPreset::Default:
+        default:
+            return "Current world defaults";
+    }
+}
+
+void Engine::applyStartupTerrainPreset() {
+    ChunkManager* chunkManager = m_world.getChunkManager();
+    if (!chunkManager) {
+        return;
+    }
+
+    if (m_startupTerrainPreset == StartupTerrainPreset::Default) {
+        m_anyLODUsesVoxel = m_world.anyLODUsesType(TerrainType::Voxel);
+        m_anyLODUsesDCCM = m_world.anyLODUsesType(TerrainType::DCCM);
+        return;
+    }
+
+    std::cout << "[Engine] Applying startup terrain preset '" << getStartupTerrainPresetName()
+              << "' (" << getStartupTerrainPresetSummary() << ")" << std::endl;
+
+    chunkManager->setLODEnabled(true);
+    chunkManager->setRenderDistanceRings(80);
+
+    switch (m_startupTerrainPreset) {
+        case StartupTerrainPreset::PerfVoxel4Lod20:
+            chunkManager->setLODRingThresholds(20, 40, 60, 80);
+            m_world.setTerrainTypesForStartup({
+                TerrainType::Voxel,
+                TerrainType::Voxel,
+                TerrainType::Voxel,
+                TerrainType::Voxel,
+                TerrainType::Voxel
+            });
+            break;
+        case StartupTerrainPreset::PerfVoxel20DccmFar:
+            chunkManager->setLODRingThresholds(std::vector<int>{20});
+            if (m_world.getDCCMTerrainLoader() == nullptr) {
+                std::cout << "[Engine] WARNING: hybrid2 preset requested but no DCCM terrain is loaded. "
+                             "Falling back to voxel terrain for all LODs." << std::endl;
+                m_world.setTerrainTypesForStartup({
+                    TerrainType::Voxel,
+                    TerrainType::Voxel,
+                    TerrainType::Voxel,
+                    TerrainType::Voxel,
+                    TerrainType::Voxel
+                });
+            } else {
+                m_world.setTerrainTypesForStartup({
+                    TerrainType::Voxel,
+                    TerrainType::DCCM,
+                    TerrainType::DCCM,
+                    TerrainType::DCCM,
+                    TerrainType::DCCM
+                });
+            }
+            break;
+        case StartupTerrainPreset::Default:
+        default:
+            break;
+    }
+
+    m_anyLODUsesVoxel = m_world.anyLODUsesType(TerrainType::Voxel);
+    m_anyLODUsesDCCM = m_world.anyLODUsesType(TerrainType::DCCM);
+
+    const auto thresholds = chunkManager->getLODRingThresholds();
+    std::cout << "[Engine] Terrain preset ready: renderDistance=" << chunkManager->getRenderDistanceRings()
+              << " rings, thresholds=[" << thresholds[0] << ", " << thresholds[1]
+              << ", " << thresholds[2] << ", " << thresholds[3] << "]" << std::endl;
+
+    if (m_perfMode && chunkManager->isPaused()) {
+        chunkManager->setPaused(false);
+        std::cout << "[Engine] Performance mode auto-started chunk generation" << std::endl;
+    }
+}
+
+void Engine::startChunkGeneration() {
+    ChunkManager* chunkManager = m_world.getChunkManager();
+    if (!chunkManager) {
+        return;
+    }
+
+    if (chunkManager->isPaused()) {
+        chunkManager->setPaused(false);
+        std::cout << "[Engine] Terrain generation started" << std::endl;
+    }
+}

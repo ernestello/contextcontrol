@@ -1098,7 +1098,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  5,
+                      "CurrentVersion":  6,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1128,6 +1128,12 @@
                                            "Version":  5,
                                            "Timestamp":  "2026-05-08T10:53:13.7773467Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000005.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-08T10:59:03.0513127Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000006.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -1348,6 +1354,258 @@
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T10:53:13.7565317Z",
                                            "Snapshot":  "files\\27ea7090fb5862d4\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/lifecycle/EngineCleanup.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\lifecycle\\EngineCleanup.cpp",
+                      "Key":  "f10421b4474ef686",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.7428158Z",
+                                           "Snapshot":  "files\\f10421b4474ef686\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/window/EngineWindowControls.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\window\\EngineWindowControls.cpp",
+                      "Key":  "5dff0aea3421a8e9",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.7568472Z",
+                                           "Snapshot":  "files\\5dff0aea3421a8e9\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/window/EngineGameplayWindow.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\window\\EngineGameplayWindow.cpp",
+                      "Key":  "0e5fd5b78ff9c582",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.7719623Z",
+                                           "Snapshot":  "files\\0e5fd5b78ff9c582\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/diagnostics/EngineGModeControls.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\diagnostics\\EngineGModeControls.cpp",
+                      "Key":  "5673bfb9eb94f93f",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.7864715Z",
+                                           "Snapshot":  "files\\5673bfb9eb94f93f\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/diagnostics/EngineTimestamps.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\diagnostics\\EngineTimestamps.cpp",
+                      "Key":  "4fa28bcdf79b5704",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.8020204Z",
+                                           "Snapshot":  "files\\4fa28bcdf79b5704\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/rendering/EngineSwapchainLifecycle.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\rendering\\EngineSwapchainLifecycle.cpp",
+                      "Key":  "19d032c6d7521816",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.8175532Z",
+                                           "Snapshot":  "files\\19d032c6d7521816\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/init/EngineSubsystemInit.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\init\\EngineSubsystemInit.cpp",
+                      "Key":  "ac20bdbdceeb4858",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.8326884Z",
+                                           "Snapshot":  "files\\ac20bdbdceeb4858\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/init/EngineMaterialOverlay.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\init\\EngineMaterialOverlay.cpp",
+                      "Key":  "06a4998c126e49dd",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.8493247Z",
+                                           "Snapshot":  "files\\06a4998c126e49dd\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/init/EngineRenderResources.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\init\\EngineRenderResources.cpp",
+                      "Key":  "725522268c3c4853",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.8668787Z",
+                                           "Snapshot":  "files\\725522268c3c4853\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/rendering/EngineRenderLoop.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\rendering\\EngineRenderLoop.cpp",
+                      "Key":  "0f1e4a26857c2eb7",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.8823975Z",
+                                           "Snapshot":  "files\\0f1e4a26857c2eb7\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/rendering/EngineCommandBuffer.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\rendering\\EngineCommandBuffer.cpp",
+                      "Key":  "0f9820996fe31ed4",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.9005689Z",
+                                           "Snapshot":  "files\\0f9820996fe31ed4\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/rendering/EngineDepthPrePass.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\rendering\\EngineDepthPrePass.cpp",
+                      "Key":  "cadf232b8880546a",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.9231243Z",
+                                           "Snapshot":  "files\\cadf232b8880546a\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/rendering/EngineShadowPass.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\rendering\\EngineShadowPass.cpp",
+                      "Key":  "6d21889fb2d16868",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.9405253Z",
+                                           "Snapshot":  "files\\6d21889fb2d16868\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/rendering/EngineGameplayRendering.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\rendering\\EngineGameplayRendering.cpp",
+                      "Key":  "f72fb8119d5aed13",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.9571590Z",
+                                           "Snapshot":  "files\\f72fb8119d5aed13\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/init/EngineVulkanInit.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\init\\EngineVulkanInit.cpp",
+                      "Key":  "af70f05edeaf3b0e",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.9755817Z",
+                                           "Snapshot":  "files\\af70f05edeaf3b0e\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/init/EngineDebugWiring.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\init\\EngineDebugWiring.cpp",
+                      "Key":  "26c6910f42d89042",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:02.9951278Z",
+                                           "Snapshot":  "files\\26c6910f42d89042\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/init/EngineShaderHotReload.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\init\\EngineShaderHotReload.cpp",
+                      "Key":  "9f3e6ba4d45295f6",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:03.0113924Z",
+                                           "Snapshot":  "files\\9f3e6ba4d45295f6\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/init/EngineSettingsPersistence.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\init\\EngineSettingsPersistence.cpp",
+                      "Key":  "71564448ea2548e6",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:59:03.0301224Z",
+                                           "Snapshot":  "files\\71564448ea2548e6\\v000001.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]

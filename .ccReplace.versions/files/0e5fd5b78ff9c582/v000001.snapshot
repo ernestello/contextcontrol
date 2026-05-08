@@ -1,0 +1,267 @@
+// GPT-DESC: Owns detached gameplay-window lifecycle helpers and dependent render targets.
+// EngineGameplayWindow.cpp - Detached gameplay window synchronization helpers.
+
+#include "core/engine/Engine.h"
+#include "ui/EngineInterface.h"
+#include "rendering/common/VulkanHelpers.h"
+#include <algorithm>
+#include <exception>
+#include <iostream>
+#include <memory>
+
+void Engine::setGameplaySeparated(bool separate) {
+    if (separate == m_gameplaySeparated) {
+        return;
+    }
+
+    auto& engineUi = m_world.getDebugOverlay().getEngineInterface();
+    m_gameplaySeparated = separate;
+
+    if (separate) {
+        int width = 1280;
+        int height = 720;
+        vkDeviceWaitIdle(m_device);
+        const QueueFamilyIndices queueFamilies =
+            VulkanHelpers::findQueueFamilies(m_physicalDevice, m_surface);
+        if (!queueFamilies.presentFamily.has_value()) {
+            m_gameplaySeparated = false;
+            engineUi.setGameplayState(EngineInterface::GameplayState::Embedded);
+            std::cout << "[Engine] Failed to find a present queue family for detached gameplay window"
+                      << std::endl;
+            return;
+        }
+        m_gameplayWindow = std::make_unique<GameplayWindow>();
+        if (!m_gameplayWindow->create(m_instance, m_physicalDevice, m_device,
+                                      queueFamilies.presentFamily.value(),
+                                      width, height,
+                                      m_renderPass, m_swapchainImageFormat,
+                                      m_depthFormat, m_vsyncEnabled, "Gameplay")) {
+            m_input.setGameplayWindow(nullptr);
+            m_gameplaySeparated = false;
+            engineUi.setGameplayState(EngineInterface::GameplayState::Embedded);
+            m_gameplayWindow.reset();
+            std::cout << "[Engine] Failed to create gameplay window" << std::endl;
+        } else {
+            m_input.setGameplayWindow(m_gameplayWindow->getHandle());
+            syncGameplayTJunctionFix(true);
+            syncHiZTarget(true);
+            recreateSwapchain();
+            engineUi.setGameplayState(EngineInterface::GameplayState::Separated);
+            if (m_gameplayWindow) {
+                std::cout << "[Engine] Gameplay window opened ("
+                          << width << "x" << height << ")" << std::endl;
+            }
+        }
+    } else {
+        m_gameplayTJunctionFix.cleanup();
+        m_gameplayWindowSwapchainGeneration = 0;
+        if (m_gameplayWindow) {
+            vkDeviceWaitIdle(m_device);
+            m_input.setGameplayWindow(nullptr);
+            m_gameplayWindow->destroy(m_instance, m_device);
+            m_gameplayWindow.reset();
+            std::cout << "[Engine] Gameplay window closed" << std::endl;
+        }
+        syncHiZTarget(true);
+        recreateSwapchain();
+        engineUi.setGameplayState(EngineInterface::GameplayState::Embedded);
+    }
+}
+
+void Engine::syncGameplayTJunctionFix(bool forceRecreate) {
+    if (!m_gameplayWindow || !m_gameplayWindow->isOpen() ||
+        m_gameplayWindow->getSwapchain() == VK_NULL_HANDLE ||
+        m_gameplayWindow->getImageViews().empty()) {
+        if (m_gameplayTJunctionFix.isReady()) {
+            m_gameplayTJunctionFix.cleanup();
+        }
+        m_gameplayWindowSwapchainGeneration = 0;
+        syncHiZTarget(forceRecreate);
+        return;
+    }
+
+    const uint64_t generation = m_gameplayWindow->getSwapchainGeneration();
+    if (!forceRecreate &&
+        m_gameplayTJunctionFix.isReady() &&
+        generation == m_gameplayWindowSwapchainGeneration) {
+        m_gameplayTJunctionFix.setEnabled(m_tjunctionFix.isEnabled());
+        m_gameplayTJunctionFix.setDepthThreshold(m_tjunctionFix.getDepthThreshold());
+        syncHiZTarget(false);
+        return;
+    }
+
+    try {
+        if (m_gameplayTJunctionFix.isReady()) {
+            m_gameplayTJunctionFix.recreate(
+                m_gameplayWindow->getFormat(),
+                m_depthFormat,
+                m_gameplayWindow->getExtent(),
+                m_gameplayWindow->getImageViews());
+        } else {
+            m_gameplayTJunctionFix.init(
+                m_device,
+                m_physicalDevice,
+                m_gameplayWindow->getFormat(),
+                m_depthFormat,
+                m_gameplayWindow->getExtent(),
+                m_gameplayWindow->getImageViews());
+        }
+
+        m_gameplayTJunctionFix.setEnabled(m_tjunctionFix.isEnabled());
+        m_gameplayTJunctionFix.setDepthThreshold(m_tjunctionFix.getDepthThreshold());
+        m_gameplayWindowSwapchainGeneration = generation;
+        syncHiZTarget(true);
+    } catch (const std::exception& ex) {
+        std::cerr << "[Engine] Failed to initialize detached T-junction fix: "
+                  << ex.what() << std::endl;
+
+        if (m_gameplayTJunctionFix.isReady()) {
+            m_gameplayTJunctionFix.cleanup();
+        }
+        m_gameplayWindowSwapchainGeneration = 0;
+
+        if (m_gameplayWindow) {
+            m_input.setGameplayWindow(nullptr);
+            m_gameplayWindow->destroy(m_instance, m_device);
+            m_gameplayWindow.reset();
+        }
+
+        m_gameplaySeparated = false;
+        if (m_input.areDebugWindowsVisible() && m_world.getDebugOverlay().isUsingEngineInterface()) {
+            m_world.getDebugOverlay().getEngineInterface()
+                .setGameplayState(EngineInterface::GameplayState::Embedded);
+        }
+        syncHiZTarget(true);
+    }
+}
+
+void Engine::syncGameplayPixelPass(bool forceRecreate) {
+    if (!m_gameplayWindow || !m_gameplayWindow->isOpen() ||
+        m_gameplayWindow->getSwapchain() == VK_NULL_HANDLE ||
+        m_gameplayWindow->getImageViews().empty()) {
+        if (m_gameplayPixelPass.isReady()) {
+            m_gameplayPixelPass.cleanup();
+        }
+        m_gameplayPixelPassSwapchainGeneration = 0;
+        return;
+    }
+
+    const uint64_t generation = m_gameplayWindow->getSwapchainGeneration();
+    if (!forceRecreate &&
+        m_gameplayPixelPass.isReady() &&
+        generation == m_gameplayPixelPassSwapchainGeneration) {
+        m_gameplayPixelPass.getSettings() = m_pixelPass.getSettings();
+        return;
+    }
+
+    try {
+        if (m_gameplayPixelPass.isReady()) {
+            m_gameplayPixelPass.recreate(
+                m_gameplayWindow->getFormat(),
+                m_depthFormat,
+                m_gameplayWindow->getExtent(),
+                m_gameplayWindow->getImageViews());
+        } else {
+            m_gameplayPixelPass.init(
+                m_device,
+                m_physicalDevice,
+                m_gameplayWindow->getFormat(),
+                m_depthFormat,
+                m_gameplayWindow->getExtent(),
+                m_gameplayWindow->getImageViews());
+        }
+
+        m_gameplayPixelPass.getSettings() = m_pixelPass.getSettings();
+        m_gameplayPixelPassSwapchainGeneration = generation;
+    } catch (const std::exception& ex) {
+        std::cerr << "[Engine] Failed to initialize detached retro pixel pass: "
+                  << ex.what() << std::endl;
+
+        if (m_gameplayPixelPass.isReady()) {
+            m_gameplayPixelPass.cleanup();
+        }
+        if (m_gameplayTJunctionFix.isReady()) {
+            m_gameplayTJunctionFix.cleanup();
+        }
+        m_gameplayWindowSwapchainGeneration = 0;
+        m_gameplayPixelPassSwapchainGeneration = 0;
+
+        if (m_gameplayWindow) {
+            m_input.setGameplayWindow(nullptr);
+            m_gameplayWindow->destroy(m_instance, m_device);
+            m_gameplayWindow.reset();
+        }
+
+        m_gameplaySeparated = false;
+        if (m_input.areDebugWindowsVisible() && m_world.getDebugOverlay().isUsingEngineInterface()) {
+            m_world.getDebugOverlay().getEngineInterface()
+                .setGameplayState(EngineInterface::GameplayState::Embedded);
+        }
+        syncHiZTarget(true);
+    }
+}
+
+void Engine::syncHiZTarget(bool forceRecreate) {
+    if (!m_hiZPyramid.isReady()) {
+        return;
+    }
+
+    VkImageView targetDepthView = m_depthView;
+    uint32_t targetWidth = m_swapchainExtent.width;
+    uint32_t targetHeight = m_swapchainExtent.height;
+
+    const bool useGameplayTarget =
+        m_gameplaySeparated &&
+        m_gameplayWindow &&
+        m_gameplayWindow->isOpen() &&
+        m_gameplayWindow->getSwapchain() != VK_NULL_HANDLE;
+    const bool useGameplayPixelPass =
+        useGameplayTarget &&
+        m_gameplayPixelPass.isReady() &&
+        m_gameplayPixelPass.getSettings().enabled;
+    const bool useMainPixelPass =
+        !useGameplayTarget &&
+        m_pixelPass.isReady() &&
+        m_pixelPass.getSettings().enabled;
+    if (useGameplayPixelPass) {
+        targetDepthView = m_gameplayPixelPass.getOffscreenDepthView();
+        targetWidth = m_gameplayWindow->getExtent().width;
+        targetHeight = m_gameplayWindow->getExtent().height;
+    } else if (useGameplayTarget) {
+        targetDepthView = m_gameplayWindow->getDepthView();
+        targetWidth = m_gameplayWindow->getExtent().width;
+        targetHeight = m_gameplayWindow->getExtent().height;
+    } else if (useMainPixelPass) {
+        targetDepthView = m_pixelPass.getOffscreenDepthView();
+        targetWidth = m_swapchainExtent.width;
+        targetHeight = m_swapchainExtent.height;
+    }
+
+    if (targetDepthView == VK_NULL_HANDLE || targetWidth == 0 || targetHeight == 0) {
+        return;
+    }
+
+    auto previousPowerOfTwo = [](uint32_t v) {
+        if (v <= 1u) {
+            return 1u;
+        }
+        v |= v >> 1u;
+        v |= v >> 2u;
+        v |= v >> 4u;
+        v |= v >> 8u;
+        v |= v >> 16u;
+        return (v >> 1u) + 1u;
+    };
+
+    const bool sizeMismatch =
+        m_hiZPyramid.getWidth() != previousPowerOfTwo(targetWidth) ||
+        m_hiZPyramid.getHeight() != previousPowerOfTwo(targetHeight);
+
+    if (forceRecreate || sizeMismatch) {
+        vkDeviceWaitIdle(m_device);
+        m_hiZPyramid.resize(targetDepthView, targetWidth, targetHeight);
+        m_gpuCulling.bindHiZPyramid(m_hiZPyramid.getImageView(), m_hiZPyramid.getSampler());
+    } else {
+        m_hiZPyramid.updateDepthSource(targetDepthView);
+    }
+}
