@@ -600,6 +600,7 @@ std::string Engine::generateFrameBottleneckReport() const {
     out << "=== EDIT / RESOURCE GROWTH CHECKS ===\n";
     out << "Texture material store: cells " << textureStats.totalCells
         << ", bricks " << textureStats.totalBricks
+        << ", stamps " << textureStats.surfaceStampCount
         << ", generation " << textureStats.generation << "\n";
     out << "Texture cells by LOD:";
     const size_t lodCount = sizeof(textureStats.cellsByLOD) / sizeof(textureStats.cellsByLOD[0]);

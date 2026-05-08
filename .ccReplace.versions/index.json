@@ -1098,7 +1098,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  4,
+                      "CurrentVersion":  5,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1122,6 +1122,12 @@
                                            "Version":  4,
                                            "Timestamp":  "2026-05-08T10:23:06.2192664Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000004.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-08T10:53:13.7773467Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000005.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -1266,6 +1272,82 @@
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T10:23:06.1525567Z",
                                            "Snapshot":  "files\\6eca290f789c4eaa\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/Engine.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\Engine.cpp",
+                      "Key":  "c22fa2d082c3c2fa",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:53:13.6710801Z",
+                                           "Snapshot":  "files\\c22fa2d082c3c2fa\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T10:53:13.6835310Z",
+                                           "Snapshot":  "files\\c22fa2d082c3c2fa\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/lifecycle/EngineLifecycle.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\lifecycle\\EngineLifecycle.cpp",
+                      "Key":  "660da8635196b701",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:53:13.7040760Z",
+                                           "Snapshot":  "files\\660da8635196b701\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/window/EngineWindow.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\window\\EngineWindow.cpp",
+                      "Key":  "9336e22593797396",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:53:13.7198723Z",
+                                           "Snapshot":  "files\\9336e22593797396\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/diagnostics/EnginePerfDiagnostics.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\diagnostics\\EnginePerfDiagnostics.cpp",
+                      "Key":  "6ddfb3510ebe3fc0",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:53:13.7398949Z",
+                                           "Snapshot":  "files\\6ddfb3510ebe3fc0\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/core/engine/diagnostics/EngineGModeDiagnostics.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\core\\engine\\diagnostics\\EngineGModeDiagnostics.cpp",
+                      "Key":  "27ea7090fb5862d4",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T10:53:13.7565317Z",
+                                           "Snapshot":  "files\\27ea7090fb5862d4\\v000001.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
