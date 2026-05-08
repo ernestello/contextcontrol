@@ -1038,7 +1038,7 @@
                       "Path":  "src/world/edit/TerrainEditMesher.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\TerrainEditMesher.cpp",
                       "Key":  "a1855b7b052ee009",
-                      "CurrentVersion":  2,
+                      "CurrentVersion":  3,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1051,6 +1051,12 @@
                                            "Timestamp":  "2026-05-07T18:48:15.6680550Z",
                                            "Snapshot":  "files\\a1855b7b052ee009\\v000002.snapshot",
                                            "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-08T11:21:53.4645851Z",
+                                           "Snapshot":  "files\\a1855b7b052ee009\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
                                        }
                                    ]
                   },
@@ -1098,7 +1104,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  6,
+                      "CurrentVersion":  7,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1134,6 +1140,12 @@
                                            "Version":  6,
                                            "Timestamp":  "2026-05-08T10:59:03.0513127Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000006.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  7,
+                                           "Timestamp":  "2026-05-08T11:21:53.5223299Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000007.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -1606,6 +1618,200 @@
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T10:59:03.0301224Z",
                                            "Snapshot":  "files\\71564448ea2548e6\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/meshing/TerrainEditMesherInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\meshing\\TerrainEditMesherInternal.h",
+                      "Key":  "6b4ec64e807706ee",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.2451536Z",
+                                           "Snapshot":  "files\\6b4ec64e807706ee\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/meshing/TerrainEditMesher.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\meshing\\TerrainEditMesher.cpp",
+                      "Key":  "b56dc1bf2fcc8c30",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.2616728Z",
+                                           "Snapshot":  "files\\b56dc1bf2fcc8c30\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/meshing/TerrainEditSolidCache.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\meshing\\TerrainEditSolidCache.cpp",
+                      "Key":  "02fc0e193f7db9e4",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.2779353Z",
+                                           "Snapshot":  "files\\02fc0e193f7db9e4\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/meshing/TerrainEditGreedyMesh.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\meshing\\TerrainEditGreedyMesh.cpp",
+                      "Key":  "1abadb808e65ae94",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.2994730Z",
+                                           "Snapshot":  "files\\1abadb808e65ae94\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/meshing/TerrainEditMaterialResolve.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\meshing\\TerrainEditMaterialResolve.cpp",
+                      "Key":  "2a46bdcef5757bb8",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.3145665Z",
+                                           "Snapshot":  "files\\2a46bdcef5757bb8\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/meshing/TerrainEditSubMeshSplit.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\meshing\\TerrainEditSubMeshSplit.cpp",
+                      "Key":  "0bbb71bacd77b03f",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.3328311Z",
+                                           "Snapshot":  "files\\0bbb71bacd77b03f\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/remesh/RemeshSchedulerInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\remesh\\RemeshSchedulerInternal.h",
+                      "Key":  "890d79e9815b5a43",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.3524124Z",
+                                           "Snapshot":  "files\\890d79e9815b5a43\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/remesh/RemeshScheduler.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\remesh\\RemeshScheduler.cpp",
+                      "Key":  "00c6bc8d9249df2f",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.3704652Z",
+                                           "Snapshot":  "files\\00c6bc8d9249df2f\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/remesh/RemeshSchedulerQueue.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\remesh\\RemeshSchedulerQueue.cpp",
+                      "Key":  "7bed1e4980e0b053",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.3880100Z",
+                                           "Snapshot":  "files\\7bed1e4980e0b053\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/remesh/RemeshSchedulerJobs.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\remesh\\RemeshSchedulerJobs.cpp",
+                      "Key":  "0c95c85e65489b23",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.4067563Z",
+                                           "Snapshot":  "files\\0c95c85e65489b23\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/remesh/RemeshSchedulerArtifacts.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\remesh\\RemeshSchedulerArtifacts.cpp",
+                      "Key":  "ce5dcf0dd9a73477",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.4253205Z",
+                                           "Snapshot":  "files\\ce5dcf0dd9a73477\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/remesh/RemeshSchedulerPagedRuntime.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\remesh\\RemeshSchedulerPagedRuntime.cpp",
+                      "Key":  "bb56d003abca8d60",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.4430295Z",
+                                           "Snapshot":  "files\\bb56d003abca8d60\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T11:23:04.5032922Z",
+                                           "Snapshot":  "files\\bb56d003abca8d60\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/TerrainEditRemeshScheduler.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\TerrainEditRemeshScheduler.cpp",
+                      "Key":  "fa4f0c7573b77ca9",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:21:53.4856239Z",
+                                           "Snapshot":  "files\\fa4f0c7573b77ca9\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T11:21:53.5012343Z",
+                                           "Snapshot":  "files\\fa4f0c7573b77ca9\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]

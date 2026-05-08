@@ -1,0 +1,538 @@
+// GPT-DESC: Drains completed terrain edit remesh artifacts into world upload/collision queues.
+#include "RemeshSchedulerInternal.h"
+
+namespace TerrainEdit::RemeshInternal {
+
+uint8_t computeDCCMCasingMask(World* world, const glm::ivec3& chunkCoord,
+                              const glm::ivec3& center)
+{
+    if (!world || !world->getChunkManager()) {
+        return 0;
+    }
+
+    static const glm::ivec3 neighborOffsets[4] = {
+        {-1,0,0}, {1,0,0}, {0,0,-1}, {0,0,1}
+    };
+
+    uint8_t casingMask = 0;
+    for (int edge = 0; edge < 4; ++edge) {
+        const glm::ivec3 neighbor = chunkCoord + neighborOffsets[edge];
+        const int neighborRing = world->getChunkManager()->calculateRingNumber(neighbor, center);
+        const int neighborLOD = world->getChunkManager()->calculateLODFromRing(neighborRing);
+        if (world->getTerrainTypeForChunk(neighbor, neighborLOD) != TerrainType::DCCM) {
+            casingMask |= (1 << edge);
+        }
+    }
+
+    return casingMask;
+}
+
+void generateDCCMCasingForEdge(int edge,
+                               const std::vector<MeshData>& mainSubChunks,
+                               uint8_t mainSubChunkCount,
+                               MeshData& outCasing)
+{
+    constexpr uint8_t FACE_DCCM_SURFACE = 6;
+    struct EdgeDef {
+        uint8_t coord;
+        bool    isXBound;
+        bool    reverseWinding;
+    };
+    static constexpr EdgeDef edgeDefs[CHUNK_EDGE_COUNT] = {
+        {   0, true,  false },
+        { 128, true,  true  },
+        {   0, false, true  },
+        { 128, false, false },
+    };
+
+    const auto& def = edgeDefs[edge];
+    std::map<uint8_t, uint16_t> boundaryVerts;
+    for (uint8_t subIndex = 0; subIndex < mainSubChunkCount && subIndex < mainSubChunks.size(); ++subIndex) {
+        for (const Vertex& vertex : mainSubChunks[subIndex].vertices) {
+            const uint32_t packedVert = vertex.packed;
+            const uint8_t vx = packedVert & 0xFF;
+            const uint16_t vy = (packedVert >> 8) & 0x3FF;
+            const uint8_t vz = (packedVert >> 18) & 0xFF;
+            if (def.isXBound) {
+                if (vx == def.coord) {
+                    auto it = boundaryVerts.find(vz);
+                    if (it == boundaryVerts.end() || vy > it->second) {
+                        boundaryVerts[vz] = vy;
+                    }
+                }
+            } else {
+                if (vz == def.coord) {
+                    auto it = boundaryVerts.find(vx);
+                    if (it == boundaryVerts.end() || vy > it->second) {
+                        boundaryVerts[vx] = vy;
+                    }
+                }
+            }
+        }
+    }
+
+    if (boundaryVerts.size() < 2) return;
+
+    auto packVert = [](uint8_t x, uint16_t y, uint8_t z, uint8_t face) -> uint32_t {
+        return uint32_t(x)
+             | (uint32_t(y)        << 8)
+             | (uint32_t(z)        << 18)
+             | (uint32_t(face & 7) << 26);
+    };
+
+    constexpr uint16_t Y_BASE = 1;
+    auto it = boundaryVerts.begin();
+    auto prev = it;
+    ++it;
+    for (; it != boundaryVerts.end(); prev = it, ++it) {
+        const uint8_t pos0 = prev->first;
+        const uint16_t h0 = prev->second;
+        const uint8_t pos1 = it->first;
+        const uint16_t h1 = it->second;
+        if (h0 <= 1 && h1 <= 1) continue;
+
+        uint8_t x0, z0, x1, z1;
+        if (def.isXBound) {
+            x0 = def.coord; z0 = pos0;
+            x1 = def.coord; z1 = pos1;
+        } else {
+            x0 = pos0; z0 = def.coord;
+            x1 = pos1; z1 = def.coord;
+        }
+
+        const uint32_t baseIdx = static_cast<uint32_t>(outCasing.vertices.size());
+        outCasing.vertices.push_back({packVert(x0, Y_BASE, z0, FACE_DCCM_SURFACE)});
+        outCasing.vertices.push_back({packVert(x1, Y_BASE, z1, FACE_DCCM_SURFACE)});
+        outCasing.vertices.push_back({packVert(x1, h1, z1, FACE_DCCM_SURFACE)});
+        outCasing.vertices.push_back({packVert(x0, h0, z0, FACE_DCCM_SURFACE)});
+
+        if (def.reverseWinding) {
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 1));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 3));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+        } else {
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 1));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 3));
+        }
+    }
+}
+
+bool computeTightAABBFromSubChunks(const std::vector<MeshData>& subChunks,
+                                   glm::vec3& outMin,
+                                   glm::vec3& outMax)
+{
+    constexpr float voxelSize = 0.25f;
+    glm::vec3 localMin(1e10f);
+    glm::vec3 localMax(-1e10f);
+    bool hasVerts = false;
+
+    for (const auto& sub : subChunks) {
+        for (const auto& v : sub.vertices) {
+            const uint32_t packed = v.packed;
+            const uint32_t xBits = (packed >> 0) & 0xFF;
+            const uint32_t yBits = (packed >> 8) & 0x3FF;
+            const uint32_t zBits = (packed >> 18) & 0xFF;
+            const float x = static_cast<float>(xBits) * voxelSize;
+            const float y = static_cast<float>(yBits) * voxelSize;
+            const float z = static_cast<float>(zBits) * voxelSize;
+            localMin = glm::min(localMin, glm::vec3(x, y, z));
+            localMax = glm::max(localMax, glm::vec3(x, y, z));
+            hasVerts = true;
+        }
+    }
+
+    if (!hasVerts) {
+        return false;
+    }
+
+    const float padding = voxelSize * 0.5f;
+    outMin = localMin - padding;
+    outMax = localMax + padding;
+    return true;
+}
+
+void releaseEditRemeshInFlight(const std::shared_ptr<ChunkVersionState>& versionState,
+                               uint32_t version)
+{
+    if (!versionState) {
+        return;
+    }
+
+    const uint32_t prev = versionState->editRemeshInFlightCount.fetch_sub(
+        1, std::memory_order_acq_rel);
+    const uint32_t remaining = (prev > 0) ? (prev - 1) : 0;
+
+    // Only clear the shared inFlight flag when the edit scheduler is still the
+    // owner of the latest version token. If another pipeline already claimed a
+    // newer version, leave inFlight alone so we do not stomp its ownership.
+    const uint32_t currentVersion = versionState->version.load(std::memory_order_acquire);
+    const uint32_t latestEditVersion =
+        versionState->editRemeshLatestVersion.load(std::memory_order_acquire);
+    if (remaining == 0 &&
+        currentVersion == latestEditVersion &&
+        currentVersion >= version) {
+        versionState->inFlight.store(false, std::memory_order_release);
+    }
+}
+
+} // namespace TerrainEdit::RemeshInternal
+
+namespace TerrainEdit {
+using namespace RemeshInternal;
+
+size_t TerrainEditRemeshScheduler::drainCompletions(World* world) {
+    std::vector<CompletedRemesh> batch;
+    {
+        std::lock_guard lock(m_completionMutex);
+        if (m_completions.empty()) return 0;
+        batch.swap(m_completions);
+    }
+
+    auto& registry = world->getRegistry();
+    auto& diag = world->editDiagMut();
+
+    using Clock = std::chrono::high_resolution_clock;
+    float collAccum = 0.0f;
+    float gpuAccum  = 0.0f;
+    size_t uploadsQueued = 0;
+
+    for (auto& comp : batch) {
+        // Stale check (entity destroyed or version bumped since dispatch)
+        if (comp.versionState->version.load(std::memory_order_acquire) != comp.version) {
+            releaseEditRemeshInFlight(comp.versionState, comp.version);
+            continue;
+        }
+
+        {
+            std::shared_lock regLock(world->registryMutex());
+            if (!registry.valid(comp.entity)) {
+                releaseEditRemeshInFlight(comp.versionState, comp.version);
+                continue;
+            }
+        }
+
+        // Record per-chunk timing for pipeline breakdown diagnostics
+        {
+            ChunkTimingRecord timing;
+            timing.dispatchTime = comp.dispatchTime;
+            timing.jobStartTime = comp.jobStartTime;
+            timing.meshDoneTime = comp.meshDoneTime;
+            timing.drainTime    = std::chrono::steady_clock::now();
+            timing.isFastMode   = comp.isFastMode;
+            timing.meshLodLevel = comp.currentArtifact.lodLevel;
+            timing.meshStats    = comp.currentArtifact.meshStats;
+            timing.loadSnapshot = comp.loadSnapshot;
+            std::lock_guard tlock(m_timingMutex);
+            m_chunkTimings[comp.chunkCoord] = timing;
+        }
+
+        world->storeEditArtifact(
+            comp.chunkCoord,
+            comp.currentArtifact.terrainType,
+            comp.currentArtifact.lodLevel,
+            std::vector<Vertex>(comp.currentArtifact.vertices.begin(), comp.currentArtifact.vertices.end()),
+            std::vector<uint32_t>(comp.currentArtifact.indices.begin(), comp.currentArtifact.indices.end()),
+            comp.currentArtifact.aabbMin,
+            comp.currentArtifact.aabbMax,
+            comp.currentArtifact.isEmpty);
+
+        const bool uploadFromTerrainEdit = !comp.materialOnly;
+
+        ChunkDebugAttribution debugInfo{};
+        debugInfo.artifactSource = ChunkArtifactSource::RuntimeEditBuild;
+        debugInfo.collisionSource = comp.materialOnly
+            ? ChunkCollisionSource::None
+            : ChunkCollisionSource::EditMeshPacked;
+        debugInfo.workModel = ChunkWorkModel::MonolithicChunk;
+        debugInfo.meshMode = static_cast<uint8_t>(ChunkMeshMode::MonolithicEdited);
+        debugInfo.artifactCacheResident = true;
+        debugInfo.fromTerrainEdit = uploadFromTerrainEdit;
+        debugInfo.artifactGeneration = world->getEditArtifactGeneration(
+            comp.chunkCoord,
+            comp.currentArtifact.terrainType,
+            comp.currentArtifact.lodLevel);
+        const glm::ivec3 maskCenter = world->getChunkManager()
+            ? world->getChunkManager()->getCenterChunk()
+            : comp.centerAtEnqueue;
+
+        if (comp.currentArtifact.isEmpty) {
+            {
+                std::unique_lock regLock(world->registryMutex());
+                if (registry.valid(comp.entity) && registry.all_of<Chunk>(comp.entity)) {
+                    auto& chunk = registry.get<Chunk>(comp.entity);
+                    const int chunkLodLevel = chunk.lodLevel;
+                    chunk.isEmpty = true;
+                    if (registry.any_of<ChunkEditRuntime>(comp.entity)) {
+                        auto& editRuntime = registry.get<ChunkEditRuntime>(comp.entity);
+                        if (shouldExposePagedEditableMode(
+                                comp.currentArtifact.terrainType,
+                                comp.currentArtifact.lodLevel,
+                                &editRuntime)) {
+                            ensurePagedRuntimeScaffold(editRuntime);
+                            partitionMergedMeshIntoPages(
+                                comp.currentArtifact.vertices,
+                                comp.currentArtifact.indices,
+                                editRuntime);
+                            finalizePagedRuntime(editRuntime, debugInfo);
+                            chunk.meshMode = ChunkMeshMode::PagedEditable;
+                        } else {
+                            chunk.meshMode = ChunkMeshMode::MonolithicEdited;
+                        }
+                    } else {
+                        chunk.meshMode = ChunkMeshMode::MonolithicEdited;
+                    }
+                    // Keep metadata aligned to the chunk's logical LOD band, not the
+                    // artifact data LOD. Using artifact LOD here causes periodic LOD
+                    // scans to see false mismatches and enqueue endless remesh/swap work.
+                    chunk.effectiveDataLod = static_cast<uint8_t>(
+                        std::clamp(world->getEffectiveLODForChunk(
+                            comp.chunkCoord, chunkLodLevel), 0, 255));
+                    if (comp.currentArtifact.terrainType == TerrainType::DCCM) {
+                        chunk.voxelSeamMask = 0;
+                        chunk.casingSeamMask = computeDCCMCasingMask(
+                            world, comp.chunkCoord, maskCenter);
+                    } else {
+                        chunk.casingSeamMask = 0;
+                        // Even empty chunks must carry the expected seam metadata for
+                        // reconciliation logic; otherwise they get re-queued forever.
+                        chunk.voxelSeamMask = (chunkLodLevel > 0 && world->getChunkManager())
+                            ? world->getChunkManager()->getSeamEdgeMask(
+                                comp.chunkCoord, maskCenter)
+                            : 0;
+                    }
+                }
+            }
+            if (!comp.materialOnly) {
+                auto t0 = Clock::now();
+                world->enqueueEditCollision(
+                    comp.entity,
+                    comp.chunkCoord,
+                    {},
+                    {},
+                    comp.versionState,
+                    comp.version,
+                    ChunkCollisionSource::EditMeshPacked);
+                collAccum += std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
+            }
+
+            {
+                auto t0Upload = Clock::now();
+                world->enqueueMeshForUpload(
+                    comp.entity,
+                    std::vector<MeshData>{},
+                    /*mainSubChunkCount=*/0,
+                    /*fromTerrainEdit=*/uploadFromTerrainEdit,
+                    comp.versionState,
+                    comp.version,
+                    comp.currentArtifact.aabbMin,
+                    comp.currentArtifact.aabbMax,
+                    /*hasTight=*/false,
+                    /*isRemesh=*/false,
+                    /*batchId=*/0,
+                    debugInfo);
+                gpuAccum += std::chrono::duration<float, std::milli>(Clock::now() - t0Upload).count();
+            }
+
+            releaseEditRemeshInFlight(comp.versionState, comp.version);
+
+            // Record edit remesh completion for chunk hole tracking
+            {
+                ChunkHoleEvent ev;
+                ev.type = ChunkHoleEvent::Type::EditRemeshCompleted;
+                ev.timestampSec = std::chrono::duration<float>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+                ev.detail = "empty_artifact";
+                world->getChunkHoleTracker().recordEvent(
+                    ChunkCoord{comp.chunkCoord.x, comp.chunkCoord.y, comp.chunkCoord.z},
+                    std::move(ev));
+            }
+            if (comp.isFastMode) {
+                std::lock_guard qlock(m_mutex);
+                m_qualityDirty.insert(ChunkCoord{comp.chunkCoord.x, comp.chunkCoord.y, comp.chunkCoord.z});
+            }
+            ++diag.chunksRemeshed;
+            continue;
+        }
+
+        // Touch chunk component
+        {
+            std::unique_lock regLock(world->registryMutex());
+            if (registry.valid(comp.entity) && registry.all_of<Chunk>(comp.entity)) {
+                auto& chunk = registry.get<Chunk>(comp.entity);
+                const int chunkLodLevel = chunk.lodLevel;
+                chunk.isEmpty = false;
+                if (registry.any_of<ChunkEditRuntime>(comp.entity)) {
+                    auto& editRuntime = registry.get<ChunkEditRuntime>(comp.entity);
+                    if (shouldExposePagedEditableMode(
+                            comp.currentArtifact.terrainType,
+                            comp.currentArtifact.lodLevel,
+                            &editRuntime)) {
+                        ensurePagedRuntimeScaffold(editRuntime);
+                        partitionMergedMeshIntoPages(
+                            comp.currentArtifact.vertices,
+                            comp.currentArtifact.indices,
+                            editRuntime);
+                        finalizePagedRuntime(editRuntime, debugInfo);
+                        chunk.meshMode = ChunkMeshMode::PagedEditable;
+                    } else {
+                        chunk.meshMode = ChunkMeshMode::MonolithicEdited;
+                    }
+                } else {
+                    chunk.meshMode = ChunkMeshMode::MonolithicEdited;
+                }
+                // Keep data-LOD metadata tied to the chunk's render LOD band.
+                chunk.effectiveDataLod = static_cast<uint8_t>(
+                    std::clamp(world->getEffectiveLODForChunk(
+                        comp.chunkCoord, chunkLodLevel), 0, 255));
+                if (comp.currentArtifact.terrainType == TerrainType::DCCM) {
+                    chunk.voxelSeamMask = 0;
+                    chunk.casingSeamMask = computeDCCMCasingMask(world, comp.chunkCoord, maskCenter);
+                } else {
+                    chunk.casingSeamMask = 0;
+                    // Match the value the LOD scan compares against, otherwise the
+                    // scan re-queues this chunk every frame -> RELOAD STORM / flicker.
+                    chunk.voxelSeamMask = (chunkLodLevel > 0 && world->getChunkManager())
+                        ? world->getChunkManager()->getSeamEdgeMask(comp.chunkCoord, maskCenter)
+                        : 0;
+                }
+            }
+        }
+
+        // Collision — count diagnostic sizes BEFORE std::move empties the vectors.
+        ++diag.chunksRemeshed;
+        if (!comp.materialOnly) {
+            diag.vertexCount += static_cast<uint32_t>(comp.collVerts.size());
+            diag.indexCount  += static_cast<uint32_t>(comp.collIndices.size());
+        }
+
+        if (!comp.materialOnly) {
+            auto t0 = Clock::now();
+            world->enqueueEditCollision(comp.entity, comp.chunkCoord,
+                                        std::move(comp.collVerts),
+                                        std::move(comp.collIndices),
+                                        comp.versionState,
+                                        comp.version,
+                                        ChunkCollisionSource::EditMeshPacked);
+            collAccum += std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
+        }
+
+        // GPU upload — split into sub-meshes if vertex count exceeds 65535
+        std::vector<MeshData> subChunks;
+        uint8_t mainSubChunkCount = 0;
+        {
+            // Build a temporary MeshResult for the split utility
+            TerrainEditMesher::MeshResult tmpResult;
+            tmpResult.vertices = std::move(comp.currentArtifact.vertices);
+            tmpResult.indices  = std::move(comp.currentArtifact.indices);
+            tmpResult.aabbMin  = comp.currentArtifact.aabbMin;
+            tmpResult.aabbMax  = comp.currentArtifact.aabbMax;
+
+            auto subs = TerrainEditMesher::splitToSubMeshes(tmpResult);
+            for (auto& sub : subs) {
+                MeshData md(comp.entity);
+                md.vertices = std::move(sub.vertices);
+                md.indices  = std::move(sub.indices);
+                subChunks.push_back(std::move(md));
+            }
+            mainSubChunkCount = static_cast<uint8_t>(subChunks.size());
+        }
+        if (comp.currentArtifact.terrainType == TerrainType::DCCM) {
+            const uint8_t casingMask = computeDCCMCasingMask(world, comp.chunkCoord, maskCenter);
+            for (int edge = 0; edge < CHUNK_EDGE_COUNT; ++edge) {
+                if ((casingMask & (1 << edge)) == 0) continue;
+                MeshData casingData(comp.entity);
+                generateDCCMCasingForEdge(edge, subChunks, mainSubChunkCount, casingData);
+                if (!casingData.isEmpty()) {
+                    subChunks.push_back(std::move(casingData));
+                }
+            }
+        }
+        debugInfo.subChunkCount = static_cast<uint16_t>(subChunks.size());
+
+        glm::vec3 tightMin(1e10f);
+        glm::vec3 tightMax(-1e10f);
+        const bool hasTight = computeTightAABBFromSubChunks(subChunks, tightMin, tightMax);
+
+        {
+            auto t0 = Clock::now();
+            world->enqueueMeshForUpload(
+                comp.entity,
+                std::move(subChunks),
+                mainSubChunkCount,
+                /*fromTerrainEdit=*/uploadFromTerrainEdit,
+                comp.versionState,
+                comp.version,
+                tightMin,
+                tightMax,
+                hasTight,
+                /*isRemesh=*/false,
+                /*batchId=*/0,
+                debugInfo);
+            ++uploadsQueued;
+            gpuAccum += std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
+        }
+
+        releaseEditRemeshInFlight(comp.versionState, comp.version);
+
+        // Record edit remesh completion for chunk hole tracking
+        {
+            ChunkHoleEvent ev;
+            ev.type = ChunkHoleEvent::Type::EditRemeshCompleted;
+            ev.timestampSec = std::chrono::duration<float>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            ev.detail = "verts=" + std::to_string(diag.vertexCount)
+                      + " idx=" + std::to_string(diag.indexCount);
+            world->getChunkHoleTracker().recordEvent(
+                ChunkCoord{comp.chunkCoord.x, comp.chunkCoord.y, comp.chunkCoord.z},
+                std::move(ev));
+        }
+        if (comp.isFastMode) {
+            std::lock_guard qlock(m_mutex);
+            m_qualityDirty.insert(ChunkCoord{comp.chunkCoord.x, comp.chunkCoord.y, comp.chunkCoord.z});
+        }
+    }
+
+    if (!batch.empty()) {
+        diag.collisionEnqueueMs += collAccum;
+        diag.gpuUploadEnqueueMs += gpuAccum;
+    }
+    return uploadsQueued;
+}
+
+// ---------------------------------------------------------------------------
+// dispatchJobs — main thread: kick background jobs for dirty chunks
+// ---------------------------------------------------------------------------
+
+void TerrainEditRemeshScheduler::drainDeferredArtifacts(World* world) {
+    std::vector<DeferredArtifactResult> batch;
+    {
+        std::lock_guard lock(m_deferredArtifactMutex);
+        if (m_deferredArtifacts.empty()) return;
+        batch.swap(m_deferredArtifacts);
+    }
+
+    for (auto& r : batch) {
+        world->storeEditArtifact(
+            r.chunkCoord,
+            r.artifact.terrainType,
+            r.artifact.lodLevel,
+            std::move(r.artifact.vertices),
+            std::move(r.artifact.indices),
+            r.artifact.aabbMin,
+            r.artifact.aabbMax,
+            r.artifact.isEmpty,
+            /*deferredBuild=*/true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deferred LOD pre-warm: separate worker job (low priority).
+
+} // namespace TerrainEdit

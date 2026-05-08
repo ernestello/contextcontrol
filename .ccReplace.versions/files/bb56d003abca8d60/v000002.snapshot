@@ -1,0 +1,380 @@
+// GPT-DESC: Owns paged editable runtime mesh bookkeeping for terrain edits.
+#include "RemeshSchedulerInternal.h"
+
+namespace TerrainEdit::RemeshInternal {
+
+constexpr uint16_t kChunkEditPagesPerAxis =
+    static_cast<uint16_t>(WorldConfig::CHUNK_SIZE / ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS);
+constexpr uint16_t kChunkEditPageCount = kChunkEditPagesPerAxis * kChunkEditPagesPerAxis;
+constexpr uint16_t kChunkVoxelHeight =
+    static_cast<uint16_t>(WorldConfig::CHUNK_HEIGHT);
+
+void ensurePagedRuntimeScaffold(ChunkEditRuntime& editRuntime)
+{
+    editRuntime.targetMode = ChunkMeshMode::PagedEditable;
+    if (!editRuntime.pages.empty()) {
+        return;
+    }
+
+    editRuntime.pages.reserve(kChunkEditPageCount);
+    for (uint16_t pageZ = 0; pageZ < kChunkEditPagesPerAxis; ++pageZ) {
+        for (uint16_t pageX = 0; pageX < kChunkEditPagesPerAxis; ++pageX) {
+            ChunkEditPageRuntime page{};
+            page.pageId = static_cast<uint16_t>(pageZ * kChunkEditPagesPerAxis + pageX);
+            page.bounds.minX = static_cast<uint16_t>(pageX * ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS);
+            page.bounds.maxX = static_cast<uint16_t>(page.bounds.minX + ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS - 1);
+            page.bounds.minY = 0;
+            page.bounds.maxY = 0;
+            page.bounds.minZ = static_cast<uint16_t>(pageZ * ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS);
+            page.bounds.maxZ = static_cast<uint16_t>(page.bounds.minZ + ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS - 1);
+            editRuntime.pages.push_back(page);
+        }
+    }
+}
+
+uint8_t decodePackedX(const Vertex& vertex)
+{
+    return static_cast<uint8_t>(vertex.packed & 0xFFu);
+}
+
+uint16_t decodePackedY(const Vertex& vertex)
+{
+    return static_cast<uint16_t>((vertex.packed >> 8) & 0x3FFu);
+}
+
+uint8_t decodePackedZ(const Vertex& vertex)
+{
+    return static_cast<uint8_t>((vertex.packed >> 18) & 0xFFu);
+}
+
+void offsetPackedVerticesXZ(std::vector<Vertex>& vertices, uint8_t offsetX, uint8_t offsetZ)
+{
+    if (offsetX == 0 && offsetZ == 0) {
+        return;
+    }
+
+    for (auto& vertex : vertices) {
+        const uint32_t packed = vertex.packed;
+        const uint32_t x = (packed & 0xFFu) + offsetX;
+        const uint32_t z = ((packed >> 18) & 0xFFu) + offsetZ;
+        vertex.packed = (packed & ~((0xFFu << 0) | (0xFFu << 18)))
+            | ((x & 0xFFu) << 0)
+            | ((z & 0xFFu) << 18);
+    }
+}
+
+bool computeAABBFromVertices(const std::vector<Vertex>& vertices,
+                             glm::vec3& outMin,
+                             glm::vec3& outMax)
+{
+    if (vertices.empty()) {
+        outMin = glm::vec3(1e10f);
+        outMax = glm::vec3(-1e10f);
+        return false;
+    }
+
+    constexpr float kVoxelSize = WorldConfig::VOXEL_SIZE_M;
+    outMin = glm::vec3(1e10f);
+    outMax = glm::vec3(-1e10f);
+    for (const auto& vertex : vertices) {
+        const glm::vec3 pos(
+            static_cast<float>(decodePackedX(vertex)) * kVoxelSize,
+            static_cast<float>(decodePackedY(vertex)) * kVoxelSize,
+            static_cast<float>(decodePackedZ(vertex)) * kVoxelSize);
+        outMin = glm::min(outMin, pos);
+        outMax = glm::max(outMax, pos);
+    }
+
+    const float pad = kVoxelSize * 0.5f;
+    outMin -= glm::vec3(pad);
+    outMax += glm::vec3(pad);
+    return true;
+}
+
+uint16_t pageIdFromTriangle(const Vertex& a, const Vertex& b, const Vertex& c)
+{
+    const float cx =
+        (static_cast<float>(decodePackedX(a)) +
+         static_cast<float>(decodePackedX(b)) +
+         static_cast<float>(decodePackedX(c))) / 3.0f;
+    const float cz =
+        (static_cast<float>(decodePackedZ(a)) +
+         static_cast<float>(decodePackedZ(b)) +
+         static_cast<float>(decodePackedZ(c))) / 3.0f;
+    const uint16_t pageX = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(cx) / ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS, 0, kChunkEditPagesPerAxis - 1));
+    const uint16_t pageZ = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(cz) / ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS, 0, kChunkEditPagesPerAxis - 1));
+    return static_cast<uint16_t>(pageZ * kChunkEditPagesPerAxis + pageX);
+}
+
+void storePageCpuMesh(ChunkEditPageRuntime& page,
+                      std::vector<Vertex>&& vertices,
+                      std::vector<uint16_t>&& indices)
+{
+    page.cpuVertices = std::move(vertices);
+    page.cpuIndices = std::move(indices);
+    if (!page.cpuVertices.empty() && !page.cpuIndices.empty()) {
+        computeAABBFromVertices(page.cpuVertices, page.localAabbMin, page.localAabbMax);
+        uint16_t minY = kChunkVoxelHeight - 1;
+        uint16_t maxY = 0;
+        for (const auto& vertex : page.cpuVertices) {
+            const uint16_t y = decodePackedY(vertex);
+            minY = std::min<uint16_t>(minY, y);
+            maxY = std::max<uint16_t>(maxY, y);
+        }
+        page.bounds.minY = minY;
+        page.bounds.maxY = maxY;
+        page.resident = true;
+    } else {
+        page.cpuVertices.clear();
+        page.cpuIndices.clear();
+        page.localAabbMin = glm::vec3(1e10f);
+        page.localAabbMax = glm::vec3(-1e10f);
+        page.resident = false;
+    }
+}
+
+void clearPageCpuMesh(ChunkEditPageRuntime& page)
+{
+    page.cpuVertices.clear();
+    page.cpuIndices.clear();
+    page.localAabbMin = glm::vec3(1e10f);
+    page.localAabbMax = glm::vec3(-1e10f);
+    page.resident = false;
+}
+
+void partitionMergedMeshIntoPages(const std::vector<Vertex>& vertices,
+                                  const std::vector<uint32_t>& indices,
+                                  ChunkEditRuntime& editRuntime)
+{
+    struct PageBuilder {
+        std::vector<Vertex> vertices;
+        std::vector<uint16_t> indices;
+        std::unordered_map<uint32_t, uint16_t> remap;
+    };
+
+    std::array<PageBuilder, kChunkEditPageCount> builders;
+    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
+        const uint32_t i0 = indices[i + 0];
+        const uint32_t i1 = indices[i + 1];
+        const uint32_t i2 = indices[i + 2];
+        if (i0 >= vertices.size() || i1 >= vertices.size() || i2 >= vertices.size()) {
+            continue;
+        }
+
+        const uint16_t pageId = pageIdFromTriangle(vertices[i0], vertices[i1], vertices[i2]);
+        auto& builder = builders[pageId];
+
+        auto addVertex = [&](uint32_t sourceIndex) -> uint16_t {
+            auto it = builder.remap.find(sourceIndex);
+            if (it != builder.remap.end()) {
+                return it->second;
+            }
+
+            const uint16_t newIndex = static_cast<uint16_t>(builder.vertices.size());
+            builder.vertices.push_back(vertices[sourceIndex]);
+            builder.remap.emplace(sourceIndex, newIndex);
+            return newIndex;
+        };
+
+        builder.indices.push_back(addVertex(i0));
+        builder.indices.push_back(addVertex(i1));
+        builder.indices.push_back(addVertex(i2));
+    }
+
+    for (uint16_t pageId = 0; pageId < editRuntime.pages.size(); ++pageId) {
+        auto& page = editRuntime.pages[pageId];
+        auto& builder = builders[pageId];
+        if (!builder.vertices.empty() && !builder.indices.empty()) {
+            storePageCpuMesh(page, std::move(builder.vertices), std::move(builder.indices));
+        } else {
+            clearPageCpuMesh(page);
+        }
+        page.dirtyData = false;
+        page.dirtyMesh = false;
+        page.uploadPending = false;
+    }
+}
+
+void mergeSubChunksToIndexedMesh(const std::vector<SubChunkMesh>& subChunks,
+                                 std::vector<Vertex>& outVertices,
+                                 std::vector<uint32_t>& outIndices)
+{
+    outVertices.clear();
+    outIndices.clear();
+
+    for (const auto& subChunk : subChunks) {
+        if (subChunk.isEmpty()) {
+            continue;
+        }
+
+        const uint32_t baseIndex = static_cast<uint32_t>(outVertices.size());
+        outVertices.reserve(outVertices.size() + subChunk.vertices.size());
+        for (uint32_t packedVertex : subChunk.vertices) {
+            outVertices.push_back(Vertex{packedVertex});
+        }
+        outIndices.reserve(outIndices.size() + subChunk.indices.size());
+        for (uint16_t index : subChunk.indices) {
+            outIndices.push_back(baseIndex + index);
+        }
+    }
+}
+
+TerrainEditRemeshScheduler::CachedArtifact combinePagedArtifact(
+    const ChunkEditRuntime& editRuntime,
+    TerrainType terrainType,
+    int lodLevel)
+{
+    TerrainEditRemeshScheduler::CachedArtifact artifact;
+    artifact.terrainType = terrainType;
+    artifact.lodLevel = lodLevel;
+    artifact.isEmpty = true;
+
+    for (const auto& page : editRuntime.pages) {
+        if (!page.hasCpuMesh()) {
+            continue;
+        }
+
+        const uint32_t baseIndex = static_cast<uint32_t>(artifact.vertices.size());
+        artifact.vertices.insert(
+            artifact.vertices.end(),
+            page.cpuVertices.begin(),
+            page.cpuVertices.end());
+        artifact.indices.reserve(artifact.indices.size() + page.cpuIndices.size());
+        for (uint16_t index : page.cpuIndices) {
+            artifact.indices.push_back(baseIndex + index);
+        }
+        artifact.aabbMin = glm::min(artifact.aabbMin, page.localAabbMin);
+        artifact.aabbMax = glm::max(artifact.aabbMax, page.localAabbMax);
+        artifact.isEmpty = false;
+    }
+
+    if (artifact.isEmpty) {
+        artifact.aabbMin = glm::vec3(1e10f);
+        artifact.aabbMax = glm::vec3(-1e10f);
+    }
+
+    return artifact;
+}
+
+void applyDirtyPageUpdate(ChunkEditRuntime& editRuntime, const DirtyChunkPages& dirtyPages)
+{
+    ensurePagedRuntimeScaffold(editRuntime);
+    editRuntime.targetMode = ChunkMeshMode::PagedEditable;
+    editRuntime.needsPromotion = true;
+    editRuntime.needsTopologyRebuild = true;
+    ++editRuntime.dataGeneration;
+
+    const size_t pageCount = std::min(dirtyPages.pageIds.size(), dirtyPages.pageBounds.size());
+    for (size_t i = 0; i < pageCount; ++i) {
+        const uint16_t pageId = dirtyPages.pageIds[i];
+        if (pageId >= editRuntime.pages.size()) {
+            continue;
+        }
+
+        auto& page = editRuntime.pages[pageId];
+        const auto& src = dirtyPages.pageBounds[i];
+        if (page.dataGeneration == 0 && !page.resident && !page.dirtyData && !page.dirtyMesh) {
+            page.bounds.minY = std::min<uint16_t>(src.minY, kChunkVoxelHeight - 1);
+            page.bounds.maxY = std::min<uint16_t>(src.maxY, kChunkVoxelHeight - 1);
+        } else {
+            page.bounds.minY = std::min<uint16_t>(page.bounds.minY, std::min<uint16_t>(src.minY, kChunkVoxelHeight - 1));
+            page.bounds.maxY = std::max<uint16_t>(page.bounds.maxY, std::min<uint16_t>(src.maxY, kChunkVoxelHeight - 1));
+        }
+
+        page.dataGeneration = editRuntime.dataGeneration;
+        page.dirtyData = true;
+        page.dirtyMesh = true;
+        page.uploadPending = false;
+        if (std::find(editRuntime.dirtyPageIds.begin(), editRuntime.dirtyPageIds.end(), pageId) ==
+            editRuntime.dirtyPageIds.end()) {
+            editRuntime.dirtyPageIds.push_back(pageId);
+        }
+    }
+}
+
+uint16_t countResidentPages(const ChunkEditRuntime& editRuntime)
+{
+    uint16_t resident = 0;
+    for (const auto& page : editRuntime.pages) {
+        if (page.resident) {
+            ++resident;
+        }
+    }
+    return resident;
+}
+
+bool shouldExposePagedEditableMode(TerrainType terrainType,
+                                   int lodLevel,
+                                   const ChunkEditRuntime* editRuntime)
+{
+    (void)editRuntime;
+    if (terrainType != TerrainType::Voxel || lodLevel != 0) {
+        return false;
+    }
+
+    // Cross-LOD edits may leave a chunk carrying a stale monolithic target
+    // from a coarser data LOD. Once we are back at full voxel LOD, that old
+    // target must not block promotion into the paged editable path, or the
+    // next full-res edit can punch temporary holes until enough nearby edits
+    // rebuild the missing local pages.
+    return true;
+}
+
+void fillPagedDebugInfo(const ChunkEditRuntime& editRuntime, ChunkDebugAttribution& debugInfo)
+{
+    debugInfo.workModel = ChunkWorkModel::PagedLocal;
+    debugInfo.meshMode = static_cast<uint8_t>(ChunkMeshMode::PagedEditable);
+    debugInfo.dirtyPages = static_cast<uint16_t>(
+        std::min<size_t>(editRuntime.dirtyPageIds.size(), UINT16_MAX));
+    debugInfo.residentPages = countResidentPages(editRuntime);
+}
+
+void finalizePagedRuntime(ChunkEditRuntime& editRuntime, ChunkDebugAttribution& debugInfo)
+{
+    fillPagedDebugInfo(editRuntime, debugInfo);
+    debugInfo.rebuiltPages = debugInfo.dirtyPages;
+
+    if (debugInfo.dirtyPages == 0) {
+        return;
+    }
+
+    ++editRuntime.meshGeneration;
+    for (const uint16_t pageId : editRuntime.dirtyPageIds) {
+        if (pageId >= editRuntime.pages.size()) {
+            continue;
+        }
+        auto& page = editRuntime.pages[pageId];
+        page.meshGeneration = editRuntime.meshGeneration;
+        page.dirtyData = false;
+        page.dirtyMesh = false;
+        page.uploadPending = false;
+        page.resident = page.hasCpuMesh();
+    }
+    editRuntime.dirtyPageIds.clear();
+    editRuntime.needsPromotion = false;
+    debugInfo.residentPages = countResidentPages(editRuntime);
+}
+
+void mergePendingDirtyPages(DirtyChunkPages& dst, const DirtyChunkPages& src)
+{
+    const size_t pageCount = std::min(src.pageIds.size(), src.pageBounds.size());
+    for (size_t i = 0; i < pageCount; ++i) {
+        const uint16_t pageId = src.pageIds[i];
+        const auto existing = std::find(dst.pageIds.begin(), dst.pageIds.end(), pageId);
+        if (existing == dst.pageIds.end()) {
+            dst.pageIds.push_back(pageId);
+            dst.pageBounds.push_back(src.pageBounds[i]);
+            continue;
+        }
+
+        const size_t existingIdx = static_cast<size_t>(existing - dst.pageIds.begin());
+        auto& bounds = dst.pageBounds[existingIdx];
+        bounds.minY = std::min(bounds.minY, src.pageBounds[i].minY);
+        bounds.maxY = std::max(bounds.maxY, src.pageBounds[i].maxY);
+    }
+    dst.directPages = static_cast<uint16_t>(
+        std::min<size_t>(dst.pageIds.size(), UINT16_MAX));
+    dst.haloPages = src.haloPages;
+}
+
+} // namespace TerrainEdit::RemeshInternal
