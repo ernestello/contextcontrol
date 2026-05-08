@@ -1,0 +1,14 @@
+// GPT-DESC: Facade accessors for the split texture paint tool implementation.
+#include "TexturePaintToolInternal.h"
+
+using TextureOverlay::TextureOverlayStore;
+
+TextureOverlayStore& TexturePaintTool::getStore() {
+    static TextureOverlayStore fallback;
+    return m_world ? m_world->getTextureMaterialStore() : fallback;
+}
+
+const TextureOverlayStore& TexturePaintTool::getStore() const {
+    static TextureOverlayStore fallback;
+    return m_world ? m_world->getTextureMaterialStore() : fallback;
+}

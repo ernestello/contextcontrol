@@ -1,0 +1,298 @@
+// GPT-DESC: Implements the texture paint ImGui debug/control window.
+#include "TexturePaintToolInternal.h"
+
+#include <algorithm>
+#include <cfloat>
+#include <climits>
+#include <cmath>
+
+#include <imgui.h>
+
+#include "world/config/WorldConfig.h"
+
+using TextureOverlay::LODTextureConfig;
+using TextureOverlay::TextureOverlayStore;
+using TextureOverlay::TextureType;
+using namespace TexturePaintToolInternal;
+
+void TexturePaintTool::renderUI() {
+    ImGui::TextColored(kAccent, "Texture Paint Brush");
+    ImGui::Separator();
+
+    ImGui::Checkbox("Brush Active", &m_active);
+    if (!m_active) {
+        ImGui::TextDisabled("Enable to paint pixel-art textures onto terrain");
+    }
+
+    // ---------------- Brush shape + radius ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Brush");
+
+    const bool isSphere = (m_shape == BrushShape::Sphere);
+    if (isSphere) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26f, 0.59f, 0.98f, 0.80f));
+    }
+    if (ImGui::Button("Sphere")) m_shape = BrushShape::Sphere;
+    if (isSphere) ImGui::PopStyleColor();
+    ImGui::SameLine();
+    const bool isBox = (m_shape == BrushShape::Box);
+    if (isBox) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26f, 0.59f, 0.98f, 0.80f));
+    }
+    if (ImGui::Button("Box")) m_shape = BrushShape::Box;
+    if (isBox) ImGui::PopStyleColor();
+
+    ImGui::SetNextItemWidth(180.0f);
+    int radius = m_radiusVoxelsLod0;
+    if (ImGui::SliderInt("Radius (LOD-0 voxels)", &radius, 1, 1024)) {
+        setBrushRadiusVoxels(radius);
+    }
+    ImGui::SetNextItemWidth(180.0f);
+    radius = m_radiusVoxelsLod0;
+    if (ImGui::InputInt("Custom radius (max 10240)", &radius, 64, 512)) {
+        setBrushRadiusVoxels(radius);
+    }
+    radius = m_radiusVoxelsLod0;
+    const int64_t side = static_cast<int64_t>(radius) * 2 + 1;
+    const int64_t approxCells = (m_shape == BrushShape::Sphere)
+        ? static_cast<int64_t>(3.14159265 * static_cast<double>(radius) * static_cast<double>(radius))
+        : side * side;
+    ImGui::TextDisabled("  -> %.3f m at LOD 0, approx %lld face cells, repeat %.0f ms",
+                        radius * WorldConfig::VOXEL_SIZE_M,
+                        static_cast<long long>(std::max<int64_t>(1, approxCells)),
+                        getPaintRepeatIntervalSec() * 1000.0f);
+
+    // ---------------- Texture type + variant ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Material");
+    static const char* TYPE_NAMES[] = { "Grass", "Mud", "Dirt", "Sand" };
+    int typeIdx = static_cast<int>(m_textureType);
+    if (ImGui::Combo("Type", &typeIdx, TYPE_NAMES, IM_ARRAYSIZE(TYPE_NAMES))) {
+        m_textureType = static_cast<TextureType>(typeIdx);
+    }
+
+    int variant = m_variant;
+    if (ImGui::SliderInt("Variant seed", &variant, 0, 7)) {
+        setVariant(static_cast<uint8_t>(variant));
+    }
+
+    const auto& activeStyle = TextureOverlay::TextureBrushStyles::getStyle(m_textureType);
+    ImGui::TextColored(kHeading, "Brush Style System");
+    ImGui::TextDisabled("Design, preview colors, variants, and edge blending are owned by TextureBrushStyles.");
+
+    auto showStyleColor = [](const char* label, const glm::vec3& color) {
+        ImGui::ColorButton(label,
+                           ImVec4(color.x, color.y, color.z, 1.0f),
+                           ImGuiColorEditFlags_NoTooltip,
+                           ImVec2(22.0f, 22.0f));
+        ImGui::SameLine();
+        ImGui::Text("%s: %.2f %.2f %.2f", label, color.x, color.y, color.z);
+    };
+
+    showStyleColor("Base", activeStyle.preview.base);
+    showStyleColor("Highlight", activeStyle.preview.highlight);
+    showStyleColor("Shadow", activeStyle.preview.shadow);
+    showStyleColor("Accent", activeStyle.preview.accent);
+
+    // ---------------- LOD targeting ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "LOD Targeting");
+
+    int modeIdx = static_cast<int>(m_lodMode);
+    ImGui::RadioButton("Auto from hit chunk", &modeIdx, 0); ImGui::SameLine();
+    ImGui::RadioButton("Manual",              &modeIdx, 1);
+    m_lodMode = static_cast<LODMode>(modeIdx);
+
+    if (m_lodMode == LODMode::Manual) {
+        int lod = m_manualLod;
+        if (ImGui::SliderInt("Target LOD", &lod, 0,
+                             TextureOverlayStore::LOD_COUNT - 1)) {
+            setManualLOD(lod);
+        }
+    } else {
+        if (m_hasPlacementContext) {
+            ImGui::Text("Hit LOD: %d  (voxel %.3f m)", m_hitLod, m_hitVoxelSizeM);
+        } else {
+            ImGui::TextDisabled("Hover terrain to resolve hit LOD");
+        }
+    }
+
+    ImGui::Checkbox("Cascade paint to coarser LODs", &m_cascadeToCoarser);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("When enabled, the same stroke also paints into all "
+                          "LOD levels coarser than the source LOD, so the "
+                          "texture stays visible after a chunk LOD swap.");
+    }
+    ImGui::TextDisabled("Shader material preview LOD: %d (final pixels are shaded in terrain)",
+                        getPreviewLOD());
+
+    // ---------------- Per-LOD resolution config ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Per-LOD Texture Resolution");
+    ImGui::TextDisabled("Texels per voxel face edge.  Adapt: each LOD step "
+                        "is 2x bigger voxels / 1/8 the cells.");
+
+    if (ImGui::BeginTable("perLodCfg", 4,
+                          ImGuiTableFlags_BordersInnerV |
+                          ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("LOD", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("Voxel size", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("Resolution", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Enabled", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableHeadersRow();
+
+        for (int lod = 0; lod < TextureOverlayStore::LOD_COUNT; ++lod) {
+            ImGui::TableNextRow();
+            ImGui::PushID(lod);
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("LOD %d", lod);
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%.3f m", WorldConfig::getLODVoxelSizeM(lod));
+
+            ImGui::TableSetColumnIndex(2);
+            LODTextureConfig cfg = getStore().getLODConfig(lod);
+            int currentIdx = 0;
+            for (int i = 0; i < TextureOverlayStore::RES_OPTION_COUNT; ++i) {
+                if (TextureOverlayStore::RES_OPTIONS[i] == cfg.pixelsPerVoxel) {
+                    currentIdx = i; break;
+                }
+            }
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::Combo("##res",
+                             &currentIdx,
+                             TextureOverlayStore::RES_OPTION_LABELS,
+                             TextureOverlayStore::RES_OPTION_COUNT)) {
+                cfg.pixelsPerVoxel = TextureOverlayStore::RES_OPTIONS[currentIdx];
+                getStore().setLODConfig(lod, cfg);
+            }
+
+            ImGui::TableSetColumnIndex(3);
+            bool enabled = cfg.enabled;
+            if (ImGui::Checkbox("##en", &enabled)) {
+                cfg.enabled = enabled;
+                getStore().setLODConfig(lod, cfg);
+            }
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    // ---------------- Live hit preview info ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Hit Preview");
+    if (!m_hasHit) {
+        ImGui::TextDisabled("Move mouse over terrain to preview");
+    } else {
+        ImGui::Text("Hit:    (%.3f, %.3f, %.3f)", m_hitPos.x, m_hitPos.y, m_hitPos.z);
+        ImGui::Text("Normal: (%.2f, %.2f, %.2f)", m_hitNormal.x, m_hitNormal.y, m_hitNormal.z);
+        const int lod = getActivePaintLOD();
+        const auto cfg = getStore().getLODConfig(lod);
+        ImGui::Text("Source paint LOD: 0 (%dx%d px/face)%s",
+                    getStore().getLODConfig(0).pixelsPerVoxel,
+                    getStore().getLODConfig(0).pixelsPerVoxel,
+                    getStore().getLODConfig(0).enabled ? "" : "  [DISABLED]");
+        ImGui::Text("Render-preview LOD: %d (%dx%d px/face)%s",
+                    lod, cfg.pixelsPerVoxel, cfg.pixelsPerVoxel,
+                    cfg.enabled ? "" : "  [DISABLED]");
+        const int rLod = (m_radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
+        ImGui::Text("Effective surface radius: %d voxel%s at LOD %d",
+                    rLod, rLod == 1 ? "" : "s", lod);
+    }
+
+    // ---------------- Last paint diagnostics ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Last Paint");
+    if (m_lastFacesCollected == 0 && m_lastCellsPainted == 0 && m_lastCellsCascaded == 0) {
+        ImGui::TextDisabled("Left click to paint");
+    } else {
+        ImGui::Text("Surface faces found: %d", m_lastFacesCollected);
+        ImGui::Text("Face cells changed: %d (LOD %d)", m_lastCellsPainted, m_lastPaintLod);
+        if (m_lastFacesUnchanged > 0) {
+            ImGui::TextDisabled("Unchanged/no-op: %d", m_lastFacesUnchanged);
+        }
+        if (m_cascadeToCoarser) {
+            ImGui::Text("Cascaded to coarser: %d cells", m_lastCellsCascaded);
+        }
+        ImGui::Text("Time: %.3f ms", m_lastPaintMs);
+        ImGui::TextDisabled("Pending material-rebake chunks: %zu", m_pendingTextureDirtyChunks.size());
+    }
+
+    if (ImGui::TreeNode("Last 50 Brush Edit Diagnostics")) {
+        ImGui::TextDisabled("Copy this table when brush spam still tanks FPS.");
+        if (ImGui::Button("Copy Last 50 Paint Stats")) {
+            m_lastDiagnosticsExport = buildPaintDiagnosticsReport();
+            ImGui::SetClipboardText(m_lastDiagnosticsExport.c_str());
+        }
+        if (!m_lastDiagnosticsExport.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("copied %zu bytes", m_lastDiagnosticsExport.size());
+        }
+
+        if (ImGui::BeginTable("paintDiagHistory", 9,
+                              ImGuiTableFlags_BordersInnerV |
+                              ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 38.0f);
+            ImGui::TableSetupColumn("total");
+            ImGui::TableSetupColumn("collect");
+            ImGui::TableSetupColumn("store");
+            ImGui::TableSetupColumn("sched");
+            ImGui::TableSetupColumn("faces");
+            ImGui::TableSetupColumn("changed");
+            ImGui::TableSetupColumn("flush");
+            ImGui::TableSetupColumn("pending");
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < m_paintDiagCount; ++i) {
+                const int idx = (m_paintDiagWriteIndex - m_paintDiagCount + i + PAINT_DIAG_HISTORY)
+                    % PAINT_DIAG_HISTORY;
+                const PaintOpDiagnostic& d = m_paintDiagHistory[static_cast<size_t>(idx)];
+
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("%llu", static_cast<unsigned long long>(d.serial));
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", d.totalMs);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", d.collectMs);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", d.storeMs);
+                ImGui::TableSetColumnIndex(4); ImGui::Text("%.2f", d.scheduleMs);
+                ImGui::TableSetColumnIndex(5); ImGui::Text("%d", d.facesCollected);
+                ImGui::TableSetColumnIndex(6); ImGui::Text("%d", d.cellsPainted);
+                ImGui::TableSetColumnIndex(7); ImGui::Text("%d", d.flushedChunks);
+                ImGui::TableSetColumnIndex(8); ImGui::Text("%d", d.pendingChunksAfter);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+
+    // ---------------- Store stats ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Voxel Material Store");
+    const auto stats = getStore().getStats();
+    ImGui::Text("Total: %zu bricks  %zu cells  (gen %zu)",
+                stats.totalBricks, stats.totalCells, stats.generation);
+    if (ImGui::TreeNode("Per-LOD breakdown")) {
+        for (int lod = 0; lod < TextureOverlayStore::LOD_COUNT; ++lod) {
+            ImGui::Text("  LOD %d: %zu bricks  %zu cells",
+                        lod, stats.bricksByLOD[lod], stats.cellsByLOD[lod]);
+        }
+        ImGui::TreePop();
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button("Clear All Textures")) {
+        getStore().clear();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear Hit LOD")) {
+        getStore().clearLOD(getActivePaintLOD());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Copy Last 50 Paint Stats##bottom")) {
+        m_lastDiagnosticsExport = buildPaintDiagnosticsReport();
+        ImGui::SetClipboardText(m_lastDiagnosticsExport.c_str());
+    }
+}

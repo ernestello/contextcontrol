@@ -1,0 +1,84 @@
+#pragma once
+
+// GPT-DESC: Shared private helpers for split TexturePaintTool implementation units.
+
+#include "ui/debug_menu/world/TexturePaintTool.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstddef>
+
+#include <imgui.h>
+#include <glm/glm.hpp>
+
+#include "world/config/WorldConfig.h"
+
+namespace TexturePaintToolInternal {
+
+inline constexpr float PREVIEW_FADE_SEC = 1.5f;
+inline constexpr int MAX_SURFACE_BRUSH_FACES = 300000;
+inline constexpr int64_t MAX_SURFACE_BRUSH_SCAN_VOXELS = 16000000;
+
+// Same screen-ray construction as TerrainEditTool.
+inline glm::vec3 screenToWorldRay(double mouseX,
+                                  double mouseY,
+                                  int viewportW,
+                                  int viewportH,
+                                  const glm::mat4& invViewProj) {
+    const float ndcX =  (2.0f * static_cast<float>(mouseX)) / static_cast<float>(viewportW) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * static_cast<float>(mouseY)) / static_cast<float>(viewportH);
+    glm::vec4 nearP = invViewProj * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    glm::vec4 farP  = invViewProj * glm::vec4(ndcX, ndcY, 0.01f, 1.0f);
+    nearP /= nearP.w;
+    farP  /= farP.w;
+    return glm::normalize(glm::vec3(farP) - glm::vec3(nearP));
+}
+
+inline const ImVec4 kAccent = ImVec4(0.95f, 0.55f, 0.10f, 1.0f);
+inline const ImVec4 kHeading = ImVec4(0.55f, 0.85f, 1.0f, 1.0f);
+
+inline ImU32 colorFromVec3(const glm::vec3& c, uint8_t alpha = 220u) {
+    const uint8_t r = static_cast<uint8_t>(std::clamp(c.x, 0.0f, 1.0f) * 255.0f);
+    const uint8_t g = static_cast<uint8_t>(std::clamp(c.y, 0.0f, 1.0f) * 255.0f);
+    const uint8_t b = static_cast<uint8_t>(std::clamp(c.z, 0.0f, 1.0f) * 255.0f);
+    return IM_COL32(r, g, b, alpha);
+}
+
+inline glm::ivec3 faceNormalI(uint8_t face) {
+    switch (face % 6u) {
+        case 0: return glm::ivec3(-1, 0, 0);
+        case 1: return glm::ivec3( 1, 0, 0);
+        case 2: return glm::ivec3(0, -1, 0);
+        case 3: return glm::ivec3(0,  1, 0);
+        case 4: return glm::ivec3(0, 0, -1);
+        default: return glm::ivec3(0, 0,  1);
+    }
+}
+
+inline glm::vec3 faceCenterWorld(const glm::ivec3& voxel, uint8_t face) {
+    glm::vec3 p = glm::vec3(voxel) + glm::vec3(0.5f);
+    p += glm::vec3(faceNormalI(face)) * 0.5f;
+    return p * WorldConfig::VOXEL_SIZE_M;
+}
+
+struct PaintFaceKey {
+    glm::ivec3 voxel{0};
+    uint8_t face{0};
+    bool operator==(const PaintFaceKey& other) const noexcept {
+        return voxel == other.voxel && face == other.face;
+    }
+};
+
+struct PaintFaceKeyHash {
+    size_t operator()(const PaintFaceKey& key) const noexcept {
+        uint64_t h = static_cast<uint32_t>(key.voxel.x) * 73856093ull;
+        h ^= static_cast<uint32_t>(key.voxel.y) * 19349663ull;
+        h ^= static_cast<uint32_t>(key.voxel.z) * 83492791ull;
+        h ^= static_cast<uint64_t>(key.face) * 2654435761ull;
+        h ^= h >> 33;
+        return static_cast<size_t>(h);
+    }
+};
+
+} // namespace TexturePaintToolInternal

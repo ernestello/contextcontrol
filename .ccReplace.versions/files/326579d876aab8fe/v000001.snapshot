@@ -1,0 +1,132 @@
+// GPT-DESC: Implements the texture paint world-space brush preview overlay.
+#include "TexturePaintToolInternal.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+
+#include <imgui.h>
+
+#include "world/config/WorldConfig.h"
+
+using TextureOverlay::TextureOverlayStore;
+using namespace TexturePaintToolInternal;
+
+void TexturePaintTool::renderPreviewOverlay(const glm::mat4& viewProj,
+                                            int viewportW, int viewportH,
+                                            float viewportOffsetX,
+                                            float viewportOffsetY) {
+    if (!m_active || !m_hasHit) return;
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+    const ImU32 col = colorFromVec3(getTypeBaseColor(m_textureType));
+    const ImU32 fill = (col & 0x00FFFFFFu) | 0x33000000u;
+
+    const float vpW = static_cast<float>(viewportW);
+    const float vpH = static_cast<float>(viewportH);
+
+    auto project = [&](const glm::vec3& wp, ImVec2& out) -> bool {
+        glm::vec4 c = viewProj * glm::vec4(wp, 1.0f);
+        if (c.w <= 0.01f) return false;
+        glm::vec3 ndc = glm::vec3(c) / c.w;
+        out.x = viewportOffsetX + (ndc.x * 0.5f + 0.5f) * vpW;
+        out.y = viewportOffsetY + (1.0f - (ndc.y * 0.5f + 0.5f)) * vpH;
+        return true;
+    };
+
+    const int lod = getActivePaintLOD();
+    const float voxelSize = WorldConfig::getLODVoxelSizeM(lod);
+    const float radiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
+
+    if (m_shape == BrushShape::Sphere) {
+        // 3 great circles, like TerrainEditTool's fallback path.
+        auto drawCircle = [&](int a0, int a1, int aN) {
+            constexpr int SEG = 32;
+            ImVec2 pts[SEG]; bool vis[SEG];
+            for (int i = 0; i < SEG; ++i) {
+                float ang = 6.28318530f * float(i) / float(SEG);
+                glm::vec3 p = m_hitPos;
+                p[a0] = m_hitPos[a0] + std::cos(ang) * radiusM;
+                p[a1] = m_hitPos[a1] + std::sin(ang) * radiusM;
+                p[aN] = m_hitPos[aN];
+                vis[i] = project(p, pts[i]);
+            }
+            for (int i = 0; i < SEG; ++i) {
+                int j = (i + 1) % SEG;
+                if (vis[i] && vis[j]) dl->AddLine(pts[i], pts[j], col, 2.0f);
+            }
+        };
+        drawCircle(0, 1, 2);
+        drawCircle(0, 2, 1);
+        drawCircle(1, 2, 0);
+    } else {
+        // Box wireframe
+        const glm::vec3 lo = m_hitPos - glm::vec3(radiusM);
+        const glm::vec3 hi = m_hitPos + glm::vec3(radiusM);
+        const glm::vec3 corners[8] = {
+            {lo.x,lo.y,lo.z}, {hi.x,lo.y,lo.z},
+            {hi.x,hi.y,lo.z}, {lo.x,hi.y,lo.z},
+            {lo.x,lo.y,hi.z}, {hi.x,lo.y,hi.z},
+            {hi.x,hi.y,hi.z}, {lo.x,hi.y,hi.z},
+        };
+        ImVec2 sp[8]; bool vis[8];
+        for (int i = 0; i < 8; ++i) vis[i] = project(corners[i], sp[i]);
+        constexpr int E[12][2] = {
+            {0,1},{1,2},{2,3},{3,0},
+            {4,5},{5,6},{6,7},{7,4},
+            {0,4},{1,5},{2,6},{3,7}
+        };
+        for (auto& e : E) {
+            if (vis[e[0]] && vis[e[1]]) dl->AddLine(sp[e[0]], sp[e[1]], col, 2.0f);
+        }
+        // Light fill on the dominant face for readability
+        constexpr int F[6][4] = {
+            {0,1,2,3},{4,5,6,7},
+            {3,2,6,7},{0,1,5,4},
+            {0,3,7,4},{1,2,6,5}
+        };
+        for (auto& f : F) {
+            if (vis[f[0]] && vis[f[1]] && vis[f[2]] && vis[f[3]]) {
+                dl->AddQuadFilled(sp[f[0]], sp[f[1]], sp[f[2]], sp[f[3]], fill);
+            }
+        }
+    }
+
+    // Mark the hit point
+    ImVec2 hitScreen;
+    if (project(m_hitPos, hitScreen)) {
+        dl->AddCircleFilled(hitScreen, 3.0f, col);
+        // Label: type + variant + active LOD + resolution
+        const auto cfg = getStore().getLODConfig(lod);
+        char label[160];
+        std::snprintf(label, sizeof(label),
+                      "%s v%u  LOD %d  %dx%d px/face  r=%.3fm  vox=%.3fm",
+                      TextureOverlay::textureTypeName(m_textureType),
+                      static_cast<unsigned>(m_variant),
+                      lod,
+                      cfg.pixelsPerVoxel, cfg.pixelsPerVoxel,
+                      radiusM,
+                      voxelSize);
+        dl->AddText(ImVec2(hitScreen.x + 12.0f, hitScreen.y - 8.0f), col, label);
+    }
+
+    // Last-paint floating ms readout (fades over PREVIEW_FADE_SEC)
+    if (m_lastPaintMs > 0.0f) {
+        const float t = std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - m_previewStartTime).count();
+        if (t < PREVIEW_FADE_SEC) {
+            const float a = std::clamp(1.0f - t / PREVIEW_FADE_SEC, 0.0f, 1.0f);
+            ImVec2 sp;
+            if (project(m_lastPaintWorldCenter, sp)) {
+                char ms[64];
+                std::snprintf(ms, sizeof(ms), "+%d/%d cells (%.2f ms)",
+                              m_lastCellsPainted, m_lastFacesCollected, m_lastPaintMs);
+                ImU32 c = (col & 0x00FFFFFFu) |
+                          (static_cast<uint32_t>(a * 255.0f) << 24);
+                dl->AddText(ImVec2(sp.x, sp.y - 24.0f), c, ms);
+            }
+        }
+    }
+}

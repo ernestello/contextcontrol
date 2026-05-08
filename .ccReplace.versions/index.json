@@ -928,7 +928,7 @@
                       "Path":  "src/ui/debug_menu/world/TexturePaintTool.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\TexturePaintTool.cpp",
                       "Key":  "984185f35b3d3aa4",
-                      "CurrentVersion":  9,
+                      "CurrentVersion":  10,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -983,6 +983,12 @@
                                            "Timestamp":  "2026-05-08T11:36:14.4842244Z",
                                            "Snapshot":  "files\\984185f35b3d3aa4\\v000009.snapshot",
                                            "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  10,
+                                           "Timestamp":  "2026-05-08T11:54:30.6363736Z",
+                                           "Snapshot":  "files\\984185f35b3d3aa4\\v000010.snapshot",
+                                           "Reason":  "applied whole_file"
                                        }
                                    ]
                   },
@@ -1140,7 +1146,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  10,
+                      "CurrentVersion":  11,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1200,6 +1206,12 @@
                                            "Version":  10,
                                            "Timestamp":  "2026-05-08T11:48:34.8505798Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000010.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  11,
+                                           "Timestamp":  "2026-05-08T11:54:30.6599609Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000011.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -2116,6 +2128,96 @@
                                            "Version":  2,
                                            "Timestamp":  "2026-05-08T11:48:34.8204160Z",
                                            "Snapshot":  "files\\702340fd2e8fadfa\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/ui/debug_menu/world/texture_paint/TexturePaintToolInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\texture_paint\\TexturePaintToolInternal.h",
+                      "Key":  "cfa203470f8acd95",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:54:30.5081246Z",
+                                           "Snapshot":  "files\\cfa203470f8acd95\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/ui/debug_menu/world/texture_paint/TexturePaintTool.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\texture_paint\\TexturePaintTool.cpp",
+                      "Key":  "1924103e6a259c38",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:54:30.5262072Z",
+                                           "Snapshot":  "files\\1924103e6a259c38\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T11:56:36.2946420Z",
+                                           "Snapshot":  "files\\1924103e6a259c38\\v000002.snapshot",
+                                           "Reason":  "applied insert_include"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/ui/debug_menu/world/texture_paint/TexturePaintToolExecution.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\texture_paint\\TexturePaintToolExecution.cpp",
+                      "Key":  "a55c4fa5d5ad358c",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:54:30.5469424Z",
+                                           "Snapshot":  "files\\a55c4fa5d5ad358c\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/ui/debug_menu/world/texture_paint/TexturePaintToolDiagnostics.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\texture_paint\\TexturePaintToolDiagnostics.cpp",
+                      "Key":  "43d4e0a34185c970",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:54:30.5689892Z",
+                                           "Snapshot":  "files\\43d4e0a34185c970\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/ui/debug_menu/world/texture_paint/TexturePaintToolUI.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\texture_paint\\TexturePaintToolUI.cpp",
+                      "Key":  "cd6787589d1137df",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:54:30.5907188Z",
+                                           "Snapshot":  "files\\cd6787589d1137df\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/ui/debug_menu/world/texture_paint/TexturePaintToolPreview.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\texture_paint\\TexturePaintToolPreview.cpp",
+                      "Key":  "326579d876aab8fe",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:54:30.6108156Z",
+                                           "Snapshot":  "files\\326579d876aab8fe\\v000001.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]

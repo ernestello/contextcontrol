@@ -1,0 +1,2 @@
+// GPT-DESC: Legacy placeholder; TexturePaintTool implementation now lives in ui/debug_menu/world/texture_paint/.
+#include "ui/debug_menu/world/TexturePaintTool.h"

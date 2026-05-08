@@ -20,2300 +20,1531 @@ Minimal rules for this turn:
 Default CMake build, when applicable: cmake --build build --config Release -j
 
 
-## src\world\edit\TextureOverlayStore.cpp
+## src\ui\debug_menu\world\TexturePaintTool.cpp
 
-Description: No CC-DESC found. C++ struct 'TextureOverlayIvec3Hash'.
+Description: No CC-DESC found. C++ struct 'PaintFaceKey'.
 
 ````cpp
-#include "world/edit/TextureOverlayStore.h"
+// GPT-DESC: Implements texture paint brush authoring, diagnostics, and debounced material rebake scheduling.
+#include "ui/debug_menu/world/TexturePaintTool.h"
 
 #include <algorithm>
-#include <cstring>
-#include <fstream>
 #include <cmath>
-#include "world/edit/texture/TextureBrushStyles.h"
+#include <string>
+#include <climits>
+#include <cstdio>
+#include <queue>
+#include <unordered_set>
 
-namespace TextureOverlay {
+#include <imgui.h>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include "world/World.h"
+#include "world/edit/TerrainEditTypes.h"
+
+using TextureOverlay::TextureOverlayStore;
+using TextureOverlay::TextureType;
+using TextureOverlay::LODTextureConfig;
+using TextureOverlay::VoxelTextureData;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 namespace {
-constexpr glm::ivec3 kNeighborDirs[6] = {
-    glm::ivec3( 1, 0, 0), glm::ivec3(-1, 0, 0),
-    glm::ivec3( 0, 1, 0), glm::ivec3( 0,-1, 0),
-    glm::ivec3( 0, 0, 1), glm::ivec3( 0, 0,-1)
-};
-uint32_t hashPaintCoord(const glm::ivec3& coord, uint8_t face, uint32_t salt) {
-    uint32_t h = static_cast<uint32_t>(coord.x) * 0x9E3779B9u;
-    h ^= static_cast<uint32_t>(coord.y) * 0x85EBCA6Bu;
-    h ^= static_cast<uint32_t>(coord.z) * 0xC2B2AE35u;
-    h ^= static_cast<uint32_t>(face) * 0x27D4EB2Du;
-    h ^= salt * 0x165667B1u;
-    h ^= h >> 16;
-    h *= 0x7FEB352Du;
-    h ^= h >> 15;
-    return h;
+
+constexpr float PREVIEW_FADE_SEC = 1.5f;
+constexpr int MAX_SURFACE_BRUSH_FACES = 300000;
+constexpr int64_t MAX_SURFACE_BRUSH_SCAN_VOXELS = 16000000;
+
+// Same screen-ray construction as TerrainEditTool.
+glm::vec3 screenToWorldRay(double mouseX, double mouseY,
+                           int viewportW, int viewportH,
+                           const glm::mat4& invViewProj) {
+    const float ndcX =  (2.0f * static_cast<float>(mouseX)) / static_cast<float>(viewportW) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * static_cast<float>(mouseY)) / static_cast<float>(viewportH);
+    glm::vec4 nearP = invViewProj * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    glm::vec4 farP  = invViewProj * glm::vec4(ndcX, ndcY, 0.01f, 1.0f);
+    nearP /= nearP.w;
+    farP  /= farP.w;
+    return glm::normalize(glm::vec3(farP) - glm::vec3(nearP));
 }
 
-uint8_t variedVariant(const glm::ivec3& coord,
-                      uint8_t face,
-                      TextureType type,
-                      uint8_t seed) {
-    return TextureBrushStyles::computeVariant(coord, face, type, seed);
+const ImVec4 kAccent = ImVec4(0.95f, 0.55f, 0.10f, 1.0f);
+const ImVec4 kHeading = ImVec4(0.55f, 0.85f, 1.0f, 1.0f);
+
+ImU32 colorFromVec3(const glm::vec3& c, uint8_t alpha = 220u) {
+    const uint8_t r = static_cast<uint8_t>(std::clamp(c.x, 0.0f, 1.0f) * 255.0f);
+    const uint8_t g = static_cast<uint8_t>(std::clamp(c.y, 0.0f, 1.0f) * 255.0f);
+    const uint8_t b = static_cast<uint8_t>(std::clamp(c.z, 0.0f, 1.0f) * 255.0f);
+    return IM_COL32(r, g, b, alpha);
 }
 
-constexpr uint32_t GPU_OVERLAY_CHUNK_SENTINEL_FACE = 7u;
-constexpr uint32_t GPU_OVERLAY_CHUNK_SENTINEL_MATERIAL = 0x40000000u;
-constexpr int64_t MAX_INDEXED_SURFACE_STAMP_CHUNKS = 4096;
-
-glm::ivec3 materialOverlayChunkSentinelCoord(const glm::ivec3& lod0Coord) {
-    return WorldConfig::microVoxelToChunk(lod0Coord);
-}
-
-TextureOverlayStore::GPUCell makeChunkSentinelGPUCell(const glm::ivec3& lod0Coord) {
-    const glm::ivec3 chunk = materialOverlayChunkSentinelCoord(lod0Coord);
-
-    TextureOverlayStore::GPUCell sentinel{};
-    sentinel.x = chunk.x;
-    sentinel.y = chunk.y;
-    sentinel.z = chunk.z;
-    sentinel.lod = 0u;
-    sentinel.packed = GPU_OVERLAY_CHUNK_SENTINEL_MATERIAL;
-    sentinel.face = GPU_OVERLAY_CHUNK_SENTINEL_FACE;
-    return sentinel;
-}
-
-int64_t chunkRangeVolumeInclusive(const glm::ivec3& minChunk,
-                                  const glm::ivec3& maxChunk) {
-    if (minChunk.x > maxChunk.x ||
-        minChunk.y > maxChunk.y ||
-        minChunk.z > maxChunk.z) {
-        return 0;
+glm::ivec3 faceNormalI(uint8_t face) {
+    switch (face % 6u) {
+        case 0: return glm::ivec3(-1, 0, 0);
+        case 1: return glm::ivec3( 1, 0, 0);
+        case 2: return glm::ivec3(0, -1, 0);
+        case 3: return glm::ivec3(0,  1, 0);
+        case 4: return glm::ivec3(0, 0, -1);
+        default: return glm::ivec3(0, 0,  1);
     }
-
-    return int64_t(maxChunk.x - minChunk.x + 1) *
-           int64_t(maxChunk.y - minChunk.y + 1) *
-           int64_t(maxChunk.z - minChunk.z + 1);
 }
 
-bool chunkInInclusiveRange(const glm::ivec3& chunk,
-                           const glm::ivec3& minChunk,
-                           const glm::ivec3& maxChunk) {
-    return chunk.x >= minChunk.x && chunk.x <= maxChunk.x &&
-           chunk.y >= minChunk.y && chunk.y <= maxChunk.y &&
-           chunk.z >= minChunk.z && chunk.z <= maxChunk.z;
+glm::vec3 faceCenterWorld(const glm::ivec3& voxel, uint8_t face) {
+    glm::vec3 p = glm::vec3(voxel) + glm::vec3(0.5f);
+    p += glm::vec3(faceNormalI(face)) * 0.5f;
+    return p * WorldConfig::VOXEL_SIZE_M;
 }
 
-struct TextureOverlayIvec3Hash {
-    size_t operator()(const glm::ivec3& v) const noexcept {
-        uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(v.x)) * 73856093ull;
-        h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.y)) * 19349663ull;
-        h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.z)) * 83492791ull;
-        h ^= h >> 33;
-        h *= 0xff51afd7ed558ccdull;
+struct PaintFaceKey {
+    glm::ivec3 voxel{0};
+    uint8_t face{0};
+    bool operator==(const PaintFaceKey& other) const noexcept {
+        return voxel == other.voxel && face == other.face;
+    }
+};
+
+struct PaintFaceKeyHash {
+    size_t operator()(const PaintFaceKey& key) const noexcept {
+        uint64_t h = static_cast<uint32_t>(key.voxel.x) * 73856093ull;
+        h ^= static_cast<uint32_t>(key.voxel.y) * 19349663ull;
+        h ^= static_cast<uint32_t>(key.voxel.z) * 83492791ull;
+        h ^= static_cast<uint64_t>(key.face) * 2654435761ull;
         h ^= h >> 33;
         return static_cast<size_t>(h);
     }
 };
 
-
-
-void facePlaneAxes(uint8_t face, int& uAxis, int& vAxis) {
-    face %= 6u;
-    if (face <= 1u) {
-        uAxis = 1; // Y
-        vAxis = 2; // Z
-    } else if (face <= 3u) {
-        uAxis = 0; // X
-        vAxis = 2; // Z
-    } else {
-        uAxis = 0; // X
-        vAxis = 1; // Y
-    }
-}
-
-using IVec3Hash = TextureOverlayIvec3Hash;
-
 } // namespace
 
-// ---------------------------------------------------------------------------
-// Static resolution options (advertised to the UI)
-// ---------------------------------------------------------------------------
-
-const uint16_t TextureOverlayStore::RES_OPTIONS[RES_OPTION_COUNT] = {
-    2, 4, 8, 16, 32, 64, 128, 256, 512, 1024
-};
-const char* TextureOverlayStore::RES_OPTION_LABELS[RES_OPTION_COUNT] = {
-    "2x2", "4x4", "8x8", "16x16", "32x32", "64x64",
-    "128x128", "256x256", "512x512", "1024x1024"
-};
-
-// ---------------------------------------------------------------------------
-// Construction / config
-// ---------------------------------------------------------------------------
-
-TextureOverlayStore::TextureOverlayStore() {
-    // Default cascade: finer voxels get more pixels.  At LOD 0 a 0.25m voxel
-    // gets 16x16 px (= 64 px/m).  Each coarser LOD halves the pixel density
-    // so the perceived texel size on screen stays roughly constant.
-    m_lodConfigs[0] = LODTextureConfig{16, true};
-    if (LOD_COUNT > 1) m_lodConfigs[1] = LODTextureConfig{8, true};
-    if (LOD_COUNT > 2) m_lodConfigs[2] = LODTextureConfig{4, true};
-    if (LOD_COUNT > 3) m_lodConfigs[3] = LODTextureConfig{2, true};
-    if (LOD_COUNT > 4) m_lodConfigs[4] = LODTextureConfig{2, true};
+TextureOverlayStore& TexturePaintTool::getStore() {
+    static TextureOverlayStore fallback;
+    return m_world ? m_world->getTextureMaterialStore() : fallback;
 }
 
-void TextureOverlayStore::setLODConfig(int lod, const LODTextureConfig& cfg) {
-    if (!isLodValid(lod)) return;
-    std::unique_lock lock(m_mutex);
-    LODTextureConfig clamped = cfg;
-    // Clamp pixelsPerVoxel to a power of two in [2, 1024].
-    uint16_t v = clamped.pixelsPerVoxel;
-    if (v < 2) v = 2;
-    if (v > 1024) v = 1024;
-    // Round down to nearest power of two.
-    uint16_t pow2 = 2;
-    while ((pow2 << 1) <= v) pow2 <<= 1;
-    clamped.pixelsPerVoxel = pow2;
-    m_lodConfigs[lod] = clamped;
-    if (lod == 0) {
-        requestFullGPUUploadLocked();
+const TextureOverlayStore& TexturePaintTool::getStore() const {
+    static TextureOverlayStore fallback;
+    return m_world ? m_world->getTextureMaterialStore() : fallback;
+}
+
+float TexturePaintTool::getPaintRepeatIntervalSec() const {
+    const int radius = std::max(1, m_radiusVoxelsLod0);
+    const int side = radius * 2 + 1;
+    const int64_t approxFaceCells = (m_shape == BrushShape::Sphere)
+        ? static_cast<int64_t>(3.14159265f * static_cast<float>(radius) * static_cast<float>(radius))
+        : static_cast<int64_t>(side) * static_cast<int64_t>(side);
+
+    // Small brushes feel like a normal paint brush. Huge brushes become
+    // stamp tools; repeating them at 20 Hz creates identical store writes and
+    // remesh storms with no visual benefit.
+    if (approxFaceCells <= 4096)   return 0.05f;
+    if (approxFaceCells <= 16384)  return 0.08f;
+    if (approxFaceCells <= 65536)  return 0.12f;
+    if (approxFaceCells <= 180000) return 0.18f;
+    return 0.25f;
+}
+
+size_t TexturePaintTool::flushPendingTextureDirtyChunks(bool force) {
+    if (!m_world || m_pendingTextureDirtyChunks.empty()) {
+        return 0u;
     }
-    m_generation.fetch_add(1, std::memory_order_release);
-}
 
-LODTextureConfig TextureOverlayStore::getLODConfig(int lod) const {
-    if (!isLodValid(lod)) return {};
-    std::shared_lock lock(m_mutex);
-    return m_lodConfigs[lod];
-}
-
-// ---------------------------------------------------------------------------
-// Coordinate helpers
-// ---------------------------------------------------------------------------
-
-TextureOverlayStore::BrickKey
-TextureOverlayStore::voxelToBrick(const glm::ivec3& v) {
-    // Arithmetic shift (>>3) gives floor-divide-by-8 for negative coords too.
-    return BrickKey{ v.x >> 3, v.y >> 3, v.z >> 3 };
-}
-
-glm::ivec3 TextureOverlayStore::voxelLocalInBrick(const glm::ivec3& v) {
-    // & 0x7 wraps correctly for negative coords (two's complement).
-    return glm::ivec3(v.x & 0x7, v.y & 0x7, v.z & 0x7);
-}
-
-glm::ivec3 TextureOverlayStore::encodeFaceCoord(const glm::ivec3& voxelCoord,
-                                                uint8_t face) {
-    return glm::ivec3(voxelCoord.x, voxelCoord.y,
-                      voxelCoord.z * 6 + static_cast<int>(face % 6u));
-}
-
-glm::ivec3 TextureOverlayStore::decodeFaceCoord(const glm::ivec3& storageCoord,
-                                                uint8_t& face) {
-    int z = storageCoord.z / 6;
-    int rem = storageCoord.z % 6;
-    if (rem < 0) {
-        rem += 6;
-        --z;
-    }
-    face = static_cast<uint8_t>(rem);
-    return glm::ivec3(storageCoord.x, storageCoord.y, z);
-}
-
-// ---------------------------------------------------------------------------
-// Brick access (caller holds appropriate lock)
-// ---------------------------------------------------------------------------
-
-TextureBrick*
-TextureOverlayStore::getOrCreateBrickLocked(BrickMap& map, int lod, BrickKey key) {
-    auto it = map.find(key);
-    if (it == map.end()) {
-        auto [newIt, _] = map.emplace(key, std::make_unique<TextureBrick>());
-        if (isLodValid(lod)) {
-            ++m_brickCountsByLOD[lod];
-        }
-        return newIt->second.get();
-    }
-    return it->second.get();
-}
-
-const TextureBrick*
-TextureOverlayStore::getBrickLocked(const BrickMap& map, BrickKey key) const {
-    auto it = map.find(key);
-    return (it != map.end()) ? it->second.get() : nullptr;
-}
-
-TextureBrick*
-TextureOverlayStore::getBrickLocked(BrickMap& map, BrickKey key) {
-    auto it = map.find(key);
-    return (it != map.end()) ? it->second.get() : nullptr;
-}
-
-void TextureOverlayStore::writeCellLocked(BrickMap& map,
-                                          int lod,
-                                          BrickKey key,
-                                          const glm::ivec3& local,
-                                          VoxelTextureData data) {
-    TextureBrick* brick = getBrickLocked(map, key);
-    if (!brick) {
-        if (data.isEmpty()) {
-            return;
-        }
-        brick = getOrCreateBrickLocked(map, lod, key);
-    }
-    int idx = TextureBrick::toIndex(local.x, local.y, local.z);
-    VoxelTextureData& slot = brick->cells[idx];
-    const bool wasActive = !slot.isEmpty();
-    const bool willBeActive = !data.isEmpty();
-    slot = data;
-    if (wasActive && !willBeActive) {
-        --brick->activeCount;
-        if (isLodValid(lod) && m_cellCountsByLOD[lod] > 0u) {
-            --m_cellCountsByLOD[lod];
-        }
-    } else if (!wasActive && willBeActive) {
-        ++brick->activeCount;
-        if (isLodValid(lod)) {
-            ++m_cellCountsByLOD[lod];
-        }
-    }
-    // Note: empty bricks intentionally retained after an active cell is erased.
-    // Paint operations are bursty, and the next stroke usually re-fills the
-    // same brick. Missing bricks are not created for empty/no-op writes.
-}
-
-uint8_t TextureOverlayStore::classifyTransitionEdge(TextureType a,
-                                                    TextureType b,
-                                                    const glm::ivec3& lodCoord) {
-    return static_cast<uint8_t>(
-        TextureBrushStyles::classifyTransitionEdge(a, b, lodCoord));
-}
-
-uint8_t TextureOverlayStore::mergeEdgeStyle(uint8_t lhs, uint8_t rhs) {
-    return static_cast<uint8_t>(
-        TextureBrushStyles::mergeEdgeStyle(
-            static_cast<TransitionEdgeStyle>(lhs & 0x3u),
-            static_cast<TransitionEdgeStyle>(rhs & 0x3u)));
-}
-
-void TextureOverlayStore::recordDirtyGPUCellLocked(int lod,
-                                                   const glm::ivec3& lodCoord,
-                                                   VoxelTextureData data) {
-    (void)lod;
-    (void)lodCoord;
-    (void)data;
-
-    // Phase 3 material-bake path:
-    //
-    // The paint brush must not grow the fragment-time global material overlay.
-    // That overlay was the bottleneck: millions of painted voxel-face cells were
-    // uploaded into one large random-access SSBO/hash table, then cube.frag had
-    // to probe it from the terrain/light pass.
-    //
-    // Painted material remains canonical in this CPU TextureOverlayStore. The
-    // renderable representation is produced by remeshing the touched chunks and
-    // packing the material into Vertex::material, which is the shader fast path.
-    //
-    // Force one empty full-upload so any old/stale overlay cells are removed
-    // from the GPU table, but never enqueue per-cell GPU deltas here.
-    if (!m_dirtyGPUFullUpload) {
-        m_dirtyGPUCells.clear();
-        m_dirtyGPUFullUpload = true;
-    }
-}
-
-void TextureOverlayStore::requestFullGPUUploadLocked() {
-    m_dirtyGPUCells.clear();
-    m_dirtyGPUFullUpload = true;
-}
-
-void TextureOverlayStore::refreshTransitionEdgesAroundCellLocked(BrickMap& map,
-                                                                 int lod,
-                                                                 const glm::ivec3& lodCoord) {
-    TextureBrick* brick = getBrickLocked(map, voxelToBrick(lodCoord));
-    if (!brick) return;
-    const glm::ivec3 local = voxelLocalInBrick(lodCoord);
-    const int idx = TextureBrick::toIndex(local.x, local.y, local.z);
-    VoxelTextureData center = brick->cells[idx];
-    if (center.isEmpty()) return;
-
-    const TextureType centerType = center.getType();
-    uint8_t centerEdge = static_cast<uint8_t>(TransitionEdgeStyle::None);
-
-    for (const glm::ivec3& d : kNeighborDirs) {
-        const glm::ivec3 ncoord = lodCoord + d;
-        TextureBrick* nbrick = getBrickLocked(map, voxelToBrick(ncoord));
-        if (!nbrick) continue;
-
-        const glm::ivec3 nlocal = voxelLocalInBrick(ncoord);
-        const int nidx = TextureBrick::toIndex(nlocal.x, nlocal.y, nlocal.z);
-        VoxelTextureData neighbor = nbrick->cells[nidx];
-        if (neighbor.isEmpty()) continue;
-
-        const TextureType neighborType = neighbor.getType();
-        if (neighborType == centerType) continue;
-
-        const uint8_t centerStyle = classifyTransitionEdge(centerType, neighborType, lodCoord);
-        centerEdge = mergeEdgeStyle(centerEdge, centerStyle);
-
-        const uint8_t neighborStyle = classifyTransitionEdge(neighborType, centerType, ncoord);
-        const uint8_t mergedNeighborEdge = mergeEdgeStyle(neighbor.getEdgeMask(), neighborStyle);
-        if (mergedNeighborEdge != neighbor.getEdgeMask()) {
-            const VoxelTextureData updated = neighbor.withEdgeMask(mergedNeighborEdge);
-            nbrick->cells[nidx] = updated;
-            recordDirtyGPUCellLocked(lod, ncoord, updated);
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && m_lastTextureDirtyFlushTime.time_since_epoch().count() != 0) {
+        const float elapsed = std::chrono::duration<float>(now - m_lastTextureDirtyFlushTime).count();
+        if (elapsed < m_textureDirtyFlushIntervalSec &&
+            static_cast<int>(m_pendingTextureDirtyChunks.size()) > m_immediateTextureDirtyChunkCap) {
+            return 0u;
         }
     }
 
-    if (centerEdge != center.getEdgeMask()) {
-        const VoxelTextureData updated = center.withEdgeMask(centerEdge);
-        brick->cells[idx] = updated;
-        recordDirtyGPUCellLocked(lod, lodCoord, updated);
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet chunks;
+    chunks.swap(m_pendingTextureDirtyChunks);
+    const size_t flushed = chunks.size();
+
+    // Canonical texture paint is baked into normal chunk material data.
+    // This is deliberately not the live-stamp path: once face cells are written,
+    // only the touched chunks are remeshed so Vertex::material becomes the same
+    // fast path as default terrain material.
+    m_world->markTextureMaterialsDirty(chunks);
+    m_lastTextureDirtyFlushTime = now;
+    return flushed;
+}
+
+void TexturePaintTool::recordPaintDiagnostic(const PaintOpDiagnostic& diag) {
+    PaintOpDiagnostic stored = diag;
+    stored.serial = ++m_paintDiagSerial;
+
+    m_paintDiagHistory[static_cast<size_t>(m_paintDiagWriteIndex)] = stored;
+    m_paintDiagWriteIndex = (m_paintDiagWriteIndex + 1) % PAINT_DIAG_HISTORY;
+    if (m_paintDiagCount < PAINT_DIAG_HISTORY) {
+        ++m_paintDiagCount;
     }
 }
 
-void TextureOverlayStore::refreshTransitionEdgesAroundFaceLocked(BrickMap& map,
-                                                                 int lod,
-                                                                 const glm::ivec3& lodCoord,
-                                                                 uint8_t face) {
-    face %= 6u;
-    const glm::ivec3 storageCoord = encodeFaceCoord(lodCoord, face);
-    TextureBrick* brick = getBrickLocked(map, voxelToBrick(storageCoord));
-    if (!brick) return;
+std::string TexturePaintTool::buildPaintDiagnosticsReport() const {
+    std::string out;
+    out.reserve(32768);
 
-    const glm::ivec3 local = voxelLocalInBrick(storageCoord);
-    const int idx = TextureBrick::toIndex(local.x, local.y, local.z);
-    VoxelTextureData center = brick->cells[idx];
-    if (center.isEmpty()) return;
+    auto appendLine = [&](const char* text) {
+        out += text;
+        out += '\n';
+    };
 
-    const TextureType centerType = center.getType();
-    uint8_t centerEdge = static_cast<uint8_t>(TransitionEdgeStyle::None);
+    struct VisualStatus {
+        float firstMs{0.0f};
+        float completeMs{0.0f};
+        int totalChunks{0};
+        int readyChunks{0};
+        int pendingChunks{0};
+        uint64_t uploadBytes{0};
+        bool complete{false};
+    };
 
-    int uAxis = 0;
-    int vAxis = 1;
-    facePlaneAxes(face, uAxis, vAxis);
-    glm::ivec3 neighborOffsets[4]{};
-    neighborOffsets[0][uAxis] =  1;
-    neighborOffsets[1][uAxis] = -1;
-    neighborOffsets[2][vAxis] =  1;
-    neighborOffsets[3][vAxis] = -1;
+    auto sameCoord = [](const glm::ivec3& a, const glm::ivec3& b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    };
 
-    for (const glm::ivec3& offset : neighborOffsets) {
-        const glm::ivec3 ncoord = lodCoord + offset;
-        const glm::ivec3 nstorage = encodeFaceCoord(ncoord, face);
-        TextureBrick* nbrick = getBrickLocked(map, voxelToBrick(nstorage));
-        if (!nbrick) continue;
+    auto computeVisualStatus = [&](const PaintOpDiagnostic& d) {
+        VisualStatus s{};
+        s.totalChunks = static_cast<int>(d.visualChunks.size());
+        s.pendingChunks = s.totalChunks;
 
-        const glm::ivec3 nlocal = voxelLocalInBrick(nstorage);
-        const int nidx = TextureBrick::toIndex(nlocal.x, nlocal.y, nlocal.z);
-        VoxelTextureData neighbor = nbrick->cells[nidx];
-        if (neighbor.isEmpty()) continue;
-
-        const TextureType neighborType = neighbor.getType();
-        if (neighborType == centerType) continue;
-
-        const uint8_t centerStyle = classifyTransitionEdge(centerType, neighborType, lodCoord);
-        centerEdge = mergeEdgeStyle(centerEdge, centerStyle);
-
-        const uint8_t neighborStyle = classifyTransitionEdge(neighborType, centerType, ncoord);
-        const uint8_t mergedNeighborEdge = mergeEdgeStyle(neighbor.getEdgeMask(), neighborStyle);
-        if (mergedNeighborEdge != neighbor.getEdgeMask()) {
-            const VoxelTextureData updated = neighbor.withEdgeMask(mergedNeighborEdge);
-            nbrick->cells[nidx] = updated;
-            recordDirtyGPUCellLocked(lod, ncoord, updated);
+        if (!m_world || d.visualChunks.empty() || d.visualStartSec <= 0.0) {
+            return s;
         }
-    }
 
-    if (centerEdge != center.getEdgeMask()) {
-        const VoxelTextureData updated = center.withEdgeMask(centerEdge);
-        brick->cells[idx] = updated;
-        recordDirtyGPUCellLocked(lod, lodCoord, updated);
-    }
-}
+        std::vector<uint8_t> seen(d.visualChunks.size(), 0u);
+        const auto& history = m_world->getChunkVisualHistory();
+        const size_t scanCount = std::min(history.count, World::ChunkVisualHistory::CAPACITY);
 
-// ---------------------------------------------------------------------------
-// Single-cell access
-// ---------------------------------------------------------------------------
+        bool anyReady = false;
+        for (size_t i = 0; i < scanCount; ++i) {
+            const auto& e = history.getFromEnd(i);
+            const double entrySec = static_cast<double>(e.timestampSec);
 
-void TextureOverlayStore::setTexture(const glm::ivec3& lodCoord,
-                                     int lod,
-                                     VoxelTextureData data) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return;
-    std::unique_lock lock(m_mutex);
-    BrickKey key = voxelToBrick(lodCoord);
-    glm::ivec3 local = voxelLocalInBrick(lodCoord);
-    writeCellLocked(m_lodMaps[lod], lod, key, local, data);
-    if (data.isEmpty()) {
-        requestFullGPUUploadLocked();
-    } else {
-        recordDirtyGPUCellLocked(lod, lodCoord, data);
-    }
-    auto& map = m_lodMaps[lod];
-    if (!data.isEmpty()) {
-        refreshTransitionEdgesAroundCellLocked(map, lod, lodCoord);
-        for (const glm::ivec3& d : kNeighborDirs) {
-            refreshTransitionEdgesAroundCellLocked(map, lod, lodCoord + d);
-        }
-    } else {
-        for (const glm::ivec3& d : kNeighborDirs) {
-            refreshTransitionEdgesAroundCellLocked(map, lod, lodCoord + d);
-        }
-    }
-    m_generation.fetch_add(1, std::memory_order_release);
-}
-
-VoxelTextureData
-TextureOverlayStore::getTexture(const glm::ivec3& lodCoord, int lod) const {
-    if (!isLodValid(lod)) return {};
-    std::shared_lock lock(m_mutex);
-    BrickKey key = voxelToBrick(lodCoord);
-    glm::ivec3 local = voxelLocalInBrick(lodCoord);
-    const TextureBrick* brick = getBrickLocked(m_lodMaps[lod], key);
-    if (!brick) return {};
-    return brick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
-}
-
-VoxelTextureData
-TextureOverlayStore::getSurfaceTexture(const glm::ivec3& lodCoord,
-                                       int lod,
-                                       uint8_t face) const {
-    if (!isLodValid(lod)) return {};
-
-    const uint8_t queryFace = static_cast<uint8_t>(face % 6u);
-    const glm::ivec3 storageCoord = encodeFaceCoord(lodCoord, queryFace);
-
-    std::shared_lock lock(m_mutex);
-
-    // Exact expanded/saved per-face cells win over deferred brush stamps.
-    {
-        const BrickKey key = voxelToBrick(storageCoord);
-        const glm::ivec3 local = voxelLocalInBrick(storageCoord);
-        const TextureBrick* brick = getBrickLocked(m_lodMaps[lod], key);
-        if (brick) {
-            const VoxelTextureData cell =
-                brick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
-            if (!cell.isEmpty()) {
-                return cell;
-            }
-        }
-    }
-
-    return sampleSurfacePaintStampsLocked(lodCoord, lod, queryFace);
-}
-
-bool TextureOverlayStore::hasSurfaceTexturesInBox(const glm::ivec3& minLodCoord,
-                                                  const glm::ivec3& maxExclusiveLodCoord,
-                                                  int lod) const {
-    if (!isLodValid(lod)) return false;
-    if (minLodCoord.x >= maxExclusiveLodCoord.x ||
-        minLodCoord.y >= maxExclusiveLodCoord.y ||
-        minLodCoord.z >= maxExclusiveLodCoord.z) {
-        return false;
-    }
-
-    const glm::ivec3 storageMin(minLodCoord.x,
-                                minLodCoord.y,
-                                minLodCoord.z * 6);
-    const glm::ivec3 storageMax(maxExclusiveLodCoord.x - 1,
-                                maxExclusiveLodCoord.y - 1,
-                                (maxExclusiveLodCoord.z - 1) * 6 + 5);
-    const BrickKey minBrick = voxelToBrick(storageMin);
-    const BrickKey maxBrick = voxelToBrick(storageMax);
-
-    std::shared_lock lock(m_mutex);
-    const auto& map = m_lodMaps[lod];
-    const int64_t brickVolume =
-        int64_t(maxBrick.bx - minBrick.bx + 1) *
-        int64_t(maxBrick.by - minBrick.by + 1) *
-        int64_t(maxBrick.bz - minBrick.bz + 1);
-
-    if (brickVolume > 0 && static_cast<uint64_t>(brickVolume) < map.size()) {
-        for (int32_t bz = minBrick.bz; bz <= maxBrick.bz; ++bz)
-        for (int32_t by = minBrick.by; by <= maxBrick.by; ++by)
-        for (int32_t bx = minBrick.bx; bx <= maxBrick.bx; ++bx) {
-            auto it = map.find(BrickKey{bx, by, bz});
-            if (it != map.end() && it->second && it->second->activeCount > 0) {
-                return true;
-            }
-        }
-    } else {
-        for (const auto& [key, brick] : map) {
-            if (!brick || brick->activeCount == 0) {
+            // ChunkVisualHistory stores timestampSec as float seconds from the
+            // same steady_clock epoch. Keep a small negative tolerance so float
+            // quantization does not hide first-frame completions.
+            if (entrySec + 0.020 < d.visualStartSec) {
                 continue;
             }
-            if (key.bx >= minBrick.bx && key.bx <= maxBrick.bx &&
-                key.by >= minBrick.by && key.by <= maxBrick.by &&
-                key.bz >= minBrick.bz && key.bz <= maxBrick.bz) {
-                return true;
+
+            for (size_t chunkIdx = 0; chunkIdx < d.visualChunks.size(); ++chunkIdx) {
+                if (seen[chunkIdx] != 0u || !sameCoord(e.chunkCoord, d.visualChunks[chunkIdx])) {
+                    continue;
+                }
+
+                seen[chunkIdx] = 1u;
+                ++s.readyChunks;
+                s.uploadBytes += e.uploadBytes;
+
+                float ms = static_cast<float>((entrySec - d.visualStartSec) * 1000.0);
+                if (ms < 0.0f) ms = 0.0f;
+                if (!anyReady) {
+                    s.firstMs = ms;
+                    s.completeMs = ms;
+                    anyReady = true;
+                } else {
+                    s.firstMs = std::min(s.firstMs, ms);
+                    s.completeMs = std::max(s.completeMs, ms);
+                }
+                break;
             }
         }
+
+        s.pendingChunks = std::max(0, s.totalChunks - s.readyChunks);
+        s.complete = s.totalChunks > 0 && s.readyChunks >= s.totalChunks;
+        return s;
+    };
+
+    appendLine("VulkanVX Texture Paint Brush Diagnostics");
+    appendLine("serial,total_ms,collect_ms,store_ms,cascade_ms,touched_ms,schedule_ms,"
+               "visual_stamp,visual_first_ms,visual_complete_ms,visual_chunks_total,"
+               "visual_chunks_ready,visual_chunks_pending,visual_complete,visual_upload_bytes,"
+               "radius_voxels,radius_m,shape,material,variant,lod,faces,changed,unchanged,"
+               "cascaded,touched_chunks,flushed_chunks,pending_chunks_after,hold_repeat,"
+               "center_x,center_y,center_z");
+
+    char line[1024];
+    for (int i = 0; i < m_paintDiagCount; ++i) {
+        const int idx = (m_paintDiagWriteIndex - m_paintDiagCount + i + PAINT_DIAG_HISTORY)
+            % PAINT_DIAG_HISTORY;
+        const PaintOpDiagnostic& d = m_paintDiagHistory[static_cast<size_t>(idx)];
+        const VisualStatus visual = computeVisualStatus(d);
+
+        std::snprintf(
+            line, sizeof(line),
+            "%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%.4f,%.4f,%d,%d,%d,%d,%llu,%d,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f",
+            static_cast<unsigned long long>(d.serial),
+            d.totalMs,
+            d.collectMs,
+            d.storeMs,
+            d.cascadeMs,
+            d.touchedMs,
+            d.scheduleMs,
+            d.visualStampOrder,
+            visual.firstMs,
+            visual.completeMs,
+            visual.totalChunks,
+            visual.readyChunks,
+            visual.pendingChunks,
+            visual.complete ? 1 : 0,
+            static_cast<unsigned long long>(visual.uploadBytes),
+            d.radiusVoxels,
+            d.radiusM,
+            d.shape,
+            d.material,
+            d.variant,
+            d.paintLod,
+            d.facesCollected,
+            d.cellsPainted,
+            d.facesUnchanged,
+            d.cellsCascaded,
+            d.touchedChunks,
+            d.flushedChunks,
+            d.pendingChunksAfter,
+            d.holdRepeat ? 1 : 0,
+            d.center.x,
+            d.center.y,
+            d.center.z);
+        appendLine(line);
     }
 
-    if (!m_surfacePaintStamps.empty()) {
-        const int step = (lod > 0) ? (1 << lod) : 1;
-        const glm::ivec3 minLod0 = lodToLOD0(minLodCoord, lod);
-        const glm::ivec3 maxLod0 =
-            lodToLOD0(maxExclusiveLodCoord - glm::ivec3(1), lod) + glm::ivec3(step - 1);
+    return out;
+}
 
-        const glm::ivec3 rawChunkMin = WorldConfig::microVoxelToChunk(minLod0);
-        const glm::ivec3 rawChunkMax = WorldConfig::microVoxelToChunk(maxLod0);
-        const glm::ivec3 chunkMin(
-            std::min(rawChunkMin.x, rawChunkMax.x),
-            std::min(rawChunkMin.y, rawChunkMax.y),
-            std::min(rawChunkMin.z, rawChunkMax.z));
-        const glm::ivec3 chunkMax(
-            std::max(rawChunkMin.x, rawChunkMax.x),
-            std::max(rawChunkMin.y, rawChunkMax.y),
-            std::max(rawChunkMin.z, rawChunkMax.z));
 
-        auto stampTouches = [&](uint32_t stampIndex) -> bool {
-            if (stampIndex >= m_surfacePaintStamps.size()) {
-                return false;
+// ---------------------------------------------------------------------------
+// Hit / LOD resolution
+// ---------------------------------------------------------------------------
+
+void TexturePaintTool::resolveHitLOD() {
+    m_hasPlacementContext = false;
+    m_hitLod = 0;
+    m_hitVoxelSizeM = WorldConfig::VOXEL_SIZE_M;
+    if (!m_world || !m_hasHit) return;
+
+    const auto ctx = m_world->getTerrainEditPlacementContext(m_hitPos);
+    if (!ctx.valid) return;
+
+    m_hasPlacementContext = true;
+    m_hitLod        = ctx.previewLodLevel;
+    m_hitVoxelSizeM = ctx.voxelSizeM;
+}
+
+int TexturePaintTool::getActivePaintLOD() const {
+    if (m_lodMode == LODMode::Manual) return m_manualLod;
+    return m_hasPlacementContext ? m_hitLod : 0;
+}
+
+int TexturePaintTool::getHitNormalAxis() const {
+    const glm::vec3 a = glm::abs(m_hitNormal);
+    if (a.y >= a.x && a.y >= a.z) return 1;
+    if (a.x >= a.y && a.x >= a.z) return 0;
+    return 2;
+}
+
+uint8_t TexturePaintTool::getHitFaceId() const {
+    const int axis = getHitNormalAxis();
+    const float sign = (axis == 0) ? m_hitNormal.x
+                     : (axis == 1) ? m_hitNormal.y
+                                   : m_hitNormal.z;
+    return static_cast<uint8_t>(axis * 2 + (sign >= 0.0f ? 1 : 0));
+}
+
+bool TexturePaintTool::isSolidLOD0(const glm::ivec3& voxelCoord) const {
+    if (!m_world) return false;
+    const auto& field = m_world->getTerrainFieldSource();
+    const int32_t scale = TerrainEdit::EDIT_CELLS_PER_VOXEL;
+    const TerrainEdit::GridCoord sampleCoord(
+        voxelCoord.x * scale + scale / 2,
+        voxelCoord.y * scale + scale / 2,
+        voxelCoord.z * scale + scale / 2);
+    return field.sample(sampleCoord).value.solid;
+}
+
+int TexturePaintTool::collectExposedSurfaceFacesLOD0(
+    std::vector<TextureOverlayStore::SurfaceFaceStamp>& outFaces) const {
+    outFaces.clear();
+    if (!m_world || !m_hasHit || m_radiusVoxelsLod0 <= 0) return 0;
+
+    const float invVoxel = static_cast<float>(WorldConfig::VOXELS_PER_METER);
+    const glm::vec3 insidePos = m_hitPos - m_hitNormal * 0.01f;
+    const glm::ivec3 startVoxel(
+        static_cast<int>(std::floor(insidePos.x * invVoxel)),
+        static_cast<int>(std::floor(insidePos.y * invVoxel)),
+        static_cast<int>(std::floor(insidePos.z * invVoxel)));
+    const uint8_t startFace = getHitFaceId();
+
+    auto isExposed = [&](const glm::ivec3& voxel, uint8_t face) {
+        return isSolidLOD0(voxel) && !isSolidLOD0(voxel + faceNormalI(face));
+    };
+
+    const float radiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
+    const float radiusSq = radiusM * radiusM;
+
+    auto insideBrush = [&](const glm::ivec3& voxel, uint8_t face) {
+        const glm::vec3 center = faceCenterWorld(voxel, face);
+        const glm::vec3 d = center - m_hitPos;
+
+        if (m_shape == BrushShape::Sphere) {
+            return glm::dot(d, d) <= radiusSq + 1e-5f;
+        }
+
+        return std::abs(d.x) <= radiusM + 1e-5f &&
+               std::abs(d.y) <= radiusM + 1e-5f &&
+               std::abs(d.z) <= radiusM + 1e-5f;
+    };
+
+    std::unordered_set<PaintFaceKey, PaintFaceKeyHash> emitted;
+    emitted.reserve(static_cast<size_t>(std::min(
+        MAX_SURFACE_BRUSH_FACES,
+        std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
+
+    auto appendFace = [&](const glm::ivec3& voxel, uint8_t face) -> bool {
+        PaintFaceKey key{voxel, static_cast<uint8_t>(face % 6u)};
+        if (emitted.find(key) != emitted.end()) {
+            return true;
+        }
+
+        emitted.insert(key);
+        outFaces.push_back(TextureOverlayStore::SurfaceFaceStamp{voxel, key.face});
+        return static_cast<int>(outFaces.size()) < MAX_SURFACE_BRUSH_FACES;
+    };
+
+    // Exact small/medium-brush path:
+    // sample local occupancy once, then collect every exposed face whose face
+    // center is inside the 3D brush volume. This catches top, bottom, and
+    // vertical voxel faces equally.
+    {
+        const int pad = m_radiusVoxelsLod0 + 2;
+        const glm::ivec3 scanMin = startVoxel - glm::ivec3(pad);
+        const glm::ivec3 scanMax = startVoxel + glm::ivec3(pad);
+        const int dimX = scanMax.x - scanMin.x + 1;
+        const int dimY = scanMax.y - scanMin.y + 1;
+        const int dimZ = scanMax.z - scanMin.z + 1;
+        const int64_t volume =
+            static_cast<int64_t>(dimX) *
+            static_cast<int64_t>(dimY) *
+            static_cast<int64_t>(dimZ);
+
+        if (dimX > 2 && dimY > 2 && dimZ > 2 &&
+            volume > 0 && volume <= MAX_SURFACE_BRUSH_SCAN_VOXELS) {
+            std::vector<uint8_t> solid(static_cast<size_t>(volume), 0u);
+
+            auto indexOf = [&](const glm::ivec3& voxel) -> size_t {
+                const int x = voxel.x - scanMin.x;
+                const int y = voxel.y - scanMin.y;
+                const int z = voxel.z - scanMin.z;
+                return static_cast<size_t>((z * dimY + y) * dimX + x);
+            };
+
+            for (int z = scanMin.z; z <= scanMax.z; ++z) {
+                for (int y = scanMin.y; y <= scanMax.y; ++y) {
+                    for (int x = scanMin.x; x <= scanMax.x; ++x) {
+                        const glm::ivec3 voxel(x, y, z);
+                        solid[indexOf(voxel)] = isSolidLOD0(voxel) ? 1u : 0u;
+                    }
+                }
             }
-            return surfaceStampTouchesBox(m_surfacePaintStamps[stampIndex], minLod0, maxLod0);
-        };
 
-        const int64_t chunkVolume = chunkRangeVolumeInclusive(chunkMin, chunkMax);
-        if (chunkVolume > 0 &&
-            static_cast<uint64_t>(chunkVolume) < m_surfacePaintStampChunkIndex.size()) {
-            for (int z = chunkMin.z; z <= chunkMax.z; ++z) {
-                for (int y = chunkMin.y; y <= chunkMax.y; ++y) {
-                    for (int x = chunkMin.x; x <= chunkMax.x; ++x) {
-                        auto it = m_surfacePaintStampChunkIndex.find(glm::ivec3(x, y, z));
-                        if (it == m_surfacePaintStampChunkIndex.end()) {
+            auto solidAt = [&](const glm::ivec3& voxel) -> bool {
+                return solid[indexOf(voxel)] != 0u;
+            };
+
+            outFaces.reserve(static_cast<size_t>(std::min(
+                MAX_SURFACE_BRUSH_FACES,
+                std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
+
+            const glm::ivec3 candidateMin = scanMin + glm::ivec3(1);
+            const glm::ivec3 candidateMax = scanMax - glm::ivec3(1);
+
+            for (int z = candidateMin.z; z <= candidateMax.z; ++z) {
+                for (int y = candidateMin.y; y <= candidateMax.y; ++y) {
+                    for (int x = candidateMin.x; x <= candidateMax.x; ++x) {
+                        const glm::ivec3 voxel(x, y, z);
+                        if (!solidAt(voxel)) {
                             continue;
                         }
-                        for (uint32_t stampIndex : it->second) {
-                            if (stampTouches(stampIndex)) {
-                                return true;
+
+                        for (uint8_t face = 0; face < 6; ++face) {
+                            if (solidAt(voxel + faceNormalI(face)) ||
+                                !insideBrush(voxel, face)) {
+                                continue;
+                            }
+
+                            if (!appendFace(voxel, face)) {
+                                return static_cast<int>(outFaces.size());
                             }
                         }
                     }
                 }
             }
-        } else {
-            for (const auto& [chunk, candidates] : m_surfacePaintStampChunkIndex) {
-                if (!chunkInInclusiveRange(chunk, chunkMin, chunkMax)) {
-                    continue;
+
+            return static_cast<int>(outFaces.size());
+        }
+    }
+
+    // Large top-hit acceleration:
+    // use heightmap columns to emit obvious top faces and simple heightmap
+    // cliff sides. Do NOT return after this path. Edited voxel geometry and
+    // non-heightmap vertical faces still need the connected crawl below.
+    if (startFace == 3u) {
+        const auto& heightmap = m_world->getHeightmapSampler();
+        if (heightmap.isLoaded()) {
+            const int pad = m_radiusVoxelsLod0 + 1;
+            constexpr int kEditedSurfaceSearch = 24;
+
+            outFaces.reserve(static_cast<size_t>(std::min(
+                MAX_SURFACE_BRUSH_FACES,
+                std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
+
+            auto tryAddTopFace = [&](int x, int z, int centerY) -> bool {
+                for (int delta = 0; delta <= kEditedSurfaceSearch; ++delta) {
+                    const int signs[2] = {1, -1};
+                    for (int signIdx = 0; signIdx < (delta == 0 ? 1 : 2); ++signIdx) {
+                        const int y = centerY + delta * signs[signIdx];
+                        const glm::ivec3 voxel(x, y, z);
+                        if (!insideBrush(voxel, startFace) ||
+                            !isExposed(voxel, startFace)) {
+                            continue;
+                        }
+                        return appendFace(voxel, startFace);
+                    }
                 }
-                for (uint32_t stampIndex : candidates) {
-                    if (stampTouches(stampIndex)) {
-                        return true;
+                return true;
+            };
+
+            auto addFaceIfValid = [&](const glm::ivec3& voxel, uint8_t face) -> bool {
+                if (!insideBrush(voxel, face) || !isExposed(voxel, face)) {
+                    return true;
+                }
+                return appendFace(voxel, face);
+            };
+
+            struct SideNeighbor {
+                int dx;
+                int dz;
+                uint8_t face;
+            };
+            constexpr SideNeighbor sideNeighbors[4] = {
+                {-1,  0, 0u},
+                { 1,  0, 1u},
+                { 0, -1, 4u},
+                { 0,  1, 5u},
+            };
+
+            for (int z = startVoxel.z - pad; z <= startVoxel.z + pad; ++z) {
+                for (int x = startVoxel.x - pad; x <= startVoxel.x + pad; ++x) {
+                    if (static_cast<int>(outFaces.size()) >= MAX_SURFACE_BRUSH_FACES) {
+                        return static_cast<int>(outFaces.size());
+                    }
+
+                    const int height = heightmap.getHeightAtVoxel(x, z);
+                    const int heightTopY = height - 1;
+
+                    bool keepGoing = tryAddTopFace(x, z, heightTopY);
+                    if (!keepGoing) {
+                        return static_cast<int>(outFaces.size());
+                    }
+
+                    if (std::abs(startVoxel.y - heightTopY) > kEditedSurfaceSearch) {
+                        keepGoing = tryAddTopFace(x, z, startVoxel.y);
+                        if (!keepGoing) {
+                            return static_cast<int>(outFaces.size());
+                        }
+                    }
+
+                    // Heightmap cliff/wall faces where this column is taller
+                    // than a neighboring column.
+                    for (const SideNeighbor& n : sideNeighbors) {
+                        const int neighborHeight = heightmap.getHeightAtVoxel(x + n.dx, z + n.dz);
+                        if (height <= neighborHeight) {
+                            continue;
+                        }
+
+                        const int y0 = std::max(neighborHeight, startVoxel.y - pad);
+                        const int y1 = std::min(height - 1, startVoxel.y + pad);
+                        for (int y = y0; y <= y1; ++y) {
+                            const glm::ivec3 voxel(x, y, z);
+                            if (!addFaceIfValid(voxel, n.face)) {
+                                return static_cast<int>(outFaces.size());
+                            }
+                        }
                     }
                 }
             }
         }
-
-        for (auto rit = m_unindexedSurfacePaintStampIndices.rbegin();
-             rit != m_unindexedSurfacePaintStampIndices.rend();
-             ++rit) {
-            if (stampTouches(*rit)) {
-                return true;
-            }
-        }
     }
 
-    return false;
-}
-
-void TextureOverlayStore::clearTexture(const glm::ivec3& lodCoord, int lod) {
-    setTexture(lodCoord, lod, VoxelTextureData{});
-}
-
-// ---------------------------------------------------------------------------
-// Brush paint operations
-//
-// Strategy: we work in the *target LOD's voxel grid*.  The brush bounding box
-// is converted from LOD-0 to the target LOD once, and we iterate that
-// (smaller) volume directly.  This is dramatically cheaper than the previous
-// "iterate every LOD-0 voxel" approach for high LOD levels.
-// ---------------------------------------------------------------------------
-
-int TextureOverlayStore::paintSphere(const glm::ivec3& centerLod0,
-                                     int radiusVoxelsLod0,
-                                     int lod,
-                                     TextureType type,
-                                     uint8_t variant) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
-    if (radiusVoxelsLod0 <= 0) return 0;
-
-    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
-    // Ceiling-divide so a radius that doesn't divide evenly still covers
-    // every LOD cell touched by the LOD-0 sphere.
-    const int shift = lod;
-    const int rLod = (radiusVoxelsLod0 + (1 << shift) - 1) >> shift;
-    if (rLod <= 0) return 0;
-    const int rSq = rLod * rLod;
-
-    VoxelTextureData data(type, variant);
-    int written = 0;
-
-    std::unique_lock lock(m_mutex);
-    auto& map = m_lodMaps[lod];
-
-    for (int dz = -rLod; dz <= rLod; ++dz) {
-        for (int dy = -rLod; dy <= rLod; ++dy) {
-            for (int dx = -rLod; dx <= rLod; ++dx) {
-                if (dx*dx + dy*dy + dz*dz > rSq) continue;
-                glm::ivec3 v = centerLod + glm::ivec3(dx, dy, dz);
-                BrickKey key = voxelToBrick(v);
-                glm::ivec3 local = voxelLocalInBrick(v);
-                writeCellLocked(map, lod, key, local, data);
-                recordDirtyGPUCellLocked(lod, v, data);
-                refreshTransitionEdgesAroundCellLocked(map, lod, v);
-                for (const glm::ivec3& d : kNeighborDirs) {
-                    refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
-                }
-                ++written;
-            }
-        }
-    }
-    if (written) m_generation.fetch_add(1, std::memory_order_release);
-    return written;
-}
-
-int TextureOverlayStore::paintBox(const glm::ivec3& minLod0,
-                                  const glm::ivec3& maxLod0,
-                                  int lod,
-                                  TextureType type,
-                                  uint8_t variant) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
-
-    glm::ivec3 a = lod0ToLOD(minLod0, lod);
-    glm::ivec3 b = lod0ToLOD(maxLod0, lod);
-    glm::ivec3 mn(std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z));
-    glm::ivec3 mx(std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z));
-
-    VoxelTextureData data(type, variant);
-    int written = 0;
-
-    std::unique_lock lock(m_mutex);
-    auto& map = m_lodMaps[lod];
-
-    for (int z = mn.z; z <= mx.z; ++z) {
-        for (int y = mn.y; y <= mx.y; ++y) {
-            for (int x = mn.x; x <= mx.x; ++x) {
-                glm::ivec3 v(x, y, z);
-                writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v), data);
-                recordDirtyGPUCellLocked(lod, v, data);
-                refreshTransitionEdgesAroundCellLocked(map, lod, v);
-                for (const glm::ivec3& d : kNeighborDirs) {
-                    refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
-                }
-                ++written;
-            }
-        }
-    }
-    if (written) m_generation.fetch_add(1, std::memory_order_release);
-    return written;
-}
-
-int TextureOverlayStore::paintFaceDisc(const glm::ivec3& centerLod0,
-                                       int radiusVoxelsLod0,
-                                       int normalAxis,
-                                       int lod,
-                                       TextureType type,
-                                       uint8_t variant,
-                                       uint8_t face,
-                                       int maxCells) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
-    if (radiusVoxelsLod0 <= 0 || maxCells <= 0) return 0;
-
-    face = static_cast<uint8_t>(face % 6u);
-    normalAxis = std::clamp(normalAxis, 0, 2);
-    const int uAxis = (normalAxis == 0) ? 1 : 0;
-    const int vAxis = (normalAxis == 2) ? 1 : 2;
-    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
-    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
-    if (rLod <= 0) return 0;
-
-    const int rSq = rLod * rLod;
-    int candidateCells = 0;
-    for (int v = -rLod; v <= rLod; ++v) {
-        for (int u = -rLod; u <= rLod; ++u) {
-            if (u * u + v * v <= rSq) ++candidateCells;
-        }
-    }
-    if (candidateCells > maxCells) return 0;
-
-    int written = 0;
-    std::unique_lock lock(m_mutex);
-    auto& map = m_lodMaps[lod];
-
-    for (int v = -rLod; v <= rLod; ++v) {
-        for (int u = -rLod; u <= rLod; ++u) {
-            if (u * u + v * v > rSq) continue;
-            glm::ivec3 coord = centerLod;
-            coord[uAxis] += u;
-            coord[vAxis] += v;
-            VoxelTextureData data(type, variedVariant(coord, face, type, variant), 0, face);
-            const glm::ivec3 storageCoord = encodeFaceCoord(coord, face);
-            writeCellLocked(map, lod, voxelToBrick(storageCoord), voxelLocalInBrick(storageCoord), data);
-            recordDirtyGPUCellLocked(lod, coord, data);
-            ++written;
-        }
+    // Connected exposed-surface fallback:
+    // essential after the large heightmap path. The heightmap path is only an
+    // acceleration for obvious top/cliff faces; this crawl catches edited voxel
+    // walls, cut sides, holes, caves, and arbitrary vertical faces connected to
+    // the hit surface.
+    if (!isExposed(startVoxel, startFace) || !insideBrush(startVoxel, startFace)) {
+        return static_cast<int>(outFaces.size());
     }
 
-    const int inner = std::max(0, rLod - 1);
-    const int innerSq = inner * inner;
-    const int outer = rLod + 1;
-    const int outerSq = outer * outer;
-    for (int v = -outer; v <= outer; ++v) {
-        for (int u = -outer; u <= outer; ++u) {
-            const int dSq = u * u + v * v;
-            if (dSq > outerSq || dSq < innerSq) continue;
-            glm::ivec3 coord = centerLod;
-            coord[uAxis] += u;
-            coord[vAxis] += v;
-            refreshTransitionEdgesAroundFaceLocked(map, lod, coord, face);
-        }
-    }
+    std::queue<PaintFaceKey> pending;
+    std::unordered_set<PaintFaceKey, PaintFaceKeyHash> visited;
+    visited.reserve(static_cast<size_t>(std::min(
+        MAX_SURFACE_BRUSH_FACES,
+        std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
 
-    if (written) m_generation.fetch_add(1, std::memory_order_release);
-    return written;
-}
+    const PaintFaceKey start{startVoxel, startFace};
+    pending.push(start);
+    visited.insert(start);
 
-int TextureOverlayStore::paintFaceRect(const glm::ivec3& centerLod0,
-                                       int radiusVoxelsLod0,
-                                       int normalAxis,
-                                       int lod,
-                                       TextureType type,
-                                       uint8_t variant,
-                                       uint8_t face,
-                                       int maxCells) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
-    if (radiusVoxelsLod0 <= 0 || maxCells <= 0) return 0;
+    constexpr glm::ivec3 kVoxelNeighbors[7] = {
+        glm::ivec3(0, 0, 0),
+        glm::ivec3( 1, 0, 0), glm::ivec3(-1, 0, 0),
+        glm::ivec3( 0, 1, 0), glm::ivec3( 0,-1, 0),
+        glm::ivec3( 0, 0, 1), glm::ivec3( 0, 0,-1),
+    };
 
-    face = static_cast<uint8_t>(face % 6u);
-    normalAxis = std::clamp(normalAxis, 0, 2);
-    const int uAxis = (normalAxis == 0) ? 1 : 0;
-    const int vAxis = (normalAxis == 2) ? 1 : 2;
-    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
-    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
-    if (rLod <= 0) return 0;
+    while (!pending.empty() && static_cast<int>(outFaces.size()) < MAX_SURFACE_BRUSH_FACES) {
+        const PaintFaceKey current = pending.front();
+        pending.pop();
 
-    const int side = rLod * 2 + 1;
-    const int64_t candidateCells = static_cast<int64_t>(side) * static_cast<int64_t>(side);
-    if (candidateCells > maxCells) return 0;
-
-    int written = 0;
-    std::unique_lock lock(m_mutex);
-    auto& map = m_lodMaps[lod];
-
-    for (int v = -rLod; v <= rLod; ++v) {
-        for (int u = -rLod; u <= rLod; ++u) {
-            glm::ivec3 coord = centerLod;
-            coord[uAxis] += u;
-            coord[vAxis] += v;
-            VoxelTextureData data(type, variedVariant(coord, face, type, variant), 0, face);
-            const glm::ivec3 storageCoord = encodeFaceCoord(coord, face);
-            writeCellLocked(map, lod, voxelToBrick(storageCoord), voxelLocalInBrick(storageCoord), data);
-            recordDirtyGPUCellLocked(lod, coord, data);
-            ++written;
-        }
-    }
-
-    const int outer = rLod + 1;
-    const int inner = std::max(0, rLod - 1);
-    for (int v = -outer; v <= outer; ++v) {
-        for (int u = -outer; u <= outer; ++u) {
-            if (std::abs(u) < inner && std::abs(v) < inner) continue;
-            glm::ivec3 coord = centerLod;
-            coord[uAxis] += u;
-            coord[vAxis] += v;
-            refreshTransitionEdgesAroundFaceLocked(map, lod, coord, face);
-        }
-    }
-
-    if (written) m_generation.fetch_add(1, std::memory_order_release);
-    return written;
-}
-
-int TextureOverlayStore::paintSurfaceFaces(const std::vector<SurfaceFaceStamp>& faces,
-                                           int lod,
-                                           TextureType type,
-                                           uint8_t variant) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled || faces.empty()) return 0;
-
-    // Huge brush stamps must be authoring-fast. Transition edge masks are
-    // cosmetic material-boundary metadata; refreshing them through an
-    // unordered_set for every changed cell is exactly the wrong cost model for
-    // 50k-300k cell stamps. Large stamps skip transition refresh in the
-    // interactive path. The procedural material remains correct; only fancy
-    // edge blending may be absent until a future offline/idle edge pass.
-    constexpr size_t kLargeInteractiveStampThreshold = 32768u;
-    const bool fastLargeStamp = faces.size() >= kLargeInteractiveStampThreshold;
-
-    int written = 0;
-
-    std::unique_lock lock(m_mutex);
-    auto& map = m_lodMaps[lod];
-
-    if (fastLargeStamp) {
-        for (const SurfaceFaceStamp& faceStamp : faces) {
-            const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
-            const VoxelTextureData data(type, variedVariant(faceStamp.lodCoord, face, type, variant), 0, face);
-            const glm::ivec3 storageCoord = encodeFaceCoord(faceStamp.lodCoord, face);
-
-            if (const TextureBrick* existingBrick = getBrickLocked(map, voxelToBrick(storageCoord))) {
-                const glm::ivec3 local = voxelLocalInBrick(storageCoord);
-                const VoxelTextureData existing =
-                    existingBrick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
-                if (!existing.isEmpty() &&
-                    existing.getType() == data.getType() &&
-                    existing.getVariant() == data.getVariant() &&
-                    existing.getFace() == data.getFace()) {
-                    continue;
-                }
-            }
-
-            writeCellLocked(map,
-                            lod,
-                            voxelToBrick(storageCoord),
-                            voxelLocalInBrick(storageCoord),
-                            data);
-            recordDirtyGPUCellLocked(lod, faceStamp.lodCoord, data);
-            ++written;
-        }
-
-        if (written) m_generation.fetch_add(1, std::memory_order_release);
-        return written;
-    }
-
-    std::vector<SurfaceFaceStamp> changedFaces;
-    changedFaces.reserve(faces.size());
-
-    // Boundary-only transition refresh acceleration. For one brush stroke,
-    // every changed face is usually painted to the same material. Interior
-    // changed-vs-changed neighbors cannot form a transition boundary, so there
-    // is no reason to refresh all 5 cells around every painted face.
-    std::unordered_set<glm::ivec3, IVec3Hash> changedStorageCoords;
-    changedStorageCoords.reserve(faces.size() * 2u + 16u);
-
-    for (const SurfaceFaceStamp& faceStamp : faces) {
-        const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
-        const VoxelTextureData data(type, variedVariant(faceStamp.lodCoord, face, type, variant), 0, face);
-        const glm::ivec3 storageCoord = encodeFaceCoord(faceStamp.lodCoord, face);
-
-        if (const TextureBrick* existingBrick = getBrickLocked(map, voxelToBrick(storageCoord))) {
-            const glm::ivec3 local = voxelLocalInBrick(storageCoord);
-            const VoxelTextureData existing =
-                existingBrick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
-            if (!existing.isEmpty() &&
-                existing.getType() == data.getType() &&
-                existing.getVariant() == data.getVariant() &&
-                existing.getFace() == data.getFace()) {
-                continue;
-            }
-        }
-
-        writeCellLocked(map,
-                        lod,
-                        voxelToBrick(storageCoord),
-                        voxelLocalInBrick(storageCoord),
-                        data);
-        recordDirtyGPUCellLocked(lod, faceStamp.lodCoord, data);
-        changedFaces.push_back(faceStamp);
-        changedStorageCoords.insert(storageCoord);
-        ++written;
-    }
-
-    for (const SurfaceFaceStamp& faceStamp : changedFaces) {
-        const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
-
-        int uAxis = 0;
-        int vAxis = 1;
-        facePlaneAxes(face, uAxis, vAxis);
-
-        glm::ivec3 neighborOffsets[4]{};
-        neighborOffsets[0][uAxis] =  1;
-        neighborOffsets[1][uAxis] = -1;
-        neighborOffsets[2][vAxis] =  1;
-        neighborOffsets[3][vAxis] = -1;
-
-        bool isBoundary = false;
-        for (const glm::ivec3& offset : neighborOffsets) {
-            const glm::ivec3 neighborStorage =
-                encodeFaceCoord(faceStamp.lodCoord + offset, face);
-            if (changedStorageCoords.find(neighborStorage) == changedStorageCoords.end()) {
-                isBoundary = true;
-                break;
-            }
-        }
-
-        if (!isBoundary) {
+        if (!isExposed(current.voxel, current.face) ||
+            !insideBrush(current.voxel, current.face)) {
             continue;
         }
 
-        refreshTransitionEdgesAroundFaceLocked(map, lod, faceStamp.lodCoord, face);
-        for (const glm::ivec3& offset : neighborOffsets) {
-            refreshTransitionEdgesAroundFaceLocked(map, lod, faceStamp.lodCoord + offset, face);
+        if (!appendFace(current.voxel, current.face)) {
+            return static_cast<int>(outFaces.size());
+        }
+
+        for (const glm::ivec3& dv : kVoxelNeighbors) {
+            const glm::ivec3 voxel = current.voxel + dv;
+            for (uint8_t face = 0; face < 6; ++face) {
+                PaintFaceKey next{voxel, face};
+                if (visited.find(next) != visited.end()) continue;
+                if (!insideBrush(voxel, face)) continue;
+                if (!isExposed(voxel, face)) continue;
+                visited.insert(next);
+                pending.push(next);
+            }
         }
     }
 
-    if (written) m_generation.fetch_add(1, std::memory_order_release);
-    return written;
+    return static_cast<int>(outFaces.size());
 }
 
-int TextureOverlayStore::clearSphere(const glm::ivec3& centerLod0,
-                                     int radiusVoxelsLod0,
-                                     int lod) {
-    if (!isLodValid(lod)) return 0;
-    if (radiusVoxelsLod0 <= 0) return 0;
+// ---------------------------------------------------------------------------
+// Per-frame update
+// ---------------------------------------------------------------------------
 
-    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
-    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
-    if (rLod <= 0) return 0;
-    const int rSq = rLod * rLod;
+void TexturePaintTool::update(double mouseX, double mouseY,
+                              int viewportW, int viewportH,
+                              const glm::mat4& view, const glm::mat4& proj,
+                              const glm::vec3& cameraPos,
+                              bool leftClickPressed,
+                              float viewportOffsetX, float viewportOffsetY) {
+    if (!m_active || !m_raycastFn) {
+        flushPendingTextureDirtyChunks(true);
+        m_hasHit = false;
+        m_hasPlacementContext = false;
+        m_leftClickWasPressed = false;
+        return;
+    }
 
-    int cleared = 0;
-    std::unique_lock lock(m_mutex);
-    requestFullGPUUploadLocked();
-    auto& map = m_lodMaps[lod];
-    for (int dz = -rLod; dz <= rLod; ++dz)
-    for (int dy = -rLod; dy <= rLod; ++dy)
-    for (int dx = -rLod; dx <= rLod; ++dx) {
-        if (dx*dx + dy*dy + dz*dz > rSq) continue;
-        glm::ivec3 v = centerLod + glm::ivec3(dx, dy, dz);
-        writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v),
-                        VoxelTextureData{});
-        for (const glm::ivec3& d : kNeighborDirs) {
-            refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
+    const glm::mat4 invViewProj = glm::inverse(proj * view);
+    const glm::vec3 rayDir = screenToWorldRay(mouseX, mouseY,
+                                              viewportW, viewportH,
+                                              invViewProj);
+
+    glm::vec3 hitPos, hitNormal;
+    m_hasHit = m_raycastFn(cameraPos, rayDir, 10000.0f, hitPos, hitNormal);
+
+    if (m_hasHit) {
+        m_hitPos = hitPos;
+        m_hitNormal = hitNormal;
+        resolveHitLOD();
+
+        // Cache preview screen position for label rendering.
+        const glm::vec4 clip = (proj * view) * glm::vec4(m_hitPos, 1.0f);
+        if (clip.w > 0.01f) {
+            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            m_previewScreenX = viewportOffsetX + (ndc.x * 0.5f + 0.5f) * static_cast<float>(viewportW);
+            m_previewScreenY = viewportOffsetY + (1.0f - (ndc.y * 0.5f + 0.5f)) * static_cast<float>(viewportH);
         }
-        ++cleared;
     }
-    if (cleared) m_generation.fetch_add(1, std::memory_order_release);
-    return cleared;
-}
 
-int TextureOverlayStore::clearBox(const glm::ivec3& minLod0,
-                                  const glm::ivec3& maxLod0,
-                                  int lod) {
-    if (!isLodValid(lod)) return 0;
-    glm::ivec3 a = lod0ToLOD(minLod0, lod);
-    glm::ivec3 b = lod0ToLOD(maxLod0, lod);
-    glm::ivec3 mn(std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z));
-    glm::ivec3 mx(std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z));
-
-    int cleared = 0;
-    std::unique_lock lock(m_mutex);
-    requestFullGPUUploadLocked();
-    auto& map = m_lodMaps[lod];
-    for (int z = mn.z; z <= mx.z; ++z)
-    for (int y = mn.y; y <= mx.y; ++y)
-    for (int x = mn.x; x <= mx.x; ++x) {
-        glm::ivec3 v(x, y, z);
-        writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v),
-                        VoxelTextureData{});
-        for (const glm::ivec3& d : kNeighborDirs) {
-            refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
-        }
-        ++cleared;
-    }
-    if (cleared) m_generation.fetch_add(1, std::memory_order_release);
-    return cleared;
-}
-
-int TextureOverlayStore::cascadeToCoarserLODs(const glm::ivec3& centerLod0,
-                                              int radiusVoxelsLod0,
-                                              int sourceLod,
-                                              TextureType type,
-                                              uint8_t variant) {
-    int total = 0;
-    for (int l = sourceLod + 1; l < LOD_COUNT; ++l) {
-        if (!m_lodConfigs[l].enabled) continue;
-        total += paintSphere(centerLod0, radiusVoxelsLod0, l, type, variant);
-    }
-    return total;
-}
-
-int TextureOverlayStore::cascadeFaceToCoarserLODs(const glm::ivec3& centerLod0,
-                                                  int radiusVoxelsLod0,
-                                                  int normalAxis,
-                                                  int sourceLod,
-                                                  SurfaceBrushShape shape,
-                                                  TextureType type,
-                                                  uint8_t variant,
-                                                  uint8_t face,
-                                                  int maxCellsPerLOD) {
-    int total = 0;
-    for (int l = sourceLod + 1; l < LOD_COUNT; ++l) {
-        if (!m_lodConfigs[l].enabled) continue;
-        if (shape == SurfaceBrushShape::Disc) {
-            total += paintFaceDisc(centerLod0, radiusVoxelsLod0, normalAxis,
-                                   l, type, variant, face, maxCellsPerLOD);
+    // Click + auto-repeat. The repeat interval now scales with brush footprint:
+    // small brushes behave like paint; huge brushes behave like stamps so they
+    // do not enqueue 20 huge authoring/rebake waves per second.
+    if (leftClickPressed && m_hasHit) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!m_leftClickWasPressed) {
+            m_holdRepeatStarted = false;
+            place();
+            m_lastPlaceTime = now;
+            m_holdStartTime = now;
         } else {
-            total += paintFaceRect(centerLod0, radiusVoxelsLod0, normalAxis,
-                                   l, type, variant, face, maxCellsPerLOD);
-        }
-    }
-    return total;
-}
-
-// ---------------------------------------------------------------------------
-// Stats / state
-// ---------------------------------------------------------------------------
-
-TextureOverlayStore::Stats TextureOverlayStore::getStats() const {
-    Stats s{};
-    std::shared_lock lock(m_mutex);
-    s.generation = m_generation.load(std::memory_order_acquire);
-    s.surfaceStampCount = m_surfacePaintStamps.size();
-    for (int lod = 0; lod < LOD_COUNT; ++lod) {
-        s.bricksByLOD[lod] = m_brickCountsByLOD[lod];
-        s.cellsByLOD[lod] = m_cellCountsByLOD[lod];
-        s.totalBricks += s.bricksByLOD[lod];
-        s.totalCells += s.cellsByLOD[lod];
-    }
-    return s;
-}
-
-size_t TextureOverlayStore::exportGPUCells(std::vector<GPUCell>& out, size_t maxCells) const {
-    (void)maxCells;
-
-    // Disabled by design.
-    //
-    // The old path exported every painted voxel face into a global GPU hash
-    // table. With millions of brush cells this becomes a terrain/light-pass
-    // tax even when the world itself can render fully textured at native speed.
-    //
-    // Painting now stays in the CPU sparse store and is made visible by rebaking
-    // affected chunks into the compact per-vertex material stream. Returning
-    // zero here keeps the shader overlay table empty, so unbaked/normal terrain
-    // remains on the procedural/native fast path.
-    out.clear();
-    return 0;
-}
-
-size_t TextureOverlayStore::exportGPUCellsForLOD(int lod,
-                                                 std::vector<GPUCell>& out,
-                                                 size_t maxCells) const {
-    (void)lod;
-    (void)maxCells;
-
-    // Same as exportGPUCells(): no per-cell material overlay is uploaded to the
-    // GPU. LOD-specific painted data is still stored for persistence/tools and
-    // for chunk material rebake, but it must not become a fragment shader hash
-    // table.
-    out.clear();
-    return 0;
-}
-
-size_t TextureOverlayStore::consumeDirtyGPUCells(std::vector<GPUCell>& out,
-                                                 size_t maxCells,
-                                                 bool& requiresFullUpload) {
-    out.clear();
-    requiresFullUpload = false;
-
-    std::unique_lock lock(m_mutex);
-    if (m_dirtyGPUFullUpload || m_dirtyGPUCells.size() > maxCells) {
-        requiresFullUpload = true;
-        m_dirtyGPUCells.clear();
-        m_dirtyGPUFullUpload = false;
-        return 0;
-    }
-
-    out.swap(m_dirtyGPUCells);
-    m_dirtyGPUCells.clear();
-    return out.size();
-}
-
-bool TextureOverlayStore::isEmpty() const {
-    std::shared_lock lock(m_mutex);
-    if (!m_surfacePaintStamps.empty()) {
-        return false;
-    }
-    for (size_t cells : m_cellCountsByLOD) {
-        if (cells != 0u) return false;
-    }
-    return true;
-}
-
-void TextureOverlayStore::clear() {
-    std::unique_lock lock(m_mutex);
-    for (auto& map : m_lodMaps) map.clear();
-    m_brickCountsByLOD.fill(0u);
-    m_cellCountsByLOD.fill(0u);
-    m_surfacePaintStamps.clear();
-    m_surfacePaintStampChunkIndex.clear();
-    m_unindexedSurfacePaintStampIndices.clear();
-    m_nextSurfacePaintStampOrder = 1u;
-    requestFullGPUUploadLocked();
-    m_generation.fetch_add(1, std::memory_order_release);
-}
-
-void TextureOverlayStore::clearLOD(int lod) {
-    if (!isLodValid(lod)) return;
-    std::unique_lock lock(m_mutex);
-    m_lodMaps[lod].clear();
-    m_brickCountsByLOD[lod] = 0u;
-        m_cellCountsByLOD[lod] = 0u;
-    if (lod == 0) {
-        m_surfacePaintStamps.clear();
-        m_surfacePaintStampChunkIndex.clear();
-        m_unindexedSurfacePaintStampIndices.clear();
-        m_nextSurfacePaintStampOrder = 1u;
-    }
-    requestFullGPUUploadLocked();
-    m_generation.fetch_add(1, std::memory_order_release);
-}
-
-// ---------------------------------------------------------------------------
-// Persistence
-// File layout:
-//   magic(4) version(4)
-//   For each LOD: pixelsPerVoxel(2) enabled(1) pad(1) brickCount(4)
-//     For each brick: key(12) activeCount(4) cells(512)
-// ---------------------------------------------------------------------------
-
-static constexpr uint32_t TEXTURE_OVERLAY_MAGIC = 0x54585050; // "TXPP"
-static constexpr uint32_t TEXTURE_OVERLAY_VERSION = 3;
-
-bool TextureOverlayStore::saveToFile(const char* path) const {
-    std::shared_lock lock(m_mutex);
-    std::ofstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-
-    uint32_t magic = TEXTURE_OVERLAY_MAGIC;
-    uint32_t ver = 4u;
-    f.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-    f.write(reinterpret_cast<const char*>(&ver), sizeof(ver));
-
-    uint32_t lodCount = LOD_COUNT;
-    f.write(reinterpret_cast<const char*>(&lodCount), sizeof(lodCount));
-
-    for (int lod = 0; lod < LOD_COUNT; ++lod) {
-        const auto& cfg = m_lodConfigs[lod];
-        uint16_t res = cfg.pixelsPerVoxel;
-        uint8_t en = cfg.enabled ? 1 : 0;
-        uint8_t pad = 0;
-        f.write(reinterpret_cast<const char*>(&res), sizeof(res));
-        f.write(reinterpret_cast<const char*>(&en),  sizeof(en));
-        f.write(reinterpret_cast<const char*>(&pad), sizeof(pad));
-
-        const auto& map = m_lodMaps[lod];
-        uint32_t brickCount = static_cast<uint32_t>(map.size());
-        f.write(reinterpret_cast<const char*>(&brickCount), sizeof(brickCount));
-
-        for (const auto& [key, brick] : map) {
-            f.write(reinterpret_cast<const char*>(&key), sizeof(key));
-            f.write(reinterpret_cast<const char*>(&brick->activeCount),
-                    sizeof(brick->activeCount));
-            f.write(reinterpret_cast<const char*>(brick->cells.data()),
-                    sizeof(VoxelTextureData) * TextureBrick::CELLS);
-        }
-    }
-
-    // Version 4: persist canonical deferred surface stamps. The live GPU stamp
-    // buffer is intentionally bounded, but the world/snapshot state must not be.
-    // LOD remeshes and snapshot reloads can now resolve the complete paint
-    // history from this canonical list instead of only the newest live entries.
-    const uint32_t stampCount = (m_surfacePaintStamps.size() > static_cast<size_t>(UINT32_MAX))
-        ? UINT32_MAX
-        : static_cast<uint32_t>(m_surfacePaintStamps.size());
-    f.write(reinterpret_cast<const char*>(&stampCount), sizeof(stampCount));
-
-    for (uint32_t i = 0; i < stampCount; ++i) {
-        const SurfacePaintStamp& stamp = m_surfacePaintStamps[i];
-        f.write(reinterpret_cast<const char*>(&stamp.centerVoxelLod0.x), sizeof(float));
-        f.write(reinterpret_cast<const char*>(&stamp.centerVoxelLod0.y), sizeof(float));
-        f.write(reinterpret_cast<const char*>(&stamp.centerVoxelLod0.z), sizeof(float));
-        f.write(reinterpret_cast<const char*>(&stamp.bboxMinLod0.x), sizeof(int32_t));
-        f.write(reinterpret_cast<const char*>(&stamp.bboxMinLod0.y), sizeof(int32_t));
-        f.write(reinterpret_cast<const char*>(&stamp.bboxMinLod0.z), sizeof(int32_t));
-        f.write(reinterpret_cast<const char*>(&stamp.bboxMaxLod0.x), sizeof(int32_t));
-        f.write(reinterpret_cast<const char*>(&stamp.bboxMaxLod0.y), sizeof(int32_t));
-        f.write(reinterpret_cast<const char*>(&stamp.bboxMaxLod0.z), sizeof(int32_t));
-
-        int32_t radius = static_cast<int32_t>(stamp.radiusVoxelsLod0);
-        uint8_t shape = static_cast<uint8_t>(stamp.shape);
-        uint8_t type = static_cast<uint8_t>(stamp.type);
-        uint8_t variant = stamp.variant;
-        uint8_t sourceFace = stamp.sourceFace;
-        uint32_t order = stamp.order;
-
-        f.write(reinterpret_cast<const char*>(&radius), sizeof(radius));
-        f.write(reinterpret_cast<const char*>(&shape), sizeof(shape));
-        f.write(reinterpret_cast<const char*>(&type), sizeof(type));
-        f.write(reinterpret_cast<const char*>(&variant), sizeof(variant));
-        f.write(reinterpret_cast<const char*>(&sourceFace), sizeof(sourceFace));
-        f.write(reinterpret_cast<const char*>(&order), sizeof(order));
-    }
-
-    return f.good();
-}
-
-bool TextureOverlayStore::loadFromFile(const char* path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-
-    uint32_t magic = 0, ver = 0;
-    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    f.read(reinterpret_cast<char*>(&ver), sizeof(ver));
-    constexpr uint32_t kTextureOverlayMaxReadableVersion = 4u;
-    if (magic != TEXTURE_OVERLAY_MAGIC || ver > kTextureOverlayMaxReadableVersion) return false;
-
-    uint32_t lodCount = 0;
-    f.read(reinterpret_cast<char*>(&lodCount), sizeof(lodCount));
-    if (lodCount > LOD_COUNT) return false;
-
-    std::unique_lock lock(m_mutex);
-    for (auto& m : m_lodMaps) m.clear();
-    m_brickCountsByLOD.fill(0u);
-    m_cellCountsByLOD.fill(0u);
-    m_surfacePaintStamps.clear();
-    m_surfacePaintStampChunkIndex.clear();
-    m_unindexedSurfacePaintStampIndices.clear();
-    m_nextSurfacePaintStampOrder = 1u;
-
-    for (uint32_t lod = 0; lod < lodCount; ++lod) {
-        uint16_t res = 0; uint8_t en = 0; uint8_t pad = 0;
-        f.read(reinterpret_cast<char*>(&res), sizeof(res));
-        f.read(reinterpret_cast<char*>(&en),  sizeof(en));
-        f.read(reinterpret_cast<char*>(&pad), sizeof(pad));
-        m_lodConfigs[lod] = LODTextureConfig{ res, en != 0 };
-
-        uint32_t brickCount = 0;
-        f.read(reinterpret_cast<char*>(&brickCount), sizeof(brickCount));
-        for (uint32_t b = 0; b < brickCount; ++b) {
-            BrickKey key{};
-            uint32_t active = 0;
-            f.read(reinterpret_cast<char*>(&key), sizeof(key));
-            f.read(reinterpret_cast<char*>(&active), sizeof(active));
-            auto brick = std::make_unique<TextureBrick>();
-            brick->activeCount = active;
-            if (ver >= 3) {
-                f.read(reinterpret_cast<char*>(brick->cells.data()),
-                       sizeof(VoxelTextureData) * TextureBrick::CELLS);
-            } else {
-                for (auto& cell : brick->cells) {
-                    uint8_t packed = 0;
-                    f.read(reinterpret_cast<char*>(&packed), sizeof(packed));
-                    cell.packed = packed;
-                    cell.face = 3;
+            const float held = std::chrono::duration<float>(now - m_holdStartTime).count();
+            if (held >= 0.15f) {
+                const float since = std::chrono::duration<float>(now - m_lastPlaceTime).count();
+                const float repeatInterval = getPaintRepeatIntervalSec();
+                if (since >= repeatInterval) {
+                    m_holdRepeatStarted = true;
+                    place();
+                    m_lastPlaceTime = now;
                 }
             }
-            uint32_t actualActive = 0u;
-            for (const auto& cell : brick->cells) {
-                if (!cell.isEmpty()) {
-                    ++actualActive;
-                }
-            }
-            brick->activeCount = actualActive;
-            ++m_brickCountsByLOD[lod];
-            m_cellCountsByLOD[lod] += brick->activeCount;
-            m_lodMaps[lod].emplace(key, std::move(brick));
-        }
-    }
-
-    if (ver >= 4) {
-        uint32_t stampCount = 0;
-        f.read(reinterpret_cast<char*>(&stampCount), sizeof(stampCount));
-        constexpr uint32_t kMaxSerializedSurfacePaintStamps = 1000000u;
-        if (stampCount > kMaxSerializedSurfacePaintStamps) {
-            return false;
         }
 
-        m_surfacePaintStamps.reserve(stampCount);
-        uint32_t maxOrder = 0u;
-        for (uint32_t i = 0; i < stampCount; ++i) {
-            SurfacePaintStamp stamp{};
-            f.read(reinterpret_cast<char*>(&stamp.centerVoxelLod0.x), sizeof(float));
-            f.read(reinterpret_cast<char*>(&stamp.centerVoxelLod0.y), sizeof(float));
-            f.read(reinterpret_cast<char*>(&stamp.centerVoxelLod0.z), sizeof(float));
-            f.read(reinterpret_cast<char*>(&stamp.bboxMinLod0.x), sizeof(int32_t));
-            f.read(reinterpret_cast<char*>(&stamp.bboxMinLod0.y), sizeof(int32_t));
-            f.read(reinterpret_cast<char*>(&stamp.bboxMinLod0.z), sizeof(int32_t));
-            f.read(reinterpret_cast<char*>(&stamp.bboxMaxLod0.x), sizeof(int32_t));
-            f.read(reinterpret_cast<char*>(&stamp.bboxMaxLod0.y), sizeof(int32_t));
-            f.read(reinterpret_cast<char*>(&stamp.bboxMaxLod0.z), sizeof(int32_t));
-
-            int32_t radius = 1;
-            uint8_t shape = 0u;
-            uint8_t type = 0u;
-            uint8_t variant = 0u;
-            uint8_t sourceFace = 3u;
-            uint32_t order = 0u;
-
-            f.read(reinterpret_cast<char*>(&radius), sizeof(radius));
-            f.read(reinterpret_cast<char*>(&shape), sizeof(shape));
-            f.read(reinterpret_cast<char*>(&type), sizeof(type));
-            f.read(reinterpret_cast<char*>(&variant), sizeof(variant));
-            f.read(reinterpret_cast<char*>(&sourceFace), sizeof(sourceFace));
-            f.read(reinterpret_cast<char*>(&order), sizeof(order));
-
-            stamp.radiusVoxelsLod0 = std::max(1, radius);
-            stamp.shape = (shape == static_cast<uint8_t>(SurfaceBrushShape::Rect))
-                ? SurfaceBrushShape::Rect
-                : SurfaceBrushShape::Disc;
-            stamp.type = (type < static_cast<uint8_t>(TextureType::COUNT))
-                ? static_cast<TextureType>(type)
-                : TextureType::Grass;
-            stamp.variant = static_cast<uint8_t>(variant & 0x7u);
-            stamp.sourceFace = (sourceFace < 6u) ? sourceFace : 3u;
-            stamp.order = (order != 0u) ? order : (i + 1u);
-            maxOrder = std::max(maxOrder, stamp.order);
-
-            m_surfacePaintStamps.push_back(stamp);
-        }
-
-        for (uint32_t i = 0; i < static_cast<uint32_t>(m_surfacePaintStamps.size()); ++i) {
-            indexSurfacePaintStampLocked(i);
-        }
-        m_nextSurfacePaintStampOrder = maxOrder + 1u;
-        if (m_nextSurfacePaintStampOrder == 0u) {
-            m_nextSurfacePaintStampOrder = 1u;
-        }
-    }
-
-    requestFullGPUUploadLocked();
-    m_generation.fetch_add(1, std::memory_order_release);
-    return f.good() || f.eof();
-}
-
-
-// ---------------------------------------------------------------------------
-// Deferred surface paint stamps — O(1) interactive brush authoring.
-// ---------------------------------------------------------------------------
-
-uint32_t TextureOverlayStore::appendSurfacePaintStamp(const glm::vec3& centerWorld,
-                                                     int radiusVoxelsLod0,
-                                                     SurfaceBrushShape shape,
-                                                     TextureType type,
-                                                     uint8_t variant,
-                                                     uint8_t sourceFace) {
-    if (radiusVoxelsLod0 <= 0) {
-        return 0u;
-    }
-
-    SurfacePaintStamp stamp{};
-    stamp.centerVoxelLod0 = centerWorld * static_cast<float>(WorldConfig::VOXELS_PER_METER);
-    stamp.radiusVoxelsLod0 = std::max(1, radiusVoxelsLod0);
-    stamp.shape = shape;
-    stamp.type = type;
-    stamp.variant = static_cast<uint8_t>(variant & 0x7u);
-    stamp.sourceFace = (sourceFace < 6u) ? sourceFace : 3u;
-
-    // Canonical stamp bounds must be tight. They are used for two separate
-    // things:
-    //   1) stamp chunk-index lookup during material baking
-    //   2) choosing which chunks need a canonical material refresh
-    //
-    // The exact test in sampleSurfacePaintStampsLocked() is still the authority
-    // for whether a face is painted. But padding this bbox by +2 voxels makes
-    // extra partial chunks enter the material-rebake queue, and those chunks can
-    // appear to update around the brush even though no face inside them should
-    // change. Use the real brush volume here; coarse-LOD face queries already
-    // expand their query rectangle when they need conservative lookup.
-    const float r = static_cast<float>(stamp.radiusVoxelsLod0);
-    stamp.bboxMinLod0 = glm::ivec3(
-        static_cast<int>(std::floor(stamp.centerVoxelLod0.x - r)),
-        static_cast<int>(std::floor(stamp.centerVoxelLod0.y - r)),
-        static_cast<int>(std::floor(stamp.centerVoxelLod0.z - r)));
-    stamp.bboxMaxLod0 = glm::ivec3(
-        static_cast<int>(std::ceil(stamp.centerVoxelLod0.x + r)),
-        static_cast<int>(std::ceil(stamp.centerVoxelLod0.y + r)),
-        static_cast<int>(std::ceil(stamp.centerVoxelLod0.z + r)));
-
-    std::unique_lock lock(m_mutex);
-    if (!m_lodConfigs[0].enabled) {
-        return 0u;
-    }
-
-    if (m_nextSurfacePaintStampOrder == 0u) {
-        m_nextSurfacePaintStampOrder = 1u;
-    }
-    stamp.order = m_nextSurfacePaintStampOrder++;
-
-    const uint32_t stampIndex = static_cast<uint32_t>(m_surfacePaintStamps.size());
-    m_surfacePaintStamps.push_back(stamp);
-    indexSurfacePaintStampLocked(stampIndex);
-
-    // Wake the canonical-store generation without generating per-cell GPU
-    // overlay deltas. The fragment-time overlay path remains disabled; the
-    // visible result is made permanent by chunk material rebake into
-    // Vertex::material for painted faces only.
-    requestFullGPUUploadLocked();
-    m_generation.fetch_add(1, std::memory_order_release);
-    return stamp.order;
-}
-
-size_t TextureOverlayStore::getSurfacePaintStampCount() const {
-    std::shared_lock lock(m_mutex);
-    return m_surfacePaintStamps.size();
-}
-
-size_t TextureOverlayStore::exportLiveSurfacePaintStamps(
-    std::vector<SurfacePaintStamp>& out,
-    size_t maxStamps) const {
-    (void)maxStamps;
-
-    // Final material rendering must not depend on a bounded live-stamp list.
-    // The texture brush now writes permanent per-face cells and schedules a
-    // material-only chunk rebake, so the visible result is packed into the
-    // normal Vertex::material path. Returning zero here disables the old
-    // fragment-time live overlay and removes the "oldest strokes disappear
-    // after maxStamps" failure mode instead of merely raising the limit.
-    out.clear();
-    return 0u;
-}
-
-
-void TextureOverlayStore::indexSurfacePaintStampLocked(uint32_t stampIndex) {
-    if (stampIndex >= m_surfacePaintStamps.size()) {
-        return;
-    }
-
-    const SurfacePaintStamp& stamp = m_surfacePaintStamps[stampIndex];
-    const glm::ivec3 rawC0 = WorldConfig::microVoxelToChunk(stamp.bboxMinLod0);
-    const glm::ivec3 rawC1 = WorldConfig::microVoxelToChunk(stamp.bboxMaxLod0);
-    const glm::ivec3 c0(
-        std::min(rawC0.x, rawC1.x),
-        std::min(rawC0.y, rawC1.y),
-        std::min(rawC0.z, rawC1.z));
-    const glm::ivec3 c1(
-        std::max(rawC0.x, rawC1.x),
-        std::max(rawC0.y, rawC1.y),
-        std::max(rawC0.z, rawC1.z));
-
-    const int64_t chunkVolume = chunkRangeVolumeInclusive(c0, c1);
-    if (chunkVolume <= 0) {
-        return;
-    }
-    if (chunkVolume > MAX_INDEXED_SURFACE_STAMP_CHUNKS) {
-        m_unindexedSurfacePaintStampIndices.push_back(stampIndex);
-        return;
-    }
-
-    for (int z = c0.z; z <= c1.z; ++z) {
-        for (int y = c0.y; y <= c1.y; ++y) {
-            for (int x = c0.x; x <= c1.x; ++x) {
-                m_surfacePaintStampChunkIndex[glm::ivec3(x, y, z)].push_back(stampIndex);
-            }
-        }
-    }
-}
-
-bool TextureOverlayStore::surfaceStampTouchesBox(const TextureOverlayStore::SurfacePaintStamp& stamp,
-                                                 const glm::ivec3& minLod0,
-                                                 const glm::ivec3& maxLod0) {
-    return !(stamp.bboxMaxLod0.x < minLod0.x || stamp.bboxMinLod0.x > maxLod0.x ||
-             stamp.bboxMaxLod0.y < minLod0.y || stamp.bboxMinLod0.y > maxLod0.y ||
-             stamp.bboxMaxLod0.z < minLod0.z || stamp.bboxMinLod0.z > maxLod0.z);
-}
-
-VoxelTextureData TextureOverlayStore::sampleSurfacePaintStampsLocked(const glm::ivec3& lodCoord,
-                                                                     int lod,
-                                                                     uint8_t face) const {
-    if (m_surfacePaintStamps.empty()) {
-        return {};
-    }
-
-    const int step = std::max(1, (lod > 0) ? (1 << lod) : 1);
-    const int halfStep = step / 2;
-    const glm::ivec3 lod0Base = lodToLOD0(lodCoord, lod);
-    const glm::ivec3 lod0Max = lod0Base + glm::ivec3(step - 1);
-    const glm::ivec3 lod0Sample = lod0Base + glm::ivec3(halfStep);
-
-    const uint8_t queryFace = static_cast<uint8_t>(face % 6u);
-    const int queryAxis = queryFace / 2;
-    const float querySign = (queryFace & 1u) ? 1.0f : -1.0f;
-
-    // Query the chunk-index range covered by this LOD face, not only the face
-    // center. Coarse LOD faces can straddle a chunk boundary; center-only lookup
-    // is why lower LODs sometimes missed paint that was perfect at LOD0.
-    glm::ivec3 queryMin = lod0Base;
-    glm::ivec3 queryMax = lod0Max;
-    if ((queryFace & 1u) != 0u) {
-        queryMax[queryAxis] += 1;
+        // During long holds, flush large pending rebakes at a fixed low rate.
+        // Small strokes flush immediately inside place().
+        flushPendingTextureDirtyChunks(false);
     } else {
-        queryMin[queryAxis] -= 1;
+        // Mouse release / no hit: force the latest authored material to be
+        // scheduled for rebake. This keeps visual latency bounded without
+        // flooding remesh while the brush is actively spamming.
+        if (m_leftClickWasPressed) {
+            flushPendingTextureDirtyChunks(true);
+        } else {
+            flushPendingTextureDirtyChunks(false);
+        }
+        m_holdRepeatStarted = false;
     }
 
-    const glm::ivec3 chunkMin = WorldConfig::microVoxelToChunk(queryMin);
-    const glm::ivec3 chunkMax = WorldConfig::microVoxelToChunk(queryMax);
+    m_leftClickWasPressed = leftClickPressed;
+}
 
-    auto clampf = [](float v, float lo, float hi) {
-        return std::max(lo, std::min(v, hi));
-    };
+// ---------------------------------------------------------------------------
+// Apply paint
+// ---------------------------------------------------------------------------
 
-    auto faceCenterPoint = [&]() {
-        glm::vec3 p = glm::vec3(lod0Sample) + glm::vec3(0.5f);
-        p[queryAxis] += querySign * 0.5f * static_cast<float>(step);
-        return p;
-    };
+void TexturePaintTool::place() {
+    if (!m_hasHit) return;
 
-    auto stampContainsQueryFace = [&](const SurfacePaintStamp& stamp) -> bool {
-        const float radius = static_cast<float>(stamp.radiusVoxelsLod0);
+    constexpr int lod = 0;
+    TextureOverlayStore& store = getStore();
+    const auto cfg = store.getLODConfig(lod);
+    if (!cfg.enabled) {
+        m_lastFacesCollected = 0;
+        m_lastFacesUnchanged = 0;
+        m_lastCellsPainted = 0;
+        m_lastCellsCascaded = 0;
+        return;
+    }
 
-        // LOD0 keeps the exact original authoring rule: the exposed face center
-        // must be inside the brush. This removes the old +1 voxel bleed that
-        // caused visible material changes around the brush edge.
-        if (step == 1) {
-            const glm::vec3 p = faceCenterPoint();
-            const glm::vec3 d = p - stamp.centerVoxelLod0;
-            if (stamp.shape == SurfaceBrushShape::Disc) {
-                return glm::dot(d, d) <= radius * radius + 1e-5f;
-            }
-            return std::abs(d.x) <= radius + 1e-5f &&
-                   std::abs(d.y) <= radius + 1e-5f &&
-                   std::abs(d.z) <= radius + 1e-5f;
+    // Texture painting is authored world state. If the user paints while
+    // viewing base terrain, branch into a normal editable snapshot first.
+    if (m_world && !m_world->hasActiveEditableSnapshot()) {
+        if (!m_world->createSnapshot()) {
+            return;
         }
+    }
 
-        // Coarser LODs use face-rectangle intersection against the same exact
-        // brush volume. This fills the lower-LOD representation whenever the
-        // coarse face actually intersects the brush, without inflating the
-        // brush radius globally.
-        const float plane = (queryFace & 1u)
-            ? static_cast<float>(lod0Base[queryAxis] + step)
-            : static_cast<float>(lod0Base[queryAxis]);
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
 
-        if (stamp.shape == SurfaceBrushShape::Disc) {
-            glm::vec3 closest = stamp.centerVoxelLod0;
-            closest[queryAxis] = plane;
-            for (int axis = 0; axis < 3; ++axis) {
-                if (axis == queryAxis) {
-                    continue;
+    // Canonical fast path:
+    // Store one permanent bounded surface-volume stamp instead of expanding a
+    // max-radius brush into 200k+ per-face cells on the UI thread. The chunk
+    // material rebake resolves this stamp through TextureOverlayStore::getSurfaceTexture()
+    // while emitting the real exposed terrain faces, so lower LODs sample the
+    // same canonical brush volume instead of relying on lossy LOD0 face mapping.
+    const TextureOverlay::SurfaceBrushShape stampShape =
+        (m_shape == BrushShape::Box)
+            ? TextureOverlay::SurfaceBrushShape::Rect
+            : TextureOverlay::SurfaceBrushShape::Disc;
+    const uint8_t sourceFace = getHitFaceId();
+    const uint32_t stampOrder = store.appendSurfacePaintStamp(
+        m_hitPos,
+        m_radiusVoxelsLod0,
+        stampShape,
+        m_textureType,
+        m_variant,
+        sourceFace);
+    const auto tStore = Clock::now();
+
+    if (stampOrder == 0u) {
+        m_lastPaintMs = std::chrono::duration<float, std::milli>(tStore - t0).count();
+        m_lastFacesCollected = 0;
+        m_lastFacesUnchanged = 0;
+        m_lastCellsPainted = 0;
+        m_lastCellsCascaded = 0;
+        m_lastPaintLod = lod;
+        m_lastPaintWorldCenter = m_hitPos;
+        m_lastPaintRadiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
+        m_previewStartTime = tStore;
+        return;
+    }
+
+    // Dirty only the chunk material bake domain touched by the brush volume.
+    // The extra pad does not paint extra texels; it only guarantees that coarse
+    // LOD face cells and exact chunk-border faces that intersect the brush are
+    // rebaked too.
+    const int maxLodStep = 1 << std::max(0, TextureOverlayStore::LOD_COUNT - 1);
+    const int dirtyPadVoxels = std::max(2, maxLodStep);
+    const float invVoxel = static_cast<float>(WorldConfig::VOXELS_PER_METER);
+    const glm::vec3 centerVoxel = m_hitPos * invVoxel;
+    const float radiusVoxels = static_cast<float>(std::max(1, m_radiusVoxelsLod0));
+    const float dirtyRadius = radiusVoxels + static_cast<float>(dirtyPadVoxels);
+
+    const glm::ivec3 minVoxel(
+        static_cast<int>(std::floor(centerVoxel.x - dirtyRadius)),
+        static_cast<int>(std::floor(centerVoxel.y - dirtyRadius)),
+        static_cast<int>(std::floor(centerVoxel.z - dirtyRadius)));
+    const glm::ivec3 maxVoxel(
+        static_cast<int>(std::ceil(centerVoxel.x + dirtyRadius)),
+        static_cast<int>(std::ceil(centerVoxel.y + dirtyRadius)),
+        static_cast<int>(std::ceil(centerVoxel.z + dirtyRadius)));
+
+    const glm::ivec3 c0 = WorldConfig::microVoxelToChunk(minVoxel);
+    const glm::ivec3 c1 = WorldConfig::microVoxelToChunk(maxVoxel);
+
+    const glm::ivec3 minChunk(
+        std::min(c0.x, c1.x),
+        std::min(c0.y, c1.y),
+        std::min(c0.z, c1.z));
+    const glm::ivec3 maxChunk(
+        std::max(c0.x, c1.x),
+        std::max(c0.y, c1.y),
+        std::max(c0.z, c1.z));
+
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet touchedChunks;
+    if (m_world) {
+        touchedChunks = m_world->collectExistingChunksInRange(minChunk, maxChunk);
+    }
+
+    std::vector<glm::ivec3> visualChunks;
+    visualChunks.reserve(touchedChunks.size());
+    for (const glm::ivec3& chunk : touchedChunks) {
+        visualChunks.push_back(chunk);
+        m_pendingTextureDirtyChunks.insert(chunk);
+    }
+
+    const int touchedChunkCount = static_cast<int>(touchedChunks.size());
+    const auto tTouched = Clock::now();
+
+    const bool immediateFlush =
+        touchedChunkCount <= m_immediateTextureDirtyChunkCap ||
+        !m_holdRepeatStarted;
+    const size_t flushed = flushPendingTextureDirtyChunks(immediateFlush);
+    const auto tSchedule = Clock::now();
+
+    if (m_world) {
+        m_world->markSnapshotDirty();
+    }
+
+    const int64_t side = static_cast<int64_t>(std::max(1, m_radiusVoxelsLod0)) * 2 + 1;
+    const int64_t estimatedSurfaceCells64 = (m_shape == BrushShape::Sphere)
+        ? static_cast<int64_t>(3.14159265 *
+            static_cast<double>(m_radiusVoxelsLod0) *
+            static_cast<double>(m_radiusVoxelsLod0))
+        : side * side;
+    const int estimatedSurfaceCells =
+        static_cast<int>(std::min<int64_t>(std::max<int64_t>(1, estimatedSurfaceCells64), INT_MAX));
+
+    m_lastPaintMs = std::chrono::duration<float, std::milli>(tSchedule - t0).count();
+    m_lastFacesCollected = std::max(1, estimatedSurfaceCells);
+    m_lastFacesUnchanged = 0;
+    m_lastCellsPainted  = std::max(1, estimatedSurfaceCells);
+    m_lastCellsCascaded = 0;
+    m_lastPaintLod      = lod;
+    m_lastPaintWorldCenter = m_hitPos;
+    m_lastPaintRadiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
+    m_previewStartTime = tSchedule;
+
+    PaintOpDiagnostic diag{};
+    diag.radiusVoxels = m_radiusVoxelsLod0;
+    diag.shape = static_cast<int>(m_shape);
+    diag.material = static_cast<int>(m_textureType);
+    diag.variant = static_cast<int>(m_variant);
+    diag.paintLod = lod;
+    diag.facesCollected = m_lastFacesCollected;
+    diag.facesUnchanged = 0;
+    diag.cellsPainted = m_lastCellsPainted;
+    diag.cellsCascaded = 0;
+    diag.touchedChunks = touchedChunkCount;
+    diag.flushedChunks = static_cast<int>(flushed);
+    diag.pendingChunksAfter = static_cast<int>(m_pendingTextureDirtyChunks.size());
+    diag.collectMs = 0.0f;
+    diag.storeMs = std::chrono::duration<float, std::milli>(tStore - t0).count();
+    diag.cascadeMs = 0.0f;
+    diag.touchedMs = std::chrono::duration<float, std::milli>(tTouched - tStore).count();
+    diag.scheduleMs = std::chrono::duration<float, std::milli>(tSchedule - tTouched).count();
+    diag.totalMs = m_lastPaintMs;
+    diag.visualStartSec = std::chrono::duration<double>(t0.time_since_epoch()).count();
+    diag.visualStampOrder = stampOrder;
+    diag.visualChunks = std::move(visualChunks);
+    diag.radiusM = m_lastPaintRadiusM;
+    diag.center = m_hitPos;
+    diag.holdRepeat = m_holdRepeatStarted;
+    recordPaintDiagnostic(diag);
+}
+
+// ---------------------------------------------------------------------------
+// Debug window
+// ---------------------------------------------------------------------------
+
+void TexturePaintTool::renderUI() {
+    ImGui::TextColored(kAccent, "Texture Paint Brush");
+    ImGui::Separator();
+
+    ImGui::Checkbox("Brush Active", &m_active);
+    if (!m_active) {
+        ImGui::TextDisabled("Enable to paint pixel-art textures onto terrain");
+    }
+
+    // ---------------- Brush shape + radius ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Brush");
+
+    const bool isSphere = (m_shape == BrushShape::Sphere);
+    if (isSphere) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26f, 0.59f, 0.98f, 0.80f));
+    }
+    if (ImGui::Button("Sphere")) m_shape = BrushShape::Sphere;
+    if (isSphere) ImGui::PopStyleColor();
+    ImGui::SameLine();
+    const bool isBox = (m_shape == BrushShape::Box);
+    if (isBox) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26f, 0.59f, 0.98f, 0.80f));
+    }
+    if (ImGui::Button("Box")) m_shape = BrushShape::Box;
+    if (isBox) ImGui::PopStyleColor();
+
+    ImGui::SetNextItemWidth(180.0f);
+    int radius = m_radiusVoxelsLod0;
+    if (ImGui::SliderInt("Radius (LOD-0 voxels)", &radius, 1, 1024)) {
+        setBrushRadiusVoxels(radius);
+    }
+    ImGui::SetNextItemWidth(180.0f);
+    radius = m_radiusVoxelsLod0;
+    if (ImGui::InputInt("Custom radius (max 10240)", &radius, 64, 512)) {
+        setBrushRadiusVoxels(radius);
+    }
+    radius = m_radiusVoxelsLod0;
+    const int64_t side = static_cast<int64_t>(radius) * 2 + 1;
+    const int64_t approxCells = (m_shape == BrushShape::Sphere)
+        ? static_cast<int64_t>(3.14159265 * static_cast<double>(radius) * static_cast<double>(radius))
+        : side * side;
+    ImGui::TextDisabled("  -> %.3f m at LOD 0, approx %lld face cells, repeat %.0f ms",
+                        radius * WorldConfig::VOXEL_SIZE_M,
+                        static_cast<long long>(std::max<int64_t>(1, approxCells)),
+                        getPaintRepeatIntervalSec() * 1000.0f);
+
+    // ---------------- Texture type + variant ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Material");
+    static const char* TYPE_NAMES[] = { "Grass", "Mud", "Dirt", "Sand" };
+    int typeIdx = static_cast<int>(m_textureType);
+    if (ImGui::Combo("Type", &typeIdx, TYPE_NAMES, IM_ARRAYSIZE(TYPE_NAMES))) {
+        m_textureType = static_cast<TextureType>(typeIdx);
+    }
+
+    int variant = m_variant;
+    if (ImGui::SliderInt("Variant seed", &variant, 0, 7)) {
+        setVariant(static_cast<uint8_t>(variant));
+    }
+
+    const auto& activeStyle = TextureOverlay::TextureBrushStyles::getStyle(m_textureType);
+    ImGui::TextColored(kHeading, "Brush Style System");
+    ImGui::TextDisabled("Design, preview colors, variants, and edge blending are owned by TextureBrushStyles.");
+
+    auto showStyleColor = [](const char* label, const glm::vec3& color) {
+        ImGui::ColorButton(label,
+                           ImVec4(color.x, color.y, color.z, 1.0f),
+                           ImGuiColorEditFlags_NoTooltip,
+                           ImVec2(22.0f, 22.0f));
+        ImGui::SameLine();
+        ImGui::Text("%s: %.2f %.2f %.2f", label, color.x, color.y, color.z);
+    };
+
+    showStyleColor("Base", activeStyle.preview.base);
+    showStyleColor("Highlight", activeStyle.preview.highlight);
+    showStyleColor("Shadow", activeStyle.preview.shadow);
+    showStyleColor("Accent", activeStyle.preview.accent);
+
+    // ---------------- LOD targeting ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "LOD Targeting");
+
+    int modeIdx = static_cast<int>(m_lodMode);
+    ImGui::RadioButton("Auto from hit chunk", &modeIdx, 0); ImGui::SameLine();
+    ImGui::RadioButton("Manual",              &modeIdx, 1);
+    m_lodMode = static_cast<LODMode>(modeIdx);
+
+    if (m_lodMode == LODMode::Manual) {
+        int lod = m_manualLod;
+        if (ImGui::SliderInt("Target LOD", &lod, 0,
+                             TextureOverlayStore::LOD_COUNT - 1)) {
+            setManualLOD(lod);
+        }
+    } else {
+        if (m_hasPlacementContext) {
+            ImGui::Text("Hit LOD: %d  (voxel %.3f m)", m_hitLod, m_hitVoxelSizeM);
+        } else {
+            ImGui::TextDisabled("Hover terrain to resolve hit LOD");
+        }
+    }
+
+    ImGui::Checkbox("Cascade paint to coarser LODs", &m_cascadeToCoarser);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("When enabled, the same stroke also paints into all "
+                          "LOD levels coarser than the source LOD, so the "
+                          "texture stays visible after a chunk LOD swap.");
+    }
+    ImGui::TextDisabled("Shader material preview LOD: %d (final pixels are shaded in terrain)",
+                        getPreviewLOD());
+
+    // ---------------- Per-LOD resolution config ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Per-LOD Texture Resolution");
+    ImGui::TextDisabled("Texels per voxel face edge.  Adapt: each LOD step "
+                        "is 2x bigger voxels / 1/8 the cells.");
+
+    if (ImGui::BeginTable("perLodCfg", 4,
+                          ImGuiTableFlags_BordersInnerV |
+                          ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("LOD", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("Voxel size", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("Resolution", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Enabled", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableHeadersRow();
+
+        for (int lod = 0; lod < TextureOverlayStore::LOD_COUNT; ++lod) {
+            ImGui::TableNextRow();
+            ImGui::PushID(lod);
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("LOD %d", lod);
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%.3f m", WorldConfig::getLODVoxelSizeM(lod));
+
+            ImGui::TableSetColumnIndex(2);
+            LODTextureConfig cfg = getStore().getLODConfig(lod);
+            int currentIdx = 0;
+            for (int i = 0; i < TextureOverlayStore::RES_OPTION_COUNT; ++i) {
+                if (TextureOverlayStore::RES_OPTIONS[i] == cfg.pixelsPerVoxel) {
+                    currentIdx = i; break;
                 }
-                closest[axis] = clampf(
-                    stamp.centerVoxelLod0[axis],
-                    static_cast<float>(lod0Base[axis]),
-                    static_cast<float>(lod0Base[axis] + step));
             }
-            const glm::vec3 d = closest - stamp.centerVoxelLod0;
-            return glm::dot(d, d) <= radius * radius + 1e-5f;
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::Combo("##res",
+                             &currentIdx,
+                             TextureOverlayStore::RES_OPTION_LABELS,
+                             TextureOverlayStore::RES_OPTION_COUNT)) {
+                cfg.pixelsPerVoxel = TextureOverlayStore::RES_OPTIONS[currentIdx];
+                getStore().setLODConfig(lod, cfg);
+            }
+
+            ImGui::TableSetColumnIndex(3);
+            bool enabled = cfg.enabled;
+            if (ImGui::Checkbox("##en", &enabled)) {
+                cfg.enabled = enabled;
+                getStore().setLODConfig(lod, cfg);
+            }
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    // ---------------- Live hit preview info ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Hit Preview");
+    if (!m_hasHit) {
+        ImGui::TextDisabled("Move mouse over terrain to preview");
+    } else {
+        ImGui::Text("Hit:    (%.3f, %.3f, %.3f)", m_hitPos.x, m_hitPos.y, m_hitPos.z);
+        ImGui::Text("Normal: (%.2f, %.2f, %.2f)", m_hitNormal.x, m_hitNormal.y, m_hitNormal.z);
+        const int lod = getActivePaintLOD();
+        const auto cfg = getStore().getLODConfig(lod);
+        ImGui::Text("Source paint LOD: 0 (%dx%d px/face)%s",
+                    getStore().getLODConfig(0).pixelsPerVoxel,
+                    getStore().getLODConfig(0).pixelsPerVoxel,
+                    getStore().getLODConfig(0).enabled ? "" : "  [DISABLED]");
+        ImGui::Text("Render-preview LOD: %d (%dx%d px/face)%s",
+                    lod, cfg.pixelsPerVoxel, cfg.pixelsPerVoxel,
+                    cfg.enabled ? "" : "  [DISABLED]");
+        const int rLod = (m_radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
+        ImGui::Text("Effective surface radius: %d voxel%s at LOD %d",
+                    rLod, rLod == 1 ? "" : "s", lod);
+    }
+
+    // ---------------- Last paint diagnostics ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Last Paint");
+    if (m_lastFacesCollected == 0 && m_lastCellsPainted == 0 && m_lastCellsCascaded == 0) {
+        ImGui::TextDisabled("Left click to paint");
+    } else {
+        ImGui::Text("Surface faces found: %d", m_lastFacesCollected);
+        ImGui::Text("Face cells changed: %d (LOD %d)", m_lastCellsPainted, m_lastPaintLod);
+        if (m_lastFacesUnchanged > 0) {
+            ImGui::TextDisabled("Unchanged/no-op: %d", m_lastFacesUnchanged);
+        }
+        if (m_cascadeToCoarser) {
+            ImGui::Text("Cascaded to coarser: %d cells", m_lastCellsCascaded);
+        }
+        ImGui::Text("Time: %.3f ms", m_lastPaintMs);
+        ImGui::TextDisabled("Pending material-rebake chunks: %zu", m_pendingTextureDirtyChunks.size());
+    }
+
+    if (ImGui::TreeNode("Last 50 Brush Edit Diagnostics")) {
+        ImGui::TextDisabled("Copy this table when brush spam still tanks FPS.");
+        if (ImGui::Button("Copy Last 50 Paint Stats")) {
+            m_lastDiagnosticsExport = buildPaintDiagnosticsReport();
+            ImGui::SetClipboardText(m_lastDiagnosticsExport.c_str());
+        }
+        if (!m_lastDiagnosticsExport.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("copied %zu bytes", m_lastDiagnosticsExport.size());
         }
 
-        if (std::abs(stamp.centerVoxelLod0[queryAxis] - plane) > radius + 1e-5f) {
-            return false;
-        }
-        for (int axis = 0; axis < 3; ++axis) {
-            if (axis == queryAxis) {
-                continue;
+        if (ImGui::BeginTable("paintDiagHistory", 9,
+                              ImGuiTableFlags_BordersInnerV |
+                              ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 38.0f);
+            ImGui::TableSetupColumn("total");
+            ImGui::TableSetupColumn("collect");
+            ImGui::TableSetupColumn("store");
+            ImGui::TableSetupColumn("sched");
+            ImGui::TableSetupColumn("faces");
+            ImGui::TableSetupColumn("changed");
+            ImGui::TableSetupColumn("flush");
+            ImGui::TableSetupColumn("pending");
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < m_paintDiagCount; ++i) {
+                const int idx = (m_paintDiagWriteIndex - m_paintDiagCount + i + PAINT_DIAG_HISTORY)
+                    % PAINT_DIAG_HISTORY;
+                const PaintOpDiagnostic& d = m_paintDiagHistory[static_cast<size_t>(idx)];
+
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("%llu", static_cast<unsigned long long>(d.serial));
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", d.totalMs);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", d.collectMs);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", d.storeMs);
+                ImGui::TableSetColumnIndex(4); ImGui::Text("%.2f", d.scheduleMs);
+                ImGui::TableSetColumnIndex(5); ImGui::Text("%d", d.facesCollected);
+                ImGui::TableSetColumnIndex(6); ImGui::Text("%d", d.cellsPainted);
+                ImGui::TableSetColumnIndex(7); ImGui::Text("%d", d.flushedChunks);
+                ImGui::TableSetColumnIndex(8); ImGui::Text("%d", d.pendingChunksAfter);
             }
-            const float a0 = static_cast<float>(lod0Base[axis]);
-            const float a1 = static_cast<float>(lod0Base[axis] + step);
-            const float b0 = stamp.centerVoxelLod0[axis] - radius;
-            const float b1 = stamp.centerVoxelLod0[axis] + radius;
-            if (a1 < b0 || b1 < a0) {
-                return false;
-            }
+            ImGui::EndTable();
         }
+        ImGui::TreePop();
+    }
+
+    // ---------------- Store stats ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Voxel Material Store");
+    const auto stats = getStore().getStats();
+    ImGui::Text("Total: %zu bricks  %zu cells  (gen %zu)",
+                stats.totalBricks, stats.totalCells, stats.generation);
+    if (ImGui::TreeNode("Per-LOD breakdown")) {
+        for (int lod = 0; lod < TextureOverlayStore::LOD_COUNT; ++lod) {
+            ImGui::Text("  LOD %d: %zu bricks  %zu cells",
+                        lod, stats.bricksByLOD[lod], stats.cellsByLOD[lod]);
+        }
+        ImGui::TreePop();
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button("Clear All Textures")) {
+        getStore().clear();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear Hit LOD")) {
+        getStore().clearLOD(getActivePaintLOD());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Copy Last 50 Paint Stats##bottom")) {
+        m_lastDiagnosticsExport = buildPaintDiagnosticsReport();
+        ImGui::SetClipboardText(m_lastDiagnosticsExport.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// World-space brush preview
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// World-space brush preview
+// ---------------------------------------------------------------------------
+
+void TexturePaintTool::renderPreviewOverlay(const glm::mat4& viewProj,
+                                            int viewportW, int viewportH,
+                                            float viewportOffsetX,
+                                            float viewportOffsetY) {
+    if (!m_active || !m_hasHit) return;
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+    const ImU32 col = colorFromVec3(getTypeBaseColor(m_textureType));
+    const ImU32 fill = (col & 0x00FFFFFFu) | 0x33000000u;
+
+    const float vpW = static_cast<float>(viewportW);
+    const float vpH = static_cast<float>(viewportH);
+
+    auto project = [&](const glm::vec3& wp, ImVec2& out) -> bool {
+        glm::vec4 c = viewProj * glm::vec4(wp, 1.0f);
+        if (c.w <= 0.01f) return false;
+        glm::vec3 ndc = glm::vec3(c) / c.w;
+        out.x = viewportOffsetX + (ndc.x * 0.5f + 0.5f) * vpW;
+        out.y = viewportOffsetY + (1.0f - (ndc.y * 0.5f + 0.5f)) * vpH;
         return true;
     };
 
-    uint32_t bestOrder = 0u;
-    VoxelTextureData best{};
+    const int lod = getActivePaintLOD();
+    const float voxelSize = WorldConfig::getLODVoxelSizeM(lod);
+    const float radiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
 
-    for (int cz = std::min(chunkMin.z, chunkMax.z); cz <= std::max(chunkMin.z, chunkMax.z); ++cz) {
-        for (int cy = std::min(chunkMin.y, chunkMax.y); cy <= std::max(chunkMin.y, chunkMax.y); ++cy) {
-            for (int cx = std::min(chunkMin.x, chunkMax.x); cx <= std::max(chunkMin.x, chunkMax.x); ++cx) {
-                auto it = m_surfacePaintStampChunkIndex.find(glm::ivec3(cx, cy, cz));
-                if (it == m_surfacePaintStampChunkIndex.end()) {
-                    continue;
-                }
-
-                const auto& candidates = it->second;
-                for (auto rit = candidates.rbegin(); rit != candidates.rend(); ++rit) {
-                    const uint32_t stampIndex = *rit;
-                    if (stampIndex >= m_surfacePaintStamps.size()) {
-                        continue;
-                    }
-
-                    const SurfacePaintStamp& stamp = m_surfacePaintStamps[stampIndex];
-                    if (stamp.order <= bestOrder) {
-                        break;
-                    }
-                    if (!surfaceStampTouchesBox(stamp, queryMin, queryMax)) {
-                        continue;
-                    }
-                    if (!stampContainsQueryFace(stamp)) {
-                        continue;
-                    }
-
-                    bestOrder = stamp.order;
-                    best = VoxelTextureData(
-                        stamp.type,
-                        variedVariant(lod0Sample, queryFace, stamp.type, stamp.variant),
-                        0u,
-                        queryFace);
-                    break;
-                }
+    if (m_shape == BrushShape::Sphere) {
+        // 3 great circles, like TerrainEditTool's fallback path.
+        auto drawCircle = [&](int a0, int a1, int aN) {
+            constexpr int SEG = 32;
+            ImVec2 pts[SEG]; bool vis[SEG];
+            for (int i = 0; i < SEG; ++i) {
+                float ang = 6.28318530f * float(i) / float(SEG);
+                glm::vec3 p = m_hitPos;
+                p[a0] = m_hitPos[a0] + std::cos(ang) * radiusM;
+                p[a1] = m_hitPos[a1] + std::sin(ang) * radiusM;
+                p[aN] = m_hitPos[aN];
+                vis[i] = project(p, pts[i]);
+            }
+            for (int i = 0; i < SEG; ++i) {
+                int j = (i + 1) % SEG;
+                if (vis[i] && vis[j]) dl->AddLine(pts[i], pts[j], col, 2.0f);
+            }
+        };
+        drawCircle(0, 1, 2);
+        drawCircle(0, 2, 1);
+        drawCircle(1, 2, 0);
+    } else {
+        // Box wireframe
+        const glm::vec3 lo = m_hitPos - glm::vec3(radiusM);
+        const glm::vec3 hi = m_hitPos + glm::vec3(radiusM);
+        const glm::vec3 corners[8] = {
+            {lo.x,lo.y,lo.z}, {hi.x,lo.y,lo.z},
+            {hi.x,hi.y,lo.z}, {lo.x,hi.y,lo.z},
+            {lo.x,lo.y,hi.z}, {hi.x,lo.y,hi.z},
+            {hi.x,hi.y,hi.z}, {lo.x,hi.y,hi.z},
+        };
+        ImVec2 sp[8]; bool vis[8];
+        for (int i = 0; i < 8; ++i) vis[i] = project(corners[i], sp[i]);
+        constexpr int E[12][2] = {
+            {0,1},{1,2},{2,3},{3,0},
+            {4,5},{5,6},{6,7},{7,4},
+            {0,4},{1,5},{2,6},{3,7}
+        };
+        for (auto& e : E) {
+            if (vis[e[0]] && vis[e[1]]) dl->AddLine(sp[e[0]], sp[e[1]], col, 2.0f);
+        }
+        // Light fill on the dominant face for readability
+        constexpr int F[6][4] = {
+            {0,1,2,3},{4,5,6,7},
+            {3,2,6,7},{0,1,5,4},
+            {0,3,7,4},{1,2,6,5}
+        };
+        for (auto& f : F) {
+            if (vis[f[0]] && vis[f[1]] && vis[f[2]] && vis[f[3]]) {
+                dl->AddQuadFilled(sp[f[0]], sp[f[1]], sp[f[2]], sp[f[3]], fill);
             }
         }
     }
 
-    for (auto rit = m_unindexedSurfacePaintStampIndices.rbegin();
-         rit != m_unindexedSurfacePaintStampIndices.rend();
-         ++rit) {
-        const uint32_t stampIndex = *rit;
-        if (stampIndex >= m_surfacePaintStamps.size()) {
-            continue;
-        }
-
-        const SurfacePaintStamp& stamp = m_surfacePaintStamps[stampIndex];
-        if (stamp.order <= bestOrder) {
-            continue;
-        }
-        if (!surfaceStampTouchesBox(stamp, queryMin, queryMax)) {
-            continue;
-        }
-        if (!stampContainsQueryFace(stamp)) {
-            continue;
-        }
-
-        bestOrder = stamp.order;
-        best = VoxelTextureData(
-            stamp.type,
-            variedVariant(lod0Sample, queryFace, stamp.type, stamp.variant),
-            0u,
-            queryFace);
+    // Mark the hit point
+    ImVec2 hitScreen;
+    if (project(m_hitPos, hitScreen)) {
+        dl->AddCircleFilled(hitScreen, 3.0f, col);
+        // Label: type + variant + active LOD + resolution
+        const auto cfg = getStore().getLODConfig(lod);
+        char label[160];
+        std::snprintf(label, sizeof(label),
+                      "%s v%u  LOD %d  %dx%d px/face  r=%.3fm  vox=%.3fm",
+                      TextureOverlay::textureTypeName(m_textureType),
+                      static_cast<unsigned>(m_variant),
+                      lod,
+                      cfg.pixelsPerVoxel, cfg.pixelsPerVoxel,
+                      radiusM,
+                      voxelSize);
+        dl->AddText(ImVec2(hitScreen.x + 12.0f, hitScreen.y - 8.0f), col, label);
     }
 
-    return best;
+    // Last-paint floating ms readout (fades over PREVIEW_FADE_SEC)
+    if (m_lastPaintMs > 0.0f) {
+        const float t = std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - m_previewStartTime).count();
+        if (t < PREVIEW_FADE_SEC) {
+            const float a = std::clamp(1.0f - t / PREVIEW_FADE_SEC, 0.0f, 1.0f);
+            ImVec2 sp;
+            if (project(m_lastPaintWorldCenter, sp)) {
+                char ms[64];
+                std::snprintf(ms, sizeof(ms), "+%d/%d cells (%.2f ms)",
+                              m_lastCellsPainted, m_lastFacesCollected, m_lastPaintMs);
+                ImU32 c = (col & 0x00FFFFFFu) |
+                          (static_cast<uint32_t>(a * 255.0f) << 24);
+                dl->AddText(ImVec2(sp.x, sp.y - 24.0f), c, ms);
+            }
+        }
+    }
 }
-
-} // namespace TextureOverlay
 
 ````
 
-## include\world\edit\TextureOverlayStore.h
+## include\ui\debug_menu\world\TexturePaintTool.h
 
-Description: No CC-DESC found. C++ struct 'VoxelTextureData'.
+Description: No CC-DESC found. C++ class 'World'.
 
 ````cpp
 #pragma once
 
-// GPT-DESC: Declares sparse texture material storage and deferred/live surface paint stamps.
+// GPT-DESC: Declares texture paint tool state, diagnostics, and debounced material rebake controls.
 
 #include <array>
-#include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <shared_mutex>
-#include <unordered_map>
+#include <functional>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include <glm/glm.hpp>
 
-#include "world/WorldTypes.h"
-#include "world/config/WorldConfig.h"
-
-namespace TextureOverlay {
-
-// ---------------------------------------------------------------------------
-// Texture material types and per-voxel storage
-// ---------------------------------------------------------------------------
-
-enum class TextureType : uint8_t {
-    Grass = 0,
-    Mud = 1,
-    Dirt = 2,
-    Sand = 3,
-    COUNT = 4
-};
-
-// Transition edge style used for material boundaries.
-// Stored in VoxelTextureData::edgeMask (2 bits).
-enum class TransitionEdgeStyle : uint8_t {
-    None = 0,
-    Leafy = 1,
-    Sloppy = 2,
-    Grainy = 3
-};
-
-enum class SurfaceBrushShape : uint8_t {
-    Disc = 0,
-    Rect = 1
-};
-
-inline const char* textureTypeName(TextureType t) {
-    switch (t) {
-        case TextureType::Grass: return "grass";
-        case TextureType::Mud:   return "mud";
-        case TextureType::Dirt:  return "dirt";
-        case TextureType::Sand:  return "sand";
-        default: return "?";
-    }
-}
-
-// Per-voxel texture assignment.  Packed into 1 byte:
-//   bit 0..1  textureType (4 types)
-//   bit 2..4  variant (8 variants — we only need 5 in practice)
-//   bit 5..6  edgeMask (2 bits, reserved for transition flags)
-//   bit 7     valid flag (1 = painted, 0 = empty)
-//
-// The valid flag is essential: without it, "Grass + variant 0" would collide
-// with "empty" (both packed=0).  It's the only way to clear a cell back to
-// its un-painted state via the same packed byte.
-struct VoxelTextureData {
-    uint8_t packed{0};
-    uint8_t face{3}; // 0..5, same face IDs as the terrain vertex format.
-
-    constexpr VoxelTextureData() = default;
-    VoxelTextureData(TextureType type,
-                     uint8_t variant,
-                     uint8_t edgeMask = 0,
-                     uint8_t faceId = 3) {
-        packed = static_cast<uint8_t>(
-            0x80u |  // valid flag
-            (static_cast<uint32_t>(type) & 0x3u) |
-            ((variant & 0x7u) << 2) |
-            ((edgeMask & 0x3u) << 5));
-        face = static_cast<uint8_t>(faceId % 6u);
-    }
-
-    TextureType getType() const {
-        return static_cast<TextureType>(packed & 0x3u);
-    }
-    uint8_t getVariant() const {
-        return static_cast<uint8_t>((packed >> 2) & 0x7u);
-    }
-    uint8_t getEdgeMask() const {
-        return static_cast<uint8_t>((packed >> 5) & 0x3u);
-    }
-    uint8_t getFace() const { return face; }
-    bool isEmpty() const { return (packed & 0x80u) == 0; }
-
-    VoxelTextureData withEdgeMask(uint8_t edgeMask) const {
-        if (isEmpty()) return *this;
-        VoxelTextureData out = *this;
-        out.packed = static_cast<uint8_t>(
-            (out.packed & ~0x60u) | ((edgeMask & 0x3u) << 5));
-        return out;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Per-LOD resolution config
-//
-// Each LOD level has its own pixels-per-voxel-face value. Selectable from
-// 2,4,8,...,1024. The terrain shader uses this to quantize procedural pixel
-// detail on a face emitted for that LOD.
-// ---------------------------------------------------------------------------
-
-struct LODTextureConfig {
-    // Texels per voxel face edge.  Must be a power of two >= 2 and <= 1024.
-    // Default cascade: LOD 0 = 16 px, LOD 1 = 8 px, LOD 2 = 4 px, LOD 3 = 2 px
-    uint16_t pixelsPerVoxel{4};
-    // If false, no painting is authored at this LOD.
-    bool enabled{true};
-};
-
-// ---------------------------------------------------------------------------
-// Sparse storage primitives
-// ---------------------------------------------------------------------------
-
-// 8x8x8 brick of texture cells (matches the edit-overlay brick size).
-struct TextureBrick {
-    static constexpr int SIZE = 8;
-    static constexpr int CELLS = SIZE * SIZE * SIZE;
-
-    std::array<VoxelTextureData, CELLS> cells{};
-    uint32_t activeCount{0};
-
-    static int toIndex(int lx, int ly, int lz) {
-        return lx + ly * SIZE + lz * SIZE * SIZE;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Sparse, per-LOD voxel-face material store
-//
-// LOD storage:
-//   - One independent BrickMap per LOD level (4 levels).
-//   - Coordinates within each LOD's BrickMap are voxel coords *at that LOD*.
-//     i.e. an LOD-1 voxel coordinate = lod0Coord >> 1, LOD-2 = lod0Coord >> 2.
-//
-// Paint operations take the LOD level explicitly so the brush can target the
-// LOD that the hit chunk is currently rendered at, and the radius scales
-// naturally (the stored cell footprint at LOD-N is 1/(2^N) of the LOD-0
-// footprint for the same world distance).
-// ---------------------------------------------------------------------------
-
-class TextureOverlayStore {
-public:
-    struct SurfaceFaceStamp {
-        glm::ivec3 lodCoord{0};
-        uint8_t face{3};
-    };
-
-    // Deferred surface brush command. This is the interactive O(1) authoring path:
-    // one huge brush stroke stores one stamp and affected chunks are rebaked later.
-    // The mesher resolves stamps through getSurfaceTexture() while emitting real
-    // terrain faces, so the click path never expands radius^2 faces.
-    struct SurfacePaintStamp {
-        glm::vec3 centerVoxelLod0{0.0f};
-        glm::ivec3 bboxMinLod0{0};
-        glm::ivec3 bboxMaxLod0{0};
-        int radiusVoxelsLod0{1};
-        SurfaceBrushShape shape{SurfaceBrushShape::Disc};
-        TextureType type{TextureType::Grass};
-        uint8_t variant{0};
-        uint8_t sourceFace{255};
-        uint32_t order{0};
-    };
-
-    struct GPUCell {
-        int32_t x{0};
-        int32_t y{0};
-        int32_t z{0};
-        uint32_t lod{0};
-        uint32_t packed{0};
-        uint32_t face{3};
-    };
-
-    static constexpr int LOD_COUNT = MAX_LOD_LEVELS;
-    static constexpr int RES_OPTION_COUNT = 10;
-    static const uint16_t RES_OPTIONS[RES_OPTION_COUNT];   // {2,4,8,...,1024}
-    static const char*   RES_OPTION_LABELS[RES_OPTION_COUNT];
-
-    TextureOverlayStore();
-
-    // -------- Per-LOD configuration --------
-    void setLODConfig(int lod, const LODTextureConfig& cfg);
-    LODTextureConfig getLODConfig(int lod) const;
-
-    // -------- Single-cell access (LOD-aware) --------
-    // 'lodCoord' is in voxel coords at the requested LOD level.
-    void setTexture(const glm::ivec3& lodCoord, int lod, VoxelTextureData data);
-    VoxelTextureData getTexture(const glm::ivec3& lodCoord, int lod) const;
-    VoxelTextureData getSurfaceTexture(const glm::ivec3& lodCoord,
-                                       int lod,
-                                       uint8_t face) const;
-    bool hasSurfaceTexturesInBox(const glm::ivec3& minLodCoord,
-                                 const glm::ivec3& maxExclusiveLodCoord,
-                                 int lod) const;
-    void clearTexture(const glm::ivec3& lodCoord, int lod);
-
-    // -------- Brush paint operations --------
-    // 'centerLod0' is the world-voxel center *at LOD-0*; the paint operation
-    // automatically converts to the target LOD's resolution.
-    // 'radiusVoxelsLod0' is the brush radius in LOD-0 voxels.
-    // Returns the number of LOD cells written.
-    int paintSphere(const glm::ivec3& centerLod0,
-                    int radiusVoxelsLod0,
-                    int lod,
-                    TextureType type,
-                    uint8_t variant);
-    int paintBox(const glm::ivec3& minLod0,
-                 const glm::ivec3& maxLod0,
-                 int lod,
-                 TextureType type,
-                 uint8_t variant);
-
-    // Fast surface stamps for texture painting. They write only the face plane
-    // under the cursor instead of filling a 3D volume.
-    int paintFaceDisc(const glm::ivec3& centerLod0,
-                      int radiusVoxelsLod0,
-                      int normalAxis,
-                      int lod,
-                      TextureType type,
-                      uint8_t variant,
-                      uint8_t face,
-                      int maxCells = 300000);
-    int paintFaceRect(const glm::ivec3& centerLod0,
-                      int radiusVoxelsLod0,
-                      int normalAxis,
-                      int lod,
-                      TextureType type,
-                      uint8_t variant,
-                      uint8_t face,
-                      int maxCells = 300000);
-    int paintSurfaceFaces(const std::vector<SurfaceFaceStamp>& faces,
-                          int lod,
-                          TextureType type,
-                          uint8_t variant);
-
-    // Theoretical-minimum interactive brush path. Stores one deferred stamp
-    // instead of expanding the brush into per-face cells. Returned value is
-    // the monotonically increasing stamp order, or 0 if the stamp was rejected.
-    uint32_t appendSurfacePaintStamp(const glm::vec3& centerWorld,
-                                     int radiusVoxelsLod0,
-                                     SurfaceBrushShape shape,
-                                     TextureType type,
-                                     uint8_t variant,
-                                     uint8_t sourceFace = 255);
-    size_t getSurfacePaintStampCount() const;
-
-    // Copy newest deferred paint stamps for the bounded live GPU overlay.
-    // Returned stamps stay chronological; the shader scans newest-first.
-    size_t exportLiveSurfacePaintStamps(std::vector<SurfacePaintStamp>& out,
-                                        size_t maxStamps) const;
-
-    int clearSphere(const glm::ivec3& centerLod0,
-                    int radiusVoxelsLod0,
-                    int lod);
-    int clearBox(const glm::ivec3& minLod0,
-                 const glm::ivec3& maxLod0,
-                 int lod);
-
-    // Cascade a paint from sourceLod to all coarser LODs (sourceLod+1..MAX).
-    // Useful when the user paints at LOD 0 and wants the texture to show up
-    // when the chunk later transitions to a coarser LOD.  Returns total cells
-    // written across all cascaded LODs.
-    int cascadeToCoarserLODs(const glm::ivec3& centerLod0,
-                             int radiusVoxelsLod0,
-                             int sourceLod,
-                             TextureType type,
-                             uint8_t variant);
-    int cascadeFaceToCoarserLODs(const glm::ivec3& centerLod0,
-                                 int radiusVoxelsLod0,
-                                 int normalAxis,
-                                 int sourceLod,
-                                 SurfaceBrushShape shape,
-                                 TextureType type,
-                                 uint8_t variant,
-                                 uint8_t face,
-                                 int maxCellsPerLOD = 300000);
-
-    // -------- Stats / state --------
-    struct Stats {
-        size_t bricksByLOD[LOD_COUNT]{};
-        size_t cellsByLOD[LOD_COUNT]{};
-        size_t totalBricks{0};
-        size_t totalCells{0};
-        size_t surfaceStampCount{0};
-        size_t generation{0};
-    };
-    Stats getStats() const;
-    size_t exportGPUCells(std::vector<GPUCell>& out, size_t maxCells) const;
-    size_t exportGPUCellsForLOD(int lod, std::vector<GPUCell>& out, size_t maxCells) const;
-    size_t consumeDirtyGPUCells(std::vector<GPUCell>& out,
-                                size_t maxCells,
-                                bool& requiresFullUpload);
-    bool isEmpty() const;
-    void clear();
-    void clearLOD(int lod);
-
-    // Monotonically incremented every write — used by mesher caches.
-    size_t getGeneration() const {
-        return m_generation.load(std::memory_order_acquire);
-    }
-
-    // -------- Persistence (binary) --------
-    bool saveToFile(const char* path) const;
-    bool loadFromFile(const char* path);
-
-    // -------- LOD/coordinate helpers --------
-    static glm::ivec3 lod0ToLOD(const glm::ivec3& lod0Coord, int lod) {
-        const int shift = lod;
-        // Arithmetic shift handles negative coords correctly for power-of-two
-        // downsampling — equivalent to floor(coord / 2^lod) for negatives too.
-        return glm::ivec3(lod0Coord.x >> shift,
-                          lod0Coord.y >> shift,
-                          lod0Coord.z >> shift);
-    }
-    static glm::ivec3 lodToLOD0(const glm::ivec3& lodCoord, int lod) {
-        return glm::ivec3(lodCoord.x << lod,
-                          lodCoord.y << lod,
-                          lodCoord.z << lod);
-    }
-
-private:
-    struct BrickKey {
-        int32_t bx, by, bz;
-        bool operator==(const BrickKey& o) const noexcept {
-            return bx == o.bx && by == o.by && bz == o.bz;
-        }
-    };
-    struct BrickKeyHash {
-        size_t operator()(const BrickKey& k) const noexcept {
-            // splitmix-style mix; cheap and good distribution
-            uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(k.bx)) * 73856093ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(k.by)) * 19349663ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(k.bz)) * 83492791ull;
-            h ^= h >> 33;
-            return static_cast<size_t>(h);
-        }
-    };
-    using BrickMap = std::unordered_map<BrickKey,
-                                        std::unique_ptr<TextureBrick>,
-                                        BrickKeyHash>;
-
-    static BrickKey voxelToBrick(const glm::ivec3& v);
-    static glm::ivec3 voxelLocalInBrick(const glm::ivec3& v);
-    static glm::ivec3 encodeFaceCoord(const glm::ivec3& voxelCoord, uint8_t face);
-    static glm::ivec3 decodeFaceCoord(const glm::ivec3& storageCoord, uint8_t& face);
-
-    TextureBrick* getOrCreateBrickLocked(BrickMap& map, int lod, BrickKey key);
-    TextureBrick* getBrickLocked(BrickMap& map, BrickKey key);
-    const TextureBrick* getBrickLocked(const BrickMap& map, BrickKey key) const;
-
-    void writeCellLocked(BrickMap& map, int lod, BrickKey key,
-                         const glm::ivec3& local,
-                         VoxelTextureData data);
-
-    static uint8_t classifyTransitionEdge(TextureType a,
-                                          TextureType b,
-                                          const glm::ivec3& lodCoord);
-    static uint8_t mergeEdgeStyle(uint8_t lhs, uint8_t rhs);
-    void recordDirtyGPUCellLocked(int lod,
-                                  const glm::ivec3& lodCoord,
-                                  VoxelTextureData data);
-    void requestFullGPUUploadLocked();
-    void refreshTransitionEdgesAroundCellLocked(BrickMap& map,
-                                                int lod,
-                                                const glm::ivec3& lodCoord);
-    void refreshTransitionEdgesAroundFaceLocked(BrickMap& map,
-                                                int lod,
-                                                const glm::ivec3& lodCoord,
-                                                uint8_t face);
-
-    struct SurfacePaintChunkHash {
-        size_t operator()(const glm::ivec3& v) const noexcept {
-            uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(v.x)) * 73856093ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.y)) * 19349663ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.z)) * 83492791ull;
-            h ^= h >> 33;
-            return static_cast<size_t>(h);
-        }
-    };
-    void indexSurfacePaintStampLocked(uint32_t stampIndex);
-    VoxelTextureData sampleSurfacePaintStampsLocked(const glm::ivec3& lodCoord,
-                                                    int lod,
-                                                    uint8_t face) const;
-    static bool surfaceStampTouchesBox(const SurfacePaintStamp& stamp,
-                                       const glm::ivec3& minLod0,
-                                       const glm::ivec3& maxLod0);
-
-    bool isLodValid(int lod) const { return lod >= 0 && lod < LOD_COUNT; }
-
-    // One BrickMap per LOD.  Indices 0..MAX_LOD_LEVEL.
-    std::array<BrickMap, LOD_COUNT> m_lodMaps;
-    std::array<size_t, LOD_COUNT> m_brickCountsByLOD{};
-    std::array<size_t, LOD_COUNT> m_cellCountsByLOD{};
-
-    std::array<LODTextureConfig, LOD_COUNT> m_lodConfigs;
-
-    mutable std::shared_mutex m_mutex;
-    std::atomic<size_t> m_generation{0};
-
-    // Deferred brush stamps indexed by affected native chunk when the affected
-    // chunk count is modest. Very large stamps are kept in an unindexed side
-    // list so a 10k-radius brush does not expand into millions of index rows.
-    // The stamp vector is append-only between clears, so indices stay stable.
-    std::vector<SurfacePaintStamp> m_surfacePaintStamps;
-    std::unordered_map<glm::ivec3, std::vector<uint32_t>, SurfacePaintChunkHash>
-        m_surfacePaintStampChunkIndex;
-    std::vector<uint32_t> m_unindexedSurfacePaintStampIndices;
-    uint32_t m_nextSurfacePaintStampOrder{1};
-
-    // Dirty LOD0 face cells consumed by the terrain material overlay SSBO.
-    // Full-upload mode is used for clears/config changes and delta overflow.
-    std::vector<GPUCell> m_dirtyGPUCells;
-    bool m_dirtyGPUFullUpload{false};
-};
-
-} // namespace TextureOverlay
-
-````
-
-## include\world\edit\texture\TextureBrushStyles.h
-
-Description: No CC-DESC found. C++ struct 'TextureStylePreviewColors'.
-
-````cpp
-#pragma once
-
-// GPT-DESC: Declares terrain texture brush material styles and blend policy.
-
-#include <cstdint>
-
-#include <glm/glm.hpp>
-
-namespace TextureOverlay {
-
-enum class TextureType : uint8_t;
-enum class TransitionEdgeStyle : uint8_t;
-
-struct TextureStylePreviewColors {
-    glm::vec3 base{1.0f};
-    glm::vec3 highlight{1.0f};
-    glm::vec3 shadow{0.0f};
-    glm::vec3 accent{1.0f};
-};
-
-struct TextureBrushStyle {
-    TextureType type;
-    const char* displayName;
-    TextureStylePreviewColors preview;
-    TransitionEdgeStyle defaultBlendEdge;
-    uint32_t variantSalt;
-};
-
-namespace TextureBrushStyles {
-
-const TextureBrushStyle& getStyle(TextureType type);
-const char* name(TextureType type);
-
-uint8_t computeVariant(const glm::ivec3& coord,
-                       uint8_t face,
-                       TextureType type,
-                       uint8_t seed);
-
-TransitionEdgeStyle classifyTransitionEdge(TextureType a,
-                                           TextureType b,
-                                           const glm::ivec3& lodCoord);
-
-TransitionEdgeStyle mergeEdgeStyle(TransitionEdgeStyle lhs,
-                                   TransitionEdgeStyle rhs);
-
-} // namespace TextureBrushStyles
-
-} // namespace TextureOverlay
-
-````
-
-## src\world\edit\texture\TextureBrushStyles.cpp
-
-Description: No CC-DESC found.
-
-````cpp
-// GPT-DESC: Owns texture brush style identity, preview colors, variants, and blend policy.
+#include "world/edit/TerrainEditTypes.h"
+#include "world/edit/TerrainEditOverlayStore.h"
+#include "world/edit/TextureOverlayStore.h"
 #include "world/edit/texture/TextureBrushStyles.h"
 
-#include <array>
-#include <algorithm>
-#include <cstddef>
+class World;
 
-#include "world/edit/TextureOverlayStore.h"
+// ---------------------------------------------------------------------------
+// TexturePaintTool
+//
+// Paints pixel-art material IDs onto existing voxel faces.
+//
+// Current render architecture:
+//   - The canonical authored paint data stays in TextureOverlayStore.
+//   - The old GPU global material-overlay hash table is intentionally kept
+//     empty because it was a terrain/light fragment bottleneck.
+//   - Visible paint is produced by rebaking touched chunk material words into
+//     the normal fast terrain vertex/material path.
+//
+// This tool therefore treats material rebakes as an asynchronous/debounced
+// consequence of brush strokes. Brush authoring must stay responsive even for
+// huge radii; chunk rebake scheduling is rate-limited so spam strokes do not
+// flood runtime remeshing/upload/finalize.
+// ---------------------------------------------------------------------------
+class TexturePaintTool {
+public:
+    enum class BrushShape : int { Sphere = 0, Box = 1 };
+    enum class LODMode    : int { AutoFromHit = 0, Manual = 1 };
+    static constexpr int MAX_BRUSH_RADIUS_VOXELS = 10240;
 
-namespace TextureOverlay {
-namespace TextureBrushStyles {
-namespace {
+    using RaycastFunc = std::function<bool(const glm::vec3& origin,
+                                           const glm::vec3& dir,
+                                           float maxDist,
+                                           glm::vec3& outPos,
+                                           glm::vec3& outNormal)>;
 
-constexpr size_t kTextureTypeCount = static_cast<size_t>(TextureType::COUNT);
+    TexturePaintTool() = default;
 
-size_t styleIndex(TextureType type) {
-    const size_t idx = static_cast<size_t>(type);
-    return (idx < kTextureTypeCount) ? idx : 0u;
-}
+    // -------- Engine wiring --------
+    void setWorld(World* world)        { m_world = world; }
+    void setRaycastFunc(RaycastFunc f) { m_raycastFn = std::move(f); }
 
-uint32_t hashPaintCoord(const glm::ivec3& coord, uint8_t face, uint32_t salt) {
-    uint32_t h = static_cast<uint32_t>(coord.x) * 0x9E3779B9u;
-    h ^= static_cast<uint32_t>(coord.y) * 0x85EBCA6Bu;
-    h ^= static_cast<uint32_t>(coord.z) * 0xC2B2AE35u;
-    h ^= static_cast<uint32_t>(face) * 0x27D4EB2Du;
-    h ^= salt * 0x165667B1u;
-    h ^= h >> 16;
-    h *= 0x7FEB352Du;
-    h ^= h >> 15;
-    return h;
-}
+    // -------- State accessors --------
+    bool isActive() const  { return m_active; }
+    void setActive(bool a) { m_active = a; }
+    TextureOverlay::TextureOverlayStore& getStore();
+    const TextureOverlay::TextureOverlayStore& getStore() const;
 
-uint8_t edgePriority(TransitionEdgeStyle style) {
-    switch (style) {
-        case TransitionEdgeStyle::Sloppy: return 3u;
-        case TransitionEdgeStyle::Leafy:  return 2u;
-        case TransitionEdgeStyle::Grainy: return 1u;
-        case TransitionEdgeStyle::None:
-        default: return 0u;
-    }
-}
+    // -------- Per-frame update --------
+    // Called from EngineRenderLoop. Performs raycast, updates preview, and
+    // triggers paint on left-click with size-aware auto-repeat on hold.
+    void update(double mouseX, double mouseY, int viewportW, int viewportH,
+                const glm::mat4& view, const glm::mat4& proj,
+                const glm::vec3& cameraPos, bool leftClickPressed,
+                float viewportOffsetX = 0.0f, float viewportOffsetY = 0.0f);
 
-const std::array<TextureBrushStyle, kTextureTypeCount> kStyles{{
-    TextureBrushStyle{
-        TextureType::Grass,
-        "Grass",
-        TextureStylePreviewColors{
-            glm::vec3(0.29f, 0.49f, 0.14f),
-            glm::vec3(0.56f, 0.76f, 0.24f),
-            glm::vec3(0.18f, 0.31f, 0.08f),
-            glm::vec3(0.42f, 0.62f, 0.18f)},
-        TransitionEdgeStyle::Leafy,
-        0x31A53B4Du},
-    TextureBrushStyle{
-        TextureType::Mud,
-        "Mud",
-        TextureStylePreviewColors{
-            glm::vec3(0.36f, 0.25f, 0.22f),
-            glm::vec3(0.55f, 0.43f, 0.35f),
-            glm::vec3(0.22f, 0.15f, 0.12f),
-            glm::vec3(0.48f, 0.35f, 0.28f)},
-        TransitionEdgeStyle::Sloppy,
-        0x6D3A2F19u},
-    TextureBrushStyle{
-        TextureType::Dirt,
-        "Dirt",
-        TextureStylePreviewColors{
-            glm::vec3(0.55f, 0.43f, 0.34f),
-            glm::vec3(0.72f, 0.60f, 0.48f),
-            glm::vec3(0.38f, 0.28f, 0.22f),
-            glm::vec3(0.62f, 0.50f, 0.40f)},
-        TransitionEdgeStyle::Grainy,
-        0x9E5B3C27u},
-    TextureBrushStyle{
-        TextureType::Sand,
-        "Sand",
-        TextureStylePreviewColors{
-            glm::vec3(0.83f, 0.65f, 0.46f),
-            glm::vec3(0.95f, 0.85f, 0.65f),
-            glm::vec3(0.65f, 0.48f, 0.32f),
-            glm::vec3(0.88f, 0.72f, 0.52f)},
-        TransitionEdgeStyle::Grainy,
-        0xD9B15E31u},
-}};
+    // -------- Rendering --------
+    // ImGui debug window (full brush + per-LOD config + stats)
+    void renderUI();
+    // World-space brush preview drawn into the foreground draw list
+    void renderPreviewOverlay(const glm::mat4& viewProj,
+                              int viewportW, int viewportH,
+                              float viewportOffsetX = 0.0f,
+                              float viewportOffsetY = 0.0f);
 
-} // namespace
-
-const TextureBrushStyle& getStyle(TextureType type) {
-    return kStyles[styleIndex(type)];
-}
-
-const char* name(TextureType type) {
-    return getStyle(type).displayName;
-}
-
-uint8_t computeVariant(const glm::ivec3& coord,
-                       uint8_t face,
-                       TextureType type,
-                       uint8_t seed) {
-    const TextureBrushStyle& style = getStyle(type);
-    const uint32_t h = hashPaintCoord(coord, face, style.variantSalt);
-    return static_cast<uint8_t>((seed + (h & 0x7u)) & 0x7u);
-}
-
-TransitionEdgeStyle classifyTransitionEdge(TextureType a,
-                                           TextureType b,
-                                           const glm::ivec3& lodCoord) {
-    if (a == b) {
-        return TransitionEdgeStyle::None;
+    // -------- Brush parameters (read by UI + paint) --------
+    int   getBrushRadiusVoxels() const { return m_radiusVoxelsLod0; }
+    void  setBrushRadiusVoxels(int r)  {
+        if (r < 1) r = 1;
+        if (r > MAX_BRUSH_RADIUS_VOXELS) r = MAX_BRUSH_RADIUS_VOXELS;
+        m_radiusVoxelsLod0 = r;
     }
 
-    const TextureBrushStyle& sa = getStyle(a);
-    const TextureBrushStyle& sb = getStyle(b);
+    BrushShape getShape() const { return m_shape; }
+    void setShape(BrushShape s) { m_shape = s; }
 
-    // Material-pair blend policy. This is intentionally centralized here so
-    // new brush materials can define their transition personality without
-    // pushing branch soup into TextureOverlayStore or UI tools.
-    if ((a == TextureType::Grass && b == TextureType::Mud) ||
-        (a == TextureType::Mud && b == TextureType::Grass)) {
-        const uint32_t h = hashPaintCoord(lodCoord, 0u, sa.variantSalt ^ sb.variantSalt);
-        return (h & 1u) ? TransitionEdgeStyle::Leafy : TransitionEdgeStyle::Sloppy;
+    TextureOverlay::TextureType getTextureType() const { return m_textureType; }
+    void setTextureType(TextureOverlay::TextureType t) { m_textureType = t; }
+
+    glm::vec3 getTypeBaseColor(TextureOverlay::TextureType t) const {
+        return TextureOverlay::TextureBrushStyles::getStyle(t).preview.base;
+    }
+    glm::vec3 getTypeHighlightColor(TextureOverlay::TextureType t) const {
+        return TextureOverlay::TextureBrushStyles::getStyle(t).preview.highlight;
+    }
+    glm::vec3 getTypeShadowColor(TextureOverlay::TextureType t) const {
+        return TextureOverlay::TextureBrushStyles::getStyle(t).preview.shadow;
+    }
+    glm::vec3 getTypeAccentColor(TextureOverlay::TextureType t) const {
+        return TextureOverlay::TextureBrushStyles::getStyle(t).preview.accent;
     }
 
-    if (a == TextureType::Mud || b == TextureType::Mud) {
-        if (a == TextureType::Sand || b == TextureType::Sand) {
-            const uint32_t h = hashPaintCoord(lodCoord, 1u, sa.variantSalt ^ sb.variantSalt);
-            return (h & 1u) ? TransitionEdgeStyle::Sloppy : TransitionEdgeStyle::Grainy;
-        }
-        if (a == TextureType::Dirt || b == TextureType::Dirt) {
-            const uint32_t h = hashPaintCoord(lodCoord, 2u, sa.variantSalt ^ sb.variantSalt);
-            return (h & 3u) == 0u ? TransitionEdgeStyle::Grainy : TransitionEdgeStyle::Sloppy;
-        }
-        return TransitionEdgeStyle::Sloppy;
+    uint8_t getVariant() const { return m_variant; }
+    void setVariant(uint8_t v) { m_variant = v & 0x7u; }
+
+    LODMode getLODMode() const { return m_lodMode; }
+    void setLODMode(LODMode m) { m_lodMode = m; }
+
+    int  getManualLOD() const { return m_manualLod; }
+    void setManualLOD(int l) {
+        if (l < 0) l = 0;
+        if (l > TextureOverlay::TextureOverlayStore::LOD_COUNT - 1)
+            l = TextureOverlay::TextureOverlayStore::LOD_COUNT - 1;
+        m_manualLod = l;
     }
 
-    return mergeEdgeStyle(sa.defaultBlendEdge, sb.defaultBlendEdge);
-}
+    // Debug preview LOD only; final paint is sampled by the terrain shader.
+    int getPreviewLOD() const {
+        return (m_lodMode == LODMode::Manual)
+            ? m_manualLod
+            : (m_hasPlacementContext ? m_hitLod : 0);
+    }
 
-TransitionEdgeStyle mergeEdgeStyle(TransitionEdgeStyle lhs,
-                                   TransitionEdgeStyle rhs) {
-    return edgePriority(rhs) >= edgePriority(lhs) ? rhs : lhs;
-}
+    bool getCascadeEnabled() const { return m_cascadeToCoarser; }
+    void setCascadeEnabled(bool b) { m_cascadeToCoarser = b; }
 
-} // namespace TextureBrushStyles
-} // namespace TextureOverlay
+private:
+    struct PaintOpDiagnostic {
+        uint64_t serial{0};
+
+        int radiusVoxels{0};
+        int shape{0};
+        int material{0};
+        int variant{0};
+        int paintLod{0};
+
+        int facesCollected{0};
+        int facesUnchanged{0};
+        int cellsPainted{0};
+        int cellsCascaded{0};
+        int touchedChunks{0};
+        int flushedChunks{0};
+        int pendingChunksAfter{0};
+
+        float collectMs{0.0f};
+        float storeMs{0.0f};
+        float cascadeMs{0.0f};
+        float touchedMs{0.0f};
+        float scheduleMs{0.0f};
+        float totalMs{0.0f};
+
+        // End-to-end visual latency diagnostic support.
+        // Texture paint is authored immediately, but visible material still
+        // lands later via chunk rebake/upload/finalize. These fields let the
+        // export compute author->visible latency by correlating touched chunks
+        // against World::ChunkVisualHistory without touching World internals.
+        double visualStartSec{0.0};
+        uint32_t visualStampOrder{0};
+        std::vector<glm::ivec3> visualChunks;
+
+        float radiusM{0.0f};
+        glm::vec3 center{0.0f};
+        bool holdRepeat{false};
+    };
+
+    void place();                  // Apply paint at current preview center
+    void resolveHitLOD();          // Update m_hitLod from World context
+    int  getActivePaintLOD() const;
+    int  getHitNormalAxis() const;
+    uint8_t getHitFaceId() const;
+    bool isSolidLOD0(const glm::ivec3& voxelCoord) const;
+    int collectExposedSurfaceFacesLOD0(
+        std::vector<TextureOverlay::TextureOverlayStore::SurfaceFaceStamp>& outFaces) const;
+
+    float getPaintRepeatIntervalSec() const;
+    size_t flushPendingTextureDirtyChunks(bool force);
+    void recordPaintDiagnostic(const PaintOpDiagnostic& diag);
+    std::string buildPaintDiagnosticsReport() const;
+
+    // -------- State --------
+    bool m_active{false};
+
+    // Brush params
+    int m_radiusVoxelsLod0{4};
+    BrushShape m_shape{BrushShape::Sphere};
+    TextureOverlay::TextureType m_textureType{TextureOverlay::TextureType::Grass};
+    uint8_t m_variant{0};
+    // LOD selection
+    LODMode m_lodMode{LODMode::AutoFromHit};
+    int m_manualLod{0};
+    bool m_cascadeToCoarser{false};
+
+    // Hit state
+    bool m_hasHit{false};
+    glm::vec3 m_hitPos{0.0f};
+    glm::vec3 m_hitNormal{0.0f, 1.0f, 0.0f};
+    int  m_hitLod{0};
+    float m_hitVoxelSizeM{::WorldConfig::VOXEL_SIZE_M};
+    bool m_hasPlacementContext{false};
+
+    // Click + repeat
+    bool m_leftClickWasPressed{false};
+    bool m_holdRepeatStarted{false};
+    std::chrono::steady_clock::time_point m_lastPlaceTime{};
+    std::chrono::steady_clock::time_point m_holdStartTime{};
+
+    // Material-rebake scheduling. Authored paint is written immediately, but
+    // chunk rebakes are debounced/rate-limited so huge brush spam cannot flood
+    // the remesh/upload/finalize pipeline.
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet m_pendingTextureDirtyChunks;
+    std::chrono::steady_clock::time_point m_lastTextureDirtyFlushTime{};
+    float m_textureDirtyFlushIntervalSec{0.18f};
+    int m_immediateTextureDirtyChunkCap{4};
+
+    // Last-paint diagnostics
+    static constexpr int PAINT_DIAG_HISTORY = 50;
+    std::array<PaintOpDiagnostic, PAINT_DIAG_HISTORY> m_paintDiagHistory{};
+    int m_paintDiagWriteIndex{0};
+    int m_paintDiagCount{0};
+    uint64_t m_paintDiagSerial{0};
+    std::string m_lastDiagnosticsExport;
+
+    int    m_lastFacesCollected{0};
+    int    m_lastFacesUnchanged{0};
+    int    m_lastCellsPainted{0};
+    int    m_lastCellsCascaded{0};
+    int    m_lastPaintLod{0};
+    float  m_lastPaintMs{0.0f};
+    glm::vec3 m_lastPaintWorldCenter{0.0f};
+    float  m_lastPaintRadiusM{0.0f};
+    std::chrono::steady_clock::time_point m_previewStartTime{};
+
+    // Preview screen position (cached for label drawing)
+    float m_previewScreenX{0.0f};
+    float m_previewScreenY{0.0f};
+
+    // Engine wiring
+    World* m_world{nullptr};
+    RaycastFunc m_raycastFn;
+};
 
 ````
 
@@ -2452,9 +1683,18 @@ set(WORLD_SOURCES
     world/WorldTerrainEditCollision.cpp
     world/config/WorldConfig.cpp
     world/TerrainFileLoader.cpp
-    world/edit/TerrainEditOverlayStore.cpp
+    world/edit/overlay/TerrainEditOverlayStore.cpp
+    world/edit/overlay/TerrainEditOverlayBrush.cpp
+    world/edit/overlay/TerrainEditOverlayDeferredFill.cpp
+    world/edit/overlay/TerrainEditOverlayQuery.cpp
+    world/edit/overlay/TerrainEditOverlaySolidCache.cpp
     world/edit/TerrainEditOverlayStore_IO.cpp
-    world/edit/TextureOverlayStore.cpp
+    world/edit/texture/TextureOverlayStore.cpp
+    world/edit/texture/TextureOverlayCells.cpp
+    world/edit/texture/TextureOverlayPaint.cpp
+    world/edit/texture/TextureOverlayStamps.cpp
+    world/edit/texture/TextureOverlayGPU.cpp
+    world/edit/texture/TextureOverlayIO.cpp
     world/edit/texture/TextureBrushStyles.cpp
     world/edit/TerrainFieldSource.cpp
     world/edit/HeightmapBaseSampler.cpp
