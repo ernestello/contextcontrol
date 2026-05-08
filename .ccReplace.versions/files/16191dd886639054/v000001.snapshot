@@ -1,0 +1,61 @@
+#include "DCCMGapFixInternal.h"
+
+// GPT-DESC: Smooths DCCM AO transitions after gap repair.
+
+// ============================================================
+// AO edge smoothing
+// ============================================================
+// After gap-fixing and welding, some edges may have AO transitions
+// of 2+ levels (e.g., AO=0 → AO=2), creating visible artifacts.
+// This is especially common at chunk boundaries where new split
+// vertices got min(parent AO) but adjacent original vertices kept
+// their converter-assigned AO values.
+//
+// Fix: iteratively clamp AO transitions to at most 1 level per edge.
+// The lower-AO vertex wins — we only REDUCE AO, never increase it.
+
+
+AOSmoothStats smoothEdgeAO(Mesh& m) {
+    AOSmoothStats stats;
+    if (m.idx.size() < 3) return stats;
+
+    // Build adjacency: for each vertex, collect connected vertex indices
+    std::vector<std::set<uint32_t>> adj(m.verts.size());
+    for (size_t ti = 0; ti < m.idx.size(); ti += 3) {
+        uint32_t a = m.idx[ti], b = m.idx[ti+1], c = m.idx[ti+2];
+        adj[a].insert(b); adj[a].insert(c);
+        adj[b].insert(a); adj[b].insert(c);
+        adj[c].insert(a); adj[c].insert(b);
+    }
+
+    // Iterative relaxation: keep clamping until no changes
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        stats.iterations++;
+
+        for (uint32_t vi = 0; vi < static_cast<uint32_t>(m.verts.size()); vi++) {
+            auto& v = m.verts[vi];
+            uint8_t myAO = v.ao();
+
+            for (uint32_t ni : adj[vi]) {
+                stats.edgesChecked++;
+                uint8_t nbrAO = m.verts[ni].ao();
+
+                // If neighbor is 2+ levels higher, pull it down
+                if (nbrAO >= myAO + 2) {
+                    uint8_t target = myAO + 1;
+                    auto& nv = m.verts[ni];
+                    nv = PackedVertex(nv.x(), nv.y(), nv.z(), nv.face(), target);
+                    stats.edgesSmoothed++;
+                    changed = true;
+                }
+            }
+        }
+
+        // Safety valve: max 10 iterations (convergence is fast for 4 AO levels)
+        if (stats.iterations >= 10) break;
+    }
+
+    return stats;
+}

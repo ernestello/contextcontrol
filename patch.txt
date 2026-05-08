@@ -1,3152 +1,1093 @@
 BEGIN CC-REPLACE
-DIR: tools/heightmap_mesh
+DIR: tools/dccm_gap_fix
 MODE: create_directory
 END CC-REPLACE
 
 BEGIN CC-REPLACE
-FILE: tools/convert_heightmap_to_meshes.cpp
-MODE: whole_file
----
-// GPT-DESC: Legacy placeholder for the heightmap mesh converter; implementation moved to tools/heightmap_mesh/.
-//
-// The convert_heightmap_to_meshes target is now built from the domain-split
-// files under tools/heightmap_mesh/. This file is kept temporarily so stale
-// references fail softly instead of pointing at a removed path.
-END CC-REPLACE
-
-BEGIN CC-REPLACE
-FILE: tools/heightmap_mesh/HeightmapMeshInternal.h
+FILE: tools/dccm_gap_fix/DCCMGapFixInternal.h
 MODE: whole_file
 ---
 #pragma once
 
-// GPT-DESC: Declares shared private types and helpers for the heightmap mesh converter tool.
+// GPT-DESC: Shared private structs and declarations for the DCCM gap fixer tool.
 
 #include <algorithm>
-#include <array>
-#include <atomic>
-#include <charconv>
-#include <chrono>
-#include <cmath>
 #include <cstdint>
-#include <cstdlib>
-#include <cstring>
-#include <filesystem>
 #include <fstream>
-#include <functional>
-#include <iomanip>
-#include <iostream>
-#include <mutex>
+#include <map>
 #include <numeric>
 #include <set>
-#include <sstream>
 #include <string>
-#include <thread>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
-#include "../IndexOptimizer.h"
+// --- Format constants (must match converter & engine) ---
+constexpr uint32_t TERRAIN_MESH_MAGIC   = 0x48534D54; // "TMSH"
+constexpr uint32_t TERRAIN_MESH_VERSION = 4;
+constexpr size_t   MAX_SUBCHUNKS        = 4;
+constexpr int      EDGE_COUNT           = 4;
 
-// Constants matching WorldConfig.h
-// Scale: 4 voxels per meter (25 cm voxels)
-// 1 heightmap pixel = 1 voxel
-// 20480 pixels = 20480 voxels = 5120 meters (5.12 km)
-constexpr int32_t CHUNK_SIZE = 128;      // voxels per chunk edge XZ (32 meters)
-constexpr int32_t CHUNK_HEIGHT = 512;    // voxels per chunk height Y (128 meters)
-constexpr int32_t MAX_LOD_LEVEL = 3;     // LOD levels 0-3
-
-// File format
-constexpr uint32_t TERRAIN_MESH_MAGIC = 0x48534D54; // "TMSH" in little-endian
-constexpr uint32_t TERRAIN_MESH_VERSION = 4; // v4: SubChunks - never merged, multiple draw calls
-
-// SubChunk limits
-// Each SubChunk must stay under 65535 vertices for 16-bit indices.
-// We use 60000 to leave headroom for edge cases.
-constexpr size_t MAX_VERTICES_PER_SUBCHUNK = 60000;
-constexpr size_t MAX_SUBCHUNKS = 4; // Max SubChunks per chunk/LOD (1 parent chunk = up to 4 draw calls)
-
-// Edge indices for seam meshes
-enum EdgeIndex : uint8_t {
-    EDGE_NEG_X = 0, // West edge  (-X)
-    EDGE_POS_X = 1, // East edge  (+X)
-    EDGE_NEG_Z = 2, // South edge (-Z)
-    EDGE_POS_Z = 3, // North edge (+Z)
-    EDGE_COUNT = 4
-};
-
-// Face directions (matching engine)
-enum FaceDirection : uint8_t {
-    FACE_NEG_X = 0,
-    FACE_POS_X = 1,
-    FACE_NEG_Y = 2,
-    FACE_POS_Y = 3,
-    FACE_NEG_Z = 4,
-    FACE_POS_Z = 5
-};
-
-/**
- * Packed vertex (4 bytes) - matches engine format
- * Bit layout: X(8) | Y(9) | Z(8) | face(3) | AO(3) = 31 bits
- * NOTE: Y is stored as (height-1) to fit range 1-512 into 9 bits (0-511)
- * NOTE: X/Z need 8 bits for vertex positions 0-128 (129 values for 128 voxels)
- */
+// --- PackedVertex (4 bytes, matches engine) ---
+// Bit layout: X(8) | Y(9) | Z(8) | face(3) | AO(2) | unused(2)
+// Y stored as (height-1) to fit 1-512 into 9 bits
 struct PackedVertex {
     uint32_t packed;
 
+    PackedVertex() : packed(0) {}
     PackedVertex(uint8_t x, uint16_t y, uint8_t z, uint8_t face, uint8_t ao = 0) {
-        // Y is offset by -1 to map 1-512 range into 0-511 (9 bits)
-        uint16_t yStored = (y > 0) ? (y - 1) : 0;
-        packed = (static_cast<uint32_t>(x) << 0) |         // 8 bits (0-128)
-                 (static_cast<uint32_t>(yStored) << 8) |   // 9 bits (0-511)
-                 (static_cast<uint32_t>(z) << 17) |        // 8 bits (0-128)
-                 (static_cast<uint32_t>(face & 0x7) << 25) |
-                 (static_cast<uint32_t>(ao & 0x3) << 28);  // 2 bits for AO (0-3)
+        uint16_t ys = (y > 0) ? static_cast<uint16_t>(y - 1) : uint16_t{0};
+        packed = uint32_t(x)
+               | (uint32_t(ys)       << 8)
+               | (uint32_t(z)        << 17)
+               | (uint32_t(face & 7) << 25)
+               | (uint32_t(ao & 3)   << 28);
     }
+    uint8_t  x()    const { return static_cast<uint8_t>(packed & 0xFFu); }
+    uint16_t y()    const { return static_cast<uint16_t>(((packed >> 8) & 0x1FFu) + 1u); }
+    uint8_t  z()    const { return static_cast<uint8_t>((packed >> 17) & 0xFFu); }
+    uint8_t  face() const { return static_cast<uint8_t>((packed >> 25) & 7u); }
+    uint8_t  ao()   const { return static_cast<uint8_t>((packed >> 28) & 3u); }
 };
 
-/**
- * Mesh data for one chunk (uses 32-bit indices internally for generation)
- */
-struct ChunkMesh {
-    std::vector<PackedVertex> vertices;
-    std::vector<uint32_t> indices;  // 32-bit during generation, split to 16-bit for storage
-
-    bool isEmpty() const { return vertices.empty(); }
-
-    void clear() {
-        vertices.clear();
-        indices.clear();
-    }
+// --- File format structs ---
+struct SubChunkFile {
+    uint64_t offset;
+    uint32_t vertexCount;
+    uint32_t indexCount;
 };
 
-/**
- * SubChunk: A self-contained mesh segment that stays under 16-bit index limit.
- * Never merged with other SubChunks - each becomes its own draw call.
- */
-struct SubChunk {
-    std::vector<PackedVertex> vertices;
-    std::vector<uint16_t> indices;  // Always 16-bit (max 65535 vertices per SubChunk)
-
-    bool isEmpty() const { return vertices.empty(); }
-
-    size_t getVertexDataSize() const { return vertices.size() * sizeof(PackedVertex); }
-    size_t getIndexDataSize() const { return indices.size() * sizeof(uint16_t); }
+struct ChunkEntry {
+    uint8_t      subCount;
+    uint8_t      seamCounts[EDGE_COUNT];
+    uint8_t      pad[3];
+    SubChunkFile subs[MAX_SUBCHUNKS];
+    SubChunkFile seams[EDGE_COUNT][MAX_SUBCHUNKS];
 };
 
-/**
- * Complete mesh data for one chunk/LOD including edge seams
- */
-struct ChunkMeshWithSeams {
-    ChunkMesh mainMesh;
-    ChunkMesh edgeSeams[EDGE_COUNT]; // Separate mesh for each edge
+static_assert(sizeof(SubChunkFile) == 16);
+static_assert(sizeof(ChunkEntry)   == 328);
 
-    bool isEmpty() const { return mainMesh.isEmpty(); }
+// --- In-memory mesh (32-bit indices internally) ---
+struct Mesh {
+    std::vector<PackedVertex> verts;
+    std::vector<uint32_t>     idx;
+    bool empty() const { return verts.empty(); }
 };
 
-struct FaceAO {
-    uint8_t tl, tr, bl, br;
-
-    bool operator==(const FaceAO& other) const {
-        return tl == other.tl && tr == other.tr && bl == other.bl && br == other.br;
-    }
-    bool operator!=(const FaceAO& other) const {
-        return !(*this == other);
-    }
+struct WeldStats {
+    int duplicateVerts  = 0;  // vertices at same (x,y,z) position
+    int aoConflicts     = 0;  // same position, different AO value
+    int degenerateTris  = 0;  // triangles collapsed after welding
 };
 
-struct AOPlane {
-    int bl = 0;
-    int du = 0;
-    int dv = 0;
+struct AOSmoothStats {
+    int edgesChecked  = 0;
+    int edgesSmoothed = 0;
+    int iterations    = 0;
 };
 
-class VoxelChunk {
-public:
-    VoxelChunk() : data(CHUNK_SIZE * CHUNK_HEIGHT * CHUNK_SIZE, 0) {}
-    
-    // Context for out-of-bounds lookups
-    const std::vector<float>* heightmap = nullptr;
-    int mapWidth = 0;
-    int mapHeight = 0;
-    int chunkX = 0;
-    int chunkZ = 0;
-    int numChunksX = 0;  // Total chunks being processed (for boundary detection)
-    int numChunksZ = 0;
+// I/O and path helpers.
+Mesh readSub(std::ifstream& f, const SubChunkFile& sc);
+Mesh merge(const std::vector<Mesh>& parts);
+std::string findMaps();
 
-    void setContext(const std::vector<float>* hm, int w, int h, int cx, int cz, int nChunksX = 0, int nChunksZ = 0) {
-        heightmap = hm;
-        mapWidth = w;
-        mapHeight = h;
-        chunkX = cx;
-        chunkZ = cz;
-        numChunksX = nChunksX;
-        numChunksZ = nChunksZ;
-    }
+// Boundary and interior T-junction repair.
+std::map<uint8_t, uint16_t> getBoundary(const Mesh& m, uint8_t coord, bool xBound);
+std::unordered_map<uint32_t, uint32_t> buildPosIndex(const Mesh& m);
+int fixBoundary(Mesh& m,
+                uint8_t bCoord,
+                bool xBound,
+                const std::map<uint8_t, uint16_t>& neighbor,
+                std::unordered_map<uint32_t, uint32_t>& posIdx);
+int fixInteriorGaps(Mesh& m, std::unordered_map<uint32_t, uint32_t>& posIdx);
 
-    void clear() {
-        std::fill(data.begin(), data.end(), 0);
-        // Keep context
+// Vertex cleanup and AO post-process.
+WeldStats weldVertices(Mesh& m);
+int removeOverlappingTriangles(Mesh& m);
+AOSmoothStats smoothEdgeAO(Mesh& m);
+END CC-REPLACE
+
+BEGIN CC-REPLACE
+FILE: tools/dccm_gap_fix/DCCMBoundary.cpp
+MODE: whole_file
+---
+#include "DCCMGapFixInternal.h"
+
+// GPT-DESC: Repairs DCCM boundary and interior T-junction gaps.
+
+// ============================================================
+// Gap detection & fix
+// ============================================================
+
+// Collect boundary vertex positions along one edge of a chunk.
+// is_x_boundary=true  → match vertices by X==coord, collect Z positions
+// is_x_boundary=false → match vertices by Z==coord, collect X positions
+// Returns: position_along_boundary → height
+std::map<uint8_t, uint16_t> getBoundary(const Mesh& m, uint8_t coord, bool xBound) {
+    std::map<uint8_t, uint16_t> r;
+    for (auto& v : m.verts) {
+        if (xBound ? (v.x() == coord) : (v.z() == coord))
+            r[xBound ? v.z() : v.x()] = v.y();
     }
-    
-    void set(int x, int y, int z, bool solid) {
-        if (x >= 0 && x < CHUNK_SIZE && y >= 0 && y < CHUNK_HEIGHT && z >= 0 && z < CHUNK_SIZE) {
-            data[index(x, y, z)] = solid ? 1 : 0;
-        }
+    return r;
+}
+
+// Helper: build a (x,y,z)→vertex-index lookup for the mesh.
+// Key packing: x + y*256 + z*256*512 (unique for valid PackedVertex ranges).
+std::unordered_map<uint32_t, uint32_t> buildPosIndex(const Mesh& m) {
+    std::unordered_map<uint32_t, uint32_t> idx;
+    idx.reserve(m.verts.size());
+    for (uint32_t i = 0; i < static_cast<uint32_t>(m.verts.size()); i++) {
+        auto& v = m.verts[i];
+        uint32_t key = uint32_t(v.x()) + uint32_t(v.y()) * 256u + uint32_t(v.z()) * 256u * 512u;
+        idx.emplace(key, i); // first-wins: keeps the original vertex
     }
-    
-    bool get(int x, int y, int z) const {
-        // Check local data first if within bounds
-        if (x >= 0 && x < CHUNK_SIZE && y >= 0 && y < CHUNK_HEIGHT && z >= 0 && z < CHUNK_SIZE) {
-            return data[index(x, y, z)] != 0;
-        }
-        
-        // Handle out of bounds XZ using heightmap for cross-chunk AO queries
-        // This enables AO calculation to "see" neighboring chunks' terrain
-        if (heightmap != nullptr && y >= 0 && y < CHUNK_HEIGHT) {
-            int worldX = chunkX * CHUNK_SIZE + x;
-            int worldZ = chunkZ * CHUNK_SIZE + z;
-            
-            // Flip logic matching createChunkVoxels
-            int flippedWorldX = mapWidth - 1 - worldX;
-            int flippedWorldZ = mapHeight - 1 - worldZ;
-            
-            if (flippedWorldZ >= 0 && flippedWorldZ < mapHeight && flippedWorldX >= 0 && flippedWorldX < mapWidth) {
-                int heightIndex = flippedWorldZ * mapWidth + flippedWorldX;
-                int height = static_cast<int>((*heightmap)[heightIndex]);
-                
-                // Return true if query Y is below the terrain height at this XZ position
-                return y < height;
+    return idx;
+}
+
+static uint32_t posKey(uint8_t x, uint16_t y, uint8_t z) {
+    return uint32_t(x) + uint32_t(y) * 256u + uint32_t(z) * 256u * 512u;
+}
+
+// Get-or-create vertex at (x,y,z). Reuses existing vertex if one exists
+// at the same position (with AO from existing vertex), otherwise creates
+// a new one with the given AO.
+uint32_t getOrCreateVertex(Mesh& m, std::unordered_map<uint32_t, uint32_t>& posIdx,
+                           uint8_t x, uint16_t y, uint8_t z, uint8_t face, uint8_t ao) {
+    uint32_t key = posKey(x, y, z);
+    auto it = posIdx.find(key);
+    if (it != posIdx.end())
+        return it->second;
+    uint32_t ni = static_cast<uint32_t>(m.verts.size());
+    m.verts.push_back(PackedVertex(x, y, z, face, ao));
+    posIdx[key] = ni;
+    return ni;
+}
+
+// For one chunk boundary, find vertices the neighbor has that we don't,
+// locate our triangle edge spanning that position, and split.
+// Returns number of vertex insertions.
+int fixBoundary(Mesh& m, uint8_t bCoord, bool xBound,
+                const std::map<uint8_t, uint16_t>& neighbor,
+                std::unordered_map<uint32_t, uint32_t>& posIdx) {
+    // Our boundary positions
+    std::set<uint8_t> ours;
+    for (auto& v : m.verts)
+        if (xBound ? (v.x() == bCoord) : (v.z() == bCoord))
+            ours.insert(xBound ? v.z() : v.x());
+
+    // Positions the neighbor has that we're missing
+    std::vector<std::pair<uint8_t, uint16_t>> miss;
+    for (auto& [pos, h] : neighbor)
+        if (!ours.count(pos))
+            miss.push_back({pos, h});
+
+    if (miss.empty()) return 0;
+    std::sort(miss.begin(), miss.end());
+
+    int splits = 0;
+
+    for (auto& [tgt, tgtH] : miss) {
+        // Scan triangles for a boundary edge that spans tgt
+        size_t numIdx = m.idx.size();
+        for (size_t ti = 0; ti < numIdx; ti += 3) {
+            uint32_t i0 = m.idx[ti], i1 = m.idx[ti+1], i2 = m.idx[ti+2];
+            uint32_t edges[3][2] = {{i0,i1},{i1,i2},{i2,i0}};
+
+            for (int e = 0; e < 3; e++) {
+                auto& va = m.verts[edges[e][0]];
+                auto& vb = m.verts[edges[e][1]];
+
+                // Both endpoints on the boundary?
+                bool onB = xBound
+                    ? (va.x() == bCoord && vb.x() == bCoord)
+                    : (va.z() == bCoord && vb.z() == bCoord);
+                if (!onB) continue;
+
+                uint8_t pa = xBound ? va.z() : va.x();
+                uint8_t pb = xBound ? vb.z() : vb.x();
+                uint8_t lo = std::min(pa, pb);
+                uint8_t hi = std::max(pa, pb);
+
+                // Target must be strictly inside the edge
+                if (tgt <= lo || tgt >= hi) continue;
+
+                // Found it — split the triangle
+                uint32_t ia = edges[e][0];
+                uint32_t ib = edges[e][1];
+                uint32_t ic = (e == 0) ? i2 : (e == 1) ? i0 : i1;
+
+                // Reuse existing vertex or create new one
+                // Use min AO (conservative: never darker than parents)
+                uint8_t interpAO = std::min(va.ao(), vb.ao());
+                uint8_t vx = xBound ? bCoord : tgt;
+                uint8_t vz = xBound ? tgt : bCoord;
+                uint32_t ni = getOrCreateVertex(m, posIdx, vx, tgtH, vz, 6, interpAO);
+
+                // Original triangle  (ia, ib, ic)  →  (ia, ni, ic)
+                m.idx[ti]   = ia;
+                m.idx[ti+1] = ni;
+                m.idx[ti+2] = ic;
+
+                // New triangle: (ni, ib, ic)
+                m.idx.push_back(ni);
+                m.idx.push_back(ib);
+                m.idx.push_back(ic);
+
+                splits++;
+                ours.insert(tgt);
+                goto next_miss;
             }
         }
-        return false;
+        next_miss:;
     }
-    
-    /**
-     * Check if voxel is solid for FACE CULLING purposes only.
-     * 
-     * WATERTIGHT MESH FIX: To avoid Z-fighting at chunk boundaries, we use
-     * the actual heightmap data for neighbor chunks instead of assuming air.
-     * This way, only ONE chunk generates each boundary face - the one where
-     * the neighbor is actually air (lower terrain).
-     * 
-     * BOUNDARY FIX: For chunks at the edge of the PROCESSED area (not just
-     * heightmap), we must generate boundary faces even if heightmap has data
-     * beyond the processed chunks.
-     * 
-     * - Out-of-bounds in Y = treat as air (generate top/bottom faces)
-     * - Out-of-bounds in XZ (outside processed chunks) = treat as air
-     * - Out-of-bounds in XZ (within processed chunks) = query heightmap
-     */
-    bool getForFaceCulling(int x, int y, int z) const {
-        // Within local chunk bounds - use local data
-        if (x >= 0 && x < CHUNK_SIZE && y >= 0 && y < CHUNK_HEIGHT && z >= 0 && z < CHUNK_SIZE) {
-            return data[index(x, y, z)] != 0;
-        }
-        
-        // Out-of-bounds in Y = treat as air
-        if (y < 0 || y >= CHUNK_HEIGHT) {
-            return false;
-        }
-        
-        // Calculate world voxel coordinates
-        int worldX = chunkX * CHUNK_SIZE + x;
-        int worldZ = chunkZ * CHUNK_SIZE + z;
-        
-        // Calculate which chunk the neighbor would be in
-        int neighborChunkX = (worldX >= 0) ? (worldX / CHUNK_SIZE) : ((worldX - CHUNK_SIZE + 1) / CHUNK_SIZE);
-        int neighborChunkZ = (worldZ >= 0) ? (worldZ / CHUNK_SIZE) : ((worldZ - CHUNK_SIZE + 1) / CHUNK_SIZE);
-        
-        // BOUNDARY FIX: If neighbor chunk is outside the PROCESSED chunk range,
-        // treat as air to ensure boundary faces are generated
-        if (numChunksX > 0 && numChunksZ > 0) {
-            if (neighborChunkX < 0 || neighborChunkX >= numChunksX ||
-                neighborChunkZ < 0 || neighborChunkZ >= numChunksZ) {
-                return false;  // Outside processed area = air
-            }
-        }
-        
-        // Out-of-bounds in XZ but within processed area = query heightmap for neighbor chunk's terrain
-        // This prevents duplicate faces at chunk boundaries
-        if (heightmap) {
-            // Apply coordinate flipping (matching VoxelChunk::get logic)
-            int flippedWorldX = mapWidth - 1 - worldX;
-            int flippedWorldZ = mapHeight - 1 - worldZ;
-            
-            if (flippedWorldX >= 0 && flippedWorldX < mapWidth && 
-                flippedWorldZ >= 0 && flippedWorldZ < mapHeight) {
-                int heightIndex = flippedWorldZ * mapWidth + flippedWorldX;
-                int terrainHeight = static_cast<int>((*heightmap)[heightIndex]);
-                // Voxel is solid if y < terrain height at that XZ
-                return y < terrainHeight;
-            }
-        }
-        
-        // Outside heightmap bounds = treat as air
-        return false;
-    }
-    
-private:
-    std::vector<uint8_t> data;
-    
-    inline size_t index(int x, int y, int z) const {
-        return x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE;
-    }
-};
+    return splits;
+}
 
-/**
- * Edge voxel debugging information
- */
-struct EdgeVoxelDebugInfo {
-    int localX, localY, localZ;     // Position within chunk
-    int worldX, worldZ;              // World position
-    int height;                      // Elevation at this position
-    std::string edgeType;            // "NORTH", "SOUTH", "EAST", "WEST", or "CORNER_NE/NW/SE/SW"
 
-    struct NeighborInfo {
-        bool exists;                 // Whether this neighbor chunk exists in the grid
-        int chunkX, chunkZ;          // Neighbor chunk coordinates
-        int expectedHeight;          // Height at the neighboring position from heightmap
-        bool shouldCheck;            // Whether we need to check this neighbor
-        std::string direction;       // "NORTH", "SOUTH", "EAST", "WEST"
+// ============================================================
+// Interior gap detection (within a single chunk mesh)
+// ============================================================
+// Scans all triangle edges for integer grid positions where another
+// vertex exists but isn't a vertex of that triangle.
+// This catches T-junctions like: vertex V at (x,z,y1) and a triangle
+// edge passing over (x,z) at interpolated y2 — the exact "under/above"
+// pattern described in the issue.
+
+int fixInteriorGaps(Mesh& m, std::unordered_map<uint32_t, uint32_t>& posIdx) {
+    if (m.empty()) return 0;
+
+    // Build position map:  (x,z) -> height (for gap detection)
+    std::map<uint64_t, uint16_t> posHeight;
+    for (uint32_t i = 0; i < static_cast<uint32_t>(m.verts.size()); i++) {
+        uint64_t key = (uint64_t(m.verts[i].x()) << 32) | m.verts[i].z();
+        posHeight[key] = m.verts[i].y();
+    }
+
+    int splits = 0;
+    bool changed = true;
+
+    while (changed) {
+        changed = false;
+        size_t numIdx = m.idx.size();
+
+        for (size_t ti = 0; ti < numIdx; ti += 3) {
+            uint32_t i0 = m.idx[ti], i1 = m.idx[ti+1], i2 = m.idx[ti+2];
+            uint32_t edges[3][2] = {{i0,i1},{i1,i2},{i2,i0}};
+
+            for (int e = 0; e < 3; e++) {
+                auto& va = m.verts[edges[e][0]];
+                auto& vb = m.verts[edges[e][1]];
+
+                int dx = int(vb.x()) - int(va.x());
+                int dz = int(vb.z()) - int(va.z());
+                int g = std::gcd(std::abs(dx), std::abs(dz));
+                if (g <= 1) continue;
+
+                for (int k = 1; k < g; k++) {
+                    int gx = int(va.x()) + k * dx / g;
+                    int gz = int(va.z()) + k * dz / g;
+
+                    uint64_t key = (uint64_t(gx) << 32) | uint64_t(gz);
+                    auto it = posHeight.find(key);
+                    if (it == posHeight.end()) continue;
+
+                    // Is this position already a vertex of THIS triangle?
+                    bool isEndpoint = false;
+                    for (int j = 0; j < 3; j++) {
+                        auto& vt = m.verts[m.idx[ti + j]];
+                        if (vt.x() == gx && vt.z() == gz) {
+                            isEndpoint = true;
+                            break;
+                        }
+                    }
+                    if (isEndpoint) continue;
+
+                    // Found a gap: vertex exists at (gx,gz) but this edge passes over it
+                    uint16_t h = it->second;
+
+                    uint32_t ia = edges[e][0];
+                    uint32_t ib = edges[e][1];
+                    uint32_t ic = (e == 0) ? i2 : (e == 1) ? i0 : i1;
+
+                    // Reuse existing vertex or create new one
+                    // Use min AO (conservative: never darker than parents)
+                    auto& iva = m.verts[edges[e][0]];
+                    auto& ivb = m.verts[edges[e][1]];
+                    uint8_t interpAO = std::min(iva.ao(), ivb.ao());
+                    uint32_t ni = getOrCreateVertex(m, posIdx,
+                        static_cast<uint8_t>(gx), h,
+                        static_cast<uint8_t>(gz), 6, interpAO);
+
+                    // Original triangle (ia, ib, ic) → (ia, ni, ic)
+                    m.idx[ti]   = ia;
+                    m.idx[ti+1] = ni;
+                    m.idx[ti+2] = ic;
+
+                    // New triangle: (ni, ib, ic)
+                    m.idx.push_back(ni);
+                    m.idx.push_back(ib);
+                    m.idx.push_back(ic);
+
+                    // Register in position map
+                    posHeight[key] = h;
+
+                    splits++;
+                    changed = true;
+                    goto next_interior_tri;
+                }
+            }
+            next_interior_tri:;
+        }
+    }
+    return splits;
+}
+END CC-REPLACE
+
+BEGIN CC-REPLACE
+FILE: tools/dccm_gap_fix/DCCMWeld.cpp
+MODE: whole_file
+---
+#include "DCCMGapFixInternal.h"
+
+// GPT-DESC: Welds duplicate DCCM vertices and removes overlapping triangles.
+
+// ============================================================
+// Vertex welding & AO harmonization
+// ============================================================
+// After gap-fixing, multiple vertices may exist at the exact same
+// (x, y, z) position but with different AO values. This happens
+// because boundary and interior splits always push_back() a new
+// vertex without checking for an existing one at that position.
+// Different triangles then reference different copies of the
+// "same" vertex, each with its own AO interpolation — causing
+// visual z-fighting where two coplanar triangles at the same
+// position render with alternating AO levels.
+//
+// Fix: merge all same-position vertices to a single canonical
+// index, harmonize their AO, and remove any degenerate triangles
+// that result from the merge (two vertices collapsing to one).
+
+
+WeldStats weldVertices(Mesh& m) {
+    WeldStats stats;
+    if (m.empty()) return stats;
+
+    // Map: (x, y, z) -> first vertex index at that position
+    // Key: x + y*256 + z*(256*512) — unique for all valid PackedVertex positions
+    std::unordered_map<uint32_t, uint32_t> posToCanon;
+    posToCanon.reserve(m.verts.size());
+    std::vector<uint32_t> remap(m.verts.size());
+
+    for (uint32_t i = 0; i < static_cast<uint32_t>(m.verts.size()); i++) {
+        auto& v = m.verts[i];
+        uint32_t key = uint32_t(v.x())
+                     + uint32_t(v.y()) * 256u
+                     + uint32_t(v.z()) * 256u * 512u;
+
+        auto it = posToCanon.find(key);
+        if (it != posToCanon.end()) {
+            uint32_t canon = it->second;
+            remap[i] = canon;
+            stats.duplicateVerts++;
+
+            if (v.ao() != m.verts[canon].ao()) {
+                stats.aoConflicts++;
+                // Use the LOWER AO (less occlusion = safer visual default)
+                uint8_t merged = std::min(v.ao(), m.verts[canon].ao());
+                auto& cv = m.verts[canon];
+                cv = PackedVertex(cv.x(), cv.y(), cv.z(), cv.face(), merged);
+            }
+        } else {
+            posToCanon[key] = i;
+            remap[i] = i;
+        }
+    }
+
+    if (stats.duplicateVerts == 0) return stats;
+
+    // Remap all indices to canonical vertices
+    for (auto& idx : m.idx) idx = remap[idx];
+
+    // Remove degenerate triangles (two or more vertices collapsed to same index)
+    size_t numTris = m.idx.size() / 3;
+    std::vector<uint32_t> newIdx;
+    newIdx.reserve(m.idx.size());
+    for (size_t ti = 0; ti < numTris; ti++) {
+        uint32_t a = m.idx[ti*3], b = m.idx[ti*3+1], c = m.idx[ti*3+2];
+        if (a == b || b == c || a == c) {
+            stats.degenerateTris++;
+            continue;
+        }
+        newIdx.push_back(a);
+        newIdx.push_back(b);
+        newIdx.push_back(c);
+    }
+    m.idx = std::move(newIdx);
+
+    return stats;
+}
+
+
+// ============================================================
+// Overlapping triangle removal
+// ============================================================
+// After vertex welding, duplicate triangles share the same vertex
+// indices. Detect triangles with identical sorted index triplets
+// and remove all but one.
+// Also falls back to (x,z) position key for robustness.
+
+int removeOverlappingTriangles(Mesh& m) {
+    if (m.idx.size() < 6) return 0;
+
+    // Build canonical key per triangle: sorted vertex index triplet.
+    // After welding, same-position vertices have the same index,
+    // so this reliably detects duplicate geometry.
+    auto triKey = [&](size_t ti) -> uint64_t {
+        uint32_t k[3] = { m.idx[ti], m.idx[ti+1], m.idx[ti+2] };
+        if (k[0] > k[1]) std::swap(k[0], k[1]);
+        if (k[1] > k[2]) std::swap(k[1], k[2]);
+        if (k[0] > k[1]) std::swap(k[0], k[1]);
+        return (uint64_t(k[0]) << 40) | (uint64_t(k[1]) << 20) | uint64_t(k[2]);
     };
-    std::vector<NeighborInfo> neighbors;
-};
 
-extern std::atomic<uint64_t> g_totalVertsBefore;
-extern std::atomic<uint64_t> g_totalVertsAfter;
-extern std::atomic<uint64_t> g_totalMeshesDeduplicated;
-extern std::atomic<uint64_t> g_affineMergeQuads;
-extern std::atomic<uint64_t> g_affineMergeCellsSaved;
+    // Also check by (x,z) position for safety (catches duplicates
+    // that slipped past welding due to different Y from height mismatch)
+    auto posKey = [&](size_t ti) -> uint64_t {
+        uint32_t k[3];
+        for (int j = 0; j < 3; j++) {
+            auto& v = m.verts[m.idx[ti + j]];
+            k[j] = (uint32_t(v.x()) << 8) | uint32_t(v.z());
+        }
+        if (k[0] > k[1]) std::swap(k[0], k[1]);
+        if (k[1] > k[2]) std::swap(k[1], k[2]);
+        if (k[0] > k[1]) std::swap(k[0], k[1]);
+        return (uint64_t(k[0]) << 32) | (uint64_t(k[1]) << 16) | uint64_t(k[2]);
+    };
 
-std::vector<SubChunk> splitMeshToSubChunks(const ChunkMesh& mesh);
-void deduplicateVertices(ChunkMesh& mesh);
-void reorderVerticesForFetch(ChunkMesh& mesh);
-void optimizeTriangleOrder(ChunkMesh& mesh);
-void optimizeMesh(ChunkMesh& mesh);
-void printDedupStats();
+    // First pass: count occurrences of each key
+    std::map<uint64_t, int> idxCounts, posCounts;
+    size_t numTris = m.idx.size() / 3;
+    for (size_t ti = 0; ti < numTris; ti++) {
+        idxCounts[triKey(ti * 3)]++;
+        posCounts[posKey(ti * 3)]++;
+    }
 
-void debugChunkEdgeVoxels(const VoxelChunk& voxels,
-                          int chunkX,
-                          int chunkZ,
-                          int numChunksX,
-                          int numChunksZ);
-
-void createChunkVoxels(VoxelChunk& chunk,
-                       const std::vector<float>& heightmap,
-                       int mapWidth,
-                       int mapHeight,
-                       int chunkX,
-                       int chunkZ,
-                       int numChunksX = 0,
-                       int numChunksZ = 0);
-
-/**
- * Greedy meshing algorithm
- */
-class GreedyMesher {
-public:
-    GreedyMesher(const VoxelChunk& voxels, int chunkX, int chunkZ);
-
-    ChunkMeshWithSeams generateMesh(int lodLevel = 0);
-
-    /**
-     * Generate mesh for a specific region (quadrant) of the chunk.
-     * Used when splitting large chunks into 4 SubChunks.
-     */
-    ChunkMeshWithSeams generateMeshForRegion(int lodLevel, int startX, int startZ, int endX, int endZ);
-
-private:
-    const VoxelChunk& voxels;
-    int m_chunkX;
-    int m_chunkZ;
-    int m_regionStartX = 0;
-    int m_regionStartZ = 0;
-    int m_regionEndX = CHUNK_SIZE;
-    int m_regionEndZ = CHUNK_SIZE;
-
-    bool isSolidWorld(int worldX, int worldY, int worldZ) const;
-    FaceAO calculateFaceAO(int x, int y, int z, int axis, int direction, int step = 1);
-    void generateLODSeamFaces(int step, ChunkMesh& mesh);
-    void generateEdgeSeamMeshes(int step, ChunkMeshWithSeams& result);
-    void generateBoundarySkirts(int step, ChunkMesh& mesh);
-    void generateEdgeFace(int edgePos, bool isXEdge, bool isPositive, int step,
-                          FaceDirection face, ChunkMesh& mesh);
-    FaceAO calculateSeamFaceAO(int x, int y, int z, FaceDirection face, int step);
-    int findColumnTop(int x, int z);
-    void addSeamQuad(int x, int y, int z, int width, int height, FaceDirection face, ChunkMesh& mesh);
-    void meshAxis(int axis, int direction, int step, ChunkMesh& mesh);
-    void greedyMeshMask(const std::vector<bool>& mask, const std::vector<FaceAO>& aoMask, int width, int height,
-                        int axis, int slicePos, int direction, FaceDirection face,
-                        int step, ChunkMesh& mesh);
-    void meshAxisForRegion(int axis, int direction, int step, ChunkMesh& mesh,
-                           int startX, int startZ, int endX, int endZ);
-    void generateSliceForRegion(int axis, int direction, int step, int n, FaceDirection face,
-                                ChunkMesh& mesh, int startX, int startZ, int endX, int endZ);
-    void greedyMeshMaskWithOffset(const std::vector<bool>& mask, const std::vector<FaceAO>& aoMask,
-                                  int width, int height, int axis, int slicePos, int direction,
-                                  FaceDirection face, int step, ChunkMesh& mesh, int uOffset, int vOffset);
-
-    static bool buildAOPlane(const FaceAO& seed, AOPlane& plane);
-    static bool aoMatchesPlane(const FaceAO& ao, const AOPlane& plane, int relU, int relV);
-    static FaceAO makeAOFromPlane(const AOPlane& plane, int widthCells, int heightCells);
-
-    void generateLODSeamFacesForRegion(int step, ChunkMesh& mesh, int startX, int startZ, int endX, int endZ);
-    void generateEdgeSeamMeshesForRegion(int step, ChunkMeshWithSeams& result,
-                                          int startX, int startZ, int endX, int endZ);
-    void generateEdgeFaceForRegion(int edgePos, bool isXEdge, bool isPositive, int step,
-                                   FaceDirection face, ChunkMesh& mesh, int iterStart, int iterEnd);
-    void addQuad(int axis, int n, int u, int v, int width, int height,
-                 int direction, FaceDirection face, int step, ChunkMesh& mesh, const FaceAO& ao);
-};
-
-/**
- * Heightfield Triangle Mesher - Optimized Low-Poly Terrain.
- */
-class HeightfieldMesher {
-public:
-    HeightfieldMesher(const std::vector<float>& heightmap, int mapWidth, int mapHeight,
-                      int chunkX, int chunkZ, int numChunksX, int numChunksZ);
-
-    ChunkMeshWithSeams generateMesh(int lodLevel = 0);
-
-private:
-    const std::vector<float>& m_heightmap;
-    int m_mapWidth, m_mapHeight;
-    int m_chunkX, m_chunkZ;
-    int m_numChunksX, m_numChunksZ;
-
-    int sampleHeight(int worldX, int worldZ) const;
-    static uint32_t addVtx(ChunkMesh& mesh, int cx, int cz, int height,
-                           int step, uint8_t face, uint8_t ao = 0);
-    void generateCasingSideFaces(const std::vector<uint32_t>& vtxIdx,
-                                 const std::vector<int>& vtxH,
-                                 int cW, int cH,
-                                 int gridW, int gridH,
-                                 int step,
-                                 ChunkMeshWithSeams& result);
-};
-
-std::vector<float> loadHeightmapCSV(const std::string& path, int& outWidth, int& outHeight);
-std::string getMapsBasePath();
-
-bool convertHeightmapToMeshes(const std::string& csvPath,
-                              const std::string& outputPath,
-                              int maxChunksPerSide = 0);
-bool convertHeightmapToHeightfield(const std::string& csvPath,
-                                   const std::string& outputPath,
-                                   int maxChunksPerSide = 0);
-END CC-REPLACE
-
-BEGIN CC-REPLACE
-FILE: tools/heightmap_mesh/HeightmapMeshTool.cpp
-MODE: whole_file
----
-#include "HeightmapMeshInternal.h"
-
-// GPT-DESC: Provides the command-line entry point for the heightmap mesh converter tool.
-
-int main(int argc, char* argv[]) {
-    // Usage: [maxChunksPerSide] [--hf-only]
-    // Reads:  maps/heightmap.csv
-    // Writes: maps/terrain.bin, maps/terrain_dccm.bin
-    // Or legacy: <input.csv> <output.bin> [maxChunksPerSide]
-    
-    std::string inputPath;
-    std::string outputPath;
-    int maxChunksPerSide = 0;
-    bool hfOnly = false;
-    
-    // Check for --hf-only flag anywhere in args
-    for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--hf-only") {
-            hfOnly = true;
+    // Second pass: mark duplicates for removal (keep first occurrence)
+    std::set<uint64_t> seenIdx, seenPos;
+    std::vector<bool> keep(numTris, true);
+    int removed = 0;
+    for (size_t ti = 0; ti < numTris; ti++) {
+        uint64_t ik = triKey(ti * 3);
+        uint64_t pk = posKey(ti * 3);
+        bool isDup = false;
+        // Duplicate by index?
+        if (idxCounts[ik] > 1 && !seenIdx.insert(ik).second)
+            isDup = true;
+        // Duplicate by position? (different indices but same world position)
+        if (!isDup && posCounts[pk] > 1 && !seenPos.insert(pk).second)
+            isDup = true;
+        if (isDup) {
+            keep[ti] = false;
+            removed++;
         }
     }
-    
-    // Check if first argument looks like a .csv file (legacy mode)
-    bool legacyMode = (argc >= 2) && 
-        (std::string(argv[1]).size() > 4 && std::string(argv[1]).substr(std::string(argv[1]).size() - 4) == ".csv");
-    
-    if (legacyMode) {
-        // Legacy mode: <input.csv> <output.bin> [maxChunksPerSide]
-        if (argc < 3) {
-            std::cerr << "Legacy mode requires both input.csv and output.bin" << std::endl;
-            return 1;
-        }
-        inputPath = argv[1];
-        outputPath = argv[2];
-        if (argc >= 4) {
-            maxChunksPerSide = std::atoi(argv[3]);
-        }
-        std::cout << "Legacy mode: " << inputPath << " -> " << outputPath << std::endl;
-    } else {
-        // New mode: maps/ flat structure
-        std::string mapsBase = getMapsBasePath();
-        
-        inputPath = (std::filesystem::path(mapsBase) / "heightmap.csv").string();
-        outputPath = (std::filesystem::path(mapsBase) / "terrain.bin").string();
-        
-        if (argc >= 2) {
-            maxChunksPerSide = std::atoi(argv[1]);
-        }
-        
-        // Ensure maps directory exists
-        if (!std::filesystem::exists(mapsBase)) {
-            std::filesystem::create_directories(mapsBase);
-            std::cout << "Created maps directory: " << mapsBase << std::endl;
-        }
-        
-        std::cout << "=== Heightmap to Terrain Mesh Converter ===" << std::endl;
-        std::cout << "Input:  " << inputPath << std::endl;
-        std::cout << "Output: " << outputPath << std::endl;
-        if (maxChunksPerSide > 0) {
-            std::cout << "Limit:  " << maxChunksPerSide << "x" << maxChunksPerSide << " chunks" << std::endl;
+
+    if (removed == 0) return 0;
+
+    // Compact the index buffer
+    std::vector<uint32_t> newIdx;
+    newIdx.reserve(m.idx.size() - removed * 3);
+    for (size_t ti = 0; ti < numTris; ti++) {
+        if (keep[ti]) {
+            newIdx.push_back(m.idx[ti * 3]);
+            newIdx.push_back(m.idx[ti * 3 + 1]);
+            newIdx.push_back(m.idx[ti * 3 + 2]);
         }
     }
-    
-    if (maxChunksPerSide < 0) {
-        std::cerr << "Error: maxChunksPerSide must be a positive integer" << std::endl;
-        return 1;
-    }
-    
-    if (!hfOnly) {
-        if (!convertHeightmapToMeshes(inputPath, outputPath, maxChunksPerSide)) {
-            return 1;
-        }
-    } else {
-        std::cout << "Skipping voxel terrain (--hf-only)" << std::endl;
-    }
-    
-    // Also generate Heightfield terrain file
-    std::string hfOutputPath;
-    if (legacyMode) {
-        // Insert "_dccm" before .bin extension (keep filename for engine compat)
-        hfOutputPath = outputPath;
-        size_t dotPos = hfOutputPath.rfind('.');
-        if (dotPos != std::string::npos) {
-            hfOutputPath.insert(dotPos, "_dccm");
-        } else {
-            hfOutputPath += "_dccm";
-        }
-    } else {
-        hfOutputPath = (std::filesystem::path(getMapsBasePath()) / "terrain_dccm.bin").string();
-    }
-    
-    std::cout << "\n=== Generating Heightfield Terrain ===" << std::endl;
-    std::cout << "Heightfield Output: " << hfOutputPath << std::endl;
-    
-    if (!convertHeightmapToHeightfield(inputPath, hfOutputPath, maxChunksPerSide)) {
-        std::cerr << "Warning: Heightfield terrain generation failed (voxel terrain was generated successfully)" << std::endl;
-    }
-    
-    return 0;
+    m.idx = std::move(newIdx);
+    return removed;
 }
 END CC-REPLACE
 
 BEGIN CC-REPLACE
-FILE: tools/heightmap_mesh/HeightmapIO.cpp
+FILE: tools/dccm_gap_fix/DCCMAOSmoothing.cpp
 MODE: whole_file
 ---
-#include "HeightmapMeshInternal.h"
+#include "DCCMGapFixInternal.h"
 
-// GPT-DESC: Loads heightmap CSV input and resolves the tool maps directory.
+// GPT-DESC: Smooths DCCM AO transitions after gap repair.
 
-std::vector<float> loadHeightmapCSV(const std::string& path, int& outWidth, int& outHeight) {
-    std::ios_base::sync_with_stdio(false);
-    
-    std::ifstream file(path, std::ios::binary);
-    if (!file.is_open()) return {};
-    
-    // Get file size and read entire file into memory
-    file.seekg(0, std::ios::end);
-    size_t fileSize = file.tellg();
-    file.seekg(0, std::ios::beg);
-    
-    std::vector<char> buffer(fileSize);
-    file.read(buffer.data(), fileSize);
-    file.close();
-    
-    std::vector<float> heights;
-    heights.reserve(20480 * 20480);
-    
-    const char* ptr = buffer.data();
-    const char* end = ptr + fileSize;
-    
-    // Skip BOM
-    if (fileSize >= 3 && (unsigned char)ptr[0] == 0xEF && (unsigned char)ptr[1] == 0xBB && (unsigned char)ptr[2] == 0xBF) {
-        ptr += 3;
+// ============================================================
+// AO edge smoothing
+// ============================================================
+// After gap-fixing and welding, some edges may have AO transitions
+// of 2+ levels (e.g., AO=0 → AO=2), creating visible artifacts.
+// This is especially common at chunk boundaries where new split
+// vertices got min(parent AO) but adjacent original vertices kept
+// their converter-assigned AO values.
+//
+// Fix: iteratively clamp AO transitions to at most 1 level per edge.
+// The lower-AO vertex wins — we only REDUCE AO, never increase it.
+
+
+AOSmoothStats smoothEdgeAO(Mesh& m) {
+    AOSmoothStats stats;
+    if (m.idx.size() < 3) return stats;
+
+    // Build adjacency: for each vertex, collect connected vertex indices
+    std::vector<std::set<uint32_t>> adj(m.verts.size());
+    for (size_t ti = 0; ti < m.idx.size(); ti += 3) {
+        uint32_t a = m.idx[ti], b = m.idx[ti+1], c = m.idx[ti+2];
+        adj[a].insert(b); adj[a].insert(c);
+        adj[b].insert(a); adj[b].insert(c);
+        adj[c].insert(a); adj[c].insert(b);
     }
-    
-    int rowCount = 0;
-    int colCount = 0;
-    int currentCol = 0;
-    
-    // Ultra-fast parsing: no validation, direct atof
-    while (ptr < end) {
-        // Parse number
-        float height = std::atof(ptr);
-        heights.push_back(height);
-        ++currentCol;
-        
-        // Skip to next comma or newline
-        while (ptr < end && *ptr != ',' && *ptr != '\n' && *ptr != '\r') ++ptr;
-        
-        if (ptr < end && *ptr == ',') {
-            ++ptr; // Skip comma
-        } else {
-            // End of line
-            if (rowCount == 0) colCount = currentCol;
-            currentCol = 0;
-            while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
-            ++rowCount;
+
+    // Iterative relaxation: keep clamping until no changes
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        stats.iterations++;
+
+        for (uint32_t vi = 0; vi < static_cast<uint32_t>(m.verts.size()); vi++) {
+            auto& v = m.verts[vi];
+            uint8_t myAO = v.ao();
+
+            for (uint32_t ni : adj[vi]) {
+                stats.edgesChecked++;
+                uint8_t nbrAO = m.verts[ni].ao();
+
+                // If neighbor is 2+ levels higher, pull it down
+                if (nbrAO >= myAO + 2) {
+                    uint8_t target = myAO + 1;
+                    auto& nv = m.verts[ni];
+                    nv = PackedVertex(nv.x(), nv.y(), nv.z(), nv.face(), target);
+                    stats.edgesSmoothed++;
+                    changed = true;
+                }
+            }
         }
+
+        // Safety valve: max 10 iterations (convergence is fast for 4 AO levels)
+        if (stats.iterations >= 10) break;
     }
-    
-    outWidth = colCount;
-    outHeight = rowCount;
-    return heights;
+
+    return stats;
+}
+END CC-REPLACE
+
+BEGIN CC-REPLACE
+FILE: tools/dccm_gap_fix/DCCMGapFixTool.cpp
+MODE: whole_file
+---
+#include "DCCMGapFixInternal.h"
+
+// GPT-DESC: Orchestrates DCCM gap-fix file loading, repair passes, and rewrite.
+
+#include <algorithm>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <vector>
+
+// ============================================================
+// I/O helpers
+// ============================================================
+
+Mesh readSub(std::ifstream& f, const SubChunkFile& sc) {
+    Mesh m;
+    if (!sc.vertexCount) return m;
+    m.verts.resize(sc.vertexCount);
+    std::vector<uint16_t> i16(sc.indexCount);
+    f.seekg(static_cast<std::streamoff>(sc.offset), std::ios::beg);
+    f.read(reinterpret_cast<char*>(m.verts.data()), static_cast<std::streamsize>(sc.vertexCount * sizeof(PackedVertex)));
+    f.read(reinterpret_cast<char*>(i16.data()),     static_cast<std::streamsize>(sc.indexCount  * sizeof(uint16_t)));
+    m.idx.reserve(sc.indexCount);
+    for (auto i : i16) m.idx.push_back(i);
+    return m;
 }
 
-std::string getMapsBasePath() {
-    // Try relative to executable first
-    std::filesystem::path cwd = std::filesystem::current_path();
-    std::filesystem::path mapsPath = cwd / "maps";
-    if (std::filesystem::exists(mapsPath)) {
-        return mapsPath.string();
+Mesh merge(const std::vector<Mesh>& parts) {
+    Mesh out;
+    for (auto& p : parts) {
+        auto base = static_cast<uint32_t>(out.verts.size());
+        out.verts.insert(out.verts.end(), p.verts.begin(), p.verts.end());
+        for (auto i : p.idx) out.idx.push_back(base + i);
     }
-    
-    // Try project root
-    std::filesystem::path projectPath = "D:/Projects/vulkanas/maps";
-    if (std::filesystem::exists(projectPath)) {
-        return projectPath.string();
-    }
-    
-    // Default to relative
+    return out;
+}
+
+
+// ============================================================
+// Path helpers
+// ============================================================
+
+std::string findMaps() {
+    auto cwd = std::filesystem::current_path();
+    if (std::filesystem::exists(cwd / "maps"))
+        return (cwd / "maps").string();
+    if (std::filesystem::exists("D:/Projects/vulkanas/maps"))
+        return "D:/Projects/vulkanas/maps";
     return "maps";
 }
-END CC-REPLACE
 
-BEGIN CC-REPLACE
-FILE: tools/heightmap_mesh/VoxelChunkBuilder.cpp
-MODE: whole_file
----
-#include "HeightmapMeshInternal.h"
 
-// GPT-DESC: Builds voxel chunks from heightmaps and keeps edge-debug utilities for the heightmap converter.
 
-static int getHeightmapHeight(const VoxelChunk& voxels, int worldX, int worldZ) {
-    if (!voxels.heightmap) return 0;
-    
-    // Apply flipping (matching VoxelChunk::get logic)
-    int flippedWorldX = voxels.mapWidth - 1 - worldX;
-    int flippedWorldZ = voxels.mapHeight - 1 - worldZ;
-    
-    if (flippedWorldZ >= 0 && flippedWorldZ < voxels.mapHeight && 
-        flippedWorldX >= 0 && flippedWorldX < voxels.mapWidth) {
-        int heightIndex = flippedWorldZ * voxels.mapWidth + flippedWorldX;
-        return static_cast<int>((*voxels.heightmap)[heightIndex]);
-    }
-    return 0;
+static uint64_t streamOffset(std::ofstream& f) {
+    return static_cast<uint64_t>(static_cast<std::streamoff>(f.tellp()));
 }
 
-void debugChunkEdgeVoxels(const VoxelChunk& voxels, int chunkX, int chunkZ, 
-                          int numChunksX, int numChunksZ) {
-    // ONLY debug chunk [2,3,1] - skip all others
-    if (chunkX != 2 || chunkZ != 3) return;
-    
-    const char* GREEN = "\033[32m";
-    const char* RESET = "\033[0m";
-    
-    std::cout << "\n=== BRUTE FORCE: [2,3,1] edges vs [1,3,1] edges ===" << std::endl;
-    std::cout << "Looking for ~12 voxels with AO\n" << std::endl;
-    
-    // Our edges: x=0, x=127, z=0, z=127
-    // Neighbor edges: x=0, x=127, z=0, z=127
-    // But neighbor chunk [1,3,1] is at worldX = 128-255, worldZ = 384-511
-    // Our chunk [2,3,1] is at worldX = 256-383, worldZ = 384-511
-    
-    struct EdgeDef {
-        const char* name;
-        int pos;        // 0 or 127
-        bool isXEdge;   // true = fixed X, varies Z; false = fixed Z, varies X
+// ============================================================
+// Main
+// ============================================================
+
+int main(int argc, char* argv[]) {
+    std::string path;
+    bool diag = false;
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--diag") diag = true;
+        else path = argv[i];
+    }
+    if (path.empty())
+        path = (std::filesystem::path(findMaps()) / "terrain_dccm.bin").string();
+
+    std::cout << "=== DCCM Gap Fix ===" << std::endl;
+    std::cout << "Input: " << path << std::endl;
+
+    // ---- Read ----
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin) {
+        std::cerr << "Cannot open " << path << std::endl;
+        return 1;
+    }
+
+    uint32_t magic, version, chunksX, chunksZ, lodLevels;
+    fin.read(reinterpret_cast<char*>(&magic),     4);
+    fin.read(reinterpret_cast<char*>(&version),   4);
+    fin.read(reinterpret_cast<char*>(&chunksX),   4);
+    fin.read(reinterpret_cast<char*>(&chunksZ),   4);
+    fin.read(reinterpret_cast<char*>(&lodLevels), 4);
+
+    if (magic != TERRAIN_MESH_MAGIC || version != TERRAIN_MESH_VERSION) {
+        std::cerr << "Invalid file (magic=0x" << std::hex << magic
+                  << " ver=" << std::dec << version << ")" << std::endl;
+        return 1;
+    }
+
+    size_t total = chunksX * chunksZ * lodLevels;
+    std::cout << "Chunks: " << chunksX << "x" << chunksZ
+              << ", LODs: " << lodLevels
+              << " (" << total << " entries)" << std::endl;
+
+    // Read chunk index
+    std::vector<ChunkEntry> entries(total);
+    for (auto& e : entries)
+        fin.read(reinterpret_cast<char*>(&e), sizeof(e));
+
+    // Load all meshes into memory
+    struct ChunkData {
+        Mesh main;                             // merged main sub-chunks
+        std::vector<Mesh> seamSubs[EDGE_COUNT]; // pass-through
     };
-    
-    EdgeDef ourEdges[] = {
-        {"x=0", 0, true},
-        {"x=127", 127, true},
-        {"z=0", 0, false},
-        {"z=127", 127, false},
-    };
-    
-    EdgeDef nbrEdges[] = {
-        {"x=0", 0, true},
-        {"x=127", 127, true},
-        {"z=0", 0, false},
-        {"z=127", 127, false},
-    };
-    
-    // Neighbor chunk [1,3,1] offset from us: deltaChunkX = -1, deltaChunkZ = 0
-    int nbrChunkX = 1;
-    int nbrChunkZ = 3;
-    
-    for (const auto& ourE : ourEdges) {
-        for (const auto& nbrE : nbrEdges) {
-            // Only compare same-axis edges (X edge to X edge, Z edge to Z edge)
-            if (ourE.isXEdge != nbrE.isXEdge) continue;
-            
-            int aoCount = 0;
-            int totalCount = 0;
-            
-            for (int var = 0; var < CHUNK_SIZE; ++var) {
-                // Our position
-                int ourX = ourE.isXEdge ? ourE.pos : var;
-                int ourZ = ourE.isXEdge ? var : ourE.pos;
-                
-                // Our height
-                int ourHeight = 0;
-                for (int y = CHUNK_HEIGHT - 1; y >= 0; --y) {
-                    if (voxels.get(ourX, y, ourZ)) { ourHeight = y + 1; break; }
-                }
-                if (ourHeight == 0) continue;
-                totalCount++;
-                
-                // Neighbor world position
-                int nbrLocalX = nbrE.isXEdge ? nbrE.pos : var;
-                int nbrLocalZ = nbrE.isXEdge ? var : nbrE.pos;
-                int nbrWorldX = nbrChunkX * CHUNK_SIZE + nbrLocalX;
-                int nbrWorldZ = nbrChunkZ * CHUNK_SIZE + nbrLocalZ;
-                
-                // Get neighbor height from heightmap directly
-                int flippedX = voxels.mapWidth - 1 - nbrWorldX;
-                int flippedZ = voxels.mapHeight - 1 - nbrWorldZ;
-                
-                int nbrHeight = 0;
-                if (flippedX >= 0 && flippedX < voxels.mapWidth && 
-                    flippedZ >= 0 && flippedZ < voxels.mapHeight) {
-                    int idx = flippedZ * voxels.mapWidth + flippedX;
-                    nbrHeight = static_cast<int>((*voxels.heightmap)[idx]);
-                }
-                
-                if (nbrHeight > ourHeight) {
-                    aoCount++;
-                }
-            }
-            
-            const char* color = (aoCount >= 10 && aoCount <= 15) ? GREEN : "";
-            const char* reset = (aoCount >= 10 && aoCount <= 15) ? RESET : "";
-            std::cout << color << "Our " << ourE.name << " vs Nbr " << nbrE.name 
-                      << " => " << aoCount << "/" << totalCount << " AO" << reset << std::endl;
-        }
+    std::vector<ChunkData> data(total);
+
+    for (size_t i = 0; i < total; i++) {
+        auto& e = entries[i];
+
+        // Main mesh — merge all sub-chunks into one
+        std::vector<Mesh> subs;
+        for (int s = 0; s < e.subCount && s < (int)MAX_SUBCHUNKS; s++)
+            subs.push_back(readSub(fin, e.subs[s]));
+        data[i].main = merge(subs);
+
+        // Seam meshes — pass through unchanged
+        for (int ed = 0; ed < EDGE_COUNT; ed++)
+            for (int s = 0; s < e.seamCounts[ed] && s < (int)MAX_SUBCHUNKS; s++)
+                data[i].seamSubs[ed].push_back(readSub(fin, e.seams[ed][s]));
     }
-    std::cout << "\n" << std::endl;
-}
+    fin.close();
 
-void createChunkVoxels(VoxelChunk& chunk, const std::vector<float>& heightmap,
-                       int mapWidth, int mapHeight, int chunkX, int chunkZ,
-                       int numChunksX, int numChunksZ) {
-    // CRITICAL: Clear chunk data to prevent voxel bleeding from previous chunks
-    chunk.clear();
-    chunk.setContext(&heightmap, mapWidth, mapHeight, chunkX, chunkZ, numChunksX, numChunksZ);
-    
-    for (int localZ = 0; localZ < CHUNK_SIZE; ++localZ) {
-        for (int localX = 0; localX < CHUNK_SIZE; ++localX) {
-            int worldX = chunkX * CHUNK_SIZE + localX;
-            int worldZ = chunkZ * CHUNK_SIZE + localZ;
-            
-            // Flip both X and Z axes to fix 180-degree rotation issue
-            // This makes north/south and east/west align correctly with the heightmap
-            int flippedWorldX = mapWidth - 1 - worldX;
-            int flippedWorldZ = mapHeight - 1 - worldZ;
-            
-            // Get height from heightmap
-            if (flippedWorldZ >= 0 && flippedWorldZ < mapHeight && flippedWorldX >= 0 && flippedWorldX < mapWidth) {
-                int heightIndex = flippedWorldZ * mapWidth + flippedWorldX;
-                int height = static_cast<int>(heightmap[heightIndex]);
-                height = std::min(height, CHUNK_HEIGHT); // Clamp to max
+    // ---- Diagnostics ----
+    if (diag) {
+        std::cout << "\n--- Mesh summary (LOD 0 only) ---" << std::endl;
+        for (uint32_t cz = 0; cz < chunksZ; cz++) {
+            for (uint32_t cx = 0; cx < chunksX; cx++) {
+                size_t i = (cz * chunksX + cx) * lodLevels + 0;
+                auto& m = data[i].main;
+                if (m.empty()) { std::cout << "  Chunk (" << cx << "," << cz << "): EMPTY\n"; continue; }
+                std::cout << "  Chunk (" << cx << "," << cz << "): "
+                          << m.verts.size() << " verts, " << m.idx.size()/3 << " tris" << std::endl;
                 
-                // Fill voxels up to height
-                for (int y = 0; y < height; ++y) {
-                    chunk.set(localX, y, localZ, true);
-                }
-            }
-        }
-    }
-}
-END CC-REPLACE
-
-BEGIN CC-REPLACE
-FILE: tools/heightmap_mesh/GreedyMesher.cpp
-MODE: whole_file
----
-#include "HeightmapMeshInternal.h"
-
-// GPT-DESC: Generates greedy voxel meshes, LOD seams, edge seams, and AO for heightmap-derived chunks.
-
-GreedyMesher::GreedyMesher(const VoxelChunk& voxels, int chunkX, int chunkZ)
-    : voxels(voxels), m_chunkX(chunkX), m_chunkZ(chunkZ) {}
-
-ChunkMeshWithSeams GreedyMesher::generateMesh(int lodLevel) {
-        return generateMeshForRegion(lodLevel, 0, 0, CHUNK_SIZE, CHUNK_SIZE);
-    }
-
-ChunkMeshWithSeams GreedyMesher::generateMeshForRegion(int lodLevel, int startX, int startZ, int endX, int endZ) {
-        ChunkMeshWithSeams result;
-        int step = 1 << lodLevel; // 1, 2, 4, 8
-        
-        // Store region bounds for use in mesh generation
-        m_regionStartX = startX;
-        m_regionStartZ = startZ;
-        m_regionEndX = endX;
-        m_regionEndZ = endZ;
-        
-        // Generate faces for all 6 directions (only within region)
-        for (int axis = 0; axis < 3; ++axis) {
-            for (int direction = 0; direction < 2; ++direction) {
-                meshAxisForRegion(axis, direction, step, result.mainMesh, startX, startZ, endX, endZ);
-            }
-        }
-        
-        // For LOD > 0, generate seam faces to fill gaps between stepped heights within region
-        if (step > 1) {
-            generateLODSeamFacesForRegion(step, result.mainMesh, startX, startZ, endX, endZ);
-        }
-        
-        // Generate edge seam meshes for LOD boundary transitions.
-        // Only generate for edges that are at chunk boundaries (not internal quadrant edges)
-        if (step > 1) {
-            generateEdgeSeamMeshesForRegion(step, result, startX, startZ, endX, endZ);
-        }
-        
-        return result;
-    }
-
-bool GreedyMesher::isSolidWorld(int worldX, int worldY, int worldZ) const {
-        // Use heightmap directly for consistent world-space queries
-        if (!voxels.heightmap || worldY < 0 || worldY >= CHUNK_HEIGHT) {
-            return false;
-        }
-        
-        int flippedWorldX = voxels.mapWidth - 1 - worldX;
-        int flippedWorldZ = voxels.mapHeight - 1 - worldZ;
-        
-        if (flippedWorldZ >= 0 && flippedWorldZ < voxels.mapHeight && 
-            flippedWorldX >= 0 && flippedWorldX < voxels.mapWidth) {
-            int heightIndex = flippedWorldZ * voxels.mapWidth + flippedWorldX;
-            int height = static_cast<int>((*voxels.heightmap)[heightIndex]);
-            return worldY < height;
-        }
-        return false;
-    }
-
-FaceAO GreedyMesher::calculateFaceAO(int x, int y, int z, int axis, int direction, int step) {
-        // For AO, we check neighbors around the face to determine corner darkness
-        // CRITICAL: Use WORLD coordinates for consistent cross-chunk AO
-        // This ensures boundary vertices get identical AO regardless of which chunk owns them
-        
-        // Convert to world coordinates
-        int worldX = m_chunkX * CHUNK_SIZE + x;
-        int worldY = y;
-        int worldZ = m_chunkZ * CHUNK_SIZE + z;
-        
-        auto isSolid = [&](int dx, int dy, int dz) -> bool {
-            // Scale offsets by step for LOD - neighbors are 'step' voxels away
-            int checkX = worldX + dx * step;
-            int checkY = worldY + dy * step;
-            int checkZ = worldZ + dz * step;
-            return isSolidWorld(checkX, checkY, checkZ);
-        };
-        
-        // SIDE FACE AO: Aligned with top faces for seamless corner triangles
-        //
-        // The key insight: Side face vertices that touch top face edges must have
-        // MATCHING AO values. Otherwise the dark AO triangle won't connect.
-        //
-        // AO levels:
-        // - Both edges blocked (true corner): AO = 3 (darkest)
-        // - One edge blocked + corner: AO = 2 (middle-dark)
-        // - One edge blocked, no corner: AO = 1 (middle-light)
-        // - Only diagonal blocked: AO = 2 (fills corner gap where edges meet)
-        // - Nothing blocked: AO = 0
-        auto vertexAO = [&](bool side1, bool side2, bool corner) -> uint8_t {
-            if (side1 && side2) return 3;  // True corner: darkest
-            if (side1 || side2) {
-                // One edge blocked: middle intensity (corner adds to it)
-                return corner ? 2 : 1;
-            }
-            // No edges blocked: corner-only gets AO=2 to fill diagonal gaps
-            // This fixes the square gap at 'A' where two perpendicular edges meet
-            return corner ? 2 : 0;
-        };
-        
-        // TOP FACE AO: Must match side face AO values for seamless corner triangles
-        // 
-        // Visual explanation:
-        //   UUUO     <- U = lower voxel under overhang, O = elevated overhang
-        //   OOOO
-        //
-        // CRITICAL: Top face edge AO must match side face edge AO!
-        // Side faces use: edge=1, edge+corner=2, true corner=3
-        // Top faces must use the same values for alignment.
-        //
-        // AO levels (matching side faces exactly):
-        // - Both edges blocked (true corner): AO = 3 (darkest triangle tip)
-        // - One edge blocked + diagonal corner: AO = 2 
-        // - One edge blocked, no corner: AO = 1 (matches side face edge)
-        // - Only diagonal blocked: AO = 1 (subtle corner fill)
-        // - Nothing blocked: AO = 0
-        auto vertexAO_TopFace = [&](bool edgeX, bool edgeZ, bool corner) -> uint8_t {
-            // TRUE CORNER: Both perpendicular edges blocked -> darkest (triangle tip)
-            if (edgeX && edgeZ) {
-                return 3;
-            }
-            
-            // STRAIGHT EDGE: One direction blocked
-            // Must match side face: edge alone = 1, edge + corner = 2
-            if (edgeX || edgeZ) {
-                return corner ? 2 : 1;
-            }
-            
-            // NO edges blocked: corner-only gets subtle AO
-            if (corner) {
-                return 1;
-            }
-            
-            return 0;
-        };
-        
-        FaceAO ao;
-        
-        if (axis == 0) { // X axis (u=z, v=y) - faces pointing left/right
-            int nx = (direction == 1 ? 1 : -1);
-            
-            // For BOTTOM vertices of side faces:
-            // We want AO when THIS voxel overhangs a SHORTER neighbor.
-            // Check if neighbor at (nx, -1, z) is solid AND neighbor at (nx, 0, z) is AIR.
-            // That means we're taller than the neighbor -> cast shadow on our own bottom edge.
-            //
-            // Original check: isSolid(nx, -1, 0) - only AO if blocked below in neighbor direction
-            // New check: Also add AO if we overhang (neighbor column is shorter)
-            bool neighborShorterCenter = !isSolid(nx, 0, 0) && isSolid(nx, -1, 0);
-            bool neighborShorterNegZ = !isSolid(nx, 0, -1) && isSolid(nx, -1, -1);
-            bool neighborShorterPosZ = !isSolid(nx, 0, 1) && isSolid(nx, -1, 1);
-            
-            // Bottom-left: combine original AO with overhang AO
-            bool bl_side1 = isSolid(nx, 0, -1);
-            bool bl_side2 = isSolid(nx, -1, 0) || neighborShorterCenter;
-            bool bl_corner = isSolid(nx, -1, -1) || neighborShorterNegZ;
-            ao.bl = vertexAO(bl_side1, bl_side2, bl_corner);
-            
-            // Bottom-right: combine original AO with overhang AO
-            bool br_side1 = isSolid(nx, 0, 1);
-            bool br_side2 = isSolid(nx, -1, 0) || neighborShorterCenter;
-            bool br_corner = isSolid(nx, -1, 1) || neighborShorterPosZ;
-            ao.br = vertexAO(br_side1, br_side2, br_corner);
-            
-            // Top vertices: no change (no overhang shadow from above)
-            ao.tr = vertexAO(isSolid(nx, 0, 1), isSolid(nx, 1, 0), isSolid(nx, 1, 1));
-            ao.tl = vertexAO(isSolid(nx, 0, -1), isSolid(nx, 1, 0), isSolid(nx, 1, -1));
-        } else if (axis == 1) { // Y axis (u=x, v=z) - faces pointing up/down (TOP faces)
-            if (direction == 1) {
-                // TOP FACE (+Y): AO from neighbors that are TALLER than us
-                
-                // Edge neighbors: does neighbor have voxel at our y+1 level?
-                bool edgeNegX = isSolid(-1, 1, 0);
-                bool edgePosX = isSolid(1, 1, 0);
-                bool edgeNegZ = isSolid(0, 1, -1);
-                bool edgePosZ = isSolid(0, 1, 1);
-                
-                // Corner neighbors
-                bool cornerNegXNegZ = isSolid(-1, 1, -1);
-                bool cornerPosXNegZ = isSolid(1, 1, -1);
-                bool cornerPosXPosZ = isSolid(1, 1, 1);
-                bool cornerNegXPosZ = isSolid(-1, 1, 1);
-                
-                // Calculate AO - only shows where TALLER neighbors exist
-                ao.bl = vertexAO_TopFace(edgeNegX, edgeNegZ, cornerNegXNegZ);
-                ao.br = vertexAO_TopFace(edgePosX, edgeNegZ, cornerPosXNegZ);
-                ao.tr = vertexAO_TopFace(edgePosX, edgePosZ, cornerPosXPosZ);
-                ao.tl = vertexAO_TopFace(edgeNegX, edgePosZ, cornerNegXPosZ);
-            } else {
-                // BOTTOM FACE (-Y): No AO needed (rarely visible, underground)
-                ao.bl = ao.br = ao.tr = ao.tl = 0;
-            }
-        } else { // Z axis (u=x, v=y) - faces pointing front/back
-            int nz = (direction == 1 ? 1 : -1);
-            
-            // Same overhang logic as X axis but for Z direction
-            bool neighborShorterCenter = !isSolid(0, 0, nz) && isSolid(0, -1, nz);
-            bool neighborShorterNegX = !isSolid(-1, 0, nz) && isSolid(-1, -1, nz);
-            bool neighborShorterPosX = !isSolid(1, 0, nz) && isSolid(1, -1, nz);
-            
-            // Bottom-left
-            bool bl_side1 = isSolid(-1, 0, nz);
-            bool bl_side2 = isSolid(0, -1, nz) || neighborShorterCenter;
-            bool bl_corner = isSolid(-1, -1, nz) || neighborShorterNegX;
-            ao.bl = vertexAO(bl_side1, bl_side2, bl_corner);
-            
-            // Bottom-right
-            bool br_side1 = isSolid(1, 0, nz);
-            bool br_side2 = isSolid(0, -1, nz) || neighborShorterCenter;
-            bool br_corner = isSolid(1, -1, nz) || neighborShorterPosX;
-            ao.br = vertexAO(br_side1, br_side2, br_corner);
-            
-            // Top vertices: no change
-            ao.tr = vertexAO(isSolid(1, 0, nz), isSolid(0, 1, nz), isSolid(1, 1, nz));
-            ao.tl = vertexAO(isSolid(-1, 0, nz), isSolid(0, 1, nz), isSolid(-1, 1, nz));
-        }
-        
-        return ao;
-    }
-
-void GreedyMesher::generateLODSeamFaces(int step, ChunkMesh& mesh) {
-        // For each XZ column in the chunk (at step intervals)
-        for (int z = 0; z < CHUNK_SIZE; z += step) {
-            for (int x = 0; x < CHUNK_SIZE; x += step) {
-                // Find the actual top height of this column
-                int topY = findColumnTop(x, z);
-                if (topY < 0) continue; // Empty column
-                
-                // The LOD-snapped top is the highest multiple of step <= topY
-                int lodTopY = (topY / step) * step;
-                
-                // Check +X neighbor (within chunk)
-                if (x + step < CHUNK_SIZE) {
-                    int nbrTopY = findColumnTop(x + step, z);
-                    int nbrLodTopY = (nbrTopY >= 0) ? (nbrTopY / step) * step : -1;
-                    
-                    // If there's a height difference, add seam faces
-                    if (lodTopY != nbrLodTopY && nbrLodTopY >= 0) {
-                        int minTop = std::min(lodTopY, nbrLodTopY);
-                        int maxTop = std::max(lodTopY, nbrLodTopY);
-                        
-                        // Add side face(s) to fill the gap
-                        // Face normal points toward the lower column
-                        FaceDirection face = (lodTopY > nbrLodTopY) ? FACE_POS_X : FACE_NEG_X;
-                        int faceX = (lodTopY > nbrLodTopY) ? x + step : x;
-                        
-                        addSeamQuad(faceX, minTop, z, step, maxTop - minTop, face, mesh);
-                    }
-                }
-                
-                // Check +Z neighbor (within chunk)
-                if (z + step < CHUNK_SIZE) {
-                    int nbrTopY = findColumnTop(x, z + step);
-                    int nbrLodTopY = (nbrTopY >= 0) ? (nbrTopY / step) * step : -1;
-                    
-                    if (lodTopY != nbrLodTopY && nbrLodTopY >= 0) {
-                        int minTop = std::min(lodTopY, nbrLodTopY);
-                        int maxTop = std::max(lodTopY, nbrLodTopY);
-                        
-                        FaceDirection face = (lodTopY > nbrLodTopY) ? FACE_POS_Z : FACE_NEG_Z;
-                        int faceZ = (lodTopY > nbrLodTopY) ? z + step : z;
-                        
-                        addSeamQuad(x, minTop, faceZ, step, maxTop - minTop, face, mesh);
-                    }
-                }
-            }
-        }
-        
-        // NOTE: Boundary seams are now generated separately in generateEdgeSeamMeshes()
-        // for conditional rendering when adjacent chunks have different LODs
-    }
-
-void GreedyMesher::generateEdgeSeamMeshes(int step, ChunkMeshWithSeams& result) {
-        // -X edge (West): WEST face pointing outward (NEG_X)
-        generateEdgeFace(0, true, false, step, FACE_NEG_X, result.edgeSeams[EDGE_NEG_X]);
-        
-        // +X edge (East): EAST face pointing outward (POS_X)
-        generateEdgeFace(CHUNK_SIZE, true, true, step, FACE_POS_X, result.edgeSeams[EDGE_POS_X]);
-        
-        // -Z edge (South): SOUTH face pointing outward (NEG_Z)
-        generateEdgeFace(0, false, false, step, FACE_NEG_Z, result.edgeSeams[EDGE_NEG_Z]);
-        
-        // +Z edge (North): NORTH face pointing outward (POS_Z)
-        generateEdgeFace(CHUNK_SIZE, false, true, step, FACE_POS_Z, result.edgeSeams[EDGE_POS_Z]);
-    }
-
-void GreedyMesher::generateBoundarySkirts(int step, ChunkMesh& mesh) {
-        // Deprecated - seams are now generated separately per edge
-        // This function is kept for reference but no longer used
-    }
-
-void GreedyMesher::generateEdgeFace(int edgePos, bool isXEdge, bool isPositive, int step,
-                                  FaceDirection face, ChunkMesh& mesh) {
-        // For X edges: iterate along Z, sample at x = 0 or x = CHUNK_SIZE - step
-        // For Z edges: iterate along X, sample at z = 0 or z = CHUNK_SIZE - step
-        
-        int samplePos = isPositive ? (isXEdge ? CHUNK_SIZE - step : CHUNK_SIZE - step) 
-                                   : 0;
-        
-        for (int i = 0; i < CHUNK_SIZE; i += step) {
-            int x, z;
-            if (isXEdge) {
-                x = samplePos;
-                z = i;
-            } else {
-                x = i;
-                z = samplePos;
-            }
-            
-            // Find the actual top and LOD-snapped top of this column
-            int actualTopY = findColumnTop(x, z);
-            if (actualTopY < 0) continue; // Empty column, no face needed
-            
-            // Snap to LOD step - this is the height the LOD mesh uses
-            int lodTopY = (actualTopY / step) * step;
-            if (lodTopY < 0) continue;
-            
-            int width = step;   // Width along the edge
-            int bottom = lodTopY;  // Start from the LOD-snapped top
-            int top = lodTopY + step;  // End at the LOD voxel's top surface
-            
-            // Calculate AO for each vertex of the seam face
-            FaceAO ao = calculateSeamFaceAO(x, lodTopY, z, face, step);
-            
-            uint32_t baseIdx = static_cast<uint32_t>(mesh.vertices.size());
-            
-            // Generate vertices matching addQuad's convention:
-            // Quad corners ordered: bottom-left(0), bottom-right(1), top-right(2), top-left(3)
-            // Use the same approach as addQuad for each axis
-            
-            if (isXEdge) {
-                // X normal (face in YZ plane): u=z, v=y
-                // Same as addQuad axis==0: x fixed, varies along z (width) and y (height)
-                int faceX = edgePos;
-                int u = i;          // z position
-                int v = bottom;     // y position (bottom)
-                
-                // Vertices: (x, y, z)
-                // 0: bottom-left  = (faceX, bottom, u)
-                // 1: bottom-right = (faceX, bottom, u + width)
-                // 2: top-right    = (faceX, top, u + width)
-                // 3: top-left     = (faceX, top, u)
-                mesh.vertices.emplace_back(static_cast<uint8_t>(faceX), static_cast<uint16_t>(bottom), static_cast<uint8_t>(u), face, ao.bl);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(faceX), static_cast<uint16_t>(bottom), static_cast<uint8_t>(u + width), face, ao.br);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(faceX), static_cast<uint16_t>(top), static_cast<uint8_t>(u + width), face, ao.tr);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(faceX), static_cast<uint16_t>(top), static_cast<uint8_t>(u), face, ao.tl);
-                
-                // Winding: for X axis, direction==1 (POS_X) uses reversed winding
-                // isPositive corresponds to direction==1
-                bool useReversedWinding = isPositive;
-                
-                if (useReversedWinding) {
-                    // Reversed: 0-2-1, 0-3-2
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 1);
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 3);
-                    mesh.indices.push_back(baseIdx + 2);
-                } else {
-                    // Normal: 0-1-2, 0-2-3
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 1);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 3);
-                }
-            } else {
-                // Z normal (face in XY plane): u=x, v=y
-                // Same as addQuad axis==2: z fixed, varies along x (width) and y (height)
-                int faceZ = edgePos;
-                int u = i;          // x position
-                int v = bottom;     // y position (bottom)
-                
-                // Vertices: (x, y, z)
-                // 0: bottom-left  = (u, bottom, faceZ)
-                // 1: bottom-right = (u + width, bottom, faceZ)
-                // 2: top-right    = (u + width, top, faceZ)
-                // 3: top-left     = (u, top, faceZ)
-                mesh.vertices.emplace_back(static_cast<uint8_t>(u), static_cast<uint16_t>(bottom), static_cast<uint8_t>(faceZ), face, ao.bl);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(u + width), static_cast<uint16_t>(bottom), static_cast<uint8_t>(faceZ), face, ao.br);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(u + width), static_cast<uint16_t>(top), static_cast<uint8_t>(faceZ), face, ao.tr);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(u), static_cast<uint16_t>(top), static_cast<uint8_t>(faceZ), face, ao.tl);
-                
-                // Winding: for Z axis, direction==0 (NEG_Z) uses reversed winding
-                // !isPositive corresponds to direction==0
-                bool useReversedWinding = !isPositive;
-                
-                if (useReversedWinding) {
-                    // Reversed: 0-2-1, 0-3-2
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 1);
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 3);
-                    mesh.indices.push_back(baseIdx + 2);
-                } else {
-                    // Normal: 0-1-2, 0-2-3
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 1);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 3);
-                }
-            }
-        }
-    }
-
-FaceAO GreedyMesher::calculateSeamFaceAO(int x, int y, int z, FaceDirection face, int step) {
-        FaceAO ao;
-        
-        // Helper to check if a voxel position is solid
-        auto isSolid = [&](int dx, int dy, int dz) -> bool {
-            int checkX = x + dx * step;
-            int checkY = y + dy * step;
-            int checkZ = z + dz * step;
-            return voxels.get(checkX, checkY, checkZ);
-        };
-        
-        // Calculate vertex AO using the standard formula
-        auto vertexAO = [](bool side1, bool side2, bool corner) -> uint8_t {
-            if (side1 && side2) return 3;  // True corner: darkest
-            if (side1 || side2) {
-                return corner ? 2 : 1;
-            }
-            return corner ? 2 : 0;
-        };
-        
-        // Determine face normal direction for neighbor checks
-        int nx = 0, nz = 0;
-        switch (face) {
-            case FACE_NEG_X: nx = -1; break;
-            case FACE_POS_X: nx = 1; break;
-            case FACE_NEG_Z: nz = -1; break;
-            case FACE_POS_Z: nz = 1; break;
-            default: break;
-        }
-        
-        if (face == FACE_NEG_X || face == FACE_POS_X) {
-            // X-facing face: side faces vary along Z axis
-            // For seam faces at chunk boundary, check AO from voxels in neighbor direction
-            // Bottom-left (y=bottom, z=0)
-            ao.bl = vertexAO(isSolid(nx, 0, -1), isSolid(nx, -1, 0), isSolid(nx, -1, -1));
-            // Bottom-right (y=bottom, z=+step)
-            ao.br = vertexAO(isSolid(nx, 0, 1), isSolid(nx, -1, 0), isSolid(nx, -1, 1));
-            // Top-right (y=top, z=+step)
-            ao.tr = vertexAO(isSolid(nx, 0, 1), isSolid(nx, 1, 0), isSolid(nx, 1, 1));
-            // Top-left (y=top, z=0)
-            ao.tl = vertexAO(isSolid(nx, 0, -1), isSolid(nx, 1, 0), isSolid(nx, 1, -1));
-        } else {
-            // Z-facing face: side faces vary along X axis
-            // Bottom-left (y=bottom, x=0)
-            ao.bl = vertexAO(isSolid(-1, 0, nz), isSolid(0, -1, nz), isSolid(-1, -1, nz));
-            // Bottom-right (y=bottom, x=+step)
-            ao.br = vertexAO(isSolid(1, 0, nz), isSolid(0, -1, nz), isSolid(1, -1, nz));
-            // Top-right (y=top, x=+step)
-            ao.tr = vertexAO(isSolid(1, 0, nz), isSolid(0, 1, nz), isSolid(1, 1, nz));
-            // Top-left (y=top, x=0)
-            ao.tl = vertexAO(isSolid(-1, 0, nz), isSolid(0, 1, nz), isSolid(-1, 1, nz));
-        }
-        
-        return ao;
-    }
-
-int GreedyMesher::findColumnTop(int x, int z) {
-        for (int y = CHUNK_HEIGHT - 1; y >= 0; --y) {
-            if (voxels.get(x, y, z)) {
-                return y;
-            }
-        }
-        return -1; // Empty column
-    }
-
-void GreedyMesher::addSeamQuad(int x, int y, int z, int width, int height, FaceDirection face, ChunkMesh& mesh) {
-        if (height <= 0) return;
-        
-        uint32_t baseIdx = static_cast<uint32_t>(mesh.vertices.size());
-        
-        // No AO for seam faces - they're filling gaps, keep them neutral
-        uint8_t ao = 0;
-        
-        // Create quad vertices based on face direction
-        // Corner IDs: 0=BL, 1=BR, 2=TR, 3=TL
-        if (face == FACE_POS_X || face == FACE_NEG_X) {
-            // X-facing quad in YZ plane
-            mesh.vertices.emplace_back(static_cast<uint8_t>(x), static_cast<uint16_t>(y), static_cast<uint8_t>(z), face, ao);
-            mesh.vertices.emplace_back(static_cast<uint8_t>(x), static_cast<uint16_t>(y), static_cast<uint8_t>(z + width), face, ao);
-            mesh.vertices.emplace_back(static_cast<uint8_t>(x), static_cast<uint16_t>(y + height), static_cast<uint8_t>(z + width), face, ao);
-            mesh.vertices.emplace_back(static_cast<uint8_t>(x), static_cast<uint16_t>(y + height), static_cast<uint8_t>(z), face, ao);
-        } else {
-            // Z-facing quad in XY plane
-            mesh.vertices.emplace_back(static_cast<uint8_t>(x), static_cast<uint16_t>(y), static_cast<uint8_t>(z), face, ao);
-            mesh.vertices.emplace_back(static_cast<uint8_t>(x + width), static_cast<uint16_t>(y), static_cast<uint8_t>(z), face, ao);
-            mesh.vertices.emplace_back(static_cast<uint8_t>(x + width), static_cast<uint16_t>(y + height), static_cast<uint8_t>(z), face, ao);
-            mesh.vertices.emplace_back(static_cast<uint8_t>(x), static_cast<uint16_t>(y + height), static_cast<uint8_t>(z), face, ao);
-        }
-        
-        // Add indices with correct winding
-        bool reversedWinding = (face == FACE_POS_X || face == FACE_POS_Z);
-        if (reversedWinding) {
-            mesh.indices.push_back(baseIdx + 0);
-            mesh.indices.push_back(baseIdx + 2);
-            mesh.indices.push_back(baseIdx + 1);
-            mesh.indices.push_back(baseIdx + 0);
-            mesh.indices.push_back(baseIdx + 3);
-            mesh.indices.push_back(baseIdx + 2);
-        } else {
-            mesh.indices.push_back(baseIdx + 0);
-            mesh.indices.push_back(baseIdx + 1);
-            mesh.indices.push_back(baseIdx + 2);
-            mesh.indices.push_back(baseIdx + 0);
-            mesh.indices.push_back(baseIdx + 2);
-            mesh.indices.push_back(baseIdx + 3);
-        }
-    }
-
-void GreedyMesher::meshAxis(int axis, int direction, int step, ChunkMesh& mesh) {
-        // Determine dimensions based on axis
-        int uDim, vDim, nDim;
-        FaceDirection face;
-        
-        if (axis == 0) { // X axis (normal along X, face in YZ plane)
-            uDim = CHUNK_SIZE; vDim = CHUNK_HEIGHT; nDim = CHUNK_SIZE;
-            face = direction == 0 ? FACE_NEG_X : FACE_POS_X;
-        } else if (axis == 1) { // Y axis (normal along Y, face in XZ plane)
-            uDim = CHUNK_SIZE; vDim = CHUNK_SIZE; nDim = CHUNK_HEIGHT;
-            face = direction == 0 ? FACE_NEG_Y : FACE_POS_Y;
-        } else { // Z axis (normal along Z, face in XY plane)
-            uDim = CHUNK_SIZE; vDim = CHUNK_HEIGHT; nDim = CHUNK_SIZE;
-            face = direction == 0 ? FACE_NEG_Z : FACE_POS_Z;
-        }
-        
-        // Sweep through slices
-        for (int n = 0; n < nDim; n += step) {
-            // Build mask for this slice
-            std::vector<bool> mask(uDim * vDim, false);
-            std::vector<FaceAO> aoMask(uDim * vDim);
-            
-            for (int v = 0; v < vDim; v += step) {
-                for (int u = 0; u < uDim; u += step) {
-                    int x, y, z, nx, ny, nz;
-                    
-                    // Get voxel coordinates
-                    // For each axis, u/v form a 2D plane perpendicular to the axis
-                    if (axis == 0) { // X-axis: face in YZ plane
-                        x = n; y = v; z = u;
-                        nx = x + (direction == 1 ? step : -step);
-                        ny = y; nz = z;
-                    } else if (axis == 1) { // Y-axis: face in XZ plane
-                        x = u; y = n; z = v;
-                        nx = x; ny = y + (direction == 1 ? step : -step); nz = z;
-                    } else { // Z-axis: face in XY plane
-                        x = u; y = v; z = n;
-                        nx = x; ny = y; nz = z + (direction == 1 ? step : -step);
-                    }
-                    
-                    // Check if face is needed
-                    // Use getForFaceCulling for neighbor check - this ensures boundary faces
-                    // are always generated (neighbor outside chunk = air)
-                    bool currentSolid = voxels.get(x, y, z);
-                    bool neighborSolid = voxels.getForFaceCulling(nx, ny, nz);
-                    
-                    if (currentSolid && !neighborSolid) {
-                        int idx = (u / step) + (v / step) * (uDim / step);
-                        mask[idx] = true;
-                        aoMask[idx] = calculateFaceAO(x, y, z, axis, direction, step);
-                    }
-                }
-            }
-            
-            // Greedy mesh the mask
-            greedyMeshMask(mask, aoMask, uDim / step, vDim / step, axis, n, direction, face, step, mesh);
-        }
-    }
-
-void GreedyMesher::greedyMeshMask(const std::vector<bool>& mask, const std::vector<FaceAO>& aoMask, int width, int height,
-                                  int axis, int slicePos, int direction, FaceDirection face,
-                                  int step, ChunkMesh& mesh) {
-        // Greedy meshing: exact AO merges first; optional affine AO merges are lossless.
-        std::vector<bool> visited(width * height, false);
-        
-        for (int j = 0; j < height; ++j) {
-            for (int i = 0; i < width; ++i) {
-                int idx = i + j * width;
-                
-                if (!mask[idx] || visited[idx]) {
-                    continue;
-                }
-                
-                FaceAO currentAO = aoMask[idx];
-
-                auto growExact = [&]() -> std::pair<int, int> {
-                    int qw = 1;
-                    while (i + qw < width) {
-                        int nextIdx = (i + qw) + j * width;
-                        if (!mask[nextIdx] || visited[nextIdx] || aoMask[nextIdx] != currentAO) {
-                            break;
-                        }
-                        ++qw;
-                    }
-
-                    int qh = 1;
-                    bool canExpand = true;
-                    while (canExpand && j + qh < height) {
-                        for (int di = 0; di < qw; ++di) {
-                            int checkIdx = (i + di) + (j + qh) * width;
-                            if (!mask[checkIdx] || visited[checkIdx] || aoMask[checkIdx] != currentAO) {
-                                canExpand = false;
-                                break;
-                            }
-                        }
-                        if (canExpand) {
-                            ++qh;
-                        }
-                    }
-                    return {qw, qh};
+                // Boundary vertices
+                auto dumpEdge = [&](const char* name, uint8_t coord, bool xb) {
+                    auto bv = getBoundary(m, coord, xb);
+                    if (bv.empty()) return;
+                    std::cout << "    " << name << " (" << bv.size() << " verts):";
+                    for (auto& [p, h] : bv) std::cout << " z" << (int)p << "=h" << h;
+                    std::cout << "\n";
                 };
-
-                AOPlane plane{};
-                const bool planeValid = buildAOPlane(currentAO, plane);
-
-                auto growAffine = [&]() -> std::pair<int, int> {
-                    if (!planeValid) {
-                        return {1, 1};
-                    }
-
-                    int qw = 1;
-                    while (i + qw < width) {
-                        int nextIdx = (i + qw) + j * width;
-                        if (!mask[nextIdx] || visited[nextIdx]
-                            || !aoMatchesPlane(aoMask[nextIdx], plane, qw, 0)) {
-                            break;
-                        }
-                        ++qw;
-                    }
-
-                    int qh = 1;
-                    bool canExpand = true;
-                    while (canExpand && j + qh < height) {
-                        for (int di = 0; di < qw; ++di) {
-                            int checkIdx = (i + di) + (j + qh) * width;
-                            if (!mask[checkIdx] || visited[checkIdx]
-                                || !aoMatchesPlane(aoMask[checkIdx], plane, di, qh)) {
-                                canExpand = false;
-                                break;
-                            }
-                        }
-                        if (canExpand) {
-                            ++qh;
-                        }
-                    }
-                    return {qw, qh};
-                };
-
-                auto [exactW, exactH] = growExact();
-                auto [affineW, affineH] = growAffine();
-
-                const int exactArea = exactW * exactH;
-                const int affineArea = affineW * affineH;
-                const bool useAffine = planeValid && affineArea > exactArea && affineArea > 1;
-
-                const int quadWidth = useAffine ? affineW : exactW;
-                const int quadHeight = useAffine ? affineH : exactH;
-                const FaceAO emitAO = useAffine ? makeAOFromPlane(plane, quadWidth, quadHeight) : currentAO;
-
-                if (useAffine) {
-                    g_affineMergeQuads.fetch_add(1, std::memory_order_relaxed);
-                    g_affineMergeCellsSaved.fetch_add(
-                        static_cast<uint64_t>(affineArea - exactArea),
-                        std::memory_order_relaxed);
-                }
-                
-                // Mark all cells in this quad as visited
-                for (int dj = 0; dj < quadHeight; ++dj) {
-                    for (int di = 0; di < quadWidth; ++di) {
-                        visited[(i + di) + (j + dj) * width] = true;
-                    }
-                }
-                
-                // Emit the merged quad
-                addQuad(axis, slicePos, i * step, j * step, 
-                       quadWidth * step, quadHeight * step,
-                       direction, face, step, mesh, emitAO);
+                dumpEdge("x=0  ", 0, true);
+                dumpEdge("x=128", 128, true);
+                dumpEdge("z=0  ", 0, false);
+                dumpEdge("z=128", 128, false);
             }
         }
+        
+        // Show boundary mismatches
+        std::cout << "\n--- Boundary mismatches (LOD 0) ---" << std::endl;
+        int mismatches = 0;
+        auto showMismatch = [&](uint32_t cx1, uint32_t cz1, uint32_t cx2, uint32_t cz2,
+                                uint8_t coord1, uint8_t coord2, bool xb, const char* label) {
+            size_t i1 = (cz1 * chunksX + cx1) * lodLevels;
+            size_t i2 = (cz2 * chunksX + cx2) * lodLevels;
+            auto b1 = getBoundary(data[i1].main, coord1, xb);
+            auto b2 = getBoundary(data[i2].main, coord2, xb);
+            for (auto& [p, h] : b1)
+                if (!b2.count(p)) {
+                    std::cout << "  " << label << " (" << cx1 << "," << cz1 << ") has "
+                              << (xb?"z":"x") << "=" << (int)p << " h=" << h
+                              << " but (" << cx2 << "," << cz2 << ") doesn't\n";
+                    mismatches++;
+                }
+            for (auto& [p, h] : b2)
+                if (!b1.count(p)) {
+                    std::cout << "  " << label << " (" << cx2 << "," << cz2 << ") has "
+                              << (xb?"z":"x") << "=" << (int)p << " h=" << h
+                              << " but (" << cx1 << "," << cz1 << ") doesn't\n";
+                    mismatches++;
+                }
+        };
+        for (uint32_t cz = 0; cz < chunksZ; cz++)
+            for (uint32_t cx = 0; cx + 1 < chunksX; cx++)
+                showMismatch(cx, cz, cx+1, cz, 128, 0, true, "X-boundary");
+        for (uint32_t cx = 0; cx < chunksX; cx++)
+            for (uint32_t cz = 0; cz + 1 < chunksZ; cz++)
+                showMismatch(cx, cz, cx, cz+1, 128, 0, false, "Z-boundary");
+        if (mismatches == 0) std::cout << "  None found.\n";
+        std::cout << std::endl;
     }
 
-void GreedyMesher::meshAxisForRegion(int axis, int direction, int step, ChunkMesh& mesh,
-                                      int startX, int startZ, int endX, int endZ) {
-        // Determine dimensions based on axis
-        FaceDirection face;
-        
-        if (axis == 0) { // X axis (normal along X, face in YZ plane)
-            face = direction == 0 ? FACE_NEG_X : FACE_POS_X;
-            // For X-axis faces: n=X position, u=Z, v=Y
-            // Only process X slices within startX..endX range
-            for (int n = startX; n < endX; n += step) {
-                generateSliceForRegion(axis, direction, step, n, face, mesh, startX, startZ, endX, endZ);
-            }
-        } else if (axis == 1) { // Y axis (normal along Y, face in XZ plane)
-            face = direction == 0 ? FACE_NEG_Y : FACE_POS_Y;
-            // For Y-axis faces: n=Y position, u=X, v=Z
-            // Process all Y slices, but only XZ within region
-            for (int n = 0; n < CHUNK_HEIGHT; n += step) {
-                generateSliceForRegion(axis, direction, step, n, face, mesh, startX, startZ, endX, endZ);
-            }
-        } else { // Z axis (normal along Z, face in XY plane)
-            face = direction == 0 ? FACE_NEG_Z : FACE_POS_Z;
-            // For Z-axis faces: n=Z position, u=X, v=Y
-            // Only process Z slices within startZ..endZ range
-            for (int n = startZ; n < endZ; n += step) {
-                generateSliceForRegion(axis, direction, step, n, face, mesh, startX, startZ, endX, endZ);
-            }
-        }
-    }
+    // ---- Fix gaps ----
+    // Build per-chunk vertex position index for vertex reuse.
+    // This prevents creating duplicate vertices at the same (x,y,z),
+    // making the fixer idempotent (safe to run multiple times).
+    std::vector<std::unordered_map<uint32_t, uint32_t>> posIndices(total);
+    for (size_t i = 0; i < total; i++)
+        posIndices[i] = buildPosIndex(data[i].main);
 
-void GreedyMesher::generateSliceForRegion(int axis, int direction, int step, int n, FaceDirection face,
-                                           ChunkMesh& mesh, int startX, int startZ, int endX, int endZ) {
-        // Calculate region dimensions for the mask
-        int regionSizeX = endX - startX;
-        int regionSizeZ = endZ - startZ;
-        
-        int uDim, vDim;
-        int uStart, vStart;
-        
-        if (axis == 0) { // X-axis: u=Z, v=Y
-            uDim = regionSizeZ;
-            vDim = CHUNK_HEIGHT;
-            uStart = startZ;
-            vStart = 0;
-        } else if (axis == 1) { // Y-axis: u=X, v=Z
-            uDim = regionSizeX;
-            vDim = regionSizeZ;
-            uStart = startX;
-            vStart = startZ;
-        } else { // Z-axis: u=X, v=Y
-            uDim = regionSizeX;
-            vDim = CHUNK_HEIGHT;
-            uStart = startX;
-            vStart = 0;
-        }
-        
-        int maskWidth = uDim / step;
-        int maskHeight = vDim / step;
-        
-        std::vector<bool> mask(maskWidth * maskHeight, false);
-        std::vector<FaceAO> aoMask(maskWidth * maskHeight);
-        
-        for (int vIdx = 0; vIdx < maskHeight; ++vIdx) {
-            for (int uIdx = 0; uIdx < maskWidth; ++uIdx) {
-                int u = uStart + uIdx * step;
-                int v = vStart + vIdx * step;
-                
-                int x, y, z, nx, ny, nz;
-                
-                // Get voxel coordinates based on axis
-                if (axis == 0) { // X-axis: n=X, u=Z, v=Y
-                    x = n; y = v; z = u;
-                    nx = x + (direction == 1 ? step : -step);
-                    ny = y; nz = z;
-                } else if (axis == 1) { // Y-axis: n=Y, u=X, v=Z
-                    x = u; y = n; z = v;
-                    nx = x; ny = y + (direction == 1 ? step : -step); nz = z;
-                } else { // Z-axis: n=Z, u=X, v=Y
-                    x = u; y = v; z = n;
-                    nx = x; ny = y; nz = z + (direction == 1 ? step : -step);
-                }
-                
-                // Check if face is needed
-                bool currentSolid = voxels.get(x, y, z);
-                bool neighborSolid = voxels.getForFaceCulling(nx, ny, nz);
-                
-                if (currentSolid && !neighborSolid) {
-                    int idx = uIdx + vIdx * maskWidth;
-                    mask[idx] = true;
-                    aoMask[idx] = calculateFaceAO(x, y, z, axis, direction, step);
-                }
-            }
-        }
-        
-        // Greedy mesh the mask, with offset for actual coordinates
-        greedyMeshMaskWithOffset(mask, aoMask, maskWidth, maskHeight, axis, n, direction, face, step, mesh, uStart, vStart);
-    }
+    int totalSplits = 0;
 
-void GreedyMesher::greedyMeshMaskWithOffset(const std::vector<bool>& mask, const std::vector<FaceAO>& aoMask,
-                                            int width, int height, int axis, int slicePos, int direction,
-                                            FaceDirection face, int step, ChunkMesh& mesh, int uOffset, int vOffset) {
-        // Greedy meshing with coordinate offsets for region-based generation.
-        // Uses the same exact/affine AO merge policy as the main path.
-        std::vector<bool> visited(width * height, false);
-        
-        for (int j = 0; j < height; ++j) {
-            for (int i = 0; i < width; ++i) {
-                int idx = i + j * width;
-                
-                if (!mask[idx] || visited[idx]) {
-                    continue;
-                }
-                
-                FaceAO currentAO = aoMask[idx];
+    for (uint32_t lod = 0; lod < lodLevels; lod++) {
+        int lodSplits = 0;
 
-                auto growExact = [&]() -> std::pair<int, int> {
-                    int qw = 1;
-                    while (i + qw < width) {
-                        int nextIdx = (i + qw) + j * width;
-                        if (!mask[nextIdx] || visited[nextIdx] || aoMask[nextIdx] != currentAO) {
-                            break;
-                        }
-                        ++qw;
-                    }
-
-                    int qh = 1;
-                    bool canExpand = true;
-                    while (canExpand && j + qh < height) {
-                        for (int di = 0; di < qw; ++di) {
-                            int checkIdx = (i + di) + (j + qh) * width;
-                            if (!mask[checkIdx] || visited[checkIdx] || aoMask[checkIdx] != currentAO) {
-                                canExpand = false;
-                                break;
-                            }
-                        }
-                        if (canExpand) {
-                            ++qh;
-                        }
-                    }
-                    return {qw, qh};
-                };
-
-                AOPlane plane{};
-                const bool planeValid = buildAOPlane(currentAO, plane);
-
-                auto growAffine = [&]() -> std::pair<int, int> {
-                    if (!planeValid) {
-                        return {1, 1};
-                    }
-
-                    int qw = 1;
-                    while (i + qw < width) {
-                        int nextIdx = (i + qw) + j * width;
-                        if (!mask[nextIdx] || visited[nextIdx]
-                            || !aoMatchesPlane(aoMask[nextIdx], plane, qw, 0)) {
-                            break;
-                        }
-                        ++qw;
-                    }
-
-                    int qh = 1;
-                    bool canExpand = true;
-                    while (canExpand && j + qh < height) {
-                        for (int di = 0; di < qw; ++di) {
-                            int checkIdx = (i + di) + (j + qh) * width;
-                            if (!mask[checkIdx] || visited[checkIdx]
-                                || !aoMatchesPlane(aoMask[checkIdx], plane, di, qh)) {
-                                canExpand = false;
-                                break;
-                            }
-                        }
-                        if (canExpand) {
-                            ++qh;
-                        }
-                    }
-                    return {qw, qh};
-                };
-
-                auto [exactW, exactH] = growExact();
-                auto [affineW, affineH] = growAffine();
-
-                const int exactArea = exactW * exactH;
-                const int affineArea = affineW * affineH;
-                const bool useAffine = planeValid && affineArea > exactArea && affineArea > 1;
-
-                const int quadWidth = useAffine ? affineW : exactW;
-                const int quadHeight = useAffine ? affineH : exactH;
-                const FaceAO emitAO = useAffine ? makeAOFromPlane(plane, quadWidth, quadHeight) : currentAO;
-
-                if (useAffine) {
-                    g_affineMergeQuads.fetch_add(1, std::memory_order_relaxed);
-                    g_affineMergeCellsSaved.fetch_add(
-                        static_cast<uint64_t>(affineArea - exactArea),
-                        std::memory_order_relaxed);
-                }
-                
-                // Mark all cells in this quad as visited
-                for (int dj = 0; dj < quadHeight; ++dj) {
-                    for (int di = 0; di < quadWidth; ++di) {
-                        visited[(i + di) + (j + dj) * width] = true;
-                    }
-                }
-                
-                // Emit the merged quad with offset coordinates
-                int u = uOffset + i * step;
-                int v = vOffset + j * step;
-                addQuad(axis, slicePos, u, v, 
-                       quadWidth * step, quadHeight * step,
-                       direction, face, step, mesh, emitAO);
-            }
-        }
-    }
-
-bool GreedyMesher::buildAOPlane(const FaceAO& seed, AOPlane& plane) {
-        plane.bl = static_cast<int>(seed.bl);
-        plane.du = static_cast<int>(seed.br) - plane.bl;
-        plane.dv = static_cast<int>(seed.tl) - plane.bl;
-        const int expectedTr = plane.bl + plane.du + plane.dv;
-        return static_cast<int>(seed.tr) == expectedTr;
-    }
-
-bool GreedyMesher::aoMatchesPlane(const FaceAO& ao, const AOPlane& plane, int relU, int relV) {
-        const int base = plane.bl + plane.du * relU + plane.dv * relV;
-        const int expectedBl = base;
-        const int expectedBr = base + plane.du;
-        const int expectedTl = base + plane.dv;
-        const int expectedTr = base + plane.du + plane.dv;
-
-        auto inRange = [](int v) { return v >= 0 && v <= 3; };
-        if (!inRange(expectedBl) || !inRange(expectedBr)
-            || !inRange(expectedTl) || !inRange(expectedTr)) {
-            return false;
-        }
-
-        return static_cast<int>(ao.bl) == expectedBl
-            && static_cast<int>(ao.br) == expectedBr
-            && static_cast<int>(ao.tl) == expectedTl
-            && static_cast<int>(ao.tr) == expectedTr;
-    }
-
-FaceAO GreedyMesher::makeAOFromPlane(const AOPlane& plane, int widthCells, int heightCells) {
-        FaceAO out{};
-        const int bl = plane.bl;
-        const int br = plane.bl + plane.du * widthCells;
-        const int tl = plane.bl + plane.dv * heightCells;
-        const int tr = plane.bl + plane.du * widthCells + plane.dv * heightCells;
-        out.bl = static_cast<uint8_t>(std::clamp(bl, 0, 3));
-        out.br = static_cast<uint8_t>(std::clamp(br, 0, 3));
-        out.tl = static_cast<uint8_t>(std::clamp(tl, 0, 3));
-        out.tr = static_cast<uint8_t>(std::clamp(tr, 0, 3));
-        return out;
-    }
-
-void GreedyMesher::generateLODSeamFacesForRegion(int step, ChunkMesh& mesh, int startX, int startZ, int endX, int endZ) {
-        // For each XZ column in the region (at step intervals)
-        for (int z = startZ; z < endZ; z += step) {
-            for (int x = startX; x < endX; x += step) {
-                int topY = findColumnTop(x, z);
-                if (topY < 0) continue;
-                
-                int lodTopY = (topY / step) * step;
-                
-                // Check +X neighbor (only if within region or at region boundary)
-                if (x + step < endX) {
-                    int nbrTopY = findColumnTop(x + step, z);
-                    int nbrLodTopY = (nbrTopY >= 0) ? (nbrTopY / step) * step : -1;
-                    
-                    if (lodTopY != nbrLodTopY && nbrLodTopY >= 0) {
-                        int minTop = std::min(lodTopY, nbrLodTopY);
-                        int maxTop = std::max(lodTopY, nbrLodTopY);
-                        FaceDirection face = (lodTopY > nbrLodTopY) ? FACE_POS_X : FACE_NEG_X;
-                        int faceX = (lodTopY > nbrLodTopY) ? x + step : x;
-                        addSeamQuad(faceX, minTop, z, step, maxTop - minTop, face, mesh);
-                    }
-                }
-                
-                // Check +Z neighbor (only if within region)
-                if (z + step < endZ) {
-                    int nbrTopY = findColumnTop(x, z + step);
-                    int nbrLodTopY = (nbrTopY >= 0) ? (nbrTopY / step) * step : -1;
-                    
-                    if (lodTopY != nbrLodTopY && nbrLodTopY >= 0) {
-                        int minTop = std::min(lodTopY, nbrLodTopY);
-                        int maxTop = std::max(lodTopY, nbrLodTopY);
-                        FaceDirection face = (lodTopY > nbrLodTopY) ? FACE_POS_Z : FACE_NEG_Z;
-                        int faceZ = (lodTopY > nbrLodTopY) ? z + step : z;
-                        addSeamQuad(x, minTop, faceZ, step, maxTop - minTop, face, mesh);
-                    }
-                }
-            }
-        }
-    }
-
-void GreedyMesher::generateEdgeSeamMeshesForRegion(int step, ChunkMeshWithSeams& result,
-                                                   int startX, int startZ, int endX, int endZ) {
-        // Only generate seams for edges that are at actual chunk boundaries
-        // West edge (-X): only if startX == 0
-        if (startX == 0) {
-            generateEdgeFaceForRegion(0, true, false, step, FACE_NEG_X, result.edgeSeams[EDGE_NEG_X], startZ, endZ);
-        }
-        
-        // East edge (+X): only if endX == CHUNK_SIZE
-        if (endX == CHUNK_SIZE) {
-            generateEdgeFaceForRegion(CHUNK_SIZE, true, true, step, FACE_POS_X, result.edgeSeams[EDGE_POS_X], startZ, endZ);
-        }
-        
-        // South edge (-Z): only if startZ == 0
-        if (startZ == 0) {
-            generateEdgeFaceForRegion(0, false, false, step, FACE_NEG_Z, result.edgeSeams[EDGE_NEG_Z], startX, endX);
-        }
-        
-        // North edge (+Z): only if endZ == CHUNK_SIZE
-        if (endZ == CHUNK_SIZE) {
-            generateEdgeFaceForRegion(CHUNK_SIZE, false, true, step, FACE_POS_Z, result.edgeSeams[EDGE_POS_Z], startX, endX);
-        }
-    }
-
-void GreedyMesher::generateEdgeFaceForRegion(int edgePos, bool isXEdge, bool isPositive, int step,
-                                             FaceDirection face, ChunkMesh& mesh, int iterStart, int iterEnd) {
-        int samplePos = isPositive ? (isXEdge ? CHUNK_SIZE - step : CHUNK_SIZE - step) : 0;
-        
-        for (int i = iterStart; i < iterEnd; i += step) {
-            int x, z;
-            if (isXEdge) {
-                x = samplePos;
-                z = i;
-            } else {
-                x = i;
-                z = samplePos;
-            }
-            
-            int actualTopY = findColumnTop(x, z);
-            if (actualTopY < 0) continue;
-            
-            int lodTopY = (actualTopY / step) * step;
-            if (lodTopY < 0) continue;
-            
-            int width = step;
-            int bottom = lodTopY;
-            int top = lodTopY + step;
-            
-            FaceAO ao = calculateSeamFaceAO(x, lodTopY, z, face, step);
-            
-            uint32_t baseIdx = static_cast<uint32_t>(mesh.vertices.size());
-            
-            if (isXEdge) {
-                int faceX = edgePos;
-                int u = i;
-                
-                mesh.vertices.emplace_back(static_cast<uint8_t>(faceX), static_cast<uint16_t>(bottom), static_cast<uint8_t>(u), face, ao.bl);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(faceX), static_cast<uint16_t>(bottom), static_cast<uint8_t>(u + width), face, ao.br);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(faceX), static_cast<uint16_t>(top), static_cast<uint8_t>(u + width), face, ao.tr);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(faceX), static_cast<uint16_t>(top), static_cast<uint8_t>(u), face, ao.tl);
-                
-                bool useReversedWinding = isPositive;
-                if (useReversedWinding) {
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 1);
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 3);
-                    mesh.indices.push_back(baseIdx + 2);
-                } else {
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 1);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 3);
-                }
-            } else {
-                int faceZ = edgePos;
-                int u = i;
-                
-                mesh.vertices.emplace_back(static_cast<uint8_t>(u), static_cast<uint16_t>(bottom), static_cast<uint8_t>(faceZ), face, ao.bl);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(u + width), static_cast<uint16_t>(bottom), static_cast<uint8_t>(faceZ), face, ao.br);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(u + width), static_cast<uint16_t>(top), static_cast<uint8_t>(faceZ), face, ao.tr);
-                mesh.vertices.emplace_back(static_cast<uint8_t>(u), static_cast<uint16_t>(top), static_cast<uint8_t>(faceZ), face, ao.tl);
-                
-                bool useReversedWinding = !isPositive;
-                if (useReversedWinding) {
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 1);
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 3);
-                    mesh.indices.push_back(baseIdx + 2);
-                } else {
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 1);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 0);
-                    mesh.indices.push_back(baseIdx + 2);
-                    mesh.indices.push_back(baseIdx + 3);
-                }
-            }
-        }
-    }
-
-void GreedyMesher::addQuad(int axis, int n, int u, int v, int width, int height,
-                         int direction, FaceDirection face, int step, ChunkMesh& mesh, const FaceAO& ao) {
-        // No vertex limit check here - we use 32-bit indices during generation
-        // and split into sub-meshes afterward if needed
-        
-        // Use uint16_t for all coordinates to avoid overflow during calculations
-        uint16_t x0, y0, z0, x1, y1, z1, x2, y2, z2, x3, y3, z3;
-        
-        // Calculate 4 corners based on axis
-        // Quad corners ordered: bottom-left, bottom-right, top-right, top-left
-        // CRITICAL: Coordinates must stay within bit field limits (X/Z: 0-128, Y: 1-512 stored as 0-511)
-        // CRITICAL: For positive direction faces, position is at n+step (the boundary between solid and air)
-        if (axis == 0) { // X normal (face in YZ plane: u=z, v=y)
-            // X position: for neg direction face is at n, for pos direction face is at n+step
-            uint16_t x = n + (direction == 1 ? step : 0);
-            x0 = x; y0 = v; z0 = u;
-            x1 = x; y1 = v; z1 = u + width;
-            x2 = x; y2 = v + height; z2 = u + width;
-            x3 = x; y3 = v + height; z3 = u;
-        } else if (axis == 1) { // Y normal (face in XZ plane: u=x, v=z)
-            // Y position: for neg direction face is at n, for pos direction face is at n+step
-            uint16_t y = n + (direction == 1 ? step : 0);
-            x0 = u; y0 = y; z0 = v;
-            x1 = u + width; y1 = y; z1 = v;
-            x2 = u + width; y2 = y; z2 = v + height;
-            x3 = u; y3 = y; z3 = v + height;
-        } else { // Z normal (face in XY plane: u=x, v=y)
-            // Z position: for neg direction face is at n, for pos direction face is at n+step
-            uint16_t z = n + (direction == 1 ? step : 0);
-            x0 = u; y0 = v; z0 = z;
-            x1 = u + width; y1 = v; z1 = z;
-            x2 = u + width; y2 = v + height; z2 = z;
-            x3 = u; y3 = v + height; z3 = z;
-        }
-
-        // Add vertices (cast to uint8_t/uint16_t for packing)
-        uint32_t baseIdx = static_cast<uint32_t>(mesh.vertices.size());
-        mesh.vertices.emplace_back(static_cast<uint8_t>(x0), static_cast<uint16_t>(y0), static_cast<uint8_t>(z0), face, ao.bl);
-        mesh.vertices.emplace_back(static_cast<uint8_t>(x1), static_cast<uint16_t>(y1), static_cast<uint8_t>(z1), face, ao.br);
-        mesh.vertices.emplace_back(static_cast<uint8_t>(x2), static_cast<uint16_t>(y2), static_cast<uint8_t>(z2), face, ao.tr);
-        mesh.vertices.emplace_back(static_cast<uint8_t>(x3), static_cast<uint16_t>(y3), static_cast<uint8_t>(z3), face, ao.tl);
-        
-        // Add indices (two triangles)
-        // Z axis needs inverted winding compared to X/Y axes due to coordinate system handedness
-        bool useReversedWinding = (axis == 2) ? (direction == 0) : (direction == 1);
-        
-        // AO-BASED QUAD FLIP: Choose diagonal that creates consistent corner triangles
-        // 
-        // The quad has 4 vertices: bl(0), br(1), tr(2), tl(3)
-        // Default diagonal: 0-2 (bl to tr), creates triangles [0,1,2] and [0,2,3]
-        // Flipped diagonal: 1-3 (br to tl), creates triangles [0,1,3] and [1,2,3]
-        //
-        // For consistent AO corner triangles:
-        // - When ao.bl + ao.tr > ao.br + ao.tl: use flipped diagonal (1-3)
-        //   This keeps the dark corner isolated to one triangle
-        // - Otherwise: use default diagonal (0-2)
-        //
-        // This ensures the AO interpolation creates:
-        // - Thinner medium bands in corners (dark isolated in corner triangle)
-        // - Larger dark bands (not split across triangles)
-        bool flipDiagonal = (ao.bl + ao.tr) > (ao.br + ao.tl);
-        
-        if (useReversedWinding) {
-            if (flipDiagonal) {
-                // CW winding, flipped diagonal (1-3)
-                mesh.indices.push_back(baseIdx + 0);
-                mesh.indices.push_back(baseIdx + 3);
-                mesh.indices.push_back(baseIdx + 1);
-                mesh.indices.push_back(baseIdx + 1);
-                mesh.indices.push_back(baseIdx + 3);
-                mesh.indices.push_back(baseIdx + 2);
-            } else {
-                // CW winding, default diagonal (0-2)
-                mesh.indices.push_back(baseIdx + 0);
-                mesh.indices.push_back(baseIdx + 2);
-                mesh.indices.push_back(baseIdx + 1);
-                mesh.indices.push_back(baseIdx + 0);
-                mesh.indices.push_back(baseIdx + 3);
-                mesh.indices.push_back(baseIdx + 2);
-            }
-        } else {
-            if (flipDiagonal) {
-                // CCW winding, flipped diagonal (1-3)
-                mesh.indices.push_back(baseIdx + 0);
-                mesh.indices.push_back(baseIdx + 1);
-                mesh.indices.push_back(baseIdx + 3);
-                mesh.indices.push_back(baseIdx + 1);
-                mesh.indices.push_back(baseIdx + 2);
-                mesh.indices.push_back(baseIdx + 3);
-            } else {
-                // CCW winding, default diagonal (0-2)
-                mesh.indices.push_back(baseIdx + 0);
-                mesh.indices.push_back(baseIdx + 1);
-                mesh.indices.push_back(baseIdx + 2);
-                mesh.indices.push_back(baseIdx + 0);
-                mesh.indices.push_back(baseIdx + 2);
-                mesh.indices.push_back(baseIdx + 3);
-            }
-        }
-    }
-END CC-REPLACE
-
-BEGIN CC-REPLACE
-FILE: tools/heightmap_mesh/HeightfieldMesher.cpp
-MODE: whole_file
----
-#include "HeightmapMeshInternal.h"
-
-// GPT-DESC: Generates RTIN heightfield terrain meshes and casing seam geometry for DCCM output.
-
-HeightfieldMesher::HeightfieldMesher(const std::vector<float>& heightmap, int mapWidth, int mapHeight,
-                                     int chunkX, int chunkZ, int numChunksX, int numChunksZ)
-    : m_heightmap(heightmap), m_mapWidth(mapWidth), m_mapHeight(mapHeight),
-      m_chunkX(chunkX), m_chunkZ(chunkZ),
-      m_numChunksX(numChunksX), m_numChunksZ(numChunksZ) {}
-
-ChunkMeshWithSeams HeightfieldMesher::generateMesh(int lodLevel) {
-        ChunkMeshWithSeams result;
-        int step = 1 << lodLevel;
-        int gridW = CHUNK_SIZE / step;  // cells along X
-        int gridH = CHUNK_SIZE / step;  // cells along Z
-        int cW = gridW + 1;             // vertex columns (one more than cells)
-        int cH = gridH + 1;             // vertex rows
-
-        // -----------------------------------------------------------
-        // 1. Build vertex height grid via DIRECT heightmap sampling.
-        //    Each vertex at grid position (vx, vz) gets the height at
-        //    world position (chunkX*128 + vx*step, chunkZ*128 + vz*step).
-        //    No MAX inflation, no neighbor blending - clean point samples.
-        // -----------------------------------------------------------
-        std::vector<int> vtxH(cW * cH, 0);
-        for (int vz = 0; vz < cH; ++vz)
-            for (int vx = 0; vx < cW; ++vx) {
-                int worldX = m_chunkX * CHUNK_SIZE + vx * step;
-                int worldZ = m_chunkZ * CHUNK_SIZE + vz * step;
-                vtxH[vz * cW + vx] = sampleHeight(worldX, worldZ);
-            }
-
-        // -----------------------------------------------------------
-        // 2. Shared vertex index grid (lazy creation).
-        //    Vertices are created on first use and shared by all
-        //    adjacent triangles. This eliminates T-junction cracks
-        //    caused by duplicate vertices at different memory locations.
-        // -----------------------------------------------------------
-        std::vector<uint32_t> vtxIdx(cW * cH, UINT32_MAX);
-
-        auto getOrCreateVtx = [&](int vx, int vz) -> uint32_t {
-            int i = vz * cW + vx;
-            if (vtxIdx[i] == UINT32_MAX) {
-                vtxIdx[i] = addVtx(result.mainMesh, vx, vz, vtxH[i], step, FACE_POS_Y, 0);
-            }
-            return vtxIdx[i];
+        auto idx = [&](uint32_t cx, uint32_t cz) -> size_t {
+            return (cz * chunksX + cx) * lodLevels + lod;
         };
 
-        // -----------------------------------------------------------
-        // 3. RTIN (Right-Triangulated Irregular Network) meshing.
-        //
-        //    Adaptive binary-triangle-tree triangulation that merges
-        //    flat areas AND slopes into a minimal triangle mesh.
-        //
-        //    T-junction free by construction: two triangles sharing
-        //    a hypotenuse always see the same error at their shared
-        //    midpoint (stored in the same grid cell) and make the
-        //    same split/no-split decision.
-        //
-        //    Error threshold 0.5: for integer heightmaps, the
-        //    interpolation error at a midpoint between heights H
-        //    and H+1 is exactly 0.5 — at the threshold, so no split.
-        //    This turns flat+slope+flat into one smooth ramp.
-        // -----------------------------------------------------------
-        constexpr float RTIN_MAX_ERROR = 0.5f;
+        // East-West boundaries (X direction)
+        for (uint32_t cz = 0; cz < chunksZ; cz++) {
+            for (uint32_t cx = 0; cx + 1 < chunksX; cx++) {
+                // Snapshot boundaries BEFORE fixing either side
+                auto east = getBoundary(data[idx(cx,   cz)].main, 128, true);
+                auto west = getBoundary(data[idx(cx+1, cz)].main,   0, true);
 
-        // Error grid: max height deviation at each position when used
-        // as a triangle split point. Includes propagated child errors.
-        std::vector<float> rtinErrors(cW * cH, 0.0f);
-
-        // Bottom-up error computation.
-        //
-        // Triangle convention: (apex, left, right) where left→right
-        // is the hypotenuse. Splitting at midpoint M creates:
-        //   Left child:  (M, apex, left)
-        //   Right child: (M, right, apex)
-        //
-        // Error at midpoint = max(interpolation_error, child_errors).
-        // Grid uses max-accumulation so cross-tree contributions merge.
-        std::function<float(int,int, int,int, int,int)> computeRTINErrors;
-        // Compute LOCAL interpolation error at every interior grid
-        // position. Each position (mx,mz) can be the midpoint of a
-        // triangle whose hypotenuse connects two specific endpoints.
-        // We compute the error for ALL possible midpoint roles by
-        // traversing both root trees.
-        //
-        // NOTE: We store only LOCAL error (no child propagation).
-        // This avoids the "split halo" effect where a single rough
-        // feature forces all ancestor triangles to split, dragging
-        // nearby flat areas into full-detail tessellation.
-        // The trade-off: a parent triangle may not split even if a
-        // child would need to (the child never gets created). This
-        // means we sacrifice detail at isolated rough features in
-        // favor of dramatically fewer triangles overall.
-        computeRTINErrors = [&](int ax, int az, int lx, int lz,
-                                int rx, int rz) -> float {
-            int mx = (lx + rx) >> 1;
-            int mz = (lz + rz) >> 1;
-
-            // Base case: midpoint collapsed to endpoint (integer div)
-            if ((mx == lx && mz == lz) || (mx == rx && mz == rz))
-                return 0.0f;
-
-            // Recurse into children
-            computeRTINErrors(mx, mz, ax, az, lx, lz);
-            computeRTINErrors(mx, mz, rx, rz, ax, az);
-
-            // LOCAL interpolation error at midpoint
-            float interp = (vtxH[lz * cW + lx] + vtxH[rz * cW + rx])
-                         * 0.5f;
-            float localErr = std::abs(
-                static_cast<float>(vtxH[mz * cW + mx]) - interp);
-
-            // Max-accumulate (handles both root trees at shared pos)
-            rtinErrors[mz * cW + mx] = std::max(
-                rtinErrors[mz * cW + mx], localErr);
-
-            return rtinErrors[mz * cW + mx];
-        };
-
-        // Compute errors for both root triangles:
-        //   Root A: apex=(gridW,0), hyp (0,0)→(gridW,gridH)
-        //   Root B: apex=(0,gridH), hyp (gridW,gridH)→(0,0)
-        computeRTINErrors(gridW, 0,   0, 0,        gridW, gridH);
-        computeRTINErrors(0, gridH,   gridW, gridH, 0, 0);
-
-        // Top-down mesh generation.
-        // Split when error > threshold, emit leaf triangles.
-        // Winding: (apex, left, right) is clockwise in XZ → +Y normal.
-        std::function<void(int,int, int,int, int,int)> emitRTIN;
-        emitRTIN = [&](int ax, int az, int lx, int lz,
-                       int rx, int rz) {
-            int mx = (lx + rx) >> 1;
-            int mz = (lz + rz) >> 1;
-
-            // Can split only if midpoint is distinct from endpoints
-            bool canSplit = !((mx == lx && mz == lz) ||
-                             (mx == rx && mz == rz));
-
-            if (canSplit && rtinErrors[mz * cW + mx] > RTIN_MAX_ERROR) {
-                emitRTIN(mx, mz, ax, az, lx, lz);  // left child
-                emitRTIN(mx, mz, rx, rz, ax, az);  // right child
-            } else {
-                // Skip empty triangles (all vertices at height 0)
-                int ha = vtxH[az * cW + ax];
-                int hl = vtxH[lz * cW + lx];
-                int hr = vtxH[rz * cW + rx];
-                if (ha == 0 && hl == 0 && hr == 0) return;
-
-                uint32_t va = getOrCreateVtx(ax, az);
-                uint32_t vl = getOrCreateVtx(lx, lz);
-                uint32_t vr = getOrCreateVtx(rx, rz);
-                result.mainMesh.indices.push_back(va);
-                result.mainMesh.indices.push_back(vl);
-                result.mainMesh.indices.push_back(vr);
+                lodSplits += fixBoundary(data[idx(cx,   cz)].main, 128, true, west, posIndices[idx(cx,   cz)]);
+                lodSplits += fixBoundary(data[idx(cx+1, cz)].main,   0, true, east, posIndices[idx(cx+1, cz)]);
             }
+        }
+
+        // North-South boundaries (Z direction)
+        for (uint32_t cx = 0; cx < chunksX; cx++) {
+            for (uint32_t cz = 0; cz + 1 < chunksZ; cz++) {
+                auto north = getBoundary(data[idx(cx, cz)].main,   128, false);
+                auto south = getBoundary(data[idx(cx, cz+1)].main,   0, false);
+
+                lodSplits += fixBoundary(data[idx(cx, cz)].main,   128, false, south, posIndices[idx(cx, cz)]);
+                lodSplits += fixBoundary(data[idx(cx, cz+1)].main,   0, false, north, posIndices[idx(cx, cz+1)]);
+            }
+        }
+
+        if (lodSplits > 0)
+            std::cout << "  LOD " << lod << ": " << lodSplits << " boundary splits" << std::endl;
+        totalSplits += lodSplits;
+
+        // Interior gap detection: vertex-on-edge within each chunk mesh
+        int interiorSplits = 0;
+        for (uint32_t cz = 0; cz < chunksZ; cz++)
+            for (uint32_t cx = 0; cx < chunksX; cx++)
+                interiorSplits += fixInteriorGaps(data[idx(cx, cz)].main, posIndices[idx(cx, cz)]);
+
+        if (interiorSplits > 0)
+            std::cout << "  LOD " << lod << ": " << interiorSplits << " interior splits" << std::endl;
+        totalSplits += interiorSplits;
+    }
+
+    std::cout << "Total: " << totalSplits << " boundary fixes" << std::endl;
+
+    // ---- Weld duplicate vertices & harmonize AO ----
+    int totalWelded = 0, totalAOConflicts = 0, totalDegenerate = 0;
+    for (uint32_t lod = 0; lod < lodLevels; lod++) {
+        int lodWelded = 0, lodAO = 0, lodDegen = 0;
+        for (uint32_t cz = 0; cz < chunksZ; cz++)
+            for (uint32_t cx = 0; cx < chunksX; cx++) {
+                size_t i = (cz * chunksX + cx) * lodLevels + lod;
+                auto ws = weldVertices(data[i].main);
+                lodWelded += ws.duplicateVerts;
+                lodAO     += ws.aoConflicts;
+                lodDegen  += ws.degenerateTris;
+            }
+        if (lodWelded > 0)
+            std::cout << "  LOD " << lod << ": welded " << lodWelded
+                      << " duplicate vertices (" << lodAO << " AO conflicts, "
+                      << lodDegen << " degenerate tris removed)" << std::endl;
+        totalWelded    += lodWelded;
+        totalAOConflicts += lodAO;
+        totalDegenerate += lodDegen;
+    }
+    if (totalWelded > 0)
+        std::cout << "Total: " << totalWelded << " vertices welded, "
+                  << totalAOConflicts << " AO conflicts resolved, "
+                  << totalDegenerate << " degenerate triangles removed" << std::endl;
+
+    // ---- Remove overlapping triangles ----
+    int totalRemoved = 0;
+    for (uint32_t lod = 0; lod < lodLevels; lod++) {
+        int lodRemoved = 0;
+        for (uint32_t cz = 0; cz < chunksZ; cz++)
+            for (uint32_t cx = 0; cx < chunksX; cx++) {
+                size_t i = (cz * chunksX + cx) * lodLevels + lod;
+                lodRemoved += removeOverlappingTriangles(data[i].main);
+            }
+        if (lodRemoved > 0)
+            std::cout << "  LOD " << lod << ": " << lodRemoved << " overlapping triangles removed" << std::endl;
+        totalRemoved += lodRemoved;
+    }
+    if (totalRemoved > 0)
+        std::cout << "Total: " << totalRemoved << " overlapping triangles removed" << std::endl;
+
+    // ---- AO edge smoothing ----
+    // Clamp AO transitions to max 1 level per edge to prevent harsh artifacts
+    int totalSmoothed = 0;
+    for (uint32_t lod = 0; lod < lodLevels; lod++) {
+        int lodSmoothed = 0;
+        for (uint32_t cz = 0; cz < chunksZ; cz++)
+            for (uint32_t cx = 0; cx < chunksX; cx++) {
+                size_t i = (cz * chunksX + cx) * lodLevels + lod;
+                auto ss = smoothEdgeAO(data[i].main);
+                lodSmoothed += ss.edgesSmoothed;
+            }
+        if (lodSmoothed > 0)
+            std::cout << "  LOD " << lod << ": smoothed " << lodSmoothed
+                      << " AO edge transitions" << std::endl;
+        totalSmoothed += lodSmoothed;
+    }
+    if (totalSmoothed > 0)
+        std::cout << "Total: " << totalSmoothed << " AO edges smoothed" << std::endl;
+
+    // ---- Regenerate seam (casing) meshes from fixed surface ----
+    // After boundary/interior fixes, the main mesh may have new vertices
+    // along chunk edges that the original casing quads don't track.
+    // Regenerate casing from the fixed surface's boundary vertices so the
+    // casing top edge perfectly matches the surface.
+    int totalSeamsRegenerated = 0;
+    {
+        // Edge constants matching converter:
+        //   EDGE 0 = NEG_X (x=0),   face=0 (FACE_NEG_X), reverseWinding=false
+        //   EDGE 1 = POS_X (x=128), face=1 (FACE_POS_X), reverseWinding=true
+        //   EDGE 2 = NEG_Z (z=0),   face=4 (FACE_NEG_Z), reverseWinding=true
+        //   EDGE 3 = POS_Z (z=128), face=5 (FACE_POS_Z), reverseWinding=false
+        struct EdgeDef {
+            uint8_t coord;      // boundary coordinate (0 or 128)
+            bool    xBound;     // true = match by X, false = match by Z
+            uint8_t face;       // face direction for casing vertices
+            bool    reverseWinding;
+        };
+        const EdgeDef edgeDefs[EDGE_COUNT] = {
+            {   0, true,  0, false }, // NEG_X
+            { 128, true,  1, true  }, // POS_X
+            {   0, false, 4, true  }, // NEG_Z
+            { 128, false, 5, false }, // POS_Z
         };
 
-        emitRTIN(gridW, 0,   0, 0,        gridW, gridH);
-        emitRTIN(0, gridH,   gridW, gridH, 0, 0);
+        auto emitCasingQuadToMesh = [](Mesh& mesh,
+                                       uint8_t x0, uint16_t yTop0, uint8_t z0,
+                                       uint8_t x1, uint16_t yTop1, uint8_t z1,
+                                       uint8_t face, bool reverseWinding) {
+            if (yTop0 <= 1 && yTop1 <= 1) return; // y=1 is the minimum (packed 0 → y=1)
 
-        // Casing side faces: vertical walls along each chunk edge.
-        // Uses the RTIN vtxIdx to find actual edge vertices, so the
-        // casing top edge perfectly matches the RTIN triangle surface
-        // (no gaps from RTIN simplification).
-        generateCasingSideFaces(vtxIdx, vtxH, cW, cH, gridW, gridH, step, result);
+            uint32_t baseIdx = static_cast<uint32_t>(mesh.verts.size());
+            const uint16_t Y_BASE = 1; // Minimum packed Y
 
-        return result;
-    }
-
-int HeightfieldMesher::sampleHeight(int worldX, int worldZ) const {
-        int fx = m_mapWidth  - 1 - worldX;
-        int fz = m_mapHeight - 1 - worldZ;
-        if (fx < 0 || fx >= m_mapWidth || fz < 0 || fz >= m_mapHeight) return 0;
-        int h = static_cast<int>(m_heightmap[fz * m_mapWidth + fx]);
-        return std::min(h, (int)CHUNK_HEIGHT);
-    }
-
-uint32_t HeightfieldMesher::addVtx(ChunkMesh& mesh, int cx, int cz, int height,
-                                      int step, uint8_t face, uint8_t ao) {
-        uint32_t idx = static_cast<uint32_t>(mesh.vertices.size());
-        uint8_t  px = static_cast<uint8_t>(std::min(cx * step, (int)CHUNK_SIZE));
-        uint16_t py = static_cast<uint16_t>(std::max(0, height));
-        uint8_t  pz = static_cast<uint8_t>(std::min(cz * step, (int)CHUNK_SIZE));
-        mesh.vertices.emplace_back(px, py, pz, face, ao);
-        return idx;
-    }
-
-void HeightfieldMesher::generateCasingSideFaces(const std::vector<uint32_t>& vtxIdx,
-                                                   const std::vector<int>& vtxH,
-                                                   int cW, int cH,
-                                                   int gridW, int gridH,
-                                                   int step,
-                                                   ChunkMeshWithSeams& result) {
-
-        // Emit a vertical quad from terrain surface down to Y=0.
-        auto emitCasingQuad = [&](ChunkMesh& mesh,
-                                  int x0, int yTop0, int z0,
-                                  int x1, int yTop1, int z1,
-                                  uint8_t face, bool reverseWinding) {
-            if (yTop0 <= 0 && yTop1 <= 0) return;
-
-            constexpr int Y_BASE = 0;
-            uint32_t baseIdx = static_cast<uint32_t>(mesh.vertices.size());
-
-            mesh.vertices.emplace_back(
-                static_cast<uint8_t>(x0), static_cast<uint16_t>(Y_BASE),
-                static_cast<uint8_t>(z0), face, static_cast<uint8_t>(0));
-            mesh.vertices.emplace_back(
-                static_cast<uint8_t>(x1), static_cast<uint16_t>(Y_BASE),
-                static_cast<uint8_t>(z1), face, static_cast<uint8_t>(0));
-            mesh.vertices.emplace_back(
-                static_cast<uint8_t>(x1), static_cast<uint16_t>(std::max(0, yTop1)),
-                static_cast<uint8_t>(z1), face, static_cast<uint8_t>(0));
-            mesh.vertices.emplace_back(
-                static_cast<uint8_t>(x0), static_cast<uint16_t>(std::max(0, yTop0)),
-                static_cast<uint8_t>(z0), face, static_cast<uint8_t>(0));
+            mesh.verts.push_back(PackedVertex(x0, Y_BASE, z0, face, 0));
+            mesh.verts.push_back(PackedVertex(x1, Y_BASE, z1, face, 0));
+            mesh.verts.push_back(PackedVertex(x1, yTop1,  z1, face, 0));
+            mesh.verts.push_back(PackedVertex(x0, yTop0,  z0, face, 0));
 
             if (reverseWinding) {
-                mesh.indices.push_back(baseIdx + 0);
-                mesh.indices.push_back(baseIdx + 2);
-                mesh.indices.push_back(baseIdx + 1);
-                mesh.indices.push_back(baseIdx + 0);
-                mesh.indices.push_back(baseIdx + 3);
-                mesh.indices.push_back(baseIdx + 2);
+                mesh.idx.push_back(baseIdx + 0);
+                mesh.idx.push_back(baseIdx + 2);
+                mesh.idx.push_back(baseIdx + 1);
+                mesh.idx.push_back(baseIdx + 0);
+                mesh.idx.push_back(baseIdx + 3);
+                mesh.idx.push_back(baseIdx + 2);
             } else {
-                mesh.indices.push_back(baseIdx + 0);
-                mesh.indices.push_back(baseIdx + 1);
-                mesh.indices.push_back(baseIdx + 2);
-                mesh.indices.push_back(baseIdx + 0);
-                mesh.indices.push_back(baseIdx + 2);
-                mesh.indices.push_back(baseIdx + 3);
+                mesh.idx.push_back(baseIdx + 0);
+                mesh.idx.push_back(baseIdx + 1);
+                mesh.idx.push_back(baseIdx + 2);
+                mesh.idx.push_back(baseIdx + 0);
+                mesh.idx.push_back(baseIdx + 2);
+                mesh.idx.push_back(baseIdx + 3);
             }
         };
 
-        // Helper: collect RTIN-created vertex positions along one edge.
-        // Returns sorted list of (grid_index, height) pairs for vertices
-        // that actually exist in the RTIN mesh (vtxIdx != UINT32_MAX).
-        // Always includes the two corner vertices (they always exist).
-        auto collectEdgeVertices = [&](bool isXEdge, bool isMaxEdge)
-            -> std::vector<std::pair<int, int>> {
-            std::vector<std::pair<int, int>> verts;
-            if (isXEdge) {
-                // Walk along Z at fixed X (x=0 or x=gridW)
-                int vx = isMaxEdge ? gridW : 0;
-                for (int vz = 0; vz <= gridH; ++vz) {
-                    int idx = vz * cW + vx;
-                    if (vtxIdx[idx] != UINT32_MAX) {
-                        verts.push_back({vz, vtxH[idx]});
+        for (size_t i = 0; i < total; i++) {
+            auto& m = data[i].main;
+            if (m.empty()) continue;
+
+            for (int ed = 0; ed < EDGE_COUNT; ed++) {
+                auto& def = edgeDefs[ed];
+
+                // Collect boundary vertices from the FIXED surface mesh,
+                // sorted by position along the edge → height
+                auto bverts = getBoundary(m, def.coord, def.xBound);
+                if (bverts.size() < 2) continue; // need at least 2 points for a quad
+
+                // Regenerate casing quads between consecutive boundary vertices
+                Mesh newSeam;
+                auto it = bverts.begin();
+                auto prev = it;
+                ++it;
+                for (; it != bverts.end(); prev = it, ++it) {
+                    uint8_t pos0 = prev->first;
+                    uint16_t h0  = prev->second;
+                    uint8_t pos1 = it->first;
+                    uint16_t h1  = it->second;
+
+                    if (def.xBound) {
+                        // Edge along X axis: coord is X, pos is Z
+                        emitCasingQuadToMesh(newSeam,
+                            def.coord, h0, pos0,
+                            def.coord, h1, pos1,
+                            def.face, def.reverseWinding);
+                    } else {
+                        // Edge along Z axis: coord is Z, pos is X
+                        emitCasingQuadToMesh(newSeam,
+                            pos0, h0, def.coord,
+                            pos1, h1, def.coord,
+                            def.face, def.reverseWinding);
                     }
                 }
-                // Ensure corners are present
-                if (verts.empty() || verts.front().first != 0)
-                    verts.insert(verts.begin(), {0, vtxH[0 * cW + vx]});
-                if (verts.back().first != gridH)
-                    verts.push_back({gridH, vtxH[gridH * cW + vx]});
-            } else {
-                // Walk along X at fixed Z (z=0 or z=gridH)
-                int vz = isMaxEdge ? gridH : 0;
-                for (int vx = 0; vx <= gridW; ++vx) {
-                    int idx = vz * cW + vx;
-                    if (vtxIdx[idx] != UINT32_MAX) {
-                        verts.push_back({vx, vtxH[idx]});
-                    }
-                }
-                if (verts.empty() || verts.front().first != 0)
-                    verts.insert(verts.begin(), {0, vtxH[vz * cW + 0]});
-                if (verts.back().first != gridW)
-                    verts.push_back({gridW, vtxH[vz * cW + gridW]});
-            }
-            return verts;
-        };
 
-        // EDGE_NEG_X (West): X=0, walk along Z, normal -X
-        {
-            auto ev = collectEdgeVertices(true, false);
-            for (size_t i = 0; i + 1 < ev.size(); ++i) {
-                emitCasingQuad(result.edgeSeams[EDGE_NEG_X],
-                    0, ev[i].second,   ev[i].first   * step,
-                    0, ev[i+1].second, ev[i+1].first * step,
-                    FACE_NEG_X, false);
-            }
-        }
-
-        // EDGE_POS_X (East): X=CHUNK_SIZE, walk along Z, normal +X
-        {
-            auto ev = collectEdgeVertices(true, true);
-            for (size_t i = 0; i + 1 < ev.size(); ++i) {
-                emitCasingQuad(result.edgeSeams[EDGE_POS_X],
-                    CHUNK_SIZE, ev[i].second,   ev[i].first   * step,
-                    CHUNK_SIZE, ev[i+1].second, ev[i+1].first * step,
-                    FACE_POS_X, true);
-            }
-        }
-
-        // EDGE_NEG_Z (South): Z=0, walk along X, normal -Z
-        {
-            auto ev = collectEdgeVertices(false, false);
-            for (size_t i = 0; i + 1 < ev.size(); ++i) {
-                emitCasingQuad(result.edgeSeams[EDGE_NEG_Z],
-                    ev[i].first   * step, ev[i].second,   0,
-                    ev[i+1].first * step, ev[i+1].second, 0,
-                    FACE_NEG_Z, true);
-            }
-        }
-
-        // EDGE_POS_Z (North): Z=CHUNK_SIZE, walk along X, normal +Z
-        {
-            auto ev = collectEdgeVertices(false, true);
-            for (size_t i = 0; i + 1 < ev.size(); ++i) {
-                emitCasingQuad(result.edgeSeams[EDGE_POS_Z],
-                    ev[i].first   * step, ev[i].second,   CHUNK_SIZE,
-                    ev[i+1].first * step, ev[i+1].second, CHUNK_SIZE,
-                    FACE_POS_Z, false);
-            }
-        }
-    }
-END CC-REPLACE
-
-BEGIN CC-REPLACE
-FILE: tools/heightmap_mesh/MeshOptimization.cpp
-MODE: whole_file
----
-#include "HeightmapMeshInternal.h"
-
-// GPT-DESC: Optimizes generated heightmap meshes and splits them into 16-bit upload chunks.
-
-std::atomic<uint64_t> g_totalVertsBefore{0};
-std::atomic<uint64_t> g_totalVertsAfter{0};
-std::atomic<uint64_t> g_totalMeshesDeduplicated{0};
-std::atomic<uint64_t> g_affineMergeQuads{0};
-std::atomic<uint64_t> g_affineMergeCellsSaved{0};
-
-static constexpr int VERTEX_CACHE_SIZE = 32; // Modern GPUs: typically 16-32
-
-std::vector<SubChunk> splitMeshToSubChunks(const ChunkMesh& mesh) {
-    std::vector<SubChunk> subChunks;
-    
-    if (mesh.isEmpty()) {
-        return subChunks;
-    }
-    
-    // If mesh fits in one SubChunk, just convert indices to 16-bit
-    if (mesh.vertices.size() <= MAX_VERTICES_PER_SUBCHUNK) {
-        SubChunk sub;
-        sub.vertices = mesh.vertices;
-        sub.indices.reserve(mesh.indices.size());
-        for (uint32_t idx : mesh.indices) {
-            sub.indices.push_back(static_cast<uint16_t>(idx));
-        }
-        subChunks.push_back(std::move(sub));
-        return subChunks;
-    }
-    
-    // Need to split - process triangles and track which vertices are used
-    SubChunk currentSub;
-    std::unordered_map<uint32_t, uint32_t> vertexRemap; // old index -> new index in current sub
-
-    // Helper to finalize current SubChunk
-    auto finalizeSub = [&]() {
-        if (!currentSub.isEmpty()) {
-            subChunks.push_back(std::move(currentSub));
-            currentSub = SubChunk();
-            vertexRemap.clear();
-        }
-    };
-    
-    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
-        uint32_t i0 = mesh.indices[i];
-        uint32_t i1 = mesh.indices[i + 1];
-        uint32_t i2 = mesh.indices[i + 2];
-        
-        // Check if adding this triangle would exceed limit
-        size_t newVertices = 0;
-        if (vertexRemap.find(i0) == vertexRemap.end()) newVertices++;
-        if (vertexRemap.find(i1) == vertexRemap.end()) newVertices++;
-        if (vertexRemap.find(i2) == vertexRemap.end()) newVertices++;
-        
-        if (currentSub.vertices.size() + newVertices > MAX_VERTICES_PER_SUBCHUNK) {
-            finalizeSub();
-        }
-        
-        // Add vertices and remap indices
-        auto addVertex = [&](uint32_t oldIdx) -> uint16_t {
-            auto it = vertexRemap.find(oldIdx);
-            if (it != vertexRemap.end()) {
-                return static_cast<uint16_t>(it->second);
-            }
-            uint32_t newIdx = static_cast<uint32_t>(currentSub.vertices.size());
-            currentSub.vertices.push_back(mesh.vertices[oldIdx]);
-            vertexRemap[oldIdx] = newIdx;
-            return static_cast<uint16_t>(newIdx);
-        };
-        
-        currentSub.indices.push_back(addVertex(i0));
-        currentSub.indices.push_back(addVertex(i1));
-        currentSub.indices.push_back(addVertex(i2));
-    }
-    
-    // Finalize last SubChunk
-    finalizeSub();
-    
-    // Warn if we had to split
-    if (subChunks.size() > 1) {
-        static std::atomic<int> splitCount{0};
-        int count = ++splitCount;
-        if (count <= 10) {
-            std::cout << "[SubChunk] Split large mesh into " << subChunks.size() 
-                      << " SubChunks (" << mesh.vertices.size() << " vertices -> "
-                      << subChunks.size() << " draw calls)" << std::endl;
-        } else if (count == 11) {
-            std::cout << "[SubChunk] (suppressing further split messages)" << std::endl;
-        }
-    }
-    
-    // ERROR if we exceed MAX_SUBCHUNKS - data will be lost!
-    if (subChunks.size() > MAX_SUBCHUNKS) {
-        std::cerr << "[ERROR] Mesh requires " << subChunks.size() 
-                  << " SubChunks but MAX_SUBCHUNKS=" << MAX_SUBCHUNKS 
-                  << "! Data will be truncated! (" << mesh.vertices.size() << " vertices)" << std::endl;
-        subChunks.resize(MAX_SUBCHUNKS);
-    }
-    
-    return subChunks;
-}
-
-void deduplicateVertices(ChunkMesh& mesh) {
-    if (mesh.isEmpty()) return;
-    
-    const size_t origVertCount = mesh.vertices.size();
-    
-    // Map: packed value -> new index in deduplicated array
-    std::unordered_map<uint32_t, uint32_t> seen;
-    seen.reserve(origVertCount);
-    
-    std::vector<PackedVertex> newVerts;
-    newVerts.reserve(origVertCount);
-    
-    // Build remap table
-    std::vector<uint32_t> remap(origVertCount);
-    for (size_t i = 0; i < origVertCount; ++i) {
-        uint32_t key = mesh.vertices[i].packed;
-        auto [it, inserted] = seen.try_emplace(key, static_cast<uint32_t>(newVerts.size()));
-        if (inserted) {
-            newVerts.push_back(mesh.vertices[i]);
-        }
-        remap[i] = it->second;
-    }
-    
-    // Remap all indices
-    for (auto& idx : mesh.indices) {
-        idx = remap[idx];
-    }
-    
-    mesh.vertices = std::move(newVerts);
-    
-    // Track stats
-    g_totalVertsBefore.fetch_add(origVertCount, std::memory_order_relaxed);
-    g_totalVertsAfter.fetch_add(mesh.vertices.size(), std::memory_order_relaxed);
-    g_totalMeshesDeduplicated.fetch_add(1, std::memory_order_relaxed);
-}
-
-void reorderVerticesForFetch(ChunkMesh& mesh) {
-    if (mesh.isEmpty()) return;
-    
-    const size_t vertCount = mesh.vertices.size();
-    std::vector<uint32_t> remap(vertCount, UINT32_MAX);
-    std::vector<PackedVertex> newVerts;
-    newVerts.reserve(vertCount);
-    
-    uint32_t nextId = 0;
-    for (auto& idx : mesh.indices) {
-        if (remap[idx] == UINT32_MAX) {
-            remap[idx] = nextId++;
-            newVerts.push_back(mesh.vertices[idx]);
-        }
-        idx = remap[idx];
-    }
-    
-    // Append any unreferenced vertices (shouldn't happen after dedup, but be safe)
-    for (size_t i = 0; i < vertCount; ++i) {
-        if (remap[i] == UINT32_MAX) {
-            newVerts.push_back(mesh.vertices[i]);
-        }
-    }
-    
-    mesh.vertices = std::move(newVerts);
-}
-
-void optimizeTriangleOrder(ChunkMesh& mesh) {
-    if (mesh.isEmpty()) return;
-    const size_t triCount = mesh.indices.size() / 3;
-    if (triCount <= 1) return;
-    const size_t vertCount = mesh.vertices.size();
-
-    // Build adjacency: for each vertex, list of triangles using it
-    std::vector<std::vector<uint32_t>> vertToTris(vertCount);
-    for (size_t t = 0; t < triCount; ++t) {
-        vertToTris[mesh.indices[t * 3 + 0]].push_back(static_cast<uint32_t>(t));
-        vertToTris[mesh.indices[t * 3 + 1]].push_back(static_cast<uint32_t>(t));
-        vertToTris[mesh.indices[t * 3 + 2]].push_back(static_cast<uint32_t>(t));
-    }
-
-    // LRU cache (FIFO ring buffer)
-    std::vector<uint32_t> cache(VERTEX_CACHE_SIZE, UINT32_MAX);
-    std::vector<bool> inCache(vertCount, false);
-    int cachePos = 0;
-
-    auto pushCache = [&](uint32_t v) {
-        if (inCache[v]) return;
-        uint32_t evicted = cache[cachePos];
-        if (evicted != UINT32_MAX) inCache[evicted] = false;
-        cache[cachePos] = v;
-        inCache[v] = true;
-        cachePos = (cachePos + 1) % VERTEX_CACHE_SIZE;
-    };
-
-    std::vector<bool> emitted(triCount, false);
-    std::vector<uint32_t> newIndices;
-    newIndices.reserve(mesh.indices.size());
-
-    // Seed: emit triangle 0
-    auto emitTri = [&](uint32_t t) {
-        emitted[t] = true;
-        uint32_t v0 = mesh.indices[t * 3 + 0];
-        uint32_t v1 = mesh.indices[t * 3 + 1];
-        uint32_t v2 = mesh.indices[t * 3 + 2];
-        newIndices.push_back(v0);
-        newIndices.push_back(v1);
-        newIndices.push_back(v2);
-        pushCache(v0);
-        pushCache(v1);
-        pushCache(v2);
-    };
-
-    emitTri(0);
-
-    for (size_t emittedCount = 1; emittedCount < triCount; ) {
-        // Find best candidate: triangle with most vertices already in cache
-        uint32_t bestTri = UINT32_MAX;
-        int bestScore = -1;
-
-        // Only search triangles adjacent to cached vertices (locality)
-        for (int ci = 0; ci < VERTEX_CACHE_SIZE; ++ci) {
-            uint32_t cv = cache[ci];
-            if (cv == UINT32_MAX) continue;
-            for (uint32_t t : vertToTris[cv]) {
-                if (emitted[t]) continue;
-                int score = 0;
-                if (inCache[mesh.indices[t * 3 + 0]]) ++score;
-                if (inCache[mesh.indices[t * 3 + 1]]) ++score;
-                if (inCache[mesh.indices[t * 3 + 2]]) ++score;
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestTri = t;
-                    if (score == 3) break; // Can't do better
+                // Replace original seam sub-chunks with single regenerated mesh
+                data[i].seamSubs[ed].clear();
+                if (!newSeam.empty()) {
+                    data[i].seamSubs[ed].push_back(std::move(newSeam));
+                    totalSeamsRegenerated++;
                 }
             }
-            if (bestScore == 3) break;
         }
+    }
+    if (totalSeamsRegenerated > 0)
+        std::cout << "Regenerated " << totalSeamsRegenerated << " seam (casing) meshes to match fixed surfaces" << std::endl;
 
-        // Fallback: if no cached neighbor found, pick first unemitted
-        if (bestTri == UINT32_MAX) {
-            for (size_t t = 0; t < triCount; ++t) {
-                if (!emitted[t]) { bestTri = static_cast<uint32_t>(t); break; }
+    if (totalSplits == 0 && totalRemoved == 0 && totalWelded == 0 && totalSmoothed == 0 && totalSeamsRegenerated == 0) {
+        std::cout << "No gaps, overlaps, or duplicates found. File unchanged." << std::endl;
+        return 0;
+    }
+
+    // ---- Write fixed file ----
+    std::ofstream fout(path, std::ios::binary);
+    if (!fout) {
+        std::cerr << "Cannot write " << path << std::endl;
+        return 1;
+    }
+
+    // Header
+    fout.write(reinterpret_cast<const char*>(&magic),     4);
+    fout.write(reinterpret_cast<const char*>(&version),   4);
+    fout.write(reinterpret_cast<const char*>(&chunksX),   4);
+    fout.write(reinterpret_cast<const char*>(&chunksZ),   4);
+    fout.write(reinterpret_cast<const char*>(&lodLevels), 4);
+
+    // Placeholder index
+    std::vector<ChunkEntry> newEntries(total, ChunkEntry{});
+    auto indexOff = fout.tellp();
+    for (auto& e : newEntries)
+        fout.write(reinterpret_cast<const char*>(&e), sizeof(e));
+
+    // Write mesh data
+    for (size_t i = 0; i < total; i++) {
+        auto& e  = newEntries[i];
+        auto& m  = data[i].main;
+
+        // Main mesh — single sub-chunk (heightfield meshes are small)
+        if (!m.empty()) {
+            if (m.verts.size() > 65535) {
+                std::cerr << "WARNING: entry " << i << " has "
+                          << m.verts.size() << " vertices (>65535)" << std::endl;
+            }
+            e.subCount              = 1;
+            e.subs[0].offset        = streamOffset(fout);
+            e.subs[0].vertexCount   = static_cast<uint32_t>(m.verts.size());
+            e.subs[0].indexCount    = static_cast<uint32_t>(m.idx.size());
+
+            fout.write(reinterpret_cast<const char*>(m.verts.data()),
+                       static_cast<std::streamsize>(m.verts.size() * sizeof(PackedVertex)));
+            for (auto idx32 : m.idx) {
+                uint16_t i16 = static_cast<uint16_t>(idx32);
+                fout.write(reinterpret_cast<const char*>(&i16), sizeof(uint16_t));
             }
         }
 
-        emitTri(bestTri);
-        ++emittedCount;
+        // Seam meshes — pass through unchanged
+        for (int ed = 0; ed < EDGE_COUNT; ed++) {
+            e.seamCounts[ed] = static_cast<uint8_t>(
+                std::min(data[i].seamSubs[ed].size(), MAX_SUBCHUNKS));
+
+            for (size_t s = 0; s < data[i].seamSubs[ed].size() && s < MAX_SUBCHUNKS; s++) {
+                auto& sm = data[i].seamSubs[ed][s];
+                if (sm.empty()) continue;
+                e.seams[ed][s].offset      = streamOffset(fout);
+                e.seams[ed][s].vertexCount = static_cast<uint32_t>(sm.verts.size());
+                e.seams[ed][s].indexCount  = static_cast<uint32_t>(sm.idx.size());
+
+                fout.write(reinterpret_cast<const char*>(sm.verts.data()),
+                           static_cast<std::streamsize>(sm.verts.size() * sizeof(PackedVertex)));
+                for (auto idx32 : sm.idx) {
+                    uint16_t i16 = static_cast<uint16_t>(idx32);
+                    fout.write(reinterpret_cast<const char*>(&i16), sizeof(uint16_t));
+                }
+            }
+        }
     }
 
-    mesh.indices = std::move(newIndices);
-}
+    // Finalize index
+    fout.seekp(indexOff);
+    for (auto& e : newEntries)
+        fout.write(reinterpret_cast<const char*>(&e), sizeof(e));
 
-void optimizeMesh(ChunkMesh& mesh) {
-    deduplicateVertices(mesh);
-    optimizeTriangleOrder(mesh);
-    reorderVerticesForFetch(mesh);
-}
-
-void printDedupStats() {
-    uint64_t before = g_totalVertsBefore.load();
-    uint64_t after  = g_totalVertsAfter.load();
-    uint64_t meshes = g_totalMeshesDeduplicated.load();
-    if (before == 0) return;
-    
-    double pct = 100.0 * (1.0 - static_cast<double>(after) / static_cast<double>(before));
-    double savedMB = static_cast<double>(before - after) * sizeof(PackedVertex) / (1024.0 * 1024.0);
-    
-    std::cout << "\n[Vertex Dedup] " << meshes << " meshes optimized"
-              << "\n  Vertices: " << before << " -> " << after 
-              << " (removed " << (before - after) << ", -" << std::fixed << std::setprecision(1) << pct << "%)"
-              << "\n  VB savings: " << std::setprecision(2) << savedMB << " MB"
-              << "\n  Affine AO merges: " << g_affineMergeQuads.load()
-              << " quads, +" << g_affineMergeCellsSaved.load() << " cells collapsed"
-              << std::endl;
+    fout.close();
+    std::cout << "Written: " << path << std::endl;
+    return 0;
 }
 END CC-REPLACE
 
 BEGIN CC-REPLACE
-FILE: tools/heightmap_mesh/TerrainFileWriter.cpp
+FILE: tools/fix_dccm_gaps.cpp
 MODE: whole_file
 ---
-#include "HeightmapMeshInternal.h"
+// GPT-DESC: Legacy placeholder; fix_dccm_gaps now builds from tools/dccm_gap_fix/.
 
-// GPT-DESC: Writes terrain.bin and terrain_dccm.bin mesh files from generated chunk meshes.
+// This source file is intentionally kept as a tiny compatibility placeholder.
+// The real tool implementation lives in:
+//   tools/dccm_gap_fix/DCCMGapFixTool.cpp
+//   tools/dccm_gap_fix/DCCMBoundary.cpp
+//   tools/dccm_gap_fix/DCCMWeld.cpp
+//   tools/dccm_gap_fix/DCCMAOSmoothing.cpp
 
-bool convertHeightmapToMeshes(const std::string& csvPath, const std::string& outputPath, int maxChunksPerSide) {
-    // Load heightmap
-    int mapWidth, mapHeight;
-    std::vector<float> heightmap = loadHeightmapCSV(csvPath, mapWidth, mapHeight);
-    if (heightmap.empty()) return false;
-
-    // Export binary heightmap cache alongside terrain.bin (used by runtime edit system)
-    {
-        std::string hbinPath;
-        auto dot = csvPath.rfind('.');
-        hbinPath = (dot != std::string::npos) ? csvPath.substr(0, dot) + ".hbin" : csvPath + ".hbin";
-        std::ofstream hbinFile(hbinPath, std::ios::binary);
-        if (hbinFile.is_open()) {
-            const char magic[4] = {'H','B','M','2'};
-            uint32_t w = static_cast<uint32_t>(mapWidth);
-            uint32_t h = static_cast<uint32_t>(mapHeight);
-            hbinFile.write(magic, 4);
-            hbinFile.write(reinterpret_cast<const char*>(&w), 4);
-            hbinFile.write(reinterpret_cast<const char*>(&h), 4);
-            hbinFile.write(reinterpret_cast<const char*>(heightmap.data()),
-                           static_cast<std::streamsize>(heightmap.size() * sizeof(float)));
-            std::cout << "[convert] Exported binary heightmap cache: " << hbinPath << std::endl;
-        } else {
-            std::cerr << "[convert] Warning: could not write heightmap cache to " << hbinPath << std::endl;
-        }
-    }
-
-    int numChunksX = (mapWidth + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    int numChunksZ = (mapHeight + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    
-    // Limit to maxChunksPerSide if specified
-    if (maxChunksPerSide > 0) {
-        numChunksX = std::min(numChunksX, maxChunksPerSide);
-        numChunksZ = std::min(numChunksZ, maxChunksPerSide);
-        std::cout << "Limiting output to " << numChunksX << "x" << numChunksZ << " chunks" << std::endl;
-    }
-    
-    int totalChunks = numChunksX * numChunksZ;
-    
-    // Open output file
-    std::ofstream outFile(outputPath, std::ios::binary);
-    if (!outFile.is_open()) return false;
-    
-    // Write header
-    outFile.write(reinterpret_cast<const char*>(&TERRAIN_MESH_MAGIC), sizeof(uint32_t));
-    outFile.write(reinterpret_cast<const char*>(&TERRAIN_MESH_VERSION), sizeof(uint32_t));
-    uint32_t chunksX = numChunksX, chunksZ = numChunksZ, lodLevels = MAX_LOD_LEVEL + 1;
-    outFile.write(reinterpret_cast<const char*>(&chunksX), sizeof(uint32_t));
-    outFile.write(reinterpret_cast<const char*>(&chunksZ), sizeof(uint32_t));
-    outFile.write(reinterpret_cast<const char*>(&lodLevels), sizeof(uint32_t));
-    
-    // Reserve space for chunk index (v3 format: supports sub-mesh splitting + optimal index sizing)
-    // Each entry: subChunkCount(1) + seam counts(4) + padding(3) + MAX_SUBCHUNKS * (offset,vcount,icount) + seams
-    // v4: SubChunks - NEVER merged, each becomes separate draw call
-    uint64_t indexOffset = outFile.tellp();
-    size_t totalEntries = numChunksX * numChunksZ * lodLevels;
-    
-    // v4 SubChunk data per entry (always 16-bit indices):
-    struct SubChunkData {
-        uint64_t offset;       // File offset to data
-        uint32_t vertexCount;  // Vertex count
-        uint32_t indexCount;   // Index count (16-bit indices)
-    };
-    
-    struct ChunkIndexEntryV4 {
-        uint8_t subChunkCount;                          // 1-4 SubChunks for main mesh
-        uint8_t seamSubChunkCounts[EDGE_COUNT];         // SubChunks per seam edge
-        uint8_t padding[3];                             // Align to 8 bytes
-        // Main mesh SubChunks (up to MAX_SUBCHUNKS)
-        SubChunkData subChunks[MAX_SUBCHUNKS];
-        // Edge seams (up to MAX_SUBCHUNKS each)
-        SubChunkData seamSubChunks[EDGE_COUNT][MAX_SUBCHUNKS];
-    };
-    
-    std::vector<ChunkIndexEntryV4> chunkIndex(totalEntries);
-    
-    // Statistics tracking for SubChunk splits
-    struct SubChunkStats {
-        std::atomic<uint32_t> totalChunks{0};
-        std::atomic<uint32_t> splitChunks{0};  // Chunks needing >1 SubChunk
-        std::atomic<uint32_t> totalSubChunks{0};
-        std::atomic<uint32_t> maxSubChunks{0};
-        
-        void record(size_t numSubChunks) {
-            totalChunks++;
-            totalSubChunks += static_cast<uint32_t>(numSubChunks);
-            if (numSubChunks > 1) splitChunks++;
-            uint32_t current = maxSubChunks.load();
-            while (numSubChunks > current && !maxSubChunks.compare_exchange_weak(current, static_cast<uint32_t>(numSubChunks)));
-        }
-        
-        void print() {
-            std::cout << "\n=== SubChunk Statistics ===\n";
-            std::cout << "Total chunks processed: " << totalChunks.load() << "\n";
-            std::cout << "Chunks needing split: " << splitChunks.load() 
-                      << " (" << (100.0f * splitChunks.load() / std::max(1u, totalChunks.load())) << "%)\n";
-            std::cout << "Total SubChunks: " << totalSubChunks.load() << "\n";
-            std::cout << "Max SubChunks per chunk: " << maxSubChunks.load() << "\n";
-            float avgDrawCalls = static_cast<float>(totalSubChunks.load()) / std::max(1u, totalChunks.load());
-            std::cout << "Average draw calls per chunk: " << std::fixed << std::setprecision(2) << avgDrawCalls << "\n";
-        }
-    } subChunkStats;
-    
-    // Write placeholder index
-    for (size_t i = 0; i < totalEntries; ++i) {
-        ChunkIndexEntryV4 entry{};
-        outFile.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
-    }
-    
-    // Batch-based multi-threaded processing to avoid OOM
-    constexpr int BATCH_SIZE = 256; // Process chunks in batches
-    
-    // Structure for mesh data - now supports quadrant-based splitting
-    struct ChunkMeshData {
-        size_t entryIndex;
-        bool needsQuadrantSplit;  // True if mesh exceeds vertex limit
-        ChunkMeshWithSeams fullMesh;  // Used when not splitting
-        std::array<ChunkMeshWithSeams, 4> quadrantMeshes;  // Used when splitting into 4 quadrants
-    };
-    
-    // Quadrant definitions: (startX, startZ, endX, endZ)
-    // Quadrant 0: SW (0, 0) to (64, 64)
-    // Quadrant 1: SE (64, 0) to (128, 64)
-    // Quadrant 2: NW (0, 64) to (64, 128)
-    // Quadrant 3: NE (64, 64) to (128, 128)
-    constexpr int HALF_CHUNK = CHUNK_SIZE / 2;
-    struct QuadrantDef { int startX, startZ, endX, endZ; };
-    const QuadrantDef quadrants[4] = {
-        {0, 0, HALF_CHUNK, HALF_CHUNK},           // SW
-        {HALF_CHUNK, 0, CHUNK_SIZE, HALF_CHUNK},   // SE
-        {0, HALF_CHUNK, HALF_CHUNK, CHUNK_SIZE},   // NW
-        {HALF_CHUNK, HALF_CHUNK, CHUNK_SIZE, CHUNK_SIZE}  // NE
-    };
-    
-    for (int batchStart = 0; batchStart < totalChunks; batchStart += BATCH_SIZE) {
-        int batchEnd = std::min(batchStart + BATCH_SIZE, totalChunks);
-        int batchSize = batchEnd - batchStart;
-        
-        std::vector<std::vector<ChunkMeshData>> batchResults(batchSize);
-        std::atomic<int> batchIndex(0);
-        std::atomic<bool> hasError(false);
-        
-        auto workerFunc = [&]() {
-            try {
-                VoxelChunk voxelChunk;
-                while (true) {
-                    int localIdx = batchIndex.fetch_add(1);
-                    if (localIdx >= batchSize) break;
-                    
-                    int idx = batchStart + localIdx;
-                    int cz = idx / numChunksX;
-                    int cx = idx % numChunksX;
-                    
-                    createChunkVoxels(voxelChunk, heightmap, mapWidth, mapHeight, cx, cz, numChunksX, numChunksZ);
-                    
-                    // Debug edge voxels for this chunk (thread-safe with mutex)
-                    static std::mutex debugMutex;
-                    {
-                        std::lock_guard<std::mutex> lock(debugMutex);
-                        debugChunkEdgeVoxels(voxelChunk, cx, cz, numChunksX, numChunksZ);
-                    }
-                    
-                    GreedyMesher mesher(voxelChunk, cx, cz);
-                    
-                    for (int lod = 0; lod <= MAX_LOD_LEVEL; ++lod) {
-                        size_t entryIndex = (cz * numChunksX + cx) * lodLevels + lod;
-                        
-                        // First, generate full mesh to check vertex count
-                        ChunkMeshWithSeams fullMesh = mesher.generateMesh(lod);
-                        
-                        ChunkMeshData meshData;
-                        meshData.entryIndex = entryIndex;
-                        
-                        // Optimize meshes: vertex dedup + fetch reorder
-                        optimizeMesh(fullMesh.mainMesh);
-                        for (int e = 0; e < EDGE_COUNT; ++e)
-                            optimizeMesh(fullMesh.edgeSeams[e]);
-                        
-                        // Check if we need quadrant-based splitting
-                        if (fullMesh.mainMesh.vertices.size() > MAX_VERTICES_PER_SUBCHUNK) {
-                            // Need to split into 4 quadrants (each 64x64)
-                            meshData.needsQuadrantSplit = true;
-                            for (int q = 0; q < 4; ++q) {
-                                const auto& qd = quadrants[q];
-                                meshData.quadrantMeshes[q] = mesher.generateMeshForRegion(
-                                    lod, qd.startX, qd.startZ, qd.endX, qd.endZ);
-                                // Optimize quadrant meshes too
-                                optimizeMesh(meshData.quadrantMeshes[q].mainMesh);
-                                for (int e2 = 0; e2 < EDGE_COUNT; ++e2)
-                                    optimizeMesh(meshData.quadrantMeshes[q].edgeSeams[e2]);
-                            }
-                            // Log the split
-                            static std::atomic<int> splitCount{0};
-                            int count = ++splitCount;
-                            if (count <= 10) {
-                                std::cout << "[SubChunk] Splitting chunk (" << cx << "," << cz << ") LOD " << lod
-                                          << " into 4 quadrants (" << fullMesh.mainMesh.vertices.size() << " vertices)" << std::endl;
-                            } else if (count == 11) {
-                                std::cout << "[SubChunk] (suppressing further split messages)" << std::endl;
-                            }
-                        } else {
-                            // Single mesh is fine
-                            meshData.needsQuadrantSplit = false;
-                            meshData.fullMesh = std::move(fullMesh);
-                        }
-                        
-                        batchResults[localIdx].push_back(std::move(meshData));
-                    }
-                }
-            } catch (...) {
-                hasError = true;
-            }
-        };
-        
-        // Launch worker threads
-        unsigned int numThreads = std::thread::hardware_concurrency();
-        if (numThreads == 0) numThreads = 8;
-        std::vector<std::thread> workers;
-        for (unsigned int i = 0; i < numThreads; ++i) {
-            workers.emplace_back(workerFunc);
-        }
-        
-        // Wait for completion
-        for (auto& worker : workers) {
-            worker.join();
-        }
-        
-        if (hasError) return false;
-        
-        // Write batch results to file (v4: SubChunks - quadrant-based spatial splitting)
-        for (int localIdx = 0; localIdx < batchSize; ++localIdx) {
-            for (auto& meshData : batchResults[localIdx]) {
-                const size_t idx = meshData.entryIndex;
-                auto& entry = chunkIndex[idx];
-                
-                if (meshData.needsQuadrantSplit) {
-                    // Write 4 quadrant meshes as SubChunks
-                    entry.subChunkCount = 4;
-                    subChunkStats.record(4);
-                    
-                    for (int q = 0; q < 4; ++q) {
-                        const auto& quadMesh = meshData.quadrantMeshes[q].mainMesh;
-                        
-                        // Convert to SubChunk (should always fit in 16-bit since each quadrant is 64x64)
-                        std::vector<SubChunk> quadSubChunks = splitMeshToSubChunks(quadMesh);
-                        if (quadSubChunks.empty()) {
-                            entry.subChunks[q].offset = 0;
-                            entry.subChunks[q].vertexCount = 0;
-                            entry.subChunks[q].indexCount = 0;
-                        } else {
-                            // Use first (should be only) SubChunk from quadrant
-                            const auto& sub = quadSubChunks[0];
-                            entry.subChunks[q].offset = outFile.tellp();
-                            entry.subChunks[q].vertexCount = static_cast<uint32_t>(sub.vertices.size());
-                            entry.subChunks[q].indexCount = static_cast<uint32_t>(sub.indices.size());
-                            
-                            if (!sub.isEmpty()) {
-                                outFile.write(reinterpret_cast<const char*>(sub.vertices.data()),
-                                             sub.getVertexDataSize());
-                                outFile.write(reinterpret_cast<const char*>(sub.indices.data()),
-                                             sub.getIndexDataSize());
-                            }
-                        }
-                    }
-                    
-                    // Merge edge seams from all quadrants
-                    // Each edge only has seams from the quadrants that touch it
-                    // -X (EDGE_NEG_X): from quadrants 0 and 2 (SW and NW)
-                    // +X (EDGE_POS_X): from quadrants 1 and 3 (SE and NE)
-                    // -Z (EDGE_NEG_Z): from quadrants 0 and 1 (SW and SE)
-                    // +Z (EDGE_POS_Z): from quadrants 2 and 3 (NW and NE)
-                    const int edgeQuadrants[EDGE_COUNT][2] = {
-                        {0, 2},  // -X: SW, NW
-                        {1, 3},  // +X: SE, NE
-                        {0, 1},  // -Z: SW, SE
-                        {2, 3}   // +Z: NW, NE
-                    };
-                    
-                    for (int e = 0; e < EDGE_COUNT; ++e) {
-                        // Merge seams from contributing quadrants
-                        ChunkMesh mergedSeam;
-                        for (int qi = 0; qi < 2; ++qi) {
-                            int q = edgeQuadrants[e][qi];
-                            const auto& quadSeam = meshData.quadrantMeshes[q].edgeSeams[e];
-                            if (!quadSeam.isEmpty()) {
-                                uint32_t baseVertex = static_cast<uint32_t>(mergedSeam.vertices.size());
-                                mergedSeam.vertices.insert(mergedSeam.vertices.end(), 
-                                                          quadSeam.vertices.begin(), quadSeam.vertices.end());
-                                for (uint32_t idx : quadSeam.indices) {
-                                    mergedSeam.indices.push_back(baseVertex + idx);
-                                }
-                            }
-                        }
-                        
-                        std::vector<SubChunk> seamSubChunks = splitMeshToSubChunks(mergedSeam);
-                        entry.seamSubChunkCounts[e] = static_cast<uint8_t>(seamSubChunks.size());
-                        
-                        for (size_t s = 0; s < entry.seamSubChunkCounts[e] && s < MAX_SUBCHUNKS; ++s) {
-                            const auto& sub = seamSubChunks[s];
-                            entry.seamSubChunks[e][s].offset = outFile.tellp();
-                            entry.seamSubChunks[e][s].vertexCount = static_cast<uint32_t>(sub.vertices.size());
-                            entry.seamSubChunks[e][s].indexCount = static_cast<uint32_t>(sub.indices.size());
-                            
-                            if (!sub.isEmpty()) {
-                                outFile.write(reinterpret_cast<const char*>(sub.vertices.data()),
-                                             sub.getVertexDataSize());
-                                outFile.write(reinterpret_cast<const char*>(sub.indices.data()),
-                                             sub.getIndexDataSize());
-                            }
-                        }
-                    }
-                } else {
-                    // Single mesh - use existing splitMeshToSubChunks for safety
-                    const auto& meshWithSeams = meshData.fullMesh;
-                    
-                    std::vector<SubChunk> mainSubChunks = splitMeshToSubChunks(meshWithSeams.mainMesh);
-                    entry.subChunkCount = static_cast<uint8_t>(mainSubChunks.size());
-                    
-                    // Track statistics
-                    subChunkStats.record(mainSubChunks.size());
-                    
-                    // Write main mesh SubChunks (always 16-bit indices)
-                    for (size_t s = 0; s < entry.subChunkCount && s < MAX_SUBCHUNKS; ++s) {
-                        const auto& sub = mainSubChunks[s];
-                        entry.subChunks[s].offset = outFile.tellp();
-                        entry.subChunks[s].vertexCount = static_cast<uint32_t>(sub.vertices.size());
-                        entry.subChunks[s].indexCount = static_cast<uint32_t>(sub.indices.size());
-                        
-                        if (!sub.isEmpty()) {
-                            outFile.write(reinterpret_cast<const char*>(sub.vertices.data()),
-                                         sub.getVertexDataSize());
-                            outFile.write(reinterpret_cast<const char*>(sub.indices.data()),
-                                         sub.getIndexDataSize());
-                        }
-                    }
-                    
-                    // Write 4 edge seam meshes
-                    for (int e = 0; e < EDGE_COUNT; ++e) {
-                        std::vector<SubChunk> seamSubChunks = splitMeshToSubChunks(meshWithSeams.edgeSeams[e]);
-                        entry.seamSubChunkCounts[e] = static_cast<uint8_t>(seamSubChunks.size());
-                        
-                        for (size_t s = 0; s < entry.seamSubChunkCounts[e] && s < MAX_SUBCHUNKS; ++s) {
-                            const auto& sub = seamSubChunks[s];
-                            entry.seamSubChunks[e][s].offset = outFile.tellp();
-                            entry.seamSubChunks[e][s].vertexCount = static_cast<uint32_t>(sub.vertices.size());
-                            entry.seamSubChunks[e][s].indexCount = static_cast<uint32_t>(sub.indices.size());
-                            
-                            if (!sub.isEmpty()) {
-                                outFile.write(reinterpret_cast<const char*>(sub.vertices.data()),
-                                             sub.getVertexDataSize());
-                                outFile.write(reinterpret_cast<const char*>(sub.indices.data()),
-                                             sub.getIndexDataSize());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Print SubChunk statistics
-    subChunkStats.print();
-    
-    // Write actual chunk index (v4 format with SubChunks)
-    std::cout << "Writing chunk index (v4 SubChunk format)..." << std::endl;
-    outFile.seekp(indexOffset);
-    for (size_t i = 0; i < totalEntries; ++i) {
-        outFile.write(reinterpret_cast<const char*>(&chunkIndex[i]), sizeof(ChunkIndexEntryV4));
-    }
-    
-    outFile.close();
-    
-    printDedupStats();
-    
-    return true;
-}
-
-bool convertHeightmapToHeightfield(const std::string& csvPath, const std::string& outputPath, int maxChunksPerSide) {
-    // Load heightmap
-    int mapWidth, mapHeight;
-    std::vector<float> heightmap = loadHeightmapCSV(csvPath, mapWidth, mapHeight);
-    if (heightmap.empty()) return false;
-    
-    // Calculate chunk grid
-    int numChunksX = (mapWidth + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    int numChunksZ = (mapHeight + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    
-    if (maxChunksPerSide > 0) {
-        numChunksX = std::min(numChunksX, maxChunksPerSide);
-        numChunksZ = std::min(numChunksZ, maxChunksPerSide);
-        std::cout << "[Heightfield] Limiting output to " << numChunksX << "x" << numChunksZ << " chunks" << std::endl;
-    }
-    
-    int totalChunks = numChunksX * numChunksZ;
-    uint32_t lodLevels = MAX_LOD_LEVEL + 1;
-    
-    // Open output file
-    std::ofstream outFile(outputPath, std::ios::binary);
-    if (!outFile.is_open()) return false;
-    
-    // Write header (same format as voxel terrain)
-    outFile.write(reinterpret_cast<const char*>(&TERRAIN_MESH_MAGIC), sizeof(uint32_t));
-    outFile.write(reinterpret_cast<const char*>(&TERRAIN_MESH_VERSION), sizeof(uint32_t));
-    uint32_t chunksX = numChunksX, chunksZ = numChunksZ;
-    outFile.write(reinterpret_cast<const char*>(&chunksX), sizeof(uint32_t));
-    outFile.write(reinterpret_cast<const char*>(&chunksZ), sizeof(uint32_t));
-    outFile.write(reinterpret_cast<const char*>(&lodLevels), sizeof(uint32_t));
-    
-    // Reserve space for chunk index
-    uint64_t indexOffset = outFile.tellp();
-    size_t totalEntries = numChunksX * numChunksZ * lodLevels;
-    
-    struct SubChunkDataLocal {
-        uint64_t offset;
-        uint32_t vertexCount;
-        uint32_t indexCount;
-    };
-    
-    struct ChunkIndexEntryV4Local {
-        uint8_t subChunkCount;
-        uint8_t seamSubChunkCounts[EDGE_COUNT];
-        uint8_t padding[3];
-        SubChunkDataLocal subChunks[MAX_SUBCHUNKS];
-        SubChunkDataLocal seamSubChunks[EDGE_COUNT][MAX_SUBCHUNKS];
-    };
-    
-    std::vector<ChunkIndexEntryV4Local> chunkIndex(totalEntries);
-    
-    // Write placeholder index
-    for (size_t i = 0; i < totalEntries; ++i) {
-        ChunkIndexEntryV4Local entry{};
-        outFile.write(reinterpret_cast<const char*>(&entry), sizeof(entry));
-    }
-    
-    // Process chunks in batches
-    constexpr int BATCH_SIZE = 256;
-    
-    struct HFMeshData {
-        size_t entryIndex;
-        ChunkMeshWithSeams mesh;
-    };
-    
-    std::atomic<uint32_t> totalHFVertices{0};
-    std::atomic<uint32_t> totalHFTriangles{0};
-    
-    for (int batchStart = 0; batchStart < totalChunks; batchStart += BATCH_SIZE) {
-        int batchEnd = std::min(batchStart + BATCH_SIZE, totalChunks);
-        int batchSize = batchEnd - batchStart;
-        
-        std::vector<std::vector<HFMeshData>> batchResults(batchSize);
-        std::atomic<int> batchIndex(0);
-        std::atomic<bool> hasError(false);
-        
-        auto workerFunc = [&]() {
-            try {
-                while (true) {
-                    int localIdx = batchIndex.fetch_add(1);
-                    if (localIdx >= batchSize) break;
-                    
-                    int idx = batchStart + localIdx;
-                    int cz = idx / numChunksX;
-                    int cx = idx % numChunksX;
-                    
-                    // Heightfield works directly from the heightmap (no VoxelChunk needed)
-                    HeightfieldMesher mesher(heightmap, mapWidth, mapHeight, cx, cz, numChunksX, numChunksZ);
-                    
-                    for (int lod = 0; lod <= MAX_LOD_LEVEL; ++lod) {
-                        size_t entryIndex = (cz * numChunksX + cx) * lodLevels + lod;
-                        
-                        ChunkMeshWithSeams hfMesh = mesher.generateMesh(lod);
-                        
-                        // Optimize meshes: vertex dedup + fetch reorder
-                        optimizeMesh(hfMesh.mainMesh);
-                        for (int e = 0; e < EDGE_COUNT; ++e)
-                            optimizeMesh(hfMesh.edgeSeams[e]);
-                        
-                        totalHFVertices += static_cast<uint32_t>(hfMesh.mainMesh.vertices.size());
-                        totalHFTriangles += static_cast<uint32_t>(hfMesh.mainMesh.indices.size() / 3);
-                        
-                        HFMeshData meshData;
-                        meshData.entryIndex = entryIndex;
-                        meshData.mesh = std::move(hfMesh);
-                        
-                        batchResults[localIdx].push_back(std::move(meshData));
-                    }
-                }
-            } catch (...) {
-                hasError = true;
-            }
-        };
-        
-        unsigned int numThreads = std::thread::hardware_concurrency();
-        if (numThreads == 0) numThreads = 8;
-        std::vector<std::thread> workers;
-        for (unsigned int i = 0; i < numThreads; ++i) {
-            workers.emplace_back(workerFunc);
-        }
-        for (auto& worker : workers) {
-            worker.join();
-        }
-        
-        if (hasError) return false;
-        
-        // Write batch results to file
-        for (int localIdx = 0; localIdx < batchSize; ++localIdx) {
-            for (auto& meshData : batchResults[localIdx]) {
-                const size_t idx = meshData.entryIndex;
-                auto& entry = chunkIndex[idx];
-                
-                const auto& meshWithSeams = meshData.mesh;
-                
-                std::vector<SubChunk> mainSubChunks = splitMeshToSubChunks(meshWithSeams.mainMesh);
-                entry.subChunkCount = static_cast<uint8_t>(mainSubChunks.size());
-                
-                for (size_t s = 0; s < entry.subChunkCount && s < MAX_SUBCHUNKS; ++s) {
-                    const auto& sub = mainSubChunks[s];
-                    entry.subChunks[s].offset = outFile.tellp();
-                    entry.subChunks[s].vertexCount = static_cast<uint32_t>(sub.vertices.size());
-                    entry.subChunks[s].indexCount = static_cast<uint32_t>(sub.indices.size());
-                    
-                    if (!sub.isEmpty()) {
-                        outFile.write(reinterpret_cast<const char*>(sub.vertices.data()),
-                                     sub.getVertexDataSize());
-                        outFile.write(reinterpret_cast<const char*>(sub.indices.data()),
-                                     sub.getIndexDataSize());
-                    }
-                }
-                
-                // Write edge seam meshes
-                for (int e = 0; e < EDGE_COUNT; ++e) {
-                    std::vector<SubChunk> seamSubChunks = splitMeshToSubChunks(meshWithSeams.edgeSeams[e]);
-                    entry.seamSubChunkCounts[e] = static_cast<uint8_t>(seamSubChunks.size());
-                    
-                    for (size_t s = 0; s < entry.seamSubChunkCounts[e] && s < MAX_SUBCHUNKS; ++s) {
-                        const auto& sub = seamSubChunks[s];
-                        entry.seamSubChunks[e][s].offset = outFile.tellp();
-                        entry.seamSubChunks[e][s].vertexCount = static_cast<uint32_t>(sub.vertices.size());
-                        entry.seamSubChunks[e][s].indexCount = static_cast<uint32_t>(sub.indices.size());
-                        
-                        if (!sub.isEmpty()) {
-                            outFile.write(reinterpret_cast<const char*>(sub.vertices.data()),
-                                         sub.getVertexDataSize());
-                            outFile.write(reinterpret_cast<const char*>(sub.indices.data()),
-                                         sub.getIndexDataSize());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Write actual chunk index
-    std::cout << "[Heightfield] Writing chunk index..." << std::endl;
-    outFile.seekp(indexOffset);
-    for (size_t i = 0; i < totalEntries; ++i) {
-        outFile.write(reinterpret_cast<const char*>(&chunkIndex[i]), sizeof(ChunkIndexEntryV4Local));
-    }
-    
-    outFile.close();
-    
-    std::cout << "\n=== Heightfield Statistics ===" << std::endl;
-    std::cout << "Total Heightfield vertices: " << totalHFVertices.load() << std::endl;
-    std::cout << "Total Heightfield triangles: " << totalHFTriangles.load() << std::endl;
-    
-    printDedupStats();
-    
-    return true;
+namespace {
+[[maybe_unused]] constexpr int kFixDccmGapsMovedToDccmGapFixFolder = 1;
 }
 END CC-REPLACE
 
@@ -3214,8 +1155,14 @@ set_target_properties(convert_heightmap_to_svo PROPERTIES
 )
 
 # DCCM gap fixer tool
-add_executable(fix_dccm_gaps fix_dccm_gaps.cpp)
+add_executable(fix_dccm_gaps
+    dccm_gap_fix/DCCMGapFixTool.cpp
+    dccm_gap_fix/DCCMBoundary.cpp
+    dccm_gap_fix/DCCMWeld.cpp
+    dccm_gap_fix/DCCMAOSmoothing.cpp
+)
 target_compile_features(fix_dccm_gaps PRIVATE cxx_std_17)
+target_include_directories(fix_dccm_gaps PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/dccm_gap_fix)
 set_target_properties(fix_dccm_gaps PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tools"
 )

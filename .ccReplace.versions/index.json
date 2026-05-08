@@ -3088,7 +3088,7 @@
                       "Path":  "tools/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\tools\\CMakeLists.txt",
                       "Key":  "bcdc8f8e8af5d5b2",
-                      "CurrentVersion":  2,
+                      "CurrentVersion":  3,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -3100,6 +3100,102 @@
                                            "Version":  2,
                                            "Timestamp":  "2026-05-08T13:05:22.0743673Z",
                                            "Snapshot":  "files\\bcdc8f8e8af5d5b2\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-08T13:13:38.0660404Z",
+                                           "Snapshot":  "files\\bcdc8f8e8af5d5b2\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/dccm_gap_fix/DCCMGapFixInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\dccm_gap_fix\\DCCMGapFixInternal.h",
+                      "Key":  "d16bbafb69be293a",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:13:37.8535800Z",
+                                           "Snapshot":  "files\\d16bbafb69be293a\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/dccm_gap_fix/DCCMBoundary.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\dccm_gap_fix\\DCCMBoundary.cpp",
+                      "Key":  "50271d5591915181",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:13:37.8788511Z",
+                                           "Snapshot":  "files\\50271d5591915181\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/dccm_gap_fix/DCCMWeld.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\dccm_gap_fix\\DCCMWeld.cpp",
+                      "Key":  "205abc64f4fc4d6e",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:13:37.9037419Z",
+                                           "Snapshot":  "files\\205abc64f4fc4d6e\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/dccm_gap_fix/DCCMAOSmoothing.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\dccm_gap_fix\\DCCMAOSmoothing.cpp",
+                      "Key":  "16191dd886639054",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:13:37.9274338Z",
+                                           "Snapshot":  "files\\16191dd886639054\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/dccm_gap_fix/DCCMGapFixTool.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\dccm_gap_fix\\DCCMGapFixTool.cpp",
+                      "Key":  "7152612b1288807b",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:13:37.9522032Z",
+                                           "Snapshot":  "files\\7152612b1288807b\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/fix_dccm_gaps.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\fix_dccm_gaps.cpp",
+                      "Key":  "8db4e33a35b3f845",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:13:37.9793403Z",
+                                           "Snapshot":  "files\\8db4e33a35b3f845\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T13:13:38.0019071Z",
+                                           "Snapshot":  "files\\8db4e33a35b3f845\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]

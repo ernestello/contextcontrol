@@ -1,0 +1,490 @@
+#include "DCCMGapFixInternal.h"
+
+// GPT-DESC: Orchestrates DCCM gap-fix file loading, repair passes, and rewrite.
+
+#include <algorithm>
+#include <filesystem>
+#include <iostream>
+#include <string>
+#include <vector>
+
+// ============================================================
+// I/O helpers
+// ============================================================
+
+Mesh readSub(std::ifstream& f, const SubChunkFile& sc) {
+    Mesh m;
+    if (!sc.vertexCount) return m;
+    m.verts.resize(sc.vertexCount);
+    std::vector<uint16_t> i16(sc.indexCount);
+    f.seekg(static_cast<std::streamoff>(sc.offset), std::ios::beg);
+    f.read(reinterpret_cast<char*>(m.verts.data()), static_cast<std::streamsize>(sc.vertexCount * sizeof(PackedVertex)));
+    f.read(reinterpret_cast<char*>(i16.data()),     static_cast<std::streamsize>(sc.indexCount  * sizeof(uint16_t)));
+    m.idx.reserve(sc.indexCount);
+    for (auto i : i16) m.idx.push_back(i);
+    return m;
+}
+
+Mesh merge(const std::vector<Mesh>& parts) {
+    Mesh out;
+    for (auto& p : parts) {
+        auto base = static_cast<uint32_t>(out.verts.size());
+        out.verts.insert(out.verts.end(), p.verts.begin(), p.verts.end());
+        for (auto i : p.idx) out.idx.push_back(base + i);
+    }
+    return out;
+}
+
+
+// ============================================================
+// Path helpers
+// ============================================================
+
+std::string findMaps() {
+    auto cwd = std::filesystem::current_path();
+    if (std::filesystem::exists(cwd / "maps"))
+        return (cwd / "maps").string();
+    if (std::filesystem::exists("D:/Projects/vulkanas/maps"))
+        return "D:/Projects/vulkanas/maps";
+    return "maps";
+}
+
+
+
+static uint64_t streamOffset(std::ofstream& f) {
+    return static_cast<uint64_t>(static_cast<std::streamoff>(f.tellp()));
+}
+
+// ============================================================
+// Main
+// ============================================================
+
+int main(int argc, char* argv[]) {
+    std::string path;
+    bool diag = false;
+    for (int i = 1; i < argc; i++) {
+        if (std::string(argv[i]) == "--diag") diag = true;
+        else path = argv[i];
+    }
+    if (path.empty())
+        path = (std::filesystem::path(findMaps()) / "terrain_dccm.bin").string();
+
+    std::cout << "=== DCCM Gap Fix ===" << std::endl;
+    std::cout << "Input: " << path << std::endl;
+
+    // ---- Read ----
+    std::ifstream fin(path, std::ios::binary);
+    if (!fin) {
+        std::cerr << "Cannot open " << path << std::endl;
+        return 1;
+    }
+
+    uint32_t magic, version, chunksX, chunksZ, lodLevels;
+    fin.read(reinterpret_cast<char*>(&magic),     4);
+    fin.read(reinterpret_cast<char*>(&version),   4);
+    fin.read(reinterpret_cast<char*>(&chunksX),   4);
+    fin.read(reinterpret_cast<char*>(&chunksZ),   4);
+    fin.read(reinterpret_cast<char*>(&lodLevels), 4);
+
+    if (magic != TERRAIN_MESH_MAGIC || version != TERRAIN_MESH_VERSION) {
+        std::cerr << "Invalid file (magic=0x" << std::hex << magic
+                  << " ver=" << std::dec << version << ")" << std::endl;
+        return 1;
+    }
+
+    size_t total = chunksX * chunksZ * lodLevels;
+    std::cout << "Chunks: " << chunksX << "x" << chunksZ
+              << ", LODs: " << lodLevels
+              << " (" << total << " entries)" << std::endl;
+
+    // Read chunk index
+    std::vector<ChunkEntry> entries(total);
+    for (auto& e : entries)
+        fin.read(reinterpret_cast<char*>(&e), sizeof(e));
+
+    // Load all meshes into memory
+    struct ChunkData {
+        Mesh main;                             // merged main sub-chunks
+        std::vector<Mesh> seamSubs[EDGE_COUNT]; // pass-through
+    };
+    std::vector<ChunkData> data(total);
+
+    for (size_t i = 0; i < total; i++) {
+        auto& e = entries[i];
+
+        // Main mesh — merge all sub-chunks into one
+        std::vector<Mesh> subs;
+        for (int s = 0; s < e.subCount && s < (int)MAX_SUBCHUNKS; s++)
+            subs.push_back(readSub(fin, e.subs[s]));
+        data[i].main = merge(subs);
+
+        // Seam meshes — pass through unchanged
+        for (int ed = 0; ed < EDGE_COUNT; ed++)
+            for (int s = 0; s < e.seamCounts[ed] && s < (int)MAX_SUBCHUNKS; s++)
+                data[i].seamSubs[ed].push_back(readSub(fin, e.seams[ed][s]));
+    }
+    fin.close();
+
+    // ---- Diagnostics ----
+    if (diag) {
+        std::cout << "\n--- Mesh summary (LOD 0 only) ---" << std::endl;
+        for (uint32_t cz = 0; cz < chunksZ; cz++) {
+            for (uint32_t cx = 0; cx < chunksX; cx++) {
+                size_t i = (cz * chunksX + cx) * lodLevels + 0;
+                auto& m = data[i].main;
+                if (m.empty()) { std::cout << "  Chunk (" << cx << "," << cz << "): EMPTY\n"; continue; }
+                std::cout << "  Chunk (" << cx << "," << cz << "): "
+                          << m.verts.size() << " verts, " << m.idx.size()/3 << " tris" << std::endl;
+                
+                // Boundary vertices
+                auto dumpEdge = [&](const char* name, uint8_t coord, bool xb) {
+                    auto bv = getBoundary(m, coord, xb);
+                    if (bv.empty()) return;
+                    std::cout << "    " << name << " (" << bv.size() << " verts):";
+                    for (auto& [p, h] : bv) std::cout << " z" << (int)p << "=h" << h;
+                    std::cout << "\n";
+                };
+                dumpEdge("x=0  ", 0, true);
+                dumpEdge("x=128", 128, true);
+                dumpEdge("z=0  ", 0, false);
+                dumpEdge("z=128", 128, false);
+            }
+        }
+        
+        // Show boundary mismatches
+        std::cout << "\n--- Boundary mismatches (LOD 0) ---" << std::endl;
+        int mismatches = 0;
+        auto showMismatch = [&](uint32_t cx1, uint32_t cz1, uint32_t cx2, uint32_t cz2,
+                                uint8_t coord1, uint8_t coord2, bool xb, const char* label) {
+            size_t i1 = (cz1 * chunksX + cx1) * lodLevels;
+            size_t i2 = (cz2 * chunksX + cx2) * lodLevels;
+            auto b1 = getBoundary(data[i1].main, coord1, xb);
+            auto b2 = getBoundary(data[i2].main, coord2, xb);
+            for (auto& [p, h] : b1)
+                if (!b2.count(p)) {
+                    std::cout << "  " << label << " (" << cx1 << "," << cz1 << ") has "
+                              << (xb?"z":"x") << "=" << (int)p << " h=" << h
+                              << " but (" << cx2 << "," << cz2 << ") doesn't\n";
+                    mismatches++;
+                }
+            for (auto& [p, h] : b2)
+                if (!b1.count(p)) {
+                    std::cout << "  " << label << " (" << cx2 << "," << cz2 << ") has "
+                              << (xb?"z":"x") << "=" << (int)p << " h=" << h
+                              << " but (" << cx1 << "," << cz1 << ") doesn't\n";
+                    mismatches++;
+                }
+        };
+        for (uint32_t cz = 0; cz < chunksZ; cz++)
+            for (uint32_t cx = 0; cx + 1 < chunksX; cx++)
+                showMismatch(cx, cz, cx+1, cz, 128, 0, true, "X-boundary");
+        for (uint32_t cx = 0; cx < chunksX; cx++)
+            for (uint32_t cz = 0; cz + 1 < chunksZ; cz++)
+                showMismatch(cx, cz, cx, cz+1, 128, 0, false, "Z-boundary");
+        if (mismatches == 0) std::cout << "  None found.\n";
+        std::cout << std::endl;
+    }
+
+    // ---- Fix gaps ----
+    // Build per-chunk vertex position index for vertex reuse.
+    // This prevents creating duplicate vertices at the same (x,y,z),
+    // making the fixer idempotent (safe to run multiple times).
+    std::vector<std::unordered_map<uint32_t, uint32_t>> posIndices(total);
+    for (size_t i = 0; i < total; i++)
+        posIndices[i] = buildPosIndex(data[i].main);
+
+    int totalSplits = 0;
+
+    for (uint32_t lod = 0; lod < lodLevels; lod++) {
+        int lodSplits = 0;
+
+        auto idx = [&](uint32_t cx, uint32_t cz) -> size_t {
+            return (cz * chunksX + cx) * lodLevels + lod;
+        };
+
+        // East-West boundaries (X direction)
+        for (uint32_t cz = 0; cz < chunksZ; cz++) {
+            for (uint32_t cx = 0; cx + 1 < chunksX; cx++) {
+                // Snapshot boundaries BEFORE fixing either side
+                auto east = getBoundary(data[idx(cx,   cz)].main, 128, true);
+                auto west = getBoundary(data[idx(cx+1, cz)].main,   0, true);
+
+                lodSplits += fixBoundary(data[idx(cx,   cz)].main, 128, true, west, posIndices[idx(cx,   cz)]);
+                lodSplits += fixBoundary(data[idx(cx+1, cz)].main,   0, true, east, posIndices[idx(cx+1, cz)]);
+            }
+        }
+
+        // North-South boundaries (Z direction)
+        for (uint32_t cx = 0; cx < chunksX; cx++) {
+            for (uint32_t cz = 0; cz + 1 < chunksZ; cz++) {
+                auto north = getBoundary(data[idx(cx, cz)].main,   128, false);
+                auto south = getBoundary(data[idx(cx, cz+1)].main,   0, false);
+
+                lodSplits += fixBoundary(data[idx(cx, cz)].main,   128, false, south, posIndices[idx(cx, cz)]);
+                lodSplits += fixBoundary(data[idx(cx, cz+1)].main,   0, false, north, posIndices[idx(cx, cz+1)]);
+            }
+        }
+
+        if (lodSplits > 0)
+            std::cout << "  LOD " << lod << ": " << lodSplits << " boundary splits" << std::endl;
+        totalSplits += lodSplits;
+
+        // Interior gap detection: vertex-on-edge within each chunk mesh
+        int interiorSplits = 0;
+        for (uint32_t cz = 0; cz < chunksZ; cz++)
+            for (uint32_t cx = 0; cx < chunksX; cx++)
+                interiorSplits += fixInteriorGaps(data[idx(cx, cz)].main, posIndices[idx(cx, cz)]);
+
+        if (interiorSplits > 0)
+            std::cout << "  LOD " << lod << ": " << interiorSplits << " interior splits" << std::endl;
+        totalSplits += interiorSplits;
+    }
+
+    std::cout << "Total: " << totalSplits << " boundary fixes" << std::endl;
+
+    // ---- Weld duplicate vertices & harmonize AO ----
+    int totalWelded = 0, totalAOConflicts = 0, totalDegenerate = 0;
+    for (uint32_t lod = 0; lod < lodLevels; lod++) {
+        int lodWelded = 0, lodAO = 0, lodDegen = 0;
+        for (uint32_t cz = 0; cz < chunksZ; cz++)
+            for (uint32_t cx = 0; cx < chunksX; cx++) {
+                size_t i = (cz * chunksX + cx) * lodLevels + lod;
+                auto ws = weldVertices(data[i].main);
+                lodWelded += ws.duplicateVerts;
+                lodAO     += ws.aoConflicts;
+                lodDegen  += ws.degenerateTris;
+            }
+        if (lodWelded > 0)
+            std::cout << "  LOD " << lod << ": welded " << lodWelded
+                      << " duplicate vertices (" << lodAO << " AO conflicts, "
+                      << lodDegen << " degenerate tris removed)" << std::endl;
+        totalWelded    += lodWelded;
+        totalAOConflicts += lodAO;
+        totalDegenerate += lodDegen;
+    }
+    if (totalWelded > 0)
+        std::cout << "Total: " << totalWelded << " vertices welded, "
+                  << totalAOConflicts << " AO conflicts resolved, "
+                  << totalDegenerate << " degenerate triangles removed" << std::endl;
+
+    // ---- Remove overlapping triangles ----
+    int totalRemoved = 0;
+    for (uint32_t lod = 0; lod < lodLevels; lod++) {
+        int lodRemoved = 0;
+        for (uint32_t cz = 0; cz < chunksZ; cz++)
+            for (uint32_t cx = 0; cx < chunksX; cx++) {
+                size_t i = (cz * chunksX + cx) * lodLevels + lod;
+                lodRemoved += removeOverlappingTriangles(data[i].main);
+            }
+        if (lodRemoved > 0)
+            std::cout << "  LOD " << lod << ": " << lodRemoved << " overlapping triangles removed" << std::endl;
+        totalRemoved += lodRemoved;
+    }
+    if (totalRemoved > 0)
+        std::cout << "Total: " << totalRemoved << " overlapping triangles removed" << std::endl;
+
+    // ---- AO edge smoothing ----
+    // Clamp AO transitions to max 1 level per edge to prevent harsh artifacts
+    int totalSmoothed = 0;
+    for (uint32_t lod = 0; lod < lodLevels; lod++) {
+        int lodSmoothed = 0;
+        for (uint32_t cz = 0; cz < chunksZ; cz++)
+            for (uint32_t cx = 0; cx < chunksX; cx++) {
+                size_t i = (cz * chunksX + cx) * lodLevels + lod;
+                auto ss = smoothEdgeAO(data[i].main);
+                lodSmoothed += ss.edgesSmoothed;
+            }
+        if (lodSmoothed > 0)
+            std::cout << "  LOD " << lod << ": smoothed " << lodSmoothed
+                      << " AO edge transitions" << std::endl;
+        totalSmoothed += lodSmoothed;
+    }
+    if (totalSmoothed > 0)
+        std::cout << "Total: " << totalSmoothed << " AO edges smoothed" << std::endl;
+
+    // ---- Regenerate seam (casing) meshes from fixed surface ----
+    // After boundary/interior fixes, the main mesh may have new vertices
+    // along chunk edges that the original casing quads don't track.
+    // Regenerate casing from the fixed surface's boundary vertices so the
+    // casing top edge perfectly matches the surface.
+    int totalSeamsRegenerated = 0;
+    {
+        // Edge constants matching converter:
+        //   EDGE 0 = NEG_X (x=0),   face=0 (FACE_NEG_X), reverseWinding=false
+        //   EDGE 1 = POS_X (x=128), face=1 (FACE_POS_X), reverseWinding=true
+        //   EDGE 2 = NEG_Z (z=0),   face=4 (FACE_NEG_Z), reverseWinding=true
+        //   EDGE 3 = POS_Z (z=128), face=5 (FACE_POS_Z), reverseWinding=false
+        struct EdgeDef {
+            uint8_t coord;      // boundary coordinate (0 or 128)
+            bool    xBound;     // true = match by X, false = match by Z
+            uint8_t face;       // face direction for casing vertices
+            bool    reverseWinding;
+        };
+        const EdgeDef edgeDefs[EDGE_COUNT] = {
+            {   0, true,  0, false }, // NEG_X
+            { 128, true,  1, true  }, // POS_X
+            {   0, false, 4, true  }, // NEG_Z
+            { 128, false, 5, false }, // POS_Z
+        };
+
+        auto emitCasingQuadToMesh = [](Mesh& mesh,
+                                       uint8_t x0, uint16_t yTop0, uint8_t z0,
+                                       uint8_t x1, uint16_t yTop1, uint8_t z1,
+                                       uint8_t face, bool reverseWinding) {
+            if (yTop0 <= 1 && yTop1 <= 1) return; // y=1 is the minimum (packed 0 → y=1)
+
+            uint32_t baseIdx = static_cast<uint32_t>(mesh.verts.size());
+            const uint16_t Y_BASE = 1; // Minimum packed Y
+
+            mesh.verts.push_back(PackedVertex(x0, Y_BASE, z0, face, 0));
+            mesh.verts.push_back(PackedVertex(x1, Y_BASE, z1, face, 0));
+            mesh.verts.push_back(PackedVertex(x1, yTop1,  z1, face, 0));
+            mesh.verts.push_back(PackedVertex(x0, yTop0,  z0, face, 0));
+
+            if (reverseWinding) {
+                mesh.idx.push_back(baseIdx + 0);
+                mesh.idx.push_back(baseIdx + 2);
+                mesh.idx.push_back(baseIdx + 1);
+                mesh.idx.push_back(baseIdx + 0);
+                mesh.idx.push_back(baseIdx + 3);
+                mesh.idx.push_back(baseIdx + 2);
+            } else {
+                mesh.idx.push_back(baseIdx + 0);
+                mesh.idx.push_back(baseIdx + 1);
+                mesh.idx.push_back(baseIdx + 2);
+                mesh.idx.push_back(baseIdx + 0);
+                mesh.idx.push_back(baseIdx + 2);
+                mesh.idx.push_back(baseIdx + 3);
+            }
+        };
+
+        for (size_t i = 0; i < total; i++) {
+            auto& m = data[i].main;
+            if (m.empty()) continue;
+
+            for (int ed = 0; ed < EDGE_COUNT; ed++) {
+                auto& def = edgeDefs[ed];
+
+                // Collect boundary vertices from the FIXED surface mesh,
+                // sorted by position along the edge → height
+                auto bverts = getBoundary(m, def.coord, def.xBound);
+                if (bverts.size() < 2) continue; // need at least 2 points for a quad
+
+                // Regenerate casing quads between consecutive boundary vertices
+                Mesh newSeam;
+                auto it = bverts.begin();
+                auto prev = it;
+                ++it;
+                for (; it != bverts.end(); prev = it, ++it) {
+                    uint8_t pos0 = prev->first;
+                    uint16_t h0  = prev->second;
+                    uint8_t pos1 = it->first;
+                    uint16_t h1  = it->second;
+
+                    if (def.xBound) {
+                        // Edge along X axis: coord is X, pos is Z
+                        emitCasingQuadToMesh(newSeam,
+                            def.coord, h0, pos0,
+                            def.coord, h1, pos1,
+                            def.face, def.reverseWinding);
+                    } else {
+                        // Edge along Z axis: coord is Z, pos is X
+                        emitCasingQuadToMesh(newSeam,
+                            pos0, h0, def.coord,
+                            pos1, h1, def.coord,
+                            def.face, def.reverseWinding);
+                    }
+                }
+
+                // Replace original seam sub-chunks with single regenerated mesh
+                data[i].seamSubs[ed].clear();
+                if (!newSeam.empty()) {
+                    data[i].seamSubs[ed].push_back(std::move(newSeam));
+                    totalSeamsRegenerated++;
+                }
+            }
+        }
+    }
+    if (totalSeamsRegenerated > 0)
+        std::cout << "Regenerated " << totalSeamsRegenerated << " seam (casing) meshes to match fixed surfaces" << std::endl;
+
+    if (totalSplits == 0 && totalRemoved == 0 && totalWelded == 0 && totalSmoothed == 0 && totalSeamsRegenerated == 0) {
+        std::cout << "No gaps, overlaps, or duplicates found. File unchanged." << std::endl;
+        return 0;
+    }
+
+    // ---- Write fixed file ----
+    std::ofstream fout(path, std::ios::binary);
+    if (!fout) {
+        std::cerr << "Cannot write " << path << std::endl;
+        return 1;
+    }
+
+    // Header
+    fout.write(reinterpret_cast<const char*>(&magic),     4);
+    fout.write(reinterpret_cast<const char*>(&version),   4);
+    fout.write(reinterpret_cast<const char*>(&chunksX),   4);
+    fout.write(reinterpret_cast<const char*>(&chunksZ),   4);
+    fout.write(reinterpret_cast<const char*>(&lodLevels), 4);
+
+    // Placeholder index
+    std::vector<ChunkEntry> newEntries(total, ChunkEntry{});
+    auto indexOff = fout.tellp();
+    for (auto& e : newEntries)
+        fout.write(reinterpret_cast<const char*>(&e), sizeof(e));
+
+    // Write mesh data
+    for (size_t i = 0; i < total; i++) {
+        auto& e  = newEntries[i];
+        auto& m  = data[i].main;
+
+        // Main mesh — single sub-chunk (heightfield meshes are small)
+        if (!m.empty()) {
+            if (m.verts.size() > 65535) {
+                std::cerr << "WARNING: entry " << i << " has "
+                          << m.verts.size() << " vertices (>65535)" << std::endl;
+            }
+            e.subCount              = 1;
+            e.subs[0].offset        = streamOffset(fout);
+            e.subs[0].vertexCount   = static_cast<uint32_t>(m.verts.size());
+            e.subs[0].indexCount    = static_cast<uint32_t>(m.idx.size());
+
+            fout.write(reinterpret_cast<const char*>(m.verts.data()),
+                       static_cast<std::streamsize>(m.verts.size() * sizeof(PackedVertex)));
+            for (auto idx32 : m.idx) {
+                uint16_t i16 = static_cast<uint16_t>(idx32);
+                fout.write(reinterpret_cast<const char*>(&i16), sizeof(uint16_t));
+            }
+        }
+
+        // Seam meshes — pass through unchanged
+        for (int ed = 0; ed < EDGE_COUNT; ed++) {
+            e.seamCounts[ed] = static_cast<uint8_t>(
+                std::min(data[i].seamSubs[ed].size(), MAX_SUBCHUNKS));
+
+            for (size_t s = 0; s < data[i].seamSubs[ed].size() && s < MAX_SUBCHUNKS; s++) {
+                auto& sm = data[i].seamSubs[ed][s];
+                if (sm.empty()) continue;
+                e.seams[ed][s].offset      = streamOffset(fout);
+                e.seams[ed][s].vertexCount = static_cast<uint32_t>(sm.verts.size());
+                e.seams[ed][s].indexCount  = static_cast<uint32_t>(sm.idx.size());
+
+                fout.write(reinterpret_cast<const char*>(sm.verts.data()),
+                           static_cast<std::streamsize>(sm.verts.size() * sizeof(PackedVertex)));
+                for (auto idx32 : sm.idx) {
+                    uint16_t i16 = static_cast<uint16_t>(idx32);
+                    fout.write(reinterpret_cast<const char*>(&i16), sizeof(uint16_t));
+                }
+            }
+        }
+    }
+
+    // Finalize index
+    fout.seekp(indexOff);
+    for (auto& e : newEntries)
+        fout.write(reinterpret_cast<const char*>(&e), sizeof(e));
+
+    fout.close();
+    std::cout << "Written: " << path << std::endl;
+    return 0;
+}

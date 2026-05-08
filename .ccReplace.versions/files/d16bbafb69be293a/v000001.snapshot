@@ -1,0 +1,98 @@
+#pragma once
+
+// GPT-DESC: Shared private structs and declarations for the DCCM gap fixer tool.
+
+#include <algorithm>
+#include <cstdint>
+#include <fstream>
+#include <map>
+#include <numeric>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+// --- Format constants (must match converter & engine) ---
+constexpr uint32_t TERRAIN_MESH_MAGIC   = 0x48534D54; // "TMSH"
+constexpr uint32_t TERRAIN_MESH_VERSION = 4;
+constexpr size_t   MAX_SUBCHUNKS        = 4;
+constexpr int      EDGE_COUNT           = 4;
+
+// --- PackedVertex (4 bytes, matches engine) ---
+// Bit layout: X(8) | Y(9) | Z(8) | face(3) | AO(2) | unused(2)
+// Y stored as (height-1) to fit 1-512 into 9 bits
+struct PackedVertex {
+    uint32_t packed;
+
+    PackedVertex() : packed(0) {}
+    PackedVertex(uint8_t x, uint16_t y, uint8_t z, uint8_t face, uint8_t ao = 0) {
+        uint16_t ys = (y > 0) ? static_cast<uint16_t>(y - 1) : uint16_t{0};
+        packed = uint32_t(x)
+               | (uint32_t(ys)       << 8)
+               | (uint32_t(z)        << 17)
+               | (uint32_t(face & 7) << 25)
+               | (uint32_t(ao & 3)   << 28);
+    }
+    uint8_t  x()    const { return static_cast<uint8_t>(packed & 0xFFu); }
+    uint16_t y()    const { return static_cast<uint16_t>(((packed >> 8) & 0x1FFu) + 1u); }
+    uint8_t  z()    const { return static_cast<uint8_t>((packed >> 17) & 0xFFu); }
+    uint8_t  face() const { return static_cast<uint8_t>((packed >> 25) & 7u); }
+    uint8_t  ao()   const { return static_cast<uint8_t>((packed >> 28) & 3u); }
+};
+
+// --- File format structs ---
+struct SubChunkFile {
+    uint64_t offset;
+    uint32_t vertexCount;
+    uint32_t indexCount;
+};
+
+struct ChunkEntry {
+    uint8_t      subCount;
+    uint8_t      seamCounts[EDGE_COUNT];
+    uint8_t      pad[3];
+    SubChunkFile subs[MAX_SUBCHUNKS];
+    SubChunkFile seams[EDGE_COUNT][MAX_SUBCHUNKS];
+};
+
+static_assert(sizeof(SubChunkFile) == 16);
+static_assert(sizeof(ChunkEntry)   == 328);
+
+// --- In-memory mesh (32-bit indices internally) ---
+struct Mesh {
+    std::vector<PackedVertex> verts;
+    std::vector<uint32_t>     idx;
+    bool empty() const { return verts.empty(); }
+};
+
+struct WeldStats {
+    int duplicateVerts  = 0;  // vertices at same (x,y,z) position
+    int aoConflicts     = 0;  // same position, different AO value
+    int degenerateTris  = 0;  // triangles collapsed after welding
+};
+
+struct AOSmoothStats {
+    int edgesChecked  = 0;
+    int edgesSmoothed = 0;
+    int iterations    = 0;
+};
+
+// I/O and path helpers.
+Mesh readSub(std::ifstream& f, const SubChunkFile& sc);
+Mesh merge(const std::vector<Mesh>& parts);
+std::string findMaps();
+
+// Boundary and interior T-junction repair.
+std::map<uint8_t, uint16_t> getBoundary(const Mesh& m, uint8_t coord, bool xBound);
+std::unordered_map<uint32_t, uint32_t> buildPosIndex(const Mesh& m);
+int fixBoundary(Mesh& m,
+                uint8_t bCoord,
+                bool xBound,
+                const std::map<uint8_t, uint16_t>& neighbor,
+                std::unordered_map<uint32_t, uint32_t>& posIdx);
+int fixInteriorGaps(Mesh& m, std::unordered_map<uint32_t, uint32_t>& posIdx);
+
+// Vertex cleanup and AO post-process.
+WeldStats weldVertices(Mesh& m);
+int removeOverlappingTriangles(Mesh& m);
+AOSmoothStats smoothEdgeAO(Mesh& m);

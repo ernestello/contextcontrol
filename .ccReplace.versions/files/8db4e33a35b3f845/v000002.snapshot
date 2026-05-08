@@ -1,0 +1,12 @@
+// GPT-DESC: Legacy placeholder; fix_dccm_gaps now builds from tools/dccm_gap_fix/.
+
+// This source file is intentionally kept as a tiny compatibility placeholder.
+// The real tool implementation lives in:
+//   tools/dccm_gap_fix/DCCMGapFixTool.cpp
+//   tools/dccm_gap_fix/DCCMBoundary.cpp
+//   tools/dccm_gap_fix/DCCMWeld.cpp
+//   tools/dccm_gap_fix/DCCMAOSmoothing.cpp
+
+namespace {
+[[maybe_unused]] constexpr int kFixDccmGapsMovedToDccmGapFixFolder = 1;
+}
