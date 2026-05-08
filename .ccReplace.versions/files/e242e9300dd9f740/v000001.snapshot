@@ -1,0 +1,120 @@
+// GPT-DESC: Facade/config/state implementation for the split TextureOverlayStore.
+#include "TextureOverlayInternal.h"
+
+#include <algorithm>
+#include <mutex>
+#include <shared_mutex>
+
+namespace TextureOverlay {
+
+// ---------------------------------------------------------------------------
+// Static resolution options (advertised to the UI)
+// ---------------------------------------------------------------------------
+
+const uint16_t TextureOverlayStore::RES_OPTIONS[RES_OPTION_COUNT] = {
+    2, 4, 8, 16, 32, 64, 128, 256, 512, 1024
+};
+const char* TextureOverlayStore::RES_OPTION_LABELS[RES_OPTION_COUNT] = {
+    "2x2", "4x4", "8x8", "16x16", "32x32", "64x64",
+    "128x128", "256x256", "512x512", "1024x1024"
+};
+
+// ---------------------------------------------------------------------------
+// Construction / config
+// ---------------------------------------------------------------------------
+
+TextureOverlayStore::TextureOverlayStore() {
+    // Default cascade: finer voxels get more pixels.  At LOD 0 a 0.25m voxel
+    // gets 16x16 px (= 64 px/m).  Each coarser LOD halves the pixel density
+    // so the perceived texel size on screen stays roughly constant.
+    m_lodConfigs[0] = LODTextureConfig{16, true};
+    if (LOD_COUNT > 1) m_lodConfigs[1] = LODTextureConfig{8, true};
+    if (LOD_COUNT > 2) m_lodConfigs[2] = LODTextureConfig{4, true};
+    if (LOD_COUNT > 3) m_lodConfigs[3] = LODTextureConfig{2, true};
+    if (LOD_COUNT > 4) m_lodConfigs[4] = LODTextureConfig{2, true};
+}
+
+void TextureOverlayStore::setLODConfig(int lod, const LODTextureConfig& cfg) {
+    if (!isLodValid(lod)) return;
+    std::unique_lock lock(m_mutex);
+    LODTextureConfig clamped = cfg;
+    // Clamp pixelsPerVoxel to a power of two in [2, 1024].
+    uint16_t v = clamped.pixelsPerVoxel;
+    if (v < 2) v = 2;
+    if (v > 1024) v = 1024;
+    // Round down to nearest power of two.
+    uint16_t pow2 = 2;
+    while ((pow2 << 1) <= v) pow2 <<= 1;
+    clamped.pixelsPerVoxel = pow2;
+    m_lodConfigs[lod] = clamped;
+    if (lod == 0) {
+        requestFullGPUUploadLocked();
+    }
+    m_generation.fetch_add(1, std::memory_order_release);
+}
+
+LODTextureConfig TextureOverlayStore::getLODConfig(int lod) const {
+    if (!isLodValid(lod)) return {};
+    std::shared_lock lock(m_mutex);
+    return m_lodConfigs[lod];
+}
+
+// ---------------------------------------------------------------------------
+// Stats / state
+// ---------------------------------------------------------------------------
+
+TextureOverlayStore::Stats TextureOverlayStore::getStats() const {
+    Stats s{};
+    std::shared_lock lock(m_mutex);
+    s.generation = m_generation.load(std::memory_order_acquire);
+    s.surfaceStampCount = m_surfacePaintStamps.size();
+    for (int lod = 0; lod < LOD_COUNT; ++lod) {
+        s.bricksByLOD[lod] = m_brickCountsByLOD[lod];
+        s.cellsByLOD[lod] = m_cellCountsByLOD[lod];
+        s.totalBricks += s.bricksByLOD[lod];
+        s.totalCells += s.cellsByLOD[lod];
+    }
+    return s;
+}
+
+bool TextureOverlayStore::isEmpty() const {
+    std::shared_lock lock(m_mutex);
+    if (!m_surfacePaintStamps.empty()) {
+        return false;
+    }
+    for (size_t cells : m_cellCountsByLOD) {
+        if (cells != 0u) return false;
+    }
+    return true;
+}
+
+void TextureOverlayStore::clear() {
+    std::unique_lock lock(m_mutex);
+    for (auto& map : m_lodMaps) map.clear();
+    m_brickCountsByLOD.fill(0u);
+    m_cellCountsByLOD.fill(0u);
+    m_surfacePaintStamps.clear();
+    m_surfacePaintStampChunkIndex.clear();
+    m_unindexedSurfacePaintStampIndices.clear();
+    m_nextSurfacePaintStampOrder = 1u;
+    requestFullGPUUploadLocked();
+    m_generation.fetch_add(1, std::memory_order_release);
+}
+
+void TextureOverlayStore::clearLOD(int lod) {
+    if (!isLodValid(lod)) return;
+    std::unique_lock lock(m_mutex);
+    m_lodMaps[lod].clear();
+    m_brickCountsByLOD[lod] = 0u;
+        m_cellCountsByLOD[lod] = 0u;
+    if (lod == 0) {
+        m_surfacePaintStamps.clear();
+        m_surfacePaintStampChunkIndex.clear();
+        m_unindexedSurfacePaintStampIndices.clear();
+        m_nextSurfacePaintStampOrder = 1u;
+    }
+    requestFullGPUUploadLocked();
+    m_generation.fetch_add(1, std::memory_order_release);
+}
+
+} // namespace TextureOverlay

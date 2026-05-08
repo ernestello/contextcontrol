@@ -1,0 +1,224 @@
+// GPT-DESC: Implements TextureOverlayStore binary persistence for sparse cells and surface stamps.
+#include "TextureOverlayInternal.h"
+
+#include <algorithm>
+#include <fstream>
+#include <mutex>
+#include <shared_mutex>
+
+namespace TextureOverlay {
+
+// ---------------------------------------------------------------------------
+// Persistence
+// File layout:
+//   magic(4) version(4)
+//   For each LOD: pixelsPerVoxel(2) enabled(1) pad(1) brickCount(4)
+//     For each brick: key(12) activeCount(4) cells(512)
+// ---------------------------------------------------------------------------
+
+static constexpr uint32_t TEXTURE_OVERLAY_MAGIC = 0x54585050; // "TXPP"
+static constexpr uint32_t TEXTURE_OVERLAY_VERSION = 3;
+
+bool TextureOverlayStore::saveToFile(const char* path) const {
+    std::shared_lock lock(m_mutex);
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+
+    uint32_t magic = TEXTURE_OVERLAY_MAGIC;
+    uint32_t ver = 4u;
+    f.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    f.write(reinterpret_cast<const char*>(&ver), sizeof(ver));
+
+    uint32_t lodCount = LOD_COUNT;
+    f.write(reinterpret_cast<const char*>(&lodCount), sizeof(lodCount));
+
+    for (int lod = 0; lod < LOD_COUNT; ++lod) {
+        const auto& cfg = m_lodConfigs[lod];
+        uint16_t res = cfg.pixelsPerVoxel;
+        uint8_t en = cfg.enabled ? 1 : 0;
+        uint8_t pad = 0;
+        f.write(reinterpret_cast<const char*>(&res), sizeof(res));
+        f.write(reinterpret_cast<const char*>(&en),  sizeof(en));
+        f.write(reinterpret_cast<const char*>(&pad), sizeof(pad));
+
+        const auto& map = m_lodMaps[lod];
+        uint32_t brickCount = static_cast<uint32_t>(map.size());
+        f.write(reinterpret_cast<const char*>(&brickCount), sizeof(brickCount));
+
+        for (const auto& [key, brick] : map) {
+            f.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            f.write(reinterpret_cast<const char*>(&brick->activeCount),
+                    sizeof(brick->activeCount));
+            f.write(reinterpret_cast<const char*>(brick->cells.data()),
+                    sizeof(VoxelTextureData) * TextureBrick::CELLS);
+        }
+    }
+
+    // Version 4: persist canonical deferred surface stamps. The live GPU stamp
+    // buffer is intentionally bounded, but the world/snapshot state must not be.
+    // LOD remeshes and snapshot reloads can now resolve the complete paint
+    // history from this canonical list instead of only the newest live entries.
+    const uint32_t stampCount = (m_surfacePaintStamps.size() > static_cast<size_t>(UINT32_MAX))
+        ? UINT32_MAX
+        : static_cast<uint32_t>(m_surfacePaintStamps.size());
+    f.write(reinterpret_cast<const char*>(&stampCount), sizeof(stampCount));
+
+    for (uint32_t i = 0; i < stampCount; ++i) {
+        const SurfacePaintStamp& stamp = m_surfacePaintStamps[i];
+        f.write(reinterpret_cast<const char*>(&stamp.centerVoxelLod0.x), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&stamp.centerVoxelLod0.y), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&stamp.centerVoxelLod0.z), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMinLod0.x), sizeof(int32_t));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMinLod0.y), sizeof(int32_t));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMinLod0.z), sizeof(int32_t));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMaxLod0.x), sizeof(int32_t));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMaxLod0.y), sizeof(int32_t));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMaxLod0.z), sizeof(int32_t));
+
+        int32_t radius = static_cast<int32_t>(stamp.radiusVoxelsLod0);
+        uint8_t shape = static_cast<uint8_t>(stamp.shape);
+        uint8_t type = static_cast<uint8_t>(stamp.type);
+        uint8_t variant = stamp.variant;
+        uint8_t sourceFace = stamp.sourceFace;
+        uint32_t order = stamp.order;
+
+        f.write(reinterpret_cast<const char*>(&radius), sizeof(radius));
+        f.write(reinterpret_cast<const char*>(&shape), sizeof(shape));
+        f.write(reinterpret_cast<const char*>(&type), sizeof(type));
+        f.write(reinterpret_cast<const char*>(&variant), sizeof(variant));
+        f.write(reinterpret_cast<const char*>(&sourceFace), sizeof(sourceFace));
+        f.write(reinterpret_cast<const char*>(&order), sizeof(order));
+    }
+
+    return f.good();
+}
+
+bool TextureOverlayStore::loadFromFile(const char* path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+
+    uint32_t magic = 0, ver = 0;
+    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    f.read(reinterpret_cast<char*>(&ver), sizeof(ver));
+    constexpr uint32_t kTextureOverlayMaxReadableVersion = 4u;
+    if (magic != TEXTURE_OVERLAY_MAGIC || ver > kTextureOverlayMaxReadableVersion) return false;
+
+    uint32_t lodCount = 0;
+    f.read(reinterpret_cast<char*>(&lodCount), sizeof(lodCount));
+    if (lodCount > LOD_COUNT) return false;
+
+    std::unique_lock lock(m_mutex);
+    for (auto& m : m_lodMaps) m.clear();
+    m_brickCountsByLOD.fill(0u);
+    m_cellCountsByLOD.fill(0u);
+    m_surfacePaintStamps.clear();
+    m_surfacePaintStampChunkIndex.clear();
+    m_unindexedSurfacePaintStampIndices.clear();
+    m_nextSurfacePaintStampOrder = 1u;
+
+    for (uint32_t lod = 0; lod < lodCount; ++lod) {
+        uint16_t res = 0; uint8_t en = 0; uint8_t pad = 0;
+        f.read(reinterpret_cast<char*>(&res), sizeof(res));
+        f.read(reinterpret_cast<char*>(&en),  sizeof(en));
+        f.read(reinterpret_cast<char*>(&pad), sizeof(pad));
+        m_lodConfigs[lod] = LODTextureConfig{ res, en != 0 };
+
+        uint32_t brickCount = 0;
+        f.read(reinterpret_cast<char*>(&brickCount), sizeof(brickCount));
+        for (uint32_t b = 0; b < brickCount; ++b) {
+            BrickKey key{};
+            uint32_t active = 0;
+            f.read(reinterpret_cast<char*>(&key), sizeof(key));
+            f.read(reinterpret_cast<char*>(&active), sizeof(active));
+            auto brick = std::make_unique<TextureBrick>();
+            brick->activeCount = active;
+            if (ver >= 3) {
+                f.read(reinterpret_cast<char*>(brick->cells.data()),
+                       sizeof(VoxelTextureData) * TextureBrick::CELLS);
+            } else {
+                for (auto& cell : brick->cells) {
+                    uint8_t packed = 0;
+                    f.read(reinterpret_cast<char*>(&packed), sizeof(packed));
+                    cell.packed = packed;
+                    cell.face = 3;
+                }
+            }
+            uint32_t actualActive = 0u;
+            for (const auto& cell : brick->cells) {
+                if (!cell.isEmpty()) {
+                    ++actualActive;
+                }
+            }
+            brick->activeCount = actualActive;
+            ++m_brickCountsByLOD[lod];
+            m_cellCountsByLOD[lod] += brick->activeCount;
+            m_lodMaps[lod].emplace(key, std::move(brick));
+        }
+    }
+
+    if (ver >= 4) {
+        uint32_t stampCount = 0;
+        f.read(reinterpret_cast<char*>(&stampCount), sizeof(stampCount));
+        constexpr uint32_t kMaxSerializedSurfacePaintStamps = 1000000u;
+        if (stampCount > kMaxSerializedSurfacePaintStamps) {
+            return false;
+        }
+
+        m_surfacePaintStamps.reserve(stampCount);
+        uint32_t maxOrder = 0u;
+        for (uint32_t i = 0; i < stampCount; ++i) {
+            SurfacePaintStamp stamp{};
+            f.read(reinterpret_cast<char*>(&stamp.centerVoxelLod0.x), sizeof(float));
+            f.read(reinterpret_cast<char*>(&stamp.centerVoxelLod0.y), sizeof(float));
+            f.read(reinterpret_cast<char*>(&stamp.centerVoxelLod0.z), sizeof(float));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMinLod0.x), sizeof(int32_t));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMinLod0.y), sizeof(int32_t));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMinLod0.z), sizeof(int32_t));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMaxLod0.x), sizeof(int32_t));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMaxLod0.y), sizeof(int32_t));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMaxLod0.z), sizeof(int32_t));
+
+            int32_t radius = 1;
+            uint8_t shape = 0u;
+            uint8_t type = 0u;
+            uint8_t variant = 0u;
+            uint8_t sourceFace = 3u;
+            uint32_t order = 0u;
+
+            f.read(reinterpret_cast<char*>(&radius), sizeof(radius));
+            f.read(reinterpret_cast<char*>(&shape), sizeof(shape));
+            f.read(reinterpret_cast<char*>(&type), sizeof(type));
+            f.read(reinterpret_cast<char*>(&variant), sizeof(variant));
+            f.read(reinterpret_cast<char*>(&sourceFace), sizeof(sourceFace));
+            f.read(reinterpret_cast<char*>(&order), sizeof(order));
+
+            stamp.radiusVoxelsLod0 = std::max(1, radius);
+            stamp.shape = (shape == static_cast<uint8_t>(SurfaceBrushShape::Rect))
+                ? SurfaceBrushShape::Rect
+                : SurfaceBrushShape::Disc;
+            stamp.type = (type < static_cast<uint8_t>(TextureType::COUNT))
+                ? static_cast<TextureType>(type)
+                : TextureType::Grass;
+            stamp.variant = static_cast<uint8_t>(variant & 0x7u);
+            stamp.sourceFace = (sourceFace < 6u) ? sourceFace : 3u;
+            stamp.order = (order != 0u) ? order : (i + 1u);
+            maxOrder = std::max(maxOrder, stamp.order);
+
+            m_surfacePaintStamps.push_back(stamp);
+        }
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_surfacePaintStamps.size()); ++i) {
+            indexSurfacePaintStampLocked(i);
+        }
+        m_nextSurfacePaintStampOrder = maxOrder + 1u;
+        if (m_nextSurfacePaintStampOrder == 0u) {
+            m_nextSurfacePaintStampOrder = 1u;
+        }
+    }
+
+    requestFullGPUUploadLocked();
+    m_generation.fetch_add(1, std::memory_order_release);
+    return f.good() || f.eof();
+}
+
+} // namespace TextureOverlay

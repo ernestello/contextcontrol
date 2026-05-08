@@ -1,0 +1,122 @@
+#pragma once
+
+// GPT-DESC: Shared private helpers for terrain edit overlay implementation files.
+
+#include "world/edit/TerrainEditOverlayStore.h"
+
+#include <algorithm>
+#include <cstdint>
+#include <cstddef>
+
+namespace TerrainEdit::OverlayInternal {
+
+inline uint64_t axisCountInclusive(int32_t minValue, int32_t maxValue) {
+    if (maxValue < minValue) {
+        return 0;
+    }
+    return static_cast<uint64_t>(maxValue - minValue) + 1u;
+}
+
+constexpr int32_t EDIT_PAGE_SIZE_XZ_VOXELS = 32;
+constexpr int32_t EDIT_PAGE_HALO_PAGES = 1;
+constexpr int32_t EDIT_PAGE_SIZE_XZ_CELLS = EDIT_PAGE_SIZE_XZ_VOXELS * EDIT_CELLS_PER_VOXEL;
+constexpr int32_t EDIT_PAGES_PER_AXIS = EDIT_CHUNK_CELLS_XZ / EDIT_PAGE_SIZE_XZ_CELLS;
+
+inline uint16_t packEditPageId(int32_t pageX, int32_t pageZ) {
+    return static_cast<uint16_t>(pageZ * EDIT_PAGES_PER_AXIS + pageX);
+}
+
+inline void appendDirtyPagesForBounds(
+    const GridCoord& a,
+    const GridCoord& b,
+    TerrainEditOverlayStore::BoxEditResult& result)
+{
+    GridCoord minCoord(
+        std::min(a.x, b.x),
+        std::min(a.y, b.y),
+        std::min(a.z, b.z));
+    GridCoord maxCoord(
+        std::max(a.x, b.x),
+        std::max(a.y, b.y),
+        std::max(a.z, b.z));
+
+    const ChunkCoord minChunk = gridToChunk(minCoord);
+    const ChunkCoord maxChunk = gridToChunk(maxCoord);
+
+    for (int32_t chunkY = minChunk.y; chunkY <= maxChunk.y; ++chunkY) {
+        for (int32_t chunkZ = minChunk.z; chunkZ <= maxChunk.z; ++chunkZ) {
+            for (int32_t chunkX = minChunk.x; chunkX <= maxChunk.x; ++chunkX) {
+                const int32_t chunkBaseX = chunkX * EDIT_CHUNK_CELLS_XZ;
+                const int32_t chunkBaseY = chunkY * EDIT_CHUNK_CELLS_Y;
+                const int32_t chunkBaseZ = chunkZ * EDIT_CHUNK_CELLS_XZ;
+                const int32_t chunkMaxX = chunkBaseX + EDIT_CHUNK_CELLS_XZ - 1;
+                const int32_t chunkMaxY = chunkBaseY + EDIT_CHUNK_CELLS_Y - 1;
+                const int32_t chunkMaxZ = chunkBaseZ + EDIT_CHUNK_CELLS_XZ - 1;
+
+                const int32_t overlapMinX = std::max(minCoord.x, chunkBaseX);
+                const int32_t overlapMaxX = std::min(maxCoord.x, chunkMaxX);
+                const int32_t overlapMinY = std::max(minCoord.y, chunkBaseY);
+                const int32_t overlapMaxY = std::min(maxCoord.y, chunkMaxY);
+                const int32_t overlapMinZ = std::max(minCoord.z, chunkBaseZ);
+                const int32_t overlapMaxZ = std::min(maxCoord.z, chunkMaxZ);
+
+                if (overlapMinX > overlapMaxX ||
+                    overlapMinY > overlapMaxY ||
+                    overlapMinZ > overlapMaxZ) {
+                    continue;
+                }
+
+                const int32_t localMinX = overlapMinX - chunkBaseX;
+                const int32_t localMaxX = overlapMaxX - chunkBaseX;
+                const int32_t localMinY = overlapMinY - chunkBaseY;
+                const int32_t localMaxY = overlapMaxY - chunkBaseY;
+                const int32_t localMinZ = overlapMinZ - chunkBaseZ;
+                const int32_t localMaxZ = overlapMaxZ - chunkBaseZ;
+
+                const int32_t directMinPageX = std::clamp(localMinX / EDIT_PAGE_SIZE_XZ_CELLS, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t directMaxPageX = std::clamp(localMaxX / EDIT_PAGE_SIZE_XZ_CELLS, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t directMinPageZ = std::clamp(localMinZ / EDIT_PAGE_SIZE_XZ_CELLS, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t directMaxPageZ = std::clamp(localMaxZ / EDIT_PAGE_SIZE_XZ_CELLS, 0, EDIT_PAGES_PER_AXIS - 1);
+
+                const int32_t dirtyMinPageX = std::clamp(directMinPageX - EDIT_PAGE_HALO_PAGES, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t dirtyMaxPageX = std::clamp(directMaxPageX + EDIT_PAGE_HALO_PAGES, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t dirtyMinPageZ = std::clamp(directMinPageZ - EDIT_PAGE_HALO_PAGES, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t dirtyMaxPageZ = std::clamp(directMaxPageZ + EDIT_PAGE_HALO_PAGES, 0, EDIT_PAGES_PER_AXIS - 1);
+
+                const int32_t minVoxelY = std::clamp((localMinY / EDIT_CELLS_PER_VOXEL) - 1, 0, (EDIT_CHUNK_CELLS_Y / EDIT_CELLS_PER_VOXEL) - 1);
+                const int32_t maxVoxelY = std::clamp((localMaxY / EDIT_CELLS_PER_VOXEL) + 1, 0, (EDIT_CHUNK_CELLS_Y / EDIT_CELLS_PER_VOXEL) - 1);
+
+                auto& chunkPages = result.dirtyChunkPages[ChunkCoord(chunkX, chunkY, chunkZ)];
+                chunkPages.pageIds.reserve(
+                    chunkPages.pageIds.size() +
+                    static_cast<size_t>((dirtyMaxPageX - dirtyMinPageX + 1) * (dirtyMaxPageZ - dirtyMinPageZ + 1)));
+                chunkPages.pageBounds.reserve(chunkPages.pageIds.capacity());
+
+                for (int32_t pageZ = dirtyMinPageZ; pageZ <= dirtyMaxPageZ; ++pageZ) {
+                    for (int32_t pageX = dirtyMinPageX; pageX <= dirtyMaxPageX; ++pageX) {
+                        const bool isHalo =
+                            pageX < directMinPageX || pageX > directMaxPageX ||
+                            pageZ < directMinPageZ || pageZ > directMaxPageZ;
+                        if (isHalo) {
+                            ++chunkPages.haloPages;
+                        } else {
+                            ++chunkPages.directPages;
+                        }
+
+                        chunkPages.pageIds.push_back(packEditPageId(pageX, pageZ));
+                        chunkPages.pageBounds.push_back(DirtyPageBounds{
+                            static_cast<uint16_t>(pageX * EDIT_PAGE_SIZE_XZ_VOXELS),
+                            static_cast<uint16_t>(pageX * EDIT_PAGE_SIZE_XZ_VOXELS + EDIT_PAGE_SIZE_XZ_VOXELS - 1),
+                            static_cast<uint16_t>(minVoxelY),
+                            static_cast<uint16_t>(maxVoxelY),
+                            static_cast<uint16_t>(pageZ * EDIT_PAGE_SIZE_XZ_VOXELS),
+                            static_cast<uint16_t>(pageZ * EDIT_PAGE_SIZE_XZ_VOXELS + EDIT_PAGE_SIZE_XZ_VOXELS - 1),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+} // namespace TerrainEdit::OverlayInternal

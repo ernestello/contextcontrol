@@ -1,0 +1,442 @@
+// GPT-DESC: Implements TextureOverlayStore direct brush paint and clear operations.
+#include "TextureOverlayInternal.h"
+
+#include <algorithm>
+#include <cmath>
+#include <mutex>
+#include <unordered_set>
+
+namespace TextureOverlay {
+using namespace TextureOverlayInternal;
+
+// ---------------------------------------------------------------------------
+// Brush paint operations
+//
+// Strategy: we work in the *target LOD's voxel grid*.  The brush bounding box
+// is converted from LOD-0 to the target LOD once, and we iterate that
+// (smaller) volume directly.  This is dramatically cheaper than the previous
+// "iterate every LOD-0 voxel" approach for high LOD levels.
+// ---------------------------------------------------------------------------
+
+int TextureOverlayStore::paintSphere(const glm::ivec3& centerLod0,
+                                     int radiusVoxelsLod0,
+                                     int lod,
+                                     TextureType type,
+                                     uint8_t variant) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
+    if (radiusVoxelsLod0 <= 0) return 0;
+
+    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
+    // Ceiling-divide so a radius that doesn't divide evenly still covers
+    // every LOD cell touched by the LOD-0 sphere.
+    const int shift = lod;
+    const int rLod = (radiusVoxelsLod0 + (1 << shift) - 1) >> shift;
+    if (rLod <= 0) return 0;
+    const int rSq = rLod * rLod;
+
+    VoxelTextureData data(type, variant);
+    int written = 0;
+
+    std::unique_lock lock(m_mutex);
+    auto& map = m_lodMaps[lod];
+
+    for (int dz = -rLod; dz <= rLod; ++dz) {
+        for (int dy = -rLod; dy <= rLod; ++dy) {
+            for (int dx = -rLod; dx <= rLod; ++dx) {
+                if (dx*dx + dy*dy + dz*dz > rSq) continue;
+                glm::ivec3 v = centerLod + glm::ivec3(dx, dy, dz);
+                BrickKey key = voxelToBrick(v);
+                glm::ivec3 local = voxelLocalInBrick(v);
+                writeCellLocked(map, lod, key, local, data);
+                recordDirtyGPUCellLocked(lod, v, data);
+                refreshTransitionEdgesAroundCellLocked(map, lod, v);
+                for (const glm::ivec3& d : kNeighborDirs) {
+                    refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
+                }
+                ++written;
+            }
+        }
+    }
+    if (written) m_generation.fetch_add(1, std::memory_order_release);
+    return written;
+}
+
+int TextureOverlayStore::paintBox(const glm::ivec3& minLod0,
+                                  const glm::ivec3& maxLod0,
+                                  int lod,
+                                  TextureType type,
+                                  uint8_t variant) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
+
+    glm::ivec3 a = lod0ToLOD(minLod0, lod);
+    glm::ivec3 b = lod0ToLOD(maxLod0, lod);
+    glm::ivec3 mn(std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z));
+    glm::ivec3 mx(std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z));
+
+    VoxelTextureData data(type, variant);
+    int written = 0;
+
+    std::unique_lock lock(m_mutex);
+    auto& map = m_lodMaps[lod];
+
+    for (int z = mn.z; z <= mx.z; ++z) {
+        for (int y = mn.y; y <= mx.y; ++y) {
+            for (int x = mn.x; x <= mx.x; ++x) {
+                glm::ivec3 v(x, y, z);
+                writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v), data);
+                recordDirtyGPUCellLocked(lod, v, data);
+                refreshTransitionEdgesAroundCellLocked(map, lod, v);
+                for (const glm::ivec3& d : kNeighborDirs) {
+                    refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
+                }
+                ++written;
+            }
+        }
+    }
+    if (written) m_generation.fetch_add(1, std::memory_order_release);
+    return written;
+}
+
+int TextureOverlayStore::paintFaceDisc(const glm::ivec3& centerLod0,
+                                       int radiusVoxelsLod0,
+                                       int normalAxis,
+                                       int lod,
+                                       TextureType type,
+                                       uint8_t variant,
+                                       uint8_t face,
+                                       int maxCells) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
+    if (radiusVoxelsLod0 <= 0 || maxCells <= 0) return 0;
+
+    face = static_cast<uint8_t>(face % 6u);
+    normalAxis = std::clamp(normalAxis, 0, 2);
+    const int uAxis = (normalAxis == 0) ? 1 : 0;
+    const int vAxis = (normalAxis == 2) ? 1 : 2;
+    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
+    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
+    if (rLod <= 0) return 0;
+
+    const int rSq = rLod * rLod;
+    int candidateCells = 0;
+    for (int v = -rLod; v <= rLod; ++v) {
+        for (int u = -rLod; u <= rLod; ++u) {
+            if (u * u + v * v <= rSq) ++candidateCells;
+        }
+    }
+    if (candidateCells > maxCells) return 0;
+
+    int written = 0;
+    std::unique_lock lock(m_mutex);
+    auto& map = m_lodMaps[lod];
+
+    for (int v = -rLod; v <= rLod; ++v) {
+        for (int u = -rLod; u <= rLod; ++u) {
+            if (u * u + v * v > rSq) continue;
+            glm::ivec3 coord = centerLod;
+            coord[uAxis] += u;
+            coord[vAxis] += v;
+            VoxelTextureData data(type, variedVariant(coord, face, type, variant), 0, face);
+            const glm::ivec3 storageCoord = encodeFaceCoord(coord, face);
+            writeCellLocked(map, lod, voxelToBrick(storageCoord), voxelLocalInBrick(storageCoord), data);
+            recordDirtyGPUCellLocked(lod, coord, data);
+            ++written;
+        }
+    }
+
+    const int inner = std::max(0, rLod - 1);
+    const int innerSq = inner * inner;
+    const int outer = rLod + 1;
+    const int outerSq = outer * outer;
+    for (int v = -outer; v <= outer; ++v) {
+        for (int u = -outer; u <= outer; ++u) {
+            const int dSq = u * u + v * v;
+            if (dSq > outerSq || dSq < innerSq) continue;
+            glm::ivec3 coord = centerLod;
+            coord[uAxis] += u;
+            coord[vAxis] += v;
+            refreshTransitionEdgesAroundFaceLocked(map, lod, coord, face);
+        }
+    }
+
+    if (written) m_generation.fetch_add(1, std::memory_order_release);
+    return written;
+}
+
+int TextureOverlayStore::paintFaceRect(const glm::ivec3& centerLod0,
+                                       int radiusVoxelsLod0,
+                                       int normalAxis,
+                                       int lod,
+                                       TextureType type,
+                                       uint8_t variant,
+                                       uint8_t face,
+                                       int maxCells) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
+    if (radiusVoxelsLod0 <= 0 || maxCells <= 0) return 0;
+
+    face = static_cast<uint8_t>(face % 6u);
+    normalAxis = std::clamp(normalAxis, 0, 2);
+    const int uAxis = (normalAxis == 0) ? 1 : 0;
+    const int vAxis = (normalAxis == 2) ? 1 : 2;
+    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
+    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
+    if (rLod <= 0) return 0;
+
+    const int side = rLod * 2 + 1;
+    const int64_t candidateCells = static_cast<int64_t>(side) * static_cast<int64_t>(side);
+    if (candidateCells > maxCells) return 0;
+
+    int written = 0;
+    std::unique_lock lock(m_mutex);
+    auto& map = m_lodMaps[lod];
+
+    for (int v = -rLod; v <= rLod; ++v) {
+        for (int u = -rLod; u <= rLod; ++u) {
+            glm::ivec3 coord = centerLod;
+            coord[uAxis] += u;
+            coord[vAxis] += v;
+            VoxelTextureData data(type, variedVariant(coord, face, type, variant), 0, face);
+            const glm::ivec3 storageCoord = encodeFaceCoord(coord, face);
+            writeCellLocked(map, lod, voxelToBrick(storageCoord), voxelLocalInBrick(storageCoord), data);
+            recordDirtyGPUCellLocked(lod, coord, data);
+            ++written;
+        }
+    }
+
+    const int outer = rLod + 1;
+    const int inner = std::max(0, rLod - 1);
+    for (int v = -outer; v <= outer; ++v) {
+        for (int u = -outer; u <= outer; ++u) {
+            if (std::abs(u) < inner && std::abs(v) < inner) continue;
+            glm::ivec3 coord = centerLod;
+            coord[uAxis] += u;
+            coord[vAxis] += v;
+            refreshTransitionEdgesAroundFaceLocked(map, lod, coord, face);
+        }
+    }
+
+    if (written) m_generation.fetch_add(1, std::memory_order_release);
+    return written;
+}
+
+int TextureOverlayStore::paintSurfaceFaces(const std::vector<SurfaceFaceStamp>& faces,
+                                           int lod,
+                                           TextureType type,
+                                           uint8_t variant) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled || faces.empty()) return 0;
+
+    // Huge brush stamps must be authoring-fast. Transition edge masks are
+    // cosmetic material-boundary metadata; refreshing them through an
+    // unordered_set for every changed cell is exactly the wrong cost model for
+    // 50k-300k cell stamps. Large stamps skip transition refresh in the
+    // interactive path. The procedural material remains correct; only fancy
+    // edge blending may be absent until a future offline/idle edge pass.
+    constexpr size_t kLargeInteractiveStampThreshold = 32768u;
+    const bool fastLargeStamp = faces.size() >= kLargeInteractiveStampThreshold;
+
+    int written = 0;
+
+    std::unique_lock lock(m_mutex);
+    auto& map = m_lodMaps[lod];
+
+    if (fastLargeStamp) {
+        for (const SurfaceFaceStamp& faceStamp : faces) {
+            const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
+            const VoxelTextureData data(type, variedVariant(faceStamp.lodCoord, face, type, variant), 0, face);
+            const glm::ivec3 storageCoord = encodeFaceCoord(faceStamp.lodCoord, face);
+
+            if (const TextureBrick* existingBrick = getBrickLocked(map, voxelToBrick(storageCoord))) {
+                const glm::ivec3 local = voxelLocalInBrick(storageCoord);
+                const VoxelTextureData existing =
+                    existingBrick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
+                if (!existing.isEmpty() &&
+                    existing.getType() == data.getType() &&
+                    existing.getVariant() == data.getVariant() &&
+                    existing.getFace() == data.getFace()) {
+                    continue;
+                }
+            }
+
+            writeCellLocked(map,
+                            lod,
+                            voxelToBrick(storageCoord),
+                            voxelLocalInBrick(storageCoord),
+                            data);
+            recordDirtyGPUCellLocked(lod, faceStamp.lodCoord, data);
+            ++written;
+        }
+
+        if (written) m_generation.fetch_add(1, std::memory_order_release);
+        return written;
+    }
+
+    std::vector<SurfaceFaceStamp> changedFaces;
+    changedFaces.reserve(faces.size());
+
+    // Boundary-only transition refresh acceleration. For one brush stroke,
+    // every changed face is usually painted to the same material. Interior
+    // changed-vs-changed neighbors cannot form a transition boundary, so there
+    // is no reason to refresh all 5 cells around every painted face.
+    std::unordered_set<glm::ivec3, IVec3Hash> changedStorageCoords;
+    changedStorageCoords.reserve(faces.size() * 2u + 16u);
+
+    for (const SurfaceFaceStamp& faceStamp : faces) {
+        const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
+        const VoxelTextureData data(type, variedVariant(faceStamp.lodCoord, face, type, variant), 0, face);
+        const glm::ivec3 storageCoord = encodeFaceCoord(faceStamp.lodCoord, face);
+
+        if (const TextureBrick* existingBrick = getBrickLocked(map, voxelToBrick(storageCoord))) {
+            const glm::ivec3 local = voxelLocalInBrick(storageCoord);
+            const VoxelTextureData existing =
+                existingBrick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
+            if (!existing.isEmpty() &&
+                existing.getType() == data.getType() &&
+                existing.getVariant() == data.getVariant() &&
+                existing.getFace() == data.getFace()) {
+                continue;
+            }
+        }
+
+        writeCellLocked(map,
+                        lod,
+                        voxelToBrick(storageCoord),
+                        voxelLocalInBrick(storageCoord),
+                        data);
+        recordDirtyGPUCellLocked(lod, faceStamp.lodCoord, data);
+        changedFaces.push_back(faceStamp);
+        changedStorageCoords.insert(storageCoord);
+        ++written;
+    }
+
+    for (const SurfaceFaceStamp& faceStamp : changedFaces) {
+        const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
+
+        int uAxis = 0;
+        int vAxis = 1;
+        facePlaneAxes(face, uAxis, vAxis);
+
+        glm::ivec3 neighborOffsets[4]{};
+        neighborOffsets[0][uAxis] =  1;
+        neighborOffsets[1][uAxis] = -1;
+        neighborOffsets[2][vAxis] =  1;
+        neighborOffsets[3][vAxis] = -1;
+
+        bool isBoundary = false;
+        for (const glm::ivec3& offset : neighborOffsets) {
+            const glm::ivec3 neighborStorage =
+                encodeFaceCoord(faceStamp.lodCoord + offset, face);
+            if (changedStorageCoords.find(neighborStorage) == changedStorageCoords.end()) {
+                isBoundary = true;
+                break;
+            }
+        }
+
+        if (!isBoundary) {
+            continue;
+        }
+
+        refreshTransitionEdgesAroundFaceLocked(map, lod, faceStamp.lodCoord, face);
+        for (const glm::ivec3& offset : neighborOffsets) {
+            refreshTransitionEdgesAroundFaceLocked(map, lod, faceStamp.lodCoord + offset, face);
+        }
+    }
+
+    if (written) m_generation.fetch_add(1, std::memory_order_release);
+    return written;
+}
+
+int TextureOverlayStore::clearSphere(const glm::ivec3& centerLod0,
+                                     int radiusVoxelsLod0,
+                                     int lod) {
+    if (!isLodValid(lod)) return 0;
+    if (radiusVoxelsLod0 <= 0) return 0;
+
+    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
+    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
+    if (rLod <= 0) return 0;
+    const int rSq = rLod * rLod;
+
+    int cleared = 0;
+    std::unique_lock lock(m_mutex);
+    requestFullGPUUploadLocked();
+    auto& map = m_lodMaps[lod];
+    for (int dz = -rLod; dz <= rLod; ++dz)
+    for (int dy = -rLod; dy <= rLod; ++dy)
+    for (int dx = -rLod; dx <= rLod; ++dx) {
+        if (dx*dx + dy*dy + dz*dz > rSq) continue;
+        glm::ivec3 v = centerLod + glm::ivec3(dx, dy, dz);
+        writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v),
+                        VoxelTextureData{});
+        for (const glm::ivec3& d : kNeighborDirs) {
+            refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
+        }
+        ++cleared;
+    }
+    if (cleared) m_generation.fetch_add(1, std::memory_order_release);
+    return cleared;
+}
+
+int TextureOverlayStore::clearBox(const glm::ivec3& minLod0,
+                                  const glm::ivec3& maxLod0,
+                                  int lod) {
+    if (!isLodValid(lod)) return 0;
+    glm::ivec3 a = lod0ToLOD(minLod0, lod);
+    glm::ivec3 b = lod0ToLOD(maxLod0, lod);
+    glm::ivec3 mn(std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z));
+    glm::ivec3 mx(std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z));
+
+    int cleared = 0;
+    std::unique_lock lock(m_mutex);
+    requestFullGPUUploadLocked();
+    auto& map = m_lodMaps[lod];
+    for (int z = mn.z; z <= mx.z; ++z)
+    for (int y = mn.y; y <= mx.y; ++y)
+    for (int x = mn.x; x <= mx.x; ++x) {
+        glm::ivec3 v(x, y, z);
+        writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v),
+                        VoxelTextureData{});
+        for (const glm::ivec3& d : kNeighborDirs) {
+            refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
+        }
+        ++cleared;
+    }
+    if (cleared) m_generation.fetch_add(1, std::memory_order_release);
+    return cleared;
+}
+
+int TextureOverlayStore::cascadeToCoarserLODs(const glm::ivec3& centerLod0,
+                                              int radiusVoxelsLod0,
+                                              int sourceLod,
+                                              TextureType type,
+                                              uint8_t variant) {
+    int total = 0;
+    for (int l = sourceLod + 1; l < LOD_COUNT; ++l) {
+        if (!m_lodConfigs[l].enabled) continue;
+        total += paintSphere(centerLod0, radiusVoxelsLod0, l, type, variant);
+    }
+    return total;
+}
+
+int TextureOverlayStore::cascadeFaceToCoarserLODs(const glm::ivec3& centerLod0,
+                                                  int radiusVoxelsLod0,
+                                                  int normalAxis,
+                                                  int sourceLod,
+                                                  SurfaceBrushShape shape,
+                                                  TextureType type,
+                                                  uint8_t variant,
+                                                  uint8_t face,
+                                                  int maxCellsPerLOD) {
+    int total = 0;
+    for (int l = sourceLod + 1; l < LOD_COUNT; ++l) {
+        if (!m_lodConfigs[l].enabled) continue;
+        if (shape == SurfaceBrushShape::Disc) {
+            total += paintFaceDisc(centerLod0, radiusVoxelsLod0, normalAxis,
+                                   l, type, variant, face, maxCellsPerLOD);
+        } else {
+            total += paintFaceRect(centerLod0, radiusVoxelsLod0, normalAxis,
+                                   l, type, variant, face, maxCellsPerLOD);
+        }
+    }
+    return total;
+}
+
+} // namespace TextureOverlay

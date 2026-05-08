@@ -1,0 +1,171 @@
+// GPT-DESC: Owns core sparse terrain edit overlay storage and basic store state.
+#include "world/edit/TerrainEditOverlayStore.h"
+
+#include <algorithm>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <shared_mutex>
+
+namespace TerrainEdit {
+
+bool TerrainEditOverlayStore::Brick::set(const GridCoord& localCoord, const CellValue& value) {
+    if (uniformActive) {
+        if (uniformValue == value) {
+            return false;
+        }
+        materializeUniform();
+    }
+
+    DetailedData& data = ensureDetailed();
+    const size_t index = flattenBrickIndex(localCoord);
+    const bool wasActive = data.activeMask.test(index);
+
+    if (wasActive && data.cells[index] == value) {
+        return false;
+    }
+
+    data.cells[index] = value;
+    if (!wasActive) {
+        data.activeMask.set(index);
+        ++activeCount;
+    }
+
+    return true;
+}
+
+bool TerrainEditOverlayStore::Brick::clear(const GridCoord& localCoord) {
+    if (uniformActive) {
+        materializeUniform();
+    }
+
+    if (!detailed) {
+        return false;
+    }
+
+    const size_t index = flattenBrickIndex(localCoord);
+    if (!detailed->activeMask.test(index)) {
+        return false;
+    }
+
+    detailed->activeMask.reset(index);
+    if (activeCount > 0) {
+        --activeCount;
+    }
+    detailed->cells[index] = CellValue{};
+    if (activeCount == 0) {
+        detailed.reset();
+    }
+    return true;
+}
+
+std::optional<CellValue> TerrainEditOverlayStore::Brick::get(const GridCoord& localCoord) const {
+    if (uniformActive) {
+        return uniformValue;
+    }
+
+    if (!detailed) {
+        return std::nullopt;
+    }
+
+    const size_t index = flattenBrickIndex(localCoord);
+    if (!detailed->activeMask.test(index)) {
+        return std::nullopt;
+    }
+    return detailed->cells[index];
+}
+
+bool TerrainEditOverlayStore::Brick::fillAll(const CellValue& value) {
+    if (uniformActive && uniformValue == value) {
+        return false;
+    }
+
+    uniformActive = true;
+    uniformValue = value;
+    activeCount = EDIT_BRICK_CELL_COUNT;
+    detailed.reset();
+    return true;
+}
+
+void TerrainEditOverlayStore::Brick::materializeUniform() {
+    if (!uniformActive) {
+        return;
+    }
+
+    DetailedData& data = ensureDetailed();
+    data.cells.fill(uniformValue);
+    data.activeMask.set();
+    activeCount = EDIT_BRICK_CELL_COUNT;
+    uniformActive = false;
+}
+
+TerrainEditOverlayStore::Brick::DetailedData& TerrainEditOverlayStore::Brick::ensureDetailed() {
+    if (!detailed) {
+        detailed = std::make_unique<DetailedData>();
+    }
+    return *detailed;
+}
+
+void TerrainEditOverlayStore::normalizeBounds(const GridCoord& a,
+                                              const GridCoord& b,
+                                              GridCoord& outMin,
+                                              GridCoord& outMax) {
+    outMin = GridCoord(
+        std::min(a.x, b.x),
+        std::min(a.y, b.y),
+        std::min(a.z, b.z)
+    );
+    outMax = GridCoord(
+        std::max(a.x, b.x),
+        std::max(a.y, b.y),
+        std::max(a.z, b.z)
+    );
+}
+
+TerrainEditOverlayStore::Brick& TerrainEditOverlayStore::getOrCreateBrickLocked(const BrickCoord& brickCoord) {
+    auto it = m_bricks.find(brickCoord);
+    if (it != m_bricks.end()) {
+        return it->second;
+    }
+    return m_bricks.emplace(brickCoord, Brick{}).first->second;
+}
+void TerrainEditOverlayStore::clear() {
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    m_bricks.clear();
+    m_boxFills.clear();
+    m_sphereFills.clear();
+    m_cylinderFills.clear();
+    m_chunkEditCounts.clear();
+    m_boxFillChunkIndex.clear();
+    m_sphereFillChunkIndex.clear();
+    m_cylinderFillChunkIndex.clear();
+    m_editedCellCount = 0;
+    m_overlayGeneration.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool TerrainEditOverlayStore::hasAnyEdits() const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return m_editedCellCount > 0;
+}
+
+size_t TerrainEditOverlayStore::getBrickCount() const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return m_bricks.size();
+}
+
+size_t TerrainEditOverlayStore::getEditedCellCount() const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return m_editedCellCount;
+}
+
+TerrainEditOverlayStore::DeferredFillCounts TerrainEditOverlayStore::getDeferredFillCounts() const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return {
+        static_cast<uint32_t>(m_sphereFills.size()),
+        static_cast<uint32_t>(m_boxFills.size()),
+        static_cast<uint32_t>(m_cylinderFills.size()),
+        static_cast<uint32_t>(m_bricks.size())
+    };
+}
+
+} // namespace TerrainEdit

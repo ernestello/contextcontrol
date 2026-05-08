@@ -1,0 +1,1668 @@
+#include "world/edit/TerrainEditOverlayStore.h"
+#include <algorithm>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
+
+namespace TerrainEdit {
+
+namespace {
+// Note: Binary file format records (Serialized*Record), magic constants,
+// and the binary read/write helpers live in TerrainEditOverlayStore_IO.cpp.
+
+uint64_t axisCountInclusive(int32_t minValue, int32_t maxValue) {
+    if (maxValue < minValue) {
+        return 0;
+    }
+    return static_cast<uint64_t>(maxValue - minValue) + 1u;
+}
+
+constexpr int32_t EDIT_PAGE_SIZE_XZ_VOXELS = 32;
+constexpr int32_t EDIT_PAGE_HALO_PAGES = 1;
+constexpr int32_t EDIT_PAGE_SIZE_XZ_CELLS = EDIT_PAGE_SIZE_XZ_VOXELS * EDIT_CELLS_PER_VOXEL;
+constexpr int32_t EDIT_PAGES_PER_AXIS = EDIT_CHUNK_CELLS_XZ / EDIT_PAGE_SIZE_XZ_CELLS;
+
+uint16_t packEditPageId(int32_t pageX, int32_t pageZ) {
+    return static_cast<uint16_t>(pageZ * EDIT_PAGES_PER_AXIS + pageX);
+}
+
+void appendDirtyPagesForBounds(
+    const GridCoord& a,
+    const GridCoord& b,
+    TerrainEditOverlayStore::BoxEditResult& result)
+{
+    GridCoord minCoord(
+        std::min(a.x, b.x),
+        std::min(a.y, b.y),
+        std::min(a.z, b.z));
+    GridCoord maxCoord(
+        std::max(a.x, b.x),
+        std::max(a.y, b.y),
+        std::max(a.z, b.z));
+
+    const ChunkCoord minChunk = gridToChunk(minCoord);
+    const ChunkCoord maxChunk = gridToChunk(maxCoord);
+
+    for (int32_t chunkY = minChunk.y; chunkY <= maxChunk.y; ++chunkY) {
+        for (int32_t chunkZ = minChunk.z; chunkZ <= maxChunk.z; ++chunkZ) {
+            for (int32_t chunkX = minChunk.x; chunkX <= maxChunk.x; ++chunkX) {
+                const int32_t chunkBaseX = chunkX * EDIT_CHUNK_CELLS_XZ;
+                const int32_t chunkBaseY = chunkY * EDIT_CHUNK_CELLS_Y;
+                const int32_t chunkBaseZ = chunkZ * EDIT_CHUNK_CELLS_XZ;
+                const int32_t chunkMaxX = chunkBaseX + EDIT_CHUNK_CELLS_XZ - 1;
+                const int32_t chunkMaxY = chunkBaseY + EDIT_CHUNK_CELLS_Y - 1;
+                const int32_t chunkMaxZ = chunkBaseZ + EDIT_CHUNK_CELLS_XZ - 1;
+
+                const int32_t overlapMinX = std::max(minCoord.x, chunkBaseX);
+                const int32_t overlapMaxX = std::min(maxCoord.x, chunkMaxX);
+                const int32_t overlapMinY = std::max(minCoord.y, chunkBaseY);
+                const int32_t overlapMaxY = std::min(maxCoord.y, chunkMaxY);
+                const int32_t overlapMinZ = std::max(minCoord.z, chunkBaseZ);
+                const int32_t overlapMaxZ = std::min(maxCoord.z, chunkMaxZ);
+
+                if (overlapMinX > overlapMaxX ||
+                    overlapMinY > overlapMaxY ||
+                    overlapMinZ > overlapMaxZ) {
+                    continue;
+                }
+
+                const int32_t localMinX = overlapMinX - chunkBaseX;
+                const int32_t localMaxX = overlapMaxX - chunkBaseX;
+                const int32_t localMinY = overlapMinY - chunkBaseY;
+                const int32_t localMaxY = overlapMaxY - chunkBaseY;
+                const int32_t localMinZ = overlapMinZ - chunkBaseZ;
+                const int32_t localMaxZ = overlapMaxZ - chunkBaseZ;
+
+                const int32_t directMinPageX = std::clamp(localMinX / EDIT_PAGE_SIZE_XZ_CELLS, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t directMaxPageX = std::clamp(localMaxX / EDIT_PAGE_SIZE_XZ_CELLS, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t directMinPageZ = std::clamp(localMinZ / EDIT_PAGE_SIZE_XZ_CELLS, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t directMaxPageZ = std::clamp(localMaxZ / EDIT_PAGE_SIZE_XZ_CELLS, 0, EDIT_PAGES_PER_AXIS - 1);
+
+                const int32_t dirtyMinPageX = std::clamp(directMinPageX - EDIT_PAGE_HALO_PAGES, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t dirtyMaxPageX = std::clamp(directMaxPageX + EDIT_PAGE_HALO_PAGES, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t dirtyMinPageZ = std::clamp(directMinPageZ - EDIT_PAGE_HALO_PAGES, 0, EDIT_PAGES_PER_AXIS - 1);
+                const int32_t dirtyMaxPageZ = std::clamp(directMaxPageZ + EDIT_PAGE_HALO_PAGES, 0, EDIT_PAGES_PER_AXIS - 1);
+
+                const int32_t minVoxelY = std::clamp((localMinY / EDIT_CELLS_PER_VOXEL) - 1, 0, (EDIT_CHUNK_CELLS_Y / EDIT_CELLS_PER_VOXEL) - 1);
+                const int32_t maxVoxelY = std::clamp((localMaxY / EDIT_CELLS_PER_VOXEL) + 1, 0, (EDIT_CHUNK_CELLS_Y / EDIT_CELLS_PER_VOXEL) - 1);
+
+                auto& chunkPages = result.dirtyChunkPages[ChunkCoord(chunkX, chunkY, chunkZ)];
+                chunkPages.pageIds.reserve(
+                    chunkPages.pageIds.size() +
+                    static_cast<size_t>((dirtyMaxPageX - dirtyMinPageX + 1) * (dirtyMaxPageZ - dirtyMinPageZ + 1)));
+                chunkPages.pageBounds.reserve(chunkPages.pageIds.capacity());
+
+                for (int32_t pageZ = dirtyMinPageZ; pageZ <= dirtyMaxPageZ; ++pageZ) {
+                    for (int32_t pageX = dirtyMinPageX; pageX <= dirtyMaxPageX; ++pageX) {
+                        const bool isHalo =
+                            pageX < directMinPageX || pageX > directMaxPageX ||
+                            pageZ < directMinPageZ || pageZ > directMaxPageZ;
+                        if (isHalo) {
+                            ++chunkPages.haloPages;
+                        } else {
+                            ++chunkPages.directPages;
+                        }
+
+                        chunkPages.pageIds.push_back(packEditPageId(pageX, pageZ));
+                        chunkPages.pageBounds.push_back(DirtyPageBounds{
+                            static_cast<uint16_t>(pageX * EDIT_PAGE_SIZE_XZ_VOXELS),
+                            static_cast<uint16_t>(pageX * EDIT_PAGE_SIZE_XZ_VOXELS + EDIT_PAGE_SIZE_XZ_VOXELS - 1),
+                            static_cast<uint16_t>(minVoxelY),
+                            static_cast<uint16_t>(maxVoxelY),
+                            static_cast<uint16_t>(pageZ * EDIT_PAGE_SIZE_XZ_VOXELS),
+                            static_cast<uint16_t>(pageZ * EDIT_PAGE_SIZE_XZ_VOXELS + EDIT_PAGE_SIZE_XZ_VOXELS - 1),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+} // namespace
+
+bool TerrainEditOverlayStore::Brick::set(const GridCoord& localCoord, const CellValue& value) {
+    if (uniformActive) {
+        if (uniformValue == value) {
+            return false;
+        }
+        materializeUniform();
+    }
+
+    DetailedData& data = ensureDetailed();
+    const size_t index = flattenBrickIndex(localCoord);
+    const bool wasActive = data.activeMask.test(index);
+
+    if (wasActive && data.cells[index] == value) {
+        return false;
+    }
+
+    data.cells[index] = value;
+    if (!wasActive) {
+        data.activeMask.set(index);
+        ++activeCount;
+    }
+
+    return true;
+}
+
+bool TerrainEditOverlayStore::Brick::clear(const GridCoord& localCoord) {
+    if (uniformActive) {
+        materializeUniform();
+    }
+
+    if (!detailed) {
+        return false;
+    }
+
+    const size_t index = flattenBrickIndex(localCoord);
+    if (!detailed->activeMask.test(index)) {
+        return false;
+    }
+
+    detailed->activeMask.reset(index);
+    if (activeCount > 0) {
+        --activeCount;
+    }
+    detailed->cells[index] = CellValue{};
+    if (activeCount == 0) {
+        detailed.reset();
+    }
+    return true;
+}
+
+std::optional<CellValue> TerrainEditOverlayStore::Brick::get(const GridCoord& localCoord) const {
+    if (uniformActive) {
+        return uniformValue;
+    }
+
+    if (!detailed) {
+        return std::nullopt;
+    }
+
+    const size_t index = flattenBrickIndex(localCoord);
+    if (!detailed->activeMask.test(index)) {
+        return std::nullopt;
+    }
+    return detailed->cells[index];
+}
+
+bool TerrainEditOverlayStore::Brick::fillAll(const CellValue& value) {
+    if (uniformActive && uniformValue == value) {
+        return false;
+    }
+
+    uniformActive = true;
+    uniformValue = value;
+    activeCount = EDIT_BRICK_CELL_COUNT;
+    detailed.reset();
+    return true;
+}
+
+void TerrainEditOverlayStore::Brick::materializeUniform() {
+    if (!uniformActive) {
+        return;
+    }
+
+    DetailedData& data = ensureDetailed();
+    data.cells.fill(uniformValue);
+    data.activeMask.set();
+    activeCount = EDIT_BRICK_CELL_COUNT;
+    uniformActive = false;
+}
+
+TerrainEditOverlayStore::Brick::DetailedData& TerrainEditOverlayStore::Brick::ensureDetailed() {
+    if (!detailed) {
+        detailed = std::make_unique<DetailedData>();
+    }
+    return *detailed;
+}
+
+void TerrainEditOverlayStore::normalizeBounds(const GridCoord& a,
+                                              const GridCoord& b,
+                                              GridCoord& outMin,
+                                              GridCoord& outMax) {
+    outMin = GridCoord(
+        std::min(a.x, b.x),
+        std::min(a.y, b.y),
+        std::min(a.z, b.z)
+    );
+    outMax = GridCoord(
+        std::max(a.x, b.x),
+        std::max(a.y, b.y),
+        std::max(a.z, b.z)
+    );
+}
+
+TerrainEditOverlayStore::Brick& TerrainEditOverlayStore::getOrCreateBrickLocked(const BrickCoord& brickCoord) {
+    auto it = m_bricks.find(brickCoord);
+    if (it != m_bricks.end()) {
+        return it->second;
+    }
+    return m_bricks.emplace(brickCoord, Brick{}).first->second;
+}
+
+uint64_t TerrainEditOverlayStore::packChunkXZKey(int32_t chunkX, int32_t chunkZ) {
+    return (static_cast<uint64_t>(static_cast<uint32_t>(chunkX)) << 32) |
+           static_cast<uint32_t>(chunkZ);
+}
+
+void TerrainEditOverlayStore::rebuildDeferredFillChunkIndexLocked() {
+    m_boxFillChunkIndex.clear();
+    m_sphereFillChunkIndex.clear();
+    m_cylinderFillChunkIndex.clear();
+    m_boxFillChunk3DIndex.clear();
+    m_sphereFillChunk3DIndex.clear();
+    m_cylinderFillChunk3DIndex.clear();
+
+    auto indexFillRange = [](ChunkXZFillIndexMap& xzIndexMap,
+                             ChunkFillIndexMap& chunk3DIndexMap,
+                             const GridCoord& minCoord,
+                             const GridCoord& maxCoord,
+                             uint32_t fillIndex) {
+        const ChunkCoord minChunk = gridToChunk(minCoord);
+        const ChunkCoord maxChunk = gridToChunk(maxCoord);
+        for (int32_t cy = minChunk.y; cy <= maxChunk.y; ++cy) {
+            for (int32_t cz = minChunk.z; cz <= maxChunk.z; ++cz) {
+                for (int32_t cx = minChunk.x; cx <= maxChunk.x; ++cx) {
+                    xzIndexMap[packChunkXZKey(cx, cz)].push_back(fillIndex);
+                    chunk3DIndexMap[ChunkCoord(cx, cy, cz)].push_back(fillIndex);
+                }
+            }
+        }
+    };
+
+    auto reserve3D = [](ChunkFillIndexMap& indexMap, size_t fillCount) {
+        if (fillCount == 0) return;
+        if (indexMap.bucket_count() < fillCount) {
+            indexMap.reserve(fillCount);
+        }
+    };
+    reserve3D(m_boxFillChunk3DIndex, m_boxFills.size());
+    reserve3D(m_sphereFillChunk3DIndex, m_sphereFills.size());
+    reserve3D(m_cylinderFillChunk3DIndex, m_cylinderFills.size());
+
+    for (uint32_t i = 0; i < static_cast<uint32_t>(m_boxFills.size()); ++i) {
+        indexFillRange(m_boxFillChunkIndex, m_boxFillChunk3DIndex, m_boxFills[i].min, m_boxFills[i].max, i);
+    }
+    for (uint32_t i = 0; i < static_cast<uint32_t>(m_sphereFills.size()); ++i) {
+        indexFillRange(m_sphereFillChunkIndex, m_sphereFillChunk3DIndex, m_sphereFills[i].bboxMin, m_sphereFills[i].bboxMax, i);
+    }
+    for (uint32_t i = 0; i < static_cast<uint32_t>(m_cylinderFills.size()); ++i) {
+        indexFillRange(m_cylinderFillChunkIndex, m_cylinderFillChunk3DIndex, m_cylinderFills[i].bboxMin, m_cylinderFills[i].bboxMax, i);
+    }
+}
+
+void TerrainEditOverlayStore::materializeOneFillLocked(const BoxFill& fill) {
+    const BrickCoord minBrick = gridToBrick(fill.min);
+    const BrickCoord maxBrick = gridToBrick(fill.max);
+
+    for (int32_t by = minBrick.y; by <= maxBrick.y; ++by) {
+        for (int32_t bz = minBrick.z; bz <= maxBrick.z; ++bz) {
+            for (int32_t bx = minBrick.x; bx <= maxBrick.x; ++bx) {
+                auto [it, inserted] = m_bricks.try_emplace(BrickCoord(bx, by, bz));
+                Brick& brick = it->second;
+
+                // Existing uniform brick from a later edit — keep it.
+                if (brick.uniformActive) continue;
+
+                const GridCoord brickBase(
+                    bx * EDIT_BRICK_EDGE_CELLS,
+                    by * EDIT_BRICK_EDGE_CELLS,
+                    bz * EDIT_BRICK_EDGE_CELLS);
+                const int32_t localMinX = std::max(0, fill.min.x - brickBase.x);
+                const int32_t localMaxX = std::min(EDIT_BRICK_EDGE_CELLS - 1,
+                                                   fill.max.x - brickBase.x);
+                const int32_t localMinY = std::max(0, fill.min.y - brickBase.y);
+                const int32_t localMaxY = std::min(EDIT_BRICK_EDGE_CELLS - 1,
+                                                   fill.max.y - brickBase.y);
+                const int32_t localMinZ = std::max(0, fill.min.z - brickBase.z);
+                const int32_t localMaxZ = std::min(EDIT_BRICK_EDGE_CELLS - 1,
+                                                   fill.max.z - brickBase.z);
+                const bool fullyCovered =
+                    localMinX == 0 &&
+                    localMaxX == EDIT_BRICK_EDGE_CELLS - 1 &&
+                    localMinY == 0 &&
+                    localMaxY == EDIT_BRICK_EDGE_CELLS - 1 &&
+                    localMinZ == 0 &&
+                    localMaxZ == EDIT_BRICK_EDGE_CELLS - 1;
+
+                if ((inserted || brick.empty()) && fullyCovered) {
+                    brick.fillAll(fill.value);
+                } else {
+                    // Partially covered or has per-cell data — fill only
+                    // unset cells within the fill bounds.
+                    for (int32_t ly = localMinY; ly <= localMaxY; ++ly) {
+                        for (int32_t lz = localMinZ; lz <= localMaxZ; ++lz) {
+                            for (int32_t lx = localMinX; lx <= localMaxX; ++lx) {
+                                const GridCoord lc(lx, ly, lz);
+                                if (!inserted && brick.detailed &&
+                                    brick.detailed->activeMask.test(flattenBrickIndex(lc))) {
+                                    continue;
+                                }
+                                brick.set(lc, fill.value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+void TerrainEditOverlayStore::materializeBoxFillsLocked() {
+    for (const auto& fill : m_boxFills) {
+        materializeOneFillLocked(fill);
+    }
+    m_boxFills.clear();
+    rebuildDeferredFillChunkIndexLocked();
+}
+
+void TerrainEditOverlayStore::materializeSphereFillsLocked() {
+    for (const auto& sf : m_sphereFills) {
+        const float invRx = 1.0f / sf.radiusX;
+        const float invRy = 1.0f / sf.radiusY;
+        const float invRz = 1.0f / sf.radiusZ;
+        for (int32_t y = sf.bboxMin.y; y <= sf.bboxMax.y; ++y) {
+            const float dy = (static_cast<float>(y) - sf.centerY) * invRy;
+            const float dy2 = dy * dy;
+            if (dy2 > 1.0f) continue;
+            for (int32_t z = sf.bboxMin.z; z <= sf.bboxMax.z; ++z) {
+                const float dz = (static_cast<float>(z) - sf.centerZ) * invRz;
+                const float dyz2 = dy2 + dz * dz;
+                if (dyz2 > 1.0f) continue;
+                for (int32_t x = sf.bboxMin.x; x <= sf.bboxMax.x; ++x) {
+                    const float dx = (static_cast<float>(x) - sf.centerX) * invRx;
+                    if (dx * dx + dyz2 > 1.0f) continue;
+                    const BrickCoord bc = gridToBrick(GridCoord(x, y, z));
+                    const GridCoord lc = getGridLocalInBrick(GridCoord(x, y, z));
+                    getOrCreateBrickLocked(bc).set(lc, sf.value);
+                }
+            }
+        }
+    }
+    m_sphereFills.clear();
+    rebuildDeferredFillChunkIndexLocked();
+}
+
+void TerrainEditOverlayStore::materializeCylinderFillsLocked() {
+    for (const auto& cf : m_cylinderFills) {
+        int uAxis, vAxis;
+        if (cf.axis == 0) { uAxis = 1; vAxis = 2; }
+        else if (cf.axis == 2) { uAxis = 0; vAxis = 1; }
+        else { uAxis = 0; vAxis = 2; }
+
+        const float invRu = 1.0f / cf.radiusU;
+        const float invRv = 1.0f / cf.radiusV;
+        // Iterate along the extrusion axis (outer), circle plane (inner).
+        for (int32_t y = cf.bboxMin.y; y <= cf.bboxMax.y; ++y) {
+            for (int32_t z = cf.bboxMin.z; z <= cf.bboxMax.z; ++z) {
+                for (int32_t x = cf.bboxMin.x; x <= cf.bboxMax.x; ++x) {
+                    const GridCoord gc(x, y, z);
+                    const float du = (static_cast<float>(gc[uAxis]) - cf.centerU) * invRu;
+                    const float dv = (static_cast<float>(gc[vAxis]) - cf.centerV) * invRv;
+                    if (du * du + dv * dv > 1.0f) continue;
+                    const BrickCoord bc = gridToBrick(gc);
+                    const GridCoord lc = getGridLocalInBrick(gc);
+                    getOrCreateBrickLocked(bc).set(lc, cf.value);
+                }
+            }
+        }
+    }
+    m_cylinderFills.clear();
+    rebuildDeferredFillChunkIndexLocked();
+}
+
+void TerrainEditOverlayStore::materializeBoxFillsInRangeLocked(
+    const GridCoord& rangeMin, const GridCoord& rangeMax)
+{
+    auto it = m_boxFills.begin();
+    while (it != m_boxFills.end()) {
+        if (it->max.x < rangeMin.x || it->min.x > rangeMax.x ||
+            it->max.y < rangeMin.y || it->min.y > rangeMax.y ||
+            it->max.z < rangeMin.z || it->min.z > rangeMax.z) {
+            ++it;
+            continue;
+        }
+        materializeOneFillLocked(*it);
+        it = m_boxFills.erase(it);
+    }
+
+    // Also materialize any sphere fills that overlap the range.
+    auto sit = m_sphereFills.begin();
+    while (sit != m_sphereFills.end()) {
+        if (sit->bboxMax.x < rangeMin.x || sit->bboxMin.x > rangeMax.x ||
+            sit->bboxMax.y < rangeMin.y || sit->bboxMin.y > rangeMax.y ||
+            sit->bboxMax.z < rangeMin.z || sit->bboxMin.z > rangeMax.z) {
+            ++sit;
+            continue;
+        }
+        // Materialize only cells in the overlap region that pass the sphere test.
+        const int32_t oMinX = std::max(sit->bboxMin.x, rangeMin.x);
+        const int32_t oMaxX = std::min(sit->bboxMax.x, rangeMax.x);
+        const int32_t oMinY = std::max(sit->bboxMin.y, rangeMin.y);
+        const int32_t oMaxY = std::min(sit->bboxMax.y, rangeMax.y);
+        const int32_t oMinZ = std::max(sit->bboxMin.z, rangeMin.z);
+        const int32_t oMaxZ = std::min(sit->bboxMax.z, rangeMax.z);
+        const float invRx = 1.0f / sit->radiusX;
+        const float invRy = 1.0f / sit->radiusY;
+        const float invRz = 1.0f / sit->radiusZ;
+        for (int32_t y = oMinY; y <= oMaxY; ++y) {
+            const float dy = (static_cast<float>(y) - sit->centerY) * invRy;
+            const float dy2 = dy * dy;
+            if (dy2 > 1.0f) continue;
+            for (int32_t z = oMinZ; z <= oMaxZ; ++z) {
+                const float dz = (static_cast<float>(z) - sit->centerZ) * invRz;
+                const float dyz2 = dy2 + dz * dz;
+                if (dyz2 > 1.0f) continue;
+                for (int32_t x = oMinX; x <= oMaxX; ++x) {
+                    const float dx = (static_cast<float>(x) - sit->centerX) * invRx;
+                    if (dx * dx + dyz2 > 1.0f) continue;
+                    const BrickCoord bc = gridToBrick(GridCoord(x, y, z));
+                    const GridCoord lc = getGridLocalInBrick(GridCoord(x, y, z));
+                    getOrCreateBrickLocked(bc).set(lc, sit->value);
+                }
+            }
+        }
+        sit = m_sphereFills.erase(sit);
+    }
+
+    // Also materialize any cylinder fills that overlap the range.
+    auto cit = m_cylinderFills.begin();
+    while (cit != m_cylinderFills.end()) {
+        if (cit->bboxMax.x < rangeMin.x || cit->bboxMin.x > rangeMax.x ||
+            cit->bboxMax.y < rangeMin.y || cit->bboxMin.y > rangeMax.y ||
+            cit->bboxMax.z < rangeMin.z || cit->bboxMin.z > rangeMax.z) {
+            ++cit;
+            continue;
+        }
+        int uAxis, vAxis;
+        if (cit->axis == 0) { uAxis = 1; vAxis = 2; }
+        else if (cit->axis == 2) { uAxis = 0; vAxis = 1; }
+        else { uAxis = 0; vAxis = 2; }
+        const float invRu = 1.0f / cit->radiusU;
+        const float invRv = 1.0f / cit->radiusV;
+        const int32_t oMinX = std::max(cit->bboxMin.x, rangeMin.x);
+        const int32_t oMaxX = std::min(cit->bboxMax.x, rangeMax.x);
+        const int32_t oMinY = std::max(cit->bboxMin.y, rangeMin.y);
+        const int32_t oMaxY = std::min(cit->bboxMax.y, rangeMax.y);
+        const int32_t oMinZ = std::max(cit->bboxMin.z, rangeMin.z);
+        const int32_t oMaxZ = std::min(cit->bboxMax.z, rangeMax.z);
+        for (int32_t y = oMinY; y <= oMaxY; ++y) {
+            for (int32_t z = oMinZ; z <= oMaxZ; ++z) {
+                for (int32_t x = oMinX; x <= oMaxX; ++x) {
+                    const GridCoord gc(x, y, z);
+                    const float du = (static_cast<float>(gc[uAxis]) - cit->centerU) * invRu;
+                    const float dv = (static_cast<float>(gc[vAxis]) - cit->centerV) * invRv;
+                    if (du * du + dv * dv > 1.0f) continue;
+                    const BrickCoord bc = gridToBrick(gc);
+                    const GridCoord lc = getGridLocalInBrick(gc);
+                    getOrCreateBrickLocked(bc).set(lc, cit->value);
+                }
+            }
+        }
+        cit = m_cylinderFills.erase(cit);
+    }
+
+    rebuildDeferredFillChunkIndexLocked();
+}
+
+void TerrainEditOverlayStore::clear() {
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    m_bricks.clear();
+    m_boxFills.clear();
+    m_sphereFills.clear();
+    m_cylinderFills.clear();
+    m_chunkEditCounts.clear();
+    m_boxFillChunkIndex.clear();
+    m_sphereFillChunkIndex.clear();
+    m_cylinderFillChunkIndex.clear();
+    m_editedCellCount = 0;
+    m_overlayGeneration.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool TerrainEditOverlayStore::hasAnyEdits() const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return m_editedCellCount > 0;
+}
+
+size_t TerrainEditOverlayStore::getBrickCount() const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return m_bricks.size();
+}
+
+size_t TerrainEditOverlayStore::getEditedCellCount() const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return m_editedCellCount;
+}
+
+TerrainEditOverlayStore::DeferredFillCounts TerrainEditOverlayStore::getDeferredFillCounts() const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return {
+        static_cast<uint32_t>(m_sphereFills.size()),
+        static_cast<uint32_t>(m_boxFills.size()),
+        static_cast<uint32_t>(m_cylinderFills.size()),
+        static_cast<uint32_t>(m_bricks.size())
+    };
+}
+
+// --- saveToFile() and loadFromFile() implementations live in
+//     TerrainEditOverlayStore_IO.cpp (binary file format I/O). ---
+
+bool TerrainEditOverlayStore::setCell(const GridCoord& coord,
+                                      const CellValue& value,
+                                      ChunkSet* touchedChunks) {
+    if (touchedChunks) {
+        collectTouchedChunksForCell(coord, *touchedChunks);
+    }
+
+    const BrickCoord brickCoord = gridToBrick(coord);
+    const GridCoord localCoord = getGridLocalInBrick(coord);
+    const ChunkCoord chunkCoord = gridToChunk(coord);
+
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+    Brick& brick = getOrCreateBrickLocked(brickCoord);
+
+    const bool alreadyHadOverride = brick.get(localCoord).has_value();
+    if (!brick.set(localCoord, value)) {
+        return false;
+    }
+
+    if (!alreadyHadOverride) {
+        ++m_editedCellCount;
+        ++m_chunkEditCounts[chunkCoord];
+    }
+
+    m_overlayGeneration.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+bool TerrainEditOverlayStore::clearCell(const GridCoord& coord,
+                                        ChunkSet* touchedChunks) {
+    if (touchedChunks) {
+        collectTouchedChunksForCell(coord, *touchedChunks);
+    }
+
+    const BrickCoord brickCoord = gridToBrick(coord);
+    const GridCoord localCoord = getGridLocalInBrick(coord);
+    const ChunkCoord chunkCoord = gridToChunk(coord);
+
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+
+    // Materialize any box fills covering this cell so their data
+    // becomes brick-level and can be properly cleared.
+    materializeBoxFillsInRangeLocked(coord, coord);
+
+    auto brickIt = m_bricks.find(brickCoord);
+    if (brickIt == m_bricks.end()) {
+        return false;
+    }
+
+    if (!brickIt->second.clear(localCoord)) {
+        return false;
+    }
+
+    if (m_editedCellCount > 0) {
+        --m_editedCellCount;
+    }
+
+    auto chunkIt = m_chunkEditCounts.find(chunkCoord);
+    if (chunkIt != m_chunkEditCounts.end()) {
+        if (chunkIt->second > 1) {
+            --chunkIt->second;
+        } else {
+            m_chunkEditCounts.erase(chunkIt);
+        }
+    }
+
+    if (brickIt->second.empty()) {
+        m_bricks.erase(brickIt);
+    }
+
+    m_overlayGeneration.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+std::optional<CellValue> TerrainEditOverlayStore::getOverride(const GridCoord& coord) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+    // Check bricks first — per-cell edits take precedence over box fills.
+    const BrickCoord brickCoord = gridToBrick(coord);
+    const auto brickIt = m_bricks.find(brickCoord);
+    if (brickIt != m_bricks.end()) {
+        auto val = brickIt->second.get(getGridLocalInBrick(coord));
+        if (val.has_value()) return val;
+    }
+
+    // Check box fills (reverse — newest wins).
+    for (auto rit = m_boxFills.rbegin(); rit != m_boxFills.rend(); ++rit) {
+        if (coord.x >= rit->min.x && coord.x <= rit->max.x &&
+            coord.y >= rit->min.y && coord.y <= rit->max.y &&
+            coord.z >= rit->min.z && coord.z <= rit->max.z) {
+            return rit->value;
+        }
+    }
+
+    // Check sphere fills (reverse — newest wins).
+    for (auto rit = m_sphereFills.rbegin(); rit != m_sphereFills.rend(); ++rit) {
+        if (coord.x < rit->bboxMin.x || coord.x > rit->bboxMax.x ||
+            coord.y < rit->bboxMin.y || coord.y > rit->bboxMax.y ||
+            coord.z < rit->bboxMin.z || coord.z > rit->bboxMax.z)
+            continue;
+        const float dx = (static_cast<float>(coord.x) - rit->centerX) / rit->radiusX;
+        const float dy = (static_cast<float>(coord.y) - rit->centerY) / rit->radiusY;
+        const float dz = (static_cast<float>(coord.z) - rit->centerZ) / rit->radiusZ;
+        if (dx * dx + dy * dy + dz * dz <= 1.0f) return rit->value;
+    }
+
+    // Check cylinder fills (reverse — newest wins).
+    for (auto rit = m_cylinderFills.rbegin(); rit != m_cylinderFills.rend(); ++rit) {
+        if (coord.x < rit->bboxMin.x || coord.x > rit->bboxMax.x ||
+            coord.y < rit->bboxMin.y || coord.y > rit->bboxMax.y ||
+            coord.z < rit->bboxMin.z || coord.z > rit->bboxMax.z)
+            continue;
+        int uAxis, vAxis;
+        if (rit->axis == 0) { uAxis = 1; vAxis = 2; }
+        else if (rit->axis == 2) { uAxis = 0; vAxis = 1; }
+        else { uAxis = 0; vAxis = 2; }
+        const float du = (static_cast<float>(coord[uAxis]) - rit->centerU) / rit->radiusU;
+        const float dv = (static_cast<float>(coord[vAxis]) - rit->centerV) / rit->radiusV;
+        if (du * du + dv * dv <= 1.0f) return rit->value;
+    }
+
+    return std::nullopt;
+}
+
+bool TerrainEditOverlayStore::hasOverride(const GridCoord& coord) const {
+    return getOverride(coord).has_value();
+}
+
+bool TerrainEditOverlayStore::hasEditsInChunk(const ChunkCoord& chunkCoord) const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    return m_chunkEditCounts.find(chunkCoord) != m_chunkEditCounts.end();
+}
+
+TerrainEditOverlayStore::ChunkSet TerrainEditOverlayStore::getEditedChunkCoords() const {
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+    ChunkSet result;
+    result.reserve(m_chunkEditCounts.size());
+    for (const auto& [coord, count] : m_chunkEditCounts) {
+        result.insert(coord);
+    }
+    return result;
+}
+
+TerrainEditOverlayStore::BoxEditResult TerrainEditOverlayStore::writeBox(const GridCoord& a,
+                                                                         const GridCoord& b,
+                                                                         const CellValue& value) {
+    BoxEditResult result;
+    collectTouchedChunksForBounds(a, b, result.touchedChunks);
+    appendDirtyPagesForBounds(a, b, result);
+
+    GridCoord minCoord;
+    GridCoord maxCoord;
+    normalizeBounds(a, b, minCoord, maxCoord);
+
+    const BrickCoord minBrick = gridToBrick(minCoord);
+    const BrickCoord maxBrick = gridToBrick(maxCoord);
+    const ChunkCoord minChunk = gridToChunk(minCoord);
+    const ChunkCoord maxChunk = gridToChunk(maxCoord);
+
+    const uint64_t touchedBrickCount =
+        axisCountInclusive(minBrick.x, maxBrick.x) *
+        axisCountInclusive(minBrick.y, maxBrick.y) *
+        axisCountInclusive(minBrick.z, maxBrick.z);
+    const uint64_t touchedChunkCount =
+        axisCountInclusive(minChunk.x, maxChunk.x) *
+        axisCountInclusive(minChunk.y, maxChunk.y) *
+        axisCountInclusive(minChunk.z, maxChunk.z);
+
+    std::unordered_map<ChunkCoord, uint32_t, IVec3Hash, IVec3Equal> newOverridesPerChunk;
+    const size_t reserveChunkCount = static_cast<size_t>(
+        std::min<uint64_t>(std::max<uint64_t>(1u, touchedChunkCount), static_cast<uint64_t>(SIZE_MAX)));
+    newOverridesPerChunk.reserve(reserveChunkCount);
+
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+
+    // --- Box fill fast path for large edits ---
+    // When the edit spans many bricks, store a compact fill volume instead
+    // of creating individual hash-map nodes.  This makes large edits O(1)
+    // regardless of volume size.
+    if (touchedBrickCount > 64) {
+        // Deduplicate: replace the last box fill if same value and fully
+        // overlapping.  Common when holding the mouse in one spot.
+        bool replaced = false;
+        if (!m_boxFills.empty()) {
+            auto& last = m_boxFills.back();
+            if (last.value == value &&
+                std::abs(last.min.x - minCoord.x) <= 1 &&
+                std::abs(last.min.y - minCoord.y) <= 1 &&
+                std::abs(last.min.z - minCoord.z) <= 1 &&
+                std::abs(last.max.x - maxCoord.x) <= 1 &&
+                std::abs(last.max.y - maxCoord.y) <= 1 &&
+                std::abs(last.max.z - maxCoord.z) <= 1) {
+                last = {minCoord, maxCoord, value};
+                replaced = true;
+            }
+        }
+        if (!replaced) {
+            m_boxFills.push_back({minCoord, maxCoord, value});
+        }
+        rebuildDeferredFillChunkIndexLocked();
+
+        const uint64_t totalCells =
+            axisCountInclusive(minCoord.x, maxCoord.x) *
+            axisCountInclusive(minCoord.y, maxCoord.y) *
+            axisCountInclusive(minCoord.z, maxCoord.z);
+        result.cellsChanged = totalCells;
+        m_editedCellCount += totalCells;
+
+        for (int32_t cy = minChunk.y; cy <= maxChunk.y; ++cy) {
+            for (int32_t cz = minChunk.z; cz <= maxChunk.z; ++cz) {
+                for (int32_t cx = minChunk.x; cx <= maxChunk.x; ++cx) {
+                    const int32_t ccMinX = cx * EDIT_CHUNK_CELLS_XZ;
+                    const int32_t ccMaxX = ccMinX + EDIT_CHUNK_CELLS_XZ - 1;
+                    const int32_t ccMinY = cy * EDIT_CHUNK_CELLS_Y;
+                    const int32_t ccMaxY = ccMinY + EDIT_CHUNK_CELLS_Y - 1;
+                    const int32_t ccMinZ = cz * EDIT_CHUNK_CELLS_XZ;
+                    const int32_t ccMaxZ = ccMinZ + EDIT_CHUNK_CELLS_XZ - 1;
+                    const uint64_t overlapCells =
+                        axisCountInclusive(std::max(minCoord.x, ccMinX),
+                                           std::min(maxCoord.x, ccMaxX)) *
+                        axisCountInclusive(std::max(minCoord.y, ccMinY),
+                                           std::min(maxCoord.y, ccMaxY)) *
+                        axisCountInclusive(std::max(minCoord.z, ccMinZ),
+                                           std::min(maxCoord.z, ccMaxZ));
+                    m_chunkEditCounts[ChunkCoord(cx, cy, cz)] += static_cast<uint32_t>(
+                        std::min<uint64_t>(overlapCells, UINT32_MAX));
+                }
+            }
+        }
+        m_overlayGeneration.fetch_add(1, std::memory_order_relaxed);
+
+        return result;
+    }
+
+    if (touchedBrickCount > 0) {
+        const uint64_t desiredBrickCapacity64 =
+            static_cast<uint64_t>(m_bricks.size()) + touchedBrickCount;
+        const size_t desiredBrickCapacity = static_cast<size_t>(
+            std::min<uint64_t>(desiredBrickCapacity64, static_cast<uint64_t>(SIZE_MAX)));
+        if (desiredBrickCapacity > m_bricks.size()) {
+            m_bricks.reserve(desiredBrickCapacity);
+        }
+    }
+    if (reserveChunkCount > m_chunkEditCounts.size()) {
+        m_chunkEditCounts.reserve(m_chunkEditCounts.size() + reserveChunkCount);
+    }
+
+    // --- Determine if the ENTIRE brick range is fully covered (common case) ---
+    // When every brick in the range is fully filled with the same value, we can
+    // avoid per-brick local min/max checks and use a faster try_emplace path.
+    const bool boxAlignedToFullBricks =
+        (minCoord.x == minBrick.x * EDIT_BRICK_EDGE_CELLS) &&
+        (minCoord.y == minBrick.y * EDIT_BRICK_EDGE_CELLS) &&
+        (minCoord.z == minBrick.z * EDIT_BRICK_EDGE_CELLS) &&
+        (maxCoord.x == (maxBrick.x + 1) * EDIT_BRICK_EDGE_CELLS - 1) &&
+        (maxCoord.y == (maxBrick.y + 1) * EDIT_BRICK_EDGE_CELLS - 1) &&
+        (maxCoord.z == (maxBrick.z + 1) * EDIT_BRICK_EDGE_CELLS - 1);
+
+    if (boxAlignedToFullBricks) {
+        // Fast path: all bricks are fully covered — skip per-cell local bounds.
+        for (int32_t brickY = minBrick.y; brickY <= maxBrick.y; ++brickY) {
+            for (int32_t brickZ = minBrick.z; brickZ <= maxBrick.z; ++brickZ) {
+                for (int32_t brickX = minBrick.x; brickX <= maxBrick.x; ++brickX) {
+                    const BrickCoord brickCoord(brickX, brickY, brickZ);
+                    auto [it, inserted] = m_bricks.try_emplace(brickCoord);
+                    Brick& brick = it->second;
+
+                    if (inserted) {
+                        // Brand new brick
+                        brick.fillAll(value);
+                        result.cellsChanged += EDIT_BRICK_CELL_COUNT;
+                        m_editedCellCount += EDIT_BRICK_CELL_COUNT;
+                        const GridCoord brickBase(
+                            brickX * EDIT_BRICK_EDGE_CELLS,
+                            brickY * EDIT_BRICK_EDGE_CELLS,
+                            brickZ * EDIT_BRICK_EDGE_CELLS);
+                        newOverridesPerChunk[gridToChunk(brickBase)] += EDIT_BRICK_CELL_COUNT;
+                    } else if (brick.uniformActive && brick.uniformValue == value) {
+                        // Already filled with same value — skip
+                    } else if (brick.uniformActive) {
+                        // Uniform with different value — all cells change
+                        brick.fillAll(value);
+                        result.cellsChanged += EDIT_BRICK_CELL_COUNT;
+                    } else if (brick.empty()) {
+                        brick.fillAll(value);
+                        result.cellsChanged += EDIT_BRICK_CELL_COUNT;
+                        m_editedCellCount += EDIT_BRICK_CELL_COUNT;
+                        const GridCoord brickBase(
+                            brickX * EDIT_BRICK_EDGE_CELLS,
+                            brickY * EDIT_BRICK_EDGE_CELLS,
+                            brickZ * EDIT_BRICK_EDGE_CELLS);
+                        newOverridesPerChunk[gridToChunk(brickBase)] += EDIT_BRICK_CELL_COUNT;
+                    } else {
+                        // Detailed brick — derive counts from activeCount (O(1))
+                        const uint32_t newOvr = EDIT_BRICK_CELL_COUNT - brick.activeCount;
+                        brick.fillAll(value);
+                        result.cellsChanged += EDIT_BRICK_CELL_COUNT;
+                        if (newOvr > 0) {
+                            m_editedCellCount += newOvr;
+                            const GridCoord brickBase(
+                                brickX * EDIT_BRICK_EDGE_CELLS,
+                                brickY * EDIT_BRICK_EDGE_CELLS,
+                                brickZ * EDIT_BRICK_EDGE_CELLS);
+                            newOverridesPerChunk[gridToChunk(brickBase)] += newOvr;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+    // General path: some bricks are partially covered.
+    for (int32_t brickY = minBrick.y; brickY <= maxBrick.y; ++brickY) {
+        for (int32_t brickZ = minBrick.z; brickZ <= maxBrick.z; ++brickZ) {
+            for (int32_t brickX = minBrick.x; brickX <= maxBrick.x; ++brickX) {
+                const BrickCoord brickCoord(brickX, brickY, brickZ);
+                const GridCoord brickBase(
+                    brickX * EDIT_BRICK_EDGE_CELLS,
+                    brickY * EDIT_BRICK_EDGE_CELLS,
+                    brickZ * EDIT_BRICK_EDGE_CELLS);
+
+                const int32_t localMinX = std::max(0, minCoord.x - brickBase.x);
+                const int32_t localMaxX = std::min(EDIT_BRICK_EDGE_CELLS - 1, maxCoord.x - brickBase.x);
+                const int32_t localMinY = std::max(0, minCoord.y - brickBase.y);
+                const int32_t localMaxY = std::min(EDIT_BRICK_EDGE_CELLS - 1, maxCoord.y - brickBase.y);
+                const int32_t localMinZ = std::max(0, minCoord.z - brickBase.z);
+                const int32_t localMaxZ = std::min(EDIT_BRICK_EDGE_CELLS - 1, maxCoord.z - brickBase.z);
+                const bool coversWholeBrick =
+                    localMinX == 0 &&
+                    localMaxX == (EDIT_BRICK_EDGE_CELLS - 1) &&
+                    localMinY == 0 &&
+                    localMaxY == (EDIT_BRICK_EDGE_CELLS - 1) &&
+                    localMinZ == 0 &&
+                    localMaxZ == (EDIT_BRICK_EDGE_CELLS - 1);
+
+                auto [it, inserted] = m_bricks.try_emplace(brickCoord);
+                Brick& brick = it->second;
+                const ChunkCoord chunkCoord = gridToChunk(brickBase);
+
+                if (coversWholeBrick) {
+                    uint32_t newOverrideCount = 0;
+                    uint32_t changedCount = 0;
+
+                    if (inserted || brick.empty()) {
+                        newOverrideCount = EDIT_BRICK_CELL_COUNT;
+                        changedCount = EDIT_BRICK_CELL_COUNT;
+                    } else if (brick.uniformActive) {
+                        if (brick.uniformValue != value) {
+                            changedCount = EDIT_BRICK_CELL_COUNT;
+                        }
+                    } else {
+                        // Detailed brick — derive counts from activeCount (O(1))
+                        newOverrideCount = EDIT_BRICK_CELL_COUNT - brick.activeCount;
+                        changedCount = EDIT_BRICK_CELL_COUNT;
+                    }
+
+                    if (changedCount == 0) {
+                        continue;
+                    }
+
+                    brick.fillAll(value);
+                    result.cellsChanged += changedCount;
+                    if (newOverrideCount > 0) {
+                        m_editedCellCount += newOverrideCount;
+                        newOverridesPerChunk[chunkCoord] += newOverrideCount;
+                    }
+                    continue;
+                }
+
+                for (int32_t localY = localMinY; localY <= localMaxY; ++localY) {
+                    for (int32_t localZ = localMinZ; localZ <= localMaxZ; ++localZ) {
+                        for (int32_t localX = localMinX; localX <= localMaxX; ++localX) {
+                            const GridCoord localCoord(localX, localY, localZ);
+                            const bool alreadyHadOverride = brick.get(localCoord).has_value();
+                            if (!brick.set(localCoord, value)) {
+                                continue;
+                            }
+
+                            ++result.cellsChanged;
+                            if (!alreadyHadOverride) {
+                                ++m_editedCellCount;
+                                const GridCoord globalCoord(
+                                    brickBase.x + localX,
+                                    brickBase.y + localY,
+                                    brickBase.z + localZ);
+                                ++newOverridesPerChunk[gridToChunk(globalCoord)];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    } // end general path
+
+    for (const auto& [chunkCoord, addedCount] : newOverridesPerChunk) {
+        m_chunkEditCounts[chunkCoord] += addedCount;
+    }
+
+    m_overlayGeneration.fetch_add(1, std::memory_order_relaxed);
+    return result;
+}
+
+TerrainEditOverlayStore::BoxEditResult TerrainEditOverlayStore::fillBox(const GridCoord& a,
+                                                                        const GridCoord& b,
+                                                                        const CellValue& value) {
+    return writeBox(a, b, value);
+}
+
+TerrainEditOverlayStore::BoxEditResult TerrainEditOverlayStore::writeSphere(
+    const GridCoord& bboxMin,
+    const GridCoord& bboxMax,
+    const CellValue& value)
+{
+    BoxEditResult result;
+    collectTouchedChunksForBounds(bboxMin, bboxMax, result.touchedChunks);
+    appendDirtyPagesForBounds(bboxMin, bboxMax, result);
+
+    GridCoord minCoord, maxCoord;
+    normalizeBounds(bboxMin, bboxMax, minCoord, maxCoord);
+
+    const float cx = (static_cast<float>(minCoord.x) + static_cast<float>(maxCoord.x)) * 0.5f;
+    const float cy = (static_cast<float>(minCoord.y) + static_cast<float>(maxCoord.y)) * 0.5f;
+    const float cz = (static_cast<float>(minCoord.z) + static_cast<float>(maxCoord.z)) * 0.5f;
+    const float rx = (static_cast<float>(maxCoord.x) - static_cast<float>(minCoord.x) + 1.0f) * 0.5f;
+    const float ry = (static_cast<float>(maxCoord.y) - static_cast<float>(minCoord.y) + 1.0f) * 0.5f;
+    const float rz = (static_cast<float>(maxCoord.z) - static_cast<float>(minCoord.z) + 1.0f) * 0.5f;
+
+    SphereFill sf{};
+    sf.centerX = cx; sf.centerY = cy; sf.centerZ = cz;
+    sf.radiusX = rx; sf.radiusY = ry; sf.radiusZ = rz;
+    sf.bboxMin = minCoord; sf.bboxMax = maxCoord;
+    sf.value = value;
+
+    // Estimate cell count (sphere ≈ π/6 of bbox volume)
+    const uint64_t bboxCells =
+        axisCountInclusive(minCoord.x, maxCoord.x) *
+        axisCountInclusive(minCoord.y, maxCoord.y) *
+        axisCountInclusive(minCoord.z, maxCoord.z);
+    const uint64_t sphereCells = static_cast<uint64_t>(
+        static_cast<double>(bboxCells) * 3.14159265358979 / 6.0);
+    result.cellsChanged = std::max<uint64_t>(sphereCells, 1u);
+
+    const ChunkCoord minChunk = gridToChunk(minCoord);
+    const ChunkCoord maxChunk = gridToChunk(maxCoord);
+
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+
+    // Deduplicate: if the last fill has the same value and a close center
+    // (within 2 cells), *replace* it instead of accumulating.  Handles the
+    // common hold-in-place pattern at zero cost — the list stays at size 1.
+    bool replaced = false;
+    if (!m_sphereFills.empty()) {
+        auto& last = m_sphereFills.back();
+        if (last.value == sf.value) {
+            const float dx = sf.centerX - last.centerX;
+            const float dy = sf.centerY - last.centerY;
+            const float dz = sf.centerZ - last.centerZ;
+            if (dx * dx + dy * dy + dz * dz < 4.0f) {
+                last = sf;
+                replaced = true;
+            }
+        }
+    }
+    if (!replaced) {
+        m_sphereFills.push_back(sf);
+    }
+    rebuildDeferredFillChunkIndexLocked();
+    m_editedCellCount += result.cellsChanged;
+
+    for (int32_t ccY = minChunk.y; ccY <= maxChunk.y; ++ccY) {
+        for (int32_t ccZ = minChunk.z; ccZ <= maxChunk.z; ++ccZ) {
+            for (int32_t ccX = minChunk.x; ccX <= maxChunk.x; ++ccX) {
+                m_chunkEditCounts[ChunkCoord(ccX, ccY, ccZ)] += 1;
+            }
+        }
+    }
+    m_overlayGeneration.fetch_add(1, std::memory_order_relaxed);
+
+    // Keep sphere fills deferred here. Materializing large ellipsoids into
+    // bricks on the input thread causes the rare 100-300ms cliffs seen while
+    // rapid circle edits are being spammed.
+    return result;
+}
+
+TerrainEditOverlayStore::BoxEditResult TerrainEditOverlayStore::writeCylinder(
+    const GridCoord& bboxMin,
+    const GridCoord& bboxMax,
+    const CellValue& value,
+    int axis)
+{
+    BoxEditResult result;
+    collectTouchedChunksForBounds(bboxMin, bboxMax, result.touchedChunks);
+    appendDirtyPagesForBounds(bboxMin, bboxMax, result);
+
+    GridCoord minCoord, maxCoord;
+    normalizeBounds(bboxMin, bboxMax, minCoord, maxCoord);
+
+    // Determine circle plane axes based on cylinder extrusion axis.
+    // axis=0(X): circle in YZ, axis=1(Y): circle in XZ, axis=2(Z): circle in XY
+    int uAxis, vAxis;
+    if (axis == 0) { uAxis = 1; vAxis = 2; }      // circle in YZ
+    else if (axis == 2) { uAxis = 0; vAxis = 1; }  // circle in XY
+    else { uAxis = 0; vAxis = 2; }                  // circle in XZ (default)
+
+    const float cu = (static_cast<float>(minCoord[uAxis]) + static_cast<float>(maxCoord[uAxis])) * 0.5f;
+    const float cv = (static_cast<float>(minCoord[vAxis]) + static_cast<float>(maxCoord[vAxis])) * 0.5f;
+    const float ru = (static_cast<float>(maxCoord[uAxis]) - static_cast<float>(minCoord[uAxis]) + 1.0f) * 0.5f;
+    const float rv = (static_cast<float>(maxCoord[vAxis]) - static_cast<float>(minCoord[vAxis]) + 1.0f) * 0.5f;
+
+    CylinderFill cf{};
+    cf.centerU = cu; cf.centerV = cv;
+    cf.radiusU = ru; cf.radiusV = rv;
+    cf.axis = axis;
+    cf.bboxMin = minCoord; cf.bboxMax = maxCoord;
+    cf.value = value;
+
+    // Estimate cell count (cylinder ≈ π/4 of bbox cross-section × full extrusion)
+    const uint64_t bboxCells =
+        axisCountInclusive(minCoord.x, maxCoord.x) *
+        axisCountInclusive(minCoord.y, maxCoord.y) *
+        axisCountInclusive(minCoord.z, maxCoord.z);
+    const uint64_t cylinderCells = static_cast<uint64_t>(
+        static_cast<double>(bboxCells) * 3.14159265358979 / 4.0);
+    result.cellsChanged = std::max<uint64_t>(cylinderCells, 1u);
+
+    const ChunkCoord minChunk = gridToChunk(minCoord);
+    const ChunkCoord maxChunk = gridToChunk(maxCoord);
+
+    std::unique_lock<std::shared_mutex> lock(m_mutex);
+
+    // Deduplicate: replace the last cylinder fill if it has the same value
+    // and overlapping axis-aligned extents (common during held edits).
+    bool replaced = false;
+    if (!m_cylinderFills.empty()) {
+        auto& last = m_cylinderFills.back();
+        if (last.value == cf.value && last.axis == cf.axis) {
+            const float du = cf.centerU - last.centerU;
+            const float dv = cf.centerV - last.centerV;
+            if (du * du + dv * dv < 4.0f) {
+                last = cf;
+                replaced = true;
+            }
+        }
+    }
+    if (!replaced) {
+        m_cylinderFills.push_back(cf);
+    }
+    rebuildDeferredFillChunkIndexLocked();
+    m_editedCellCount += result.cellsChanged;
+
+    for (int32_t ccY = minChunk.y; ccY <= maxChunk.y; ++ccY) {
+        for (int32_t ccZ = minChunk.z; ccZ <= maxChunk.z; ++ccZ) {
+            for (int32_t ccX = minChunk.x; ccX <= maxChunk.x; ++ccX) {
+                m_chunkEditCounts[ChunkCoord(ccX, ccY, ccZ)] += 1;
+            }
+        }
+    }
+    m_overlayGeneration.fetch_add(1, std::memory_order_relaxed);
+
+    // Keep cylinder fills deferred for the same reason as spheres: avoid
+    // converting a large deferred volume into per-brick state on the input
+    // thread where it would stall editing.
+    return result;
+}
+
+TerrainEditOverlayStore::BoxEditResult TerrainEditOverlayStore::clearBox(const GridCoord& a,
+                                                                         const GridCoord& b) {
+    BoxEditResult result;
+    collectTouchedChunksForBounds(a, b, result.touchedChunks);
+    appendDirtyPagesForBounds(a, b, result);
+
+    GridCoord minCoord;
+    GridCoord maxCoord;
+    normalizeBounds(a, b, minCoord, maxCoord);
+
+    // Materialize box fills overlapping the clear range up-front so
+    // the per-cell loop below can operate on bricks normally.
+    {
+        std::unique_lock<std::shared_mutex> lock(m_mutex);
+        materializeBoxFillsInRangeLocked(minCoord, maxCoord);
+    }
+
+    for (int32_t y = minCoord.y; y <= maxCoord.y; ++y) {
+        for (int32_t z = minCoord.z; z <= maxCoord.z; ++z) {
+            for (int32_t x = minCoord.x; x <= maxCoord.x; ++x) {
+                if (clearCell(GridCoord(x, y, z), nullptr)) {
+                    ++result.cellsChanged;
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+void TerrainEditOverlayStore::collectTouchedChunksForCell(const GridCoord& coord,
+                                                          ChunkSet& outChunks) {
+    collectTouchedChunksForBounds(coord, coord, outChunks);
+}
+
+void TerrainEditOverlayStore::collectTouchedChunksForBounds(const GridCoord& a,
+                                                            const GridCoord& b,
+                                                            ChunkSet& outChunks) {
+    GridCoord minCoord;
+    GridCoord maxCoord;
+    normalizeBounds(a, b, minCoord, maxCoord);
+
+    const ChunkCoord minChunk = gridToChunk(minCoord);
+    const ChunkCoord maxChunk = gridToChunk(maxCoord);
+
+    auto addRange = [&outChunks](int32_t minX, int32_t maxX,
+                                 int32_t minY, int32_t maxY,
+                                 int32_t minZ, int32_t maxZ) {
+        for (int32_t y = minY; y <= maxY; ++y) {
+            for (int32_t z = minZ; z <= maxZ; ++z) {
+                for (int32_t x = minX; x <= maxX; ++x) {
+                    outChunks.insert(ChunkCoord(x, y, z));
+                }
+            }
+        }
+    };
+
+    addRange(minChunk.x, maxChunk.x, minChunk.y, maxChunk.y, minChunk.z, maxChunk.z);
+
+    const GridCoord minLocal = getGridLocalInChunk(minCoord);
+    const GridCoord maxLocal = getGridLocalInChunk(maxCoord);
+
+    int32_t xOffsets[3] = {0, 0, 0};
+    int32_t yOffsets[3] = {0, 0, 0};
+    int32_t zOffsets[3] = {0, 0, 0};
+    size_t xCount = 1;
+    size_t yCount = 1;
+    size_t zCount = 1;
+
+    if (minLocal.x == 0) {
+        xOffsets[xCount++] = -1;
+    }
+    if (maxLocal.x == (EDIT_CHUNK_CELLS_XZ - 1)) {
+        xOffsets[xCount++] = 1;
+    }
+    if (minLocal.y == 0) {
+        yOffsets[yCount++] = -1;
+    }
+    if (maxLocal.y == (EDIT_CHUNK_CELLS_Y - 1)) {
+        yOffsets[yCount++] = 1;
+    }
+    if (minLocal.z == 0) {
+        zOffsets[zCount++] = -1;
+    }
+    if (maxLocal.z == (EDIT_CHUNK_CELLS_XZ - 1)) {
+        zOffsets[zCount++] = 1;
+    }
+
+    // Include edge/corner neighbor combinations (not only face-neighbors).
+    // This closes corner-intersection gaps where diagonal chunks must rebuild.
+    for (size_t ix = 0; ix < xCount; ++ix) {
+        for (size_t iy = 0; iy < yCount; ++iy) {
+            for (size_t iz = 0; iz < zCount; ++iz) {
+                const int32_t dx = xOffsets[ix];
+                const int32_t dy = yOffsets[iy];
+                const int32_t dz = zOffsets[iz];
+                if (dx == 0 && dy == 0 && dz == 0) {
+                    continue;
+                }
+                addRange(minChunk.x + dx, maxChunk.x + dx,
+                         minChunk.y + dy, maxChunk.y + dy,
+                         minChunk.z + dz, maxChunk.z + dz);
+            }
+        }
+    }
+}
+
+std::pair<int,int> TerrainEditOverlayStore::getEditVoxelYRange(
+    int baseVoxelX, int baseVoxelZ, int chunkSizeVoxels) const
+{
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+    int yMin = INT_MAX;
+    int yMax = INT_MIN;
+
+    // Expand XZ by 1 voxel on each side to catch edits that affect
+    // neighbor lookups at chunk borders.
+    const int cellMinX = (baseVoxelX - 1) * EDIT_CELLS_PER_VOXEL;
+    const int cellMaxX = (baseVoxelX + chunkSizeVoxels + 1) * EDIT_CELLS_PER_VOXEL - 1;
+    const int cellMinZ = (baseVoxelZ - 1) * EDIT_CELLS_PER_VOXEL;
+    const int cellMaxZ = (baseVoxelZ + chunkSizeVoxels + 1) * EDIT_CELLS_PER_VOXEL - 1;
+    const ChunkCoord minChunk = gridToChunk(GridCoord(cellMinX, 0, cellMinZ));
+    const ChunkCoord maxChunk = gridToChunk(GridCoord(cellMaxX, 0, cellMaxZ));
+
+    const BrickCoord bMin = gridToBrick(GridCoord(cellMinX, 0, cellMinZ));
+    const BrickCoord bMax = gridToBrick(GridCoord(cellMaxX, INT_MAX / 2, cellMaxZ));
+
+    auto gatherFillIndices = [&](const ChunkXZFillIndexMap& indexMap,
+                                 std::vector<uint32_t>& outIndices) {
+        outIndices.clear();
+        for (int32_t cz = minChunk.z; cz <= maxChunk.z; ++cz) {
+            for (int32_t cx = minChunk.x; cx <= maxChunk.x; ++cx) {
+                auto it = indexMap.find(packChunkXZKey(cx, cz));
+                if (it == indexMap.end()) {
+                    continue;
+                }
+                outIndices.insert(outIndices.end(), it->second.begin(), it->second.end());
+            }
+        }
+        std::sort(outIndices.begin(), outIndices.end());
+        outIndices.erase(std::unique(outIndices.begin(), outIndices.end()), outIndices.end());
+    };
+
+    std::vector<uint32_t> relevantBoxFillIndices;
+    std::vector<uint32_t> relevantSphereFillIndices;
+    std::vector<uint32_t> relevantCylinderFillIndices;
+    gatherFillIndices(m_boxFillChunkIndex, relevantBoxFillIndices);
+    gatherFillIndices(m_sphereFillChunkIndex, relevantSphereFillIndices);
+    gatherFillIndices(m_cylinderFillChunkIndex, relevantCylinderFillIndices);
+
+    for (const auto& [brickCoord, brick] : m_bricks) {
+        if (brickCoord.x < bMin.x || brickCoord.x > bMax.x ||
+            brickCoord.z < bMin.z || brickCoord.z > bMax.z)
+            continue;
+        if (brick.empty()) continue;
+
+        // Brick covers voxels [brickCoord * 16 / 8, brickCoord * 16 / 8 + 2)
+        // = [brickCoord * 2, brickCoord * 2 + 2)
+        const int brickVoxelYMin = brickCoord.y * (EDIT_BRICK_EDGE_CELLS / EDIT_CELLS_PER_VOXEL);
+        const int brickVoxelYMax = brickVoxelYMin + (EDIT_BRICK_EDGE_CELLS / EDIT_CELLS_PER_VOXEL) - 1;
+        if (brickVoxelYMin < yMin) yMin = brickVoxelYMin;
+        if (brickVoxelYMax > yMax) yMax = brickVoxelYMax;
+    }
+
+    // Check box fills for Y range in the query XZ region.
+    for (uint32_t fillIndex : relevantBoxFillIndices) {
+        const auto& fill = m_boxFills[fillIndex];
+        if (fill.max.x < cellMinX || fill.min.x > cellMaxX ||
+            fill.max.z < cellMinZ || fill.min.z > cellMaxZ)
+            continue;
+
+        const int fillVoxelYMin = floorDiv(fill.min.y, EDIT_CELLS_PER_VOXEL);
+        const int fillVoxelYMax = floorDiv(fill.max.y, EDIT_CELLS_PER_VOXEL);
+        if (fillVoxelYMin < yMin) yMin = fillVoxelYMin;
+        if (fillVoxelYMax > yMax) yMax = fillVoxelYMax;
+    }
+
+    // Check sphere fills for Y range.
+    for (uint32_t fillIndex : relevantSphereFillIndices) {
+        const auto& sf = m_sphereFills[fillIndex];
+        if (sf.bboxMax.x < cellMinX || sf.bboxMin.x > cellMaxX ||
+            sf.bboxMax.z < cellMinZ || sf.bboxMin.z > cellMaxZ)
+            continue;
+
+        const int sfVoxelYMin = floorDiv(sf.bboxMin.y, EDIT_CELLS_PER_VOXEL);
+        const int sfVoxelYMax = floorDiv(sf.bboxMax.y, EDIT_CELLS_PER_VOXEL);
+        if (sfVoxelYMin < yMin) yMin = sfVoxelYMin;
+        if (sfVoxelYMax > yMax) yMax = sfVoxelYMax;
+    }
+
+    // Check cylinder fills for Y range.
+    for (uint32_t fillIndex : relevantCylinderFillIndices) {
+        const auto& cf = m_cylinderFills[fillIndex];
+        if (cf.bboxMax.x < cellMinX || cf.bboxMin.x > cellMaxX ||
+            cf.bboxMax.z < cellMinZ || cf.bboxMin.z > cellMaxZ)
+            continue;
+
+        const int cfVoxelYMin = floorDiv(cf.bboxMin.y, EDIT_CELLS_PER_VOXEL);
+        const int cfVoxelYMax = floorDiv(cf.bboxMax.y, EDIT_CELLS_PER_VOXEL);
+        if (cfVoxelYMin < yMin) yMin = cfVoxelYMin;
+        if (cfVoxelYMax > yMax) yMax = cfVoxelYMax;
+    }
+
+    return {yMin, yMax};
+}
+
+std::pair<int,int> TerrainEditOverlayStore::getGlobalEditYRange() const
+{
+    std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+    int yMin = INT_MAX;
+    int yMax = INT_MIN;
+
+    for (const auto& [brickCoord, brick] : m_bricks) {
+        if (brick.empty()) continue;
+        const int brickVoxelYMin = brickCoord.y * (EDIT_BRICK_EDGE_CELLS / EDIT_CELLS_PER_VOXEL);
+        const int brickVoxelYMax = brickVoxelYMin + (EDIT_BRICK_EDGE_CELLS / EDIT_CELLS_PER_VOXEL) - 1;
+        if (brickVoxelYMin < yMin) yMin = brickVoxelYMin;
+        if (brickVoxelYMax > yMax) yMax = brickVoxelYMax;
+    }
+
+    for (const auto& fill : m_boxFills) {
+        const int fy0 = floorDiv(fill.min.y, EDIT_CELLS_PER_VOXEL);
+        const int fy1 = floorDiv(fill.max.y, EDIT_CELLS_PER_VOXEL);
+        if (fy0 < yMin) yMin = fy0;
+        if (fy1 > yMax) yMax = fy1;
+    }
+
+    for (const auto& sf : m_sphereFills) {
+        const int fy0 = floorDiv(sf.bboxMin.y, EDIT_CELLS_PER_VOXEL);
+        const int fy1 = floorDiv(sf.bboxMax.y, EDIT_CELLS_PER_VOXEL);
+        if (fy0 < yMin) yMin = fy0;
+        if (fy1 > yMax) yMax = fy1;
+    }
+
+    for (const auto& cf : m_cylinderFills) {
+        const int fy0 = floorDiv(cf.bboxMin.y, EDIT_CELLS_PER_VOXEL);
+        const int fy1 = floorDiv(cf.bboxMax.y, EDIT_CELLS_PER_VOXEL);
+        if (fy0 < yMin) yMin = fy0;
+        if (fy1 > yMax) yMax = fy1;
+    }
+
+    return {yMin, yMax};
+}
+
+void TerrainEditOverlayStore::bulkApplyToSolidCache(
+    uint8_t* cache,
+    int baseVoxelX, int baseVoxelZ,
+    int cacheMinY,
+    int cacheXZ, int cacheY,
+    const RemeshCancellationToken* cancelToken) const
+{
+    const int cellMinX = baseVoxelX * EDIT_CELLS_PER_VOXEL;
+    const int cellMaxX = (baseVoxelX + cacheXZ) * EDIT_CELLS_PER_VOXEL - 1;
+    const int cellMinY = cacheMinY * EDIT_CELLS_PER_VOXEL;
+    const int cellMaxY = (cacheMinY + cacheY) * EDIT_CELLS_PER_VOXEL - 1;
+    const int cellMinZ = baseVoxelZ * EDIT_CELLS_PER_VOXEL;
+    const int cellMaxZ = (baseVoxelZ + cacheXZ) * EDIT_CELLS_PER_VOXEL - 1;
+    const ChunkCoord fillChunkMin = gridToChunk(GridCoord(cellMinX, cellMinY, cellMinZ));
+    const ChunkCoord fillChunkMax = gridToChunk(GridCoord(cellMaxX, cellMaxY, cellMaxZ));
+
+    const BrickCoord bMin = gridToBrick(GridCoord(cellMinX, cellMinY, cellMinZ));
+    const BrickCoord bMax = gridToBrick(GridCoord(cellMaxX, cellMaxY, cellMaxZ));
+
+    // -----------------------------------------------------------------------
+    // Phase 1: Snapshot fill vectors + brick voxel data under a BRIEF lock.
+    // This minimises the shared_lock hold time so write operations on the
+    // main thread (writeSphere, writeBox) are never blocked for more than
+    // a few microseconds — eliminating the main-thread stalls that caused
+    // intermittent lag during rapid editing.
+    // -----------------------------------------------------------------------
+    std::vector<BoxFill> localBoxFills;
+    std::vector<SphereFill> localSphereFills;
+    std::vector<CylinderFill> localCylinderFills;
+
+    struct VoxelOverride { size_t idx; uint8_t solid; };
+    std::vector<VoxelOverride> brickOverrides;
+
+    {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+        if (m_boxFills.empty() && m_sphereFills.empty() &&
+            m_cylinderFills.empty() && m_bricks.empty()) {
+            return;
+        }
+
+        auto gatherFillIndices = [&](const ChunkFillIndexMap& indexMap,
+                                     std::vector<uint32_t>& outIndices) {
+            outIndices.clear();
+            if (indexMap.empty()) {
+                return;
+            }
+            const int32_t cxCount = std::max(0, fillChunkMax.x - fillChunkMin.x + 1);
+            const int32_t cyCount = std::max(0, fillChunkMax.y - fillChunkMin.y + 1);
+            const int32_t czCount = std::max(0, fillChunkMax.z - fillChunkMin.z + 1);
+            const size_t chunkCount = static_cast<size_t>(cxCount) *
+                                      static_cast<size_t>(cyCount) *
+                                      static_cast<size_t>(czCount);
+            if (chunkCount > 0) {
+                outIndices.reserve(std::min<size_t>(chunkCount * 4, 4096));
+            }
+            ChunkCoord key{};
+            for (int32_t cy = fillChunkMin.y; cy <= fillChunkMax.y; ++cy) {
+            for (int32_t cz = fillChunkMin.z; cz <= fillChunkMax.z; ++cz) {
+                for (int32_t cx = fillChunkMin.x; cx <= fillChunkMax.x; ++cx) {
+                        key.x = cx;
+                        key.y = cy;
+                        key.z = cz;
+                    auto it = indexMap.find(key);
+                    if (it == indexMap.end()) {
+                        continue;
+                    }
+                    outIndices.insert(outIndices.end(), it->second.begin(), it->second.end());
+                }
+            }
+            }
+            std::sort(outIndices.begin(), outIndices.end());
+            outIndices.erase(std::unique(outIndices.begin(), outIndices.end()), outIndices.end());
+        };
+
+        std::vector<uint32_t> boxFillIndices;
+        std::vector<uint32_t> sphereFillIndices;
+        std::vector<uint32_t> cylinderFillIndices;
+        gatherFillIndices(m_boxFillChunk3DIndex, boxFillIndices);
+        gatherFillIndices(m_sphereFillChunk3DIndex, sphereFillIndices);
+        gatherFillIndices(m_cylinderFillChunk3DIndex, cylinderFillIndices);
+
+        localBoxFills.reserve(boxFillIndices.size());
+        for (uint32_t fillIndex : boxFillIndices) {
+            localBoxFills.push_back(m_boxFills[fillIndex]);
+        }
+        localSphereFills.reserve(sphereFillIndices.size());
+        for (uint32_t fillIndex : sphereFillIndices) {
+            localSphereFills.push_back(m_sphereFills[fillIndex]);
+        }
+        localCylinderFills.reserve(cylinderFillIndices.size());
+        for (uint32_t fillIndex : cylinderFillIndices) {
+            localCylinderFills.push_back(m_cylinderFills[fillIndex]);
+        }
+
+        // Snapshot relevant brick voxel data (8 voxels per brick max).
+        constexpr int VPB = EDIT_BRICK_EDGE_CELLS / EDIT_CELLS_PER_VOXEL; // 2
+        brickOverrides.reserve(m_bricks.size() * (VPB * VPB * VPB));
+
+        for (const auto& [brickCoord, brick] : m_bricks) {
+            if (brickCoord.x < bMin.x || brickCoord.x > bMax.x ||
+                brickCoord.y < bMin.y || brickCoord.y > bMax.y ||
+                brickCoord.z < bMin.z || brickCoord.z > bMax.z)
+                continue;
+            if (brick.empty()) continue;
+
+            const int bvx = brickCoord.x * VPB;
+            const int bvy = brickCoord.y * VPB;
+            const int bvz = brickCoord.z * VPB;
+
+            for (int ly = 0; ly < VPB; ++ly) {
+                for (int lz = 0; lz < VPB; ++lz) {
+                    for (int lx = 0; lx < VPB; ++lx) {
+                        const int cx = bvx + lx - baseVoxelX;
+                        const int cy = bvy + ly - cacheMinY;
+                        const int cz = bvz + lz - baseVoxelZ;
+                        if (cx < 0 || cx >= cacheXZ ||
+                            cy < 0 || cy >= cacheY ||
+                            cz < 0 || cz >= cacheXZ)
+                            continue;
+
+                        const GridCoord centerLocal(
+                            lx * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2,
+                            ly * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2,
+                            lz * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2);
+                        const auto value = brick.get(centerLocal);
+                        if (!value.has_value()) continue;
+
+                        const size_t idx = static_cast<size_t>(
+                            (cy * cacheXZ + cz) * cacheXZ + cx);
+                        brickOverrides.push_back({idx, value->solid ? uint8_t(1) : uint8_t(0)});
+                    }
+                }
+            }
+        }
+    }
+    // --- Lock released. All processing below is lock-free. ---
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Apply fill volumes to cache (lock-free).
+    // Order: box fills -> sphere fills -> cylinder fills -> brick overrides.
+    // -----------------------------------------------------------------------
+    constexpr int HALF_CPV = EDIT_CELLS_PER_VOXEL / 2;
+
+    // Box fills — use memset for contiguous X-rows.
+    for (const auto& fill : localBoxFills) {
+        if (cancelToken && cancelToken->isCancelled()) {
+            return;
+        }
+        const int fvxMin = ceilDiv(fill.min.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int fvxMax = floorDiv(fill.max.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int fvyMin = ceilDiv(fill.min.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int fvyMax = floorDiv(fill.max.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int fvzMin = ceilDiv(fill.min.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int fvzMax = floorDiv(fill.max.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+
+        const int vxMin = std::max(fvxMin, baseVoxelX);
+        const int vxMax = std::min(fvxMax, baseVoxelX + cacheXZ - 1);
+        const int vyMin = std::max(fvyMin, cacheMinY);
+        const int vyMax = std::min(fvyMax, cacheMinY + cacheY - 1);
+        const int vzMin = std::max(fvzMin, baseVoxelZ);
+        const int vzMax = std::min(fvzMax, baseVoxelZ + cacheXZ - 1);
+
+        if (vxMin > vxMax || vyMin > vyMax || vzMin > vzMax) continue;
+
+        const uint8_t solidVal = fill.value.solid ? 1 : 0;
+        const int cxMin = vxMin - baseVoxelX;
+        const size_t rowLen = static_cast<size_t>(vxMax - vxMin + 1);
+        for (int vy = vyMin; vy <= vyMax; ++vy) {
+            if (cancelToken && cancelToken->isCancelled()) {
+                return;
+            }
+            const int cy = vy - cacheMinY;
+            for (int vz = vzMin; vz <= vzMax; ++vz) {
+                const int cz = vz - baseVoxelZ;
+                const size_t rowStart = static_cast<size_t>(
+                    (cy * cacheXZ + cz) * cacheXZ + cxMin);
+                std::memset(&cache[rowStart], solidVal, rowLen);
+            }
+        }
+    }
+
+    // Sphere fills — per-voxel ellipsoid distance test.
+    for (const auto& sf : localSphereFills) {
+        if (cancelToken && cancelToken->isCancelled()) {
+            return;
+        }
+        const int svxMin = ceilDiv(sf.bboxMin.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int svxMax = floorDiv(sf.bboxMax.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int svyMin = ceilDiv(sf.bboxMin.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int svyMax = floorDiv(sf.bboxMax.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int svzMin = ceilDiv(sf.bboxMin.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int svzMax = floorDiv(sf.bboxMax.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+
+        const int vxMin = std::max(svxMin, baseVoxelX);
+        const int vxMax = std::min(svxMax, baseVoxelX + cacheXZ - 1);
+        const int vyMin = std::max(svyMin, cacheMinY);
+        const int vyMax = std::min(svyMax, cacheMinY + cacheY - 1);
+        const int vzMin = std::max(svzMin, baseVoxelZ);
+        const int vzMax = std::min(svzMax, baseVoxelZ + cacheXZ - 1);
+
+        if (vxMin > vxMax || vyMin > vyMax || vzMin > vzMax) continue;
+
+        const float sCenterVx = sf.centerX / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float sCenterVy = sf.centerY / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float sCenterVz = sf.centerZ / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float sRadVx = sf.radiusX / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float sRadVy = sf.radiusY / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float sRadVz = sf.radiusZ / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float invRx = 1.0f / sRadVx;
+        const float invRy = 1.0f / sRadVy;
+        const float invRz = 1.0f / sRadVz;
+
+        const uint8_t solidVal = sf.value.solid ? 1 : 0;
+        for (int vy = vyMin; vy <= vyMax; ++vy) {
+            if (cancelToken && cancelToken->isCancelled()) {
+                return;
+            }
+            // +0.5f: test at voxel CENTER to match brick readout (center cell)
+            const float dy = (static_cast<float>(vy) + 0.5f - sCenterVy) * invRy;
+            const float dy2 = dy * dy;
+            if (dy2 > 1.0f) continue;
+            const int cy = vy - cacheMinY;
+            for (int vz = vzMin; vz <= vzMax; ++vz) {
+                const float dz = (static_cast<float>(vz) + 0.5f - sCenterVz) * invRz;
+                const float dyz2 = dy2 + dz * dz;
+                if (dyz2 > 1.0f) continue;
+                const int cz = vz - baseVoxelZ;
+                for (int vx = vxMin; vx <= vxMax; ++vx) {
+                    const float dx = (static_cast<float>(vx) + 0.5f - sCenterVx) * invRx;
+                    if (dx * dx + dyz2 > 1.0f) continue;
+                    const int cx = vx - baseVoxelX;
+                    const size_t idx = static_cast<size_t>(
+                        (cy * cacheXZ + cz) * cacheXZ + cx);
+                    cache[idx] = solidVal;
+                }
+            }
+        }
+    }
+
+    // Cylinder fills — 2D circle test + full extrusion axis.
+    for (const auto& cf : localCylinderFills) {
+        if (cancelToken && cancelToken->isCancelled()) {
+            return;
+        }
+        int uAxis, vAxis;
+        if (cf.axis == 0) { uAxis = 1; vAxis = 2; }
+        else if (cf.axis == 2) { uAxis = 0; vAxis = 1; }
+        else { uAxis = 0; vAxis = 2; }
+
+        const int cvxMin = ceilDiv(cf.bboxMin.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int cvxMax = floorDiv(cf.bboxMax.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int cvyMin = ceilDiv(cf.bboxMin.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int cvyMax = floorDiv(cf.bboxMax.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int cvzMin = ceilDiv(cf.bboxMin.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int cvzMax = floorDiv(cf.bboxMax.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+
+        const int vxMin = std::max(cvxMin, baseVoxelX);
+        const int vxMax = std::min(cvxMax, baseVoxelX + cacheXZ - 1);
+        const int vyMin = std::max(cvyMin, cacheMinY);
+        const int vyMax = std::min(cvyMax, cacheMinY + cacheY - 1);
+        const int vzMin = std::max(cvzMin, baseVoxelZ);
+        const int vzMax = std::min(cvzMax, baseVoxelZ + cacheXZ - 1);
+
+        if (vxMin > vxMax || vyMin > vyMax || vzMin > vzMax) continue;
+
+        const float cCenterU = cf.centerU / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float cCenterV = cf.centerV / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float cRadU = cf.radiusU / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float cRadV = cf.radiusV / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float invRu = 1.0f / cRadU;
+        const float invRv = 1.0f / cRadV;
+        const uint8_t solidVal = cf.value.solid ? 1 : 0;
+
+        for (int vz = vzMin; vz <= vzMax; ++vz) {
+            if (cancelToken && cancelToken->isCancelled()) {
+                return;
+            }
+            for (int vx = vxMin; vx <= vxMax; ++vx) {
+                const glm::ivec3 voxel(vx, 0, vz);
+                // +0.5f: test at voxel CENTER to match brick readout
+                const float du = (static_cast<float>(voxel[uAxis]) + 0.5f - cCenterU) * invRu;
+                const float dv = (static_cast<float>(voxel[vAxis]) + 0.5f - cCenterV) * invRv;
+                if (du * du + dv * dv > 1.0f) continue;
+                const int cx = vx - baseVoxelX;
+                const int cz = vz - baseVoxelZ;
+                for (int vy = vyMin; vy <= vyMax; ++vy) {
+                    const int cy = vy - cacheMinY;
+                    const size_t idx = static_cast<size_t>(
+                        (cy * cacheXZ + cz) * cacheXZ + cx);
+                    cache[idx] = solidVal;
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: Apply brick overrides — highest priority, overwrites fills.
+    // -----------------------------------------------------------------------
+    for (const auto& ov : brickOverrides) {
+        cache[ov.idx] = ov.solid;
+    }
+}
+
+} // namespace TerrainEdit

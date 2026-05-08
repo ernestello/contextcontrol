@@ -1,0 +1,313 @@
+// GPT-DESC: Implements TextureOverlayStore deferred surface paint stamps and stamp sampling.
+#include "TextureOverlayInternal.h"
+
+#include <algorithm>
+#include <cmath>
+#include <mutex>
+#include <shared_mutex>
+
+namespace TextureOverlay {
+using namespace TextureOverlayInternal;
+
+// ---------------------------------------------------------------------------
+// Deferred surface paint stamps — O(1) interactive brush authoring.
+// ---------------------------------------------------------------------------
+
+uint32_t TextureOverlayStore::appendSurfacePaintStamp(const glm::vec3& centerWorld,
+                                                     int radiusVoxelsLod0,
+                                                     SurfaceBrushShape shape,
+                                                     TextureType type,
+                                                     uint8_t variant,
+                                                     uint8_t sourceFace) {
+    if (radiusVoxelsLod0 <= 0) {
+        return 0u;
+    }
+
+    SurfacePaintStamp stamp{};
+    stamp.centerVoxelLod0 = centerWorld * static_cast<float>(WorldConfig::VOXELS_PER_METER);
+    stamp.radiusVoxelsLod0 = std::max(1, radiusVoxelsLod0);
+    stamp.shape = shape;
+    stamp.type = type;
+    stamp.variant = static_cast<uint8_t>(variant & 0x7u);
+    stamp.sourceFace = (sourceFace < 6u) ? sourceFace : 3u;
+
+    // Canonical stamp bounds must be tight. They are used for two separate
+    // things:
+    //   1) stamp chunk-index lookup during material baking
+    //   2) choosing which chunks need a canonical material refresh
+    //
+    // The exact test in sampleSurfacePaintStampsLocked() is still the authority
+    // for whether a face is painted. But padding this bbox by +2 voxels makes
+    // extra partial chunks enter the material-rebake queue, and those chunks can
+    // appear to update around the brush even though no face inside them should
+    // change. Use the real brush volume here; coarse-LOD face queries already
+    // expand their query rectangle when they need conservative lookup.
+    const float r = static_cast<float>(stamp.radiusVoxelsLod0);
+    stamp.bboxMinLod0 = glm::ivec3(
+        static_cast<int>(std::floor(stamp.centerVoxelLod0.x - r)),
+        static_cast<int>(std::floor(stamp.centerVoxelLod0.y - r)),
+        static_cast<int>(std::floor(stamp.centerVoxelLod0.z - r)));
+    stamp.bboxMaxLod0 = glm::ivec3(
+        static_cast<int>(std::ceil(stamp.centerVoxelLod0.x + r)),
+        static_cast<int>(std::ceil(stamp.centerVoxelLod0.y + r)),
+        static_cast<int>(std::ceil(stamp.centerVoxelLod0.z + r)));
+
+    std::unique_lock lock(m_mutex);
+    if (!m_lodConfigs[0].enabled) {
+        return 0u;
+    }
+
+    if (m_nextSurfacePaintStampOrder == 0u) {
+        m_nextSurfacePaintStampOrder = 1u;
+    }
+    stamp.order = m_nextSurfacePaintStampOrder++;
+
+    const uint32_t stampIndex = static_cast<uint32_t>(m_surfacePaintStamps.size());
+    m_surfacePaintStamps.push_back(stamp);
+    indexSurfacePaintStampLocked(stampIndex);
+
+    // Wake the canonical-store generation without generating per-cell GPU
+    // overlay deltas. The fragment-time overlay path remains disabled; the
+    // visible result is made permanent by chunk material rebake into
+    // Vertex::material for painted faces only.
+    requestFullGPUUploadLocked();
+    m_generation.fetch_add(1, std::memory_order_release);
+    return stamp.order;
+}
+
+size_t TextureOverlayStore::getSurfacePaintStampCount() const {
+    std::shared_lock lock(m_mutex);
+    return m_surfacePaintStamps.size();
+}
+
+size_t TextureOverlayStore::exportLiveSurfacePaintStamps(
+    std::vector<SurfacePaintStamp>& out,
+    size_t maxStamps) const {
+    (void)maxStamps;
+
+    // Final material rendering must not depend on a bounded live-stamp list.
+    // The texture brush now writes permanent per-face cells and schedules a
+    // material-only chunk rebake, so the visible result is packed into the
+    // normal Vertex::material path. Returning zero here disables the old
+    // fragment-time live overlay and removes the "oldest strokes disappear
+    // after maxStamps" failure mode instead of merely raising the limit.
+    out.clear();
+    return 0u;
+}
+
+
+void TextureOverlayStore::indexSurfacePaintStampLocked(uint32_t stampIndex) {
+    if (stampIndex >= m_surfacePaintStamps.size()) {
+        return;
+    }
+
+    const SurfacePaintStamp& stamp = m_surfacePaintStamps[stampIndex];
+    const glm::ivec3 rawC0 = WorldConfig::microVoxelToChunk(stamp.bboxMinLod0);
+    const glm::ivec3 rawC1 = WorldConfig::microVoxelToChunk(stamp.bboxMaxLod0);
+    const glm::ivec3 c0(
+        std::min(rawC0.x, rawC1.x),
+        std::min(rawC0.y, rawC1.y),
+        std::min(rawC0.z, rawC1.z));
+    const glm::ivec3 c1(
+        std::max(rawC0.x, rawC1.x),
+        std::max(rawC0.y, rawC1.y),
+        std::max(rawC0.z, rawC1.z));
+
+    const int64_t chunkVolume = chunkRangeVolumeInclusive(c0, c1);
+    if (chunkVolume <= 0) {
+        return;
+    }
+    if (chunkVolume > MAX_INDEXED_SURFACE_STAMP_CHUNKS) {
+        m_unindexedSurfacePaintStampIndices.push_back(stampIndex);
+        return;
+    }
+
+    for (int z = c0.z; z <= c1.z; ++z) {
+        for (int y = c0.y; y <= c1.y; ++y) {
+            for (int x = c0.x; x <= c1.x; ++x) {
+                m_surfacePaintStampChunkIndex[glm::ivec3(x, y, z)].push_back(stampIndex);
+            }
+        }
+    }
+}
+
+bool TextureOverlayStore::surfaceStampTouchesBox(const TextureOverlayStore::SurfacePaintStamp& stamp,
+                                                 const glm::ivec3& minLod0,
+                                                 const glm::ivec3& maxLod0) {
+    return !(stamp.bboxMaxLod0.x < minLod0.x || stamp.bboxMinLod0.x > maxLod0.x ||
+             stamp.bboxMaxLod0.y < minLod0.y || stamp.bboxMinLod0.y > maxLod0.y ||
+             stamp.bboxMaxLod0.z < minLod0.z || stamp.bboxMinLod0.z > maxLod0.z);
+}
+
+VoxelTextureData TextureOverlayStore::sampleSurfacePaintStampsLocked(const glm::ivec3& lodCoord,
+                                                                     int lod,
+                                                                     uint8_t face) const {
+    if (m_surfacePaintStamps.empty()) {
+        return {};
+    }
+
+    const int step = std::max(1, (lod > 0) ? (1 << lod) : 1);
+    const int halfStep = step / 2;
+    const glm::ivec3 lod0Base = lodToLOD0(lodCoord, lod);
+    const glm::ivec3 lod0Max = lod0Base + glm::ivec3(step - 1);
+    const glm::ivec3 lod0Sample = lod0Base + glm::ivec3(halfStep);
+
+    const uint8_t queryFace = static_cast<uint8_t>(face % 6u);
+    const int queryAxis = queryFace / 2;
+    const float querySign = (queryFace & 1u) ? 1.0f : -1.0f;
+
+    // Query the chunk-index range covered by this LOD face, not only the face
+    // center. Coarse LOD faces can straddle a chunk boundary; center-only lookup
+    // is why lower LODs sometimes missed paint that was perfect at LOD0.
+    glm::ivec3 queryMin = lod0Base;
+    glm::ivec3 queryMax = lod0Max;
+    if ((queryFace & 1u) != 0u) {
+        queryMax[queryAxis] += 1;
+    } else {
+        queryMin[queryAxis] -= 1;
+    }
+
+    const glm::ivec3 chunkMin = WorldConfig::microVoxelToChunk(queryMin);
+    const glm::ivec3 chunkMax = WorldConfig::microVoxelToChunk(queryMax);
+
+    auto clampf = [](float v, float lo, float hi) {
+        return std::max(lo, std::min(v, hi));
+    };
+
+    auto faceCenterPoint = [&]() {
+        glm::vec3 p = glm::vec3(lod0Sample) + glm::vec3(0.5f);
+        p[queryAxis] += querySign * 0.5f * static_cast<float>(step);
+        return p;
+    };
+
+    auto stampContainsQueryFace = [&](const SurfacePaintStamp& stamp) -> bool {
+        const float radius = static_cast<float>(stamp.radiusVoxelsLod0);
+
+        // LOD0 keeps the exact original authoring rule: the exposed face center
+        // must be inside the brush. This removes the old +1 voxel bleed that
+        // caused visible material changes around the brush edge.
+        if (step == 1) {
+            const glm::vec3 p = faceCenterPoint();
+            const glm::vec3 d = p - stamp.centerVoxelLod0;
+            if (stamp.shape == SurfaceBrushShape::Disc) {
+                return glm::dot(d, d) <= radius * radius + 1e-5f;
+            }
+            return std::abs(d.x) <= radius + 1e-5f &&
+                   std::abs(d.y) <= radius + 1e-5f &&
+                   std::abs(d.z) <= radius + 1e-5f;
+        }
+
+        // Coarser LODs use face-rectangle intersection against the same exact
+        // brush volume. This fills the lower-LOD representation whenever the
+        // coarse face actually intersects the brush, without inflating the
+        // brush radius globally.
+        const float plane = (queryFace & 1u)
+            ? static_cast<float>(lod0Base[queryAxis] + step)
+            : static_cast<float>(lod0Base[queryAxis]);
+
+        if (stamp.shape == SurfaceBrushShape::Disc) {
+            glm::vec3 closest = stamp.centerVoxelLod0;
+            closest[queryAxis] = plane;
+            for (int axis = 0; axis < 3; ++axis) {
+                if (axis == queryAxis) {
+                    continue;
+                }
+                closest[axis] = clampf(
+                    stamp.centerVoxelLod0[axis],
+                    static_cast<float>(lod0Base[axis]),
+                    static_cast<float>(lod0Base[axis] + step));
+            }
+            const glm::vec3 d = closest - stamp.centerVoxelLod0;
+            return glm::dot(d, d) <= radius * radius + 1e-5f;
+        }
+
+        if (std::abs(stamp.centerVoxelLod0[queryAxis] - plane) > radius + 1e-5f) {
+            return false;
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            if (axis == queryAxis) {
+                continue;
+            }
+            const float a0 = static_cast<float>(lod0Base[axis]);
+            const float a1 = static_cast<float>(lod0Base[axis] + step);
+            const float b0 = stamp.centerVoxelLod0[axis] - radius;
+            const float b1 = stamp.centerVoxelLod0[axis] + radius;
+            if (a1 < b0 || b1 < a0) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    uint32_t bestOrder = 0u;
+    VoxelTextureData best{};
+
+    for (int cz = std::min(chunkMin.z, chunkMax.z); cz <= std::max(chunkMin.z, chunkMax.z); ++cz) {
+        for (int cy = std::min(chunkMin.y, chunkMax.y); cy <= std::max(chunkMin.y, chunkMax.y); ++cy) {
+            for (int cx = std::min(chunkMin.x, chunkMax.x); cx <= std::max(chunkMin.x, chunkMax.x); ++cx) {
+                auto it = m_surfacePaintStampChunkIndex.find(glm::ivec3(cx, cy, cz));
+                if (it == m_surfacePaintStampChunkIndex.end()) {
+                    continue;
+                }
+
+                const auto& candidates = it->second;
+                for (auto rit = candidates.rbegin(); rit != candidates.rend(); ++rit) {
+                    const uint32_t stampIndex = *rit;
+                    if (stampIndex >= m_surfacePaintStamps.size()) {
+                        continue;
+                    }
+
+                    const SurfacePaintStamp& stamp = m_surfacePaintStamps[stampIndex];
+                    if (stamp.order <= bestOrder) {
+                        break;
+                    }
+                    if (!surfaceStampTouchesBox(stamp, queryMin, queryMax)) {
+                        continue;
+                    }
+                    if (!stampContainsQueryFace(stamp)) {
+                        continue;
+                    }
+
+                    bestOrder = stamp.order;
+                    best = VoxelTextureData(
+                        stamp.type,
+                        variedVariant(lod0Sample, queryFace, stamp.type, stamp.variant),
+                        0u,
+                        queryFace);
+                    break;
+                }
+            }
+        }
+    }
+
+    for (auto rit = m_unindexedSurfacePaintStampIndices.rbegin();
+         rit != m_unindexedSurfacePaintStampIndices.rend();
+         ++rit) {
+        const uint32_t stampIndex = *rit;
+        if (stampIndex >= m_surfacePaintStamps.size()) {
+            continue;
+        }
+
+        const SurfacePaintStamp& stamp = m_surfacePaintStamps[stampIndex];
+        if (stamp.order <= bestOrder) {
+            continue;
+        }
+        if (!surfaceStampTouchesBox(stamp, queryMin, queryMax)) {
+            continue;
+        }
+        if (!stampContainsQueryFace(stamp)) {
+            continue;
+        }
+
+        bestOrder = stamp.order;
+        best = VoxelTextureData(
+            stamp.type,
+            variedVariant(lod0Sample, queryFace, stamp.type, stamp.variant),
+            0u,
+            queryFace);
+    }
+
+    return best;
+}
+
+} // namespace TextureOverlay

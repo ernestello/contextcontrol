@@ -1,0 +1,316 @@
+// GPT-DESC: Applies terrain edit overlay data into chunk solid-cache arrays for remeshing.
+#include "TerrainEditOverlayInternal.h"
+
+#include <algorithm>
+#include <cstring>
+#include <shared_mutex>
+#include <vector>
+
+namespace TerrainEdit {
+using namespace OverlayInternal;
+
+void TerrainEditOverlayStore::bulkApplyToSolidCache(
+    uint8_t* cache,
+    int baseVoxelX, int baseVoxelZ,
+    int cacheMinY,
+    int cacheXZ, int cacheY,
+    const RemeshCancellationToken* cancelToken) const
+{
+    const int cellMinX = baseVoxelX * EDIT_CELLS_PER_VOXEL;
+    const int cellMaxX = (baseVoxelX + cacheXZ) * EDIT_CELLS_PER_VOXEL - 1;
+    const int cellMinY = cacheMinY * EDIT_CELLS_PER_VOXEL;
+    const int cellMaxY = (cacheMinY + cacheY) * EDIT_CELLS_PER_VOXEL - 1;
+    const int cellMinZ = baseVoxelZ * EDIT_CELLS_PER_VOXEL;
+    const int cellMaxZ = (baseVoxelZ + cacheXZ) * EDIT_CELLS_PER_VOXEL - 1;
+    const ChunkCoord fillChunkMin = gridToChunk(GridCoord(cellMinX, cellMinY, cellMinZ));
+    const ChunkCoord fillChunkMax = gridToChunk(GridCoord(cellMaxX, cellMaxY, cellMaxZ));
+
+    const BrickCoord bMin = gridToBrick(GridCoord(cellMinX, cellMinY, cellMinZ));
+    const BrickCoord bMax = gridToBrick(GridCoord(cellMaxX, cellMaxY, cellMaxZ));
+
+    // -----------------------------------------------------------------------
+    // Phase 1: Snapshot fill vectors + brick voxel data under a BRIEF lock.
+    // This minimises the shared_lock hold time so write operations on the
+    // main thread (writeSphere, writeBox) are never blocked for more than
+    // a few microseconds — eliminating the main-thread stalls that caused
+    // intermittent lag during rapid editing.
+    // -----------------------------------------------------------------------
+    std::vector<BoxFill> localBoxFills;
+    std::vector<SphereFill> localSphereFills;
+    std::vector<CylinderFill> localCylinderFills;
+
+    struct VoxelOverride { size_t idx; uint8_t solid; };
+    std::vector<VoxelOverride> brickOverrides;
+
+    {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+
+        if (m_boxFills.empty() && m_sphereFills.empty() &&
+            m_cylinderFills.empty() && m_bricks.empty()) {
+            return;
+        }
+
+        auto gatherFillIndices = [&](const ChunkFillIndexMap& indexMap,
+                                     std::vector<uint32_t>& outIndices) {
+            outIndices.clear();
+            if (indexMap.empty()) {
+                return;
+            }
+            const int32_t cxCount = std::max(0, fillChunkMax.x - fillChunkMin.x + 1);
+            const int32_t cyCount = std::max(0, fillChunkMax.y - fillChunkMin.y + 1);
+            const int32_t czCount = std::max(0, fillChunkMax.z - fillChunkMin.z + 1);
+            const size_t chunkCount = static_cast<size_t>(cxCount) *
+                                      static_cast<size_t>(cyCount) *
+                                      static_cast<size_t>(czCount);
+            if (chunkCount > 0) {
+                outIndices.reserve(std::min<size_t>(chunkCount * 4, 4096));
+            }
+            ChunkCoord key{};
+            for (int32_t cy = fillChunkMin.y; cy <= fillChunkMax.y; ++cy) {
+            for (int32_t cz = fillChunkMin.z; cz <= fillChunkMax.z; ++cz) {
+                for (int32_t cx = fillChunkMin.x; cx <= fillChunkMax.x; ++cx) {
+                        key.x = cx;
+                        key.y = cy;
+                        key.z = cz;
+                    auto it = indexMap.find(key);
+                    if (it == indexMap.end()) {
+                        continue;
+                    }
+                    outIndices.insert(outIndices.end(), it->second.begin(), it->second.end());
+                }
+            }
+            }
+            std::sort(outIndices.begin(), outIndices.end());
+            outIndices.erase(std::unique(outIndices.begin(), outIndices.end()), outIndices.end());
+        };
+
+        std::vector<uint32_t> boxFillIndices;
+        std::vector<uint32_t> sphereFillIndices;
+        std::vector<uint32_t> cylinderFillIndices;
+        gatherFillIndices(m_boxFillChunk3DIndex, boxFillIndices);
+        gatherFillIndices(m_sphereFillChunk3DIndex, sphereFillIndices);
+        gatherFillIndices(m_cylinderFillChunk3DIndex, cylinderFillIndices);
+
+        localBoxFills.reserve(boxFillIndices.size());
+        for (uint32_t fillIndex : boxFillIndices) {
+            localBoxFills.push_back(m_boxFills[fillIndex]);
+        }
+        localSphereFills.reserve(sphereFillIndices.size());
+        for (uint32_t fillIndex : sphereFillIndices) {
+            localSphereFills.push_back(m_sphereFills[fillIndex]);
+        }
+        localCylinderFills.reserve(cylinderFillIndices.size());
+        for (uint32_t fillIndex : cylinderFillIndices) {
+            localCylinderFills.push_back(m_cylinderFills[fillIndex]);
+        }
+
+        // Snapshot relevant brick voxel data (8 voxels per brick max).
+        constexpr int VPB = EDIT_BRICK_EDGE_CELLS / EDIT_CELLS_PER_VOXEL; // 2
+        brickOverrides.reserve(m_bricks.size() * (VPB * VPB * VPB));
+
+        for (const auto& [brickCoord, brick] : m_bricks) {
+            if (brickCoord.x < bMin.x || brickCoord.x > bMax.x ||
+                brickCoord.y < bMin.y || brickCoord.y > bMax.y ||
+                brickCoord.z < bMin.z || brickCoord.z > bMax.z)
+                continue;
+            if (brick.empty()) continue;
+
+            const int bvx = brickCoord.x * VPB;
+            const int bvy = brickCoord.y * VPB;
+            const int bvz = brickCoord.z * VPB;
+
+            for (int ly = 0; ly < VPB; ++ly) {
+                for (int lz = 0; lz < VPB; ++lz) {
+                    for (int lx = 0; lx < VPB; ++lx) {
+                        const int cx = bvx + lx - baseVoxelX;
+                        const int cy = bvy + ly - cacheMinY;
+                        const int cz = bvz + lz - baseVoxelZ;
+                        if (cx < 0 || cx >= cacheXZ ||
+                            cy < 0 || cy >= cacheY ||
+                            cz < 0 || cz >= cacheXZ)
+                            continue;
+
+                        const GridCoord centerLocal(
+                            lx * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2,
+                            ly * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2,
+                            lz * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2);
+                        const auto value = brick.get(centerLocal);
+                        if (!value.has_value()) continue;
+
+                        const size_t idx = static_cast<size_t>(
+                            (cy * cacheXZ + cz) * cacheXZ + cx);
+                        brickOverrides.push_back({idx, value->solid ? uint8_t(1) : uint8_t(0)});
+                    }
+                }
+            }
+        }
+    }
+    // --- Lock released. All processing below is lock-free. ---
+
+    // -----------------------------------------------------------------------
+    // Phase 2: Apply fill volumes to cache (lock-free).
+    // Order: box fills -> sphere fills -> cylinder fills -> brick overrides.
+    // -----------------------------------------------------------------------
+    constexpr int HALF_CPV = EDIT_CELLS_PER_VOXEL / 2;
+
+    // Box fills — use memset for contiguous X-rows.
+    for (const auto& fill : localBoxFills) {
+        if (cancelToken && cancelToken->isCancelled()) {
+            return;
+        }
+        const int fvxMin = ceilDiv(fill.min.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int fvxMax = floorDiv(fill.max.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int fvyMin = ceilDiv(fill.min.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int fvyMax = floorDiv(fill.max.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int fvzMin = ceilDiv(fill.min.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int fvzMax = floorDiv(fill.max.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+
+        const int vxMin = std::max(fvxMin, baseVoxelX);
+        const int vxMax = std::min(fvxMax, baseVoxelX + cacheXZ - 1);
+        const int vyMin = std::max(fvyMin, cacheMinY);
+        const int vyMax = std::min(fvyMax, cacheMinY + cacheY - 1);
+        const int vzMin = std::max(fvzMin, baseVoxelZ);
+        const int vzMax = std::min(fvzMax, baseVoxelZ + cacheXZ - 1);
+
+        if (vxMin > vxMax || vyMin > vyMax || vzMin > vzMax) continue;
+
+        const uint8_t solidVal = fill.value.solid ? 1 : 0;
+        const int cxMin = vxMin - baseVoxelX;
+        const size_t rowLen = static_cast<size_t>(vxMax - vxMin + 1);
+        for (int vy = vyMin; vy <= vyMax; ++vy) {
+            if (cancelToken && cancelToken->isCancelled()) {
+                return;
+            }
+            const int cy = vy - cacheMinY;
+            for (int vz = vzMin; vz <= vzMax; ++vz) {
+                const int cz = vz - baseVoxelZ;
+                const size_t rowStart = static_cast<size_t>(
+                    (cy * cacheXZ + cz) * cacheXZ + cxMin);
+                std::memset(&cache[rowStart], solidVal, rowLen);
+            }
+        }
+    }
+
+    // Sphere fills — per-voxel ellipsoid distance test.
+    for (const auto& sf : localSphereFills) {
+        if (cancelToken && cancelToken->isCancelled()) {
+            return;
+        }
+        const int svxMin = ceilDiv(sf.bboxMin.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int svxMax = floorDiv(sf.bboxMax.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int svyMin = ceilDiv(sf.bboxMin.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int svyMax = floorDiv(sf.bboxMax.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int svzMin = ceilDiv(sf.bboxMin.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int svzMax = floorDiv(sf.bboxMax.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+
+        const int vxMin = std::max(svxMin, baseVoxelX);
+        const int vxMax = std::min(svxMax, baseVoxelX + cacheXZ - 1);
+        const int vyMin = std::max(svyMin, cacheMinY);
+        const int vyMax = std::min(svyMax, cacheMinY + cacheY - 1);
+        const int vzMin = std::max(svzMin, baseVoxelZ);
+        const int vzMax = std::min(svzMax, baseVoxelZ + cacheXZ - 1);
+
+        if (vxMin > vxMax || vyMin > vyMax || vzMin > vzMax) continue;
+
+        const float sCenterVx = sf.centerX / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float sCenterVy = sf.centerY / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float sCenterVz = sf.centerZ / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float sRadVx = sf.radiusX / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float sRadVy = sf.radiusY / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float sRadVz = sf.radiusZ / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float invRx = 1.0f / sRadVx;
+        const float invRy = 1.0f / sRadVy;
+        const float invRz = 1.0f / sRadVz;
+
+        const uint8_t solidVal = sf.value.solid ? 1 : 0;
+        for (int vy = vyMin; vy <= vyMax; ++vy) {
+            if (cancelToken && cancelToken->isCancelled()) {
+                return;
+            }
+            // +0.5f: test at voxel CENTER to match brick readout (center cell)
+            const float dy = (static_cast<float>(vy) + 0.5f - sCenterVy) * invRy;
+            const float dy2 = dy * dy;
+            if (dy2 > 1.0f) continue;
+            const int cy = vy - cacheMinY;
+            for (int vz = vzMin; vz <= vzMax; ++vz) {
+                const float dz = (static_cast<float>(vz) + 0.5f - sCenterVz) * invRz;
+                const float dyz2 = dy2 + dz * dz;
+                if (dyz2 > 1.0f) continue;
+                const int cz = vz - baseVoxelZ;
+                for (int vx = vxMin; vx <= vxMax; ++vx) {
+                    const float dx = (static_cast<float>(vx) + 0.5f - sCenterVx) * invRx;
+                    if (dx * dx + dyz2 > 1.0f) continue;
+                    const int cx = vx - baseVoxelX;
+                    const size_t idx = static_cast<size_t>(
+                        (cy * cacheXZ + cz) * cacheXZ + cx);
+                    cache[idx] = solidVal;
+                }
+            }
+        }
+    }
+
+    // Cylinder fills — 2D circle test + full extrusion axis.
+    for (const auto& cf : localCylinderFills) {
+        if (cancelToken && cancelToken->isCancelled()) {
+            return;
+        }
+        int uAxis, vAxis;
+        if (cf.axis == 0) { uAxis = 1; vAxis = 2; }
+        else if (cf.axis == 2) { uAxis = 0; vAxis = 1; }
+        else { uAxis = 0; vAxis = 2; }
+
+        const int cvxMin = ceilDiv(cf.bboxMin.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int cvxMax = floorDiv(cf.bboxMax.x - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int cvyMin = ceilDiv(cf.bboxMin.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int cvyMax = floorDiv(cf.bboxMax.y - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int cvzMin = ceilDiv(cf.bboxMin.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+        const int cvzMax = floorDiv(cf.bboxMax.z - HALF_CPV, EDIT_CELLS_PER_VOXEL);
+
+        const int vxMin = std::max(cvxMin, baseVoxelX);
+        const int vxMax = std::min(cvxMax, baseVoxelX + cacheXZ - 1);
+        const int vyMin = std::max(cvyMin, cacheMinY);
+        const int vyMax = std::min(cvyMax, cacheMinY + cacheY - 1);
+        const int vzMin = std::max(cvzMin, baseVoxelZ);
+        const int vzMax = std::min(cvzMax, baseVoxelZ + cacheXZ - 1);
+
+        if (vxMin > vxMax || vyMin > vyMax || vzMin > vzMax) continue;
+
+        const float cCenterU = cf.centerU / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float cCenterV = cf.centerV / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float cRadU = cf.radiusU / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float cRadV = cf.radiusV / static_cast<float>(EDIT_CELLS_PER_VOXEL);
+        const float invRu = 1.0f / cRadU;
+        const float invRv = 1.0f / cRadV;
+        const uint8_t solidVal = cf.value.solid ? 1 : 0;
+
+        for (int vz = vzMin; vz <= vzMax; ++vz) {
+            if (cancelToken && cancelToken->isCancelled()) {
+                return;
+            }
+            for (int vx = vxMin; vx <= vxMax; ++vx) {
+                const glm::ivec3 voxel(vx, 0, vz);
+                // +0.5f: test at voxel CENTER to match brick readout
+                const float du = (static_cast<float>(voxel[uAxis]) + 0.5f - cCenterU) * invRu;
+                const float dv = (static_cast<float>(voxel[vAxis]) + 0.5f - cCenterV) * invRv;
+                if (du * du + dv * dv > 1.0f) continue;
+                const int cx = vx - baseVoxelX;
+                const int cz = vz - baseVoxelZ;
+                for (int vy = vyMin; vy <= vyMax; ++vy) {
+                    const int cy = vy - cacheMinY;
+                    const size_t idx = static_cast<size_t>(
+                        (cy * cacheXZ + cz) * cacheXZ + cx);
+                    cache[idx] = solidVal;
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: Apply brick overrides — highest priority, overwrites fills.
+    // -----------------------------------------------------------------------
+    for (const auto& ov : brickOverrides) {
+        cache[ov.idx] = ov.solid;
+    }
+}
+
+} // namespace TerrainEdit

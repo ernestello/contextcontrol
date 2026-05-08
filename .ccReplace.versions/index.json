@@ -258,7 +258,7 @@
                       "Path":  "src/world/edit/TextureOverlayStore.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\TextureOverlayStore.cpp",
                       "Key":  "b7ce26efdbfc487f",
-                      "CurrentVersion":  12,
+                      "CurrentVersion":  13,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -331,6 +331,12 @@
                                            "Timestamp":  "2026-05-08T11:36:14.3960287Z",
                                            "Snapshot":  "files\\b7ce26efdbfc487f\\v000012.snapshot",
                                            "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  13,
+                                           "Timestamp":  "2026-05-08T11:44:28.8214605Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000013.snapshot",
+                                           "Reason":  "applied whole_file"
                                        }
                                    ]
                   },
@@ -1134,7 +1140,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  8,
+                      "CurrentVersion":  10,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1182,6 +1188,18 @@
                                            "Version":  8,
                                            "Timestamp":  "2026-05-08T11:36:14.5171727Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000008.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  9,
+                                           "Timestamp":  "2026-05-08T11:44:28.8439455Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000009.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  10,
+                                           "Timestamp":  "2026-05-08T11:48:34.8505798Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000010.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -1896,6 +1914,208 @@
                                            "Version":  2,
                                            "Timestamp":  "2026-05-08T11:36:14.4474166Z",
                                            "Snapshot":  "files\\33cf7e9c4689ad83\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/texture/TextureOverlayInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\texture\\TextureOverlayInternal.h",
+                      "Key":  "5a3f9cbc3aa47100",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:44:28.6701164Z",
+                                           "Snapshot":  "files\\5a3f9cbc3aa47100\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/texture/TextureOverlayStore.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\texture\\TextureOverlayStore.cpp",
+                      "Key":  "e242e9300dd9f740",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:44:28.6887115Z",
+                                           "Snapshot":  "files\\e242e9300dd9f740\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/texture/TextureOverlayCells.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\texture\\TextureOverlayCells.cpp",
+                      "Key":  "7fe9cbdf689c2fcf",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:44:28.7100231Z",
+                                           "Snapshot":  "files\\7fe9cbdf689c2fcf\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/texture/TextureOverlayPaint.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\texture\\TextureOverlayPaint.cpp",
+                      "Key":  "0d43b8d9e80bfd74",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:44:28.7319153Z",
+                                           "Snapshot":  "files\\0d43b8d9e80bfd74\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/texture/TextureOverlayGPU.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\texture\\TextureOverlayGPU.cpp",
+                      "Key":  "4e77f3c2581e9ee8",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:44:28.7535099Z",
+                                           "Snapshot":  "files\\4e77f3c2581e9ee8\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/texture/TextureOverlayIO.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\texture\\TextureOverlayIO.cpp",
+                      "Key":  "d31514bbef302a72",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:44:28.7756301Z",
+                                           "Snapshot":  "files\\d31514bbef302a72\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/texture/TextureOverlayStamps.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\texture\\TextureOverlayStamps.cpp",
+                      "Key":  "0f52181f06981eee",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:44:28.7973704Z",
+                                           "Snapshot":  "files\\0f52181f06981eee\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/overlay/TerrainEditOverlayInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\overlay\\TerrainEditOverlayInternal.h",
+                      "Key":  "bf4df845e4b367b5",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:48:34.6074364Z",
+                                           "Snapshot":  "files\\bf4df845e4b367b5\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/overlay/TerrainEditOverlayStore.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\overlay\\TerrainEditOverlayStore.cpp",
+                      "Key":  "6f03623383f66c5c",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:48:34.6330092Z",
+                                           "Snapshot":  "files\\6f03623383f66c5c\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/overlay/TerrainEditOverlayDeferredFill.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\overlay\\TerrainEditOverlayDeferredFill.cpp",
+                      "Key":  "7b088fd13d0b62b9",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:48:34.6631888Z",
+                                           "Snapshot":  "files\\7b088fd13d0b62b9\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/overlay/TerrainEditOverlayBrush.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\overlay\\TerrainEditOverlayBrush.cpp",
+                      "Key":  "80bfd245a0e2b29b",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:48:34.6984625Z",
+                                           "Snapshot":  "files\\80bfd245a0e2b29b\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/overlay/TerrainEditOverlayQuery.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\overlay\\TerrainEditOverlayQuery.cpp",
+                      "Key":  "72694540555738c0",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:48:34.7295475Z",
+                                           "Snapshot":  "files\\72694540555738c0\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/overlay/TerrainEditOverlaySolidCache.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\overlay\\TerrainEditOverlaySolidCache.cpp",
+                      "Key":  "1e3ead5e4b7d2273",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:48:34.7634812Z",
+                                           "Snapshot":  "files\\1e3ead5e4b7d2273\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/TerrainEditOverlayStore.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\TerrainEditOverlayStore.cpp",
+                      "Key":  "702340fd2e8fadfa",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:48:34.7961561Z",
+                                           "Snapshot":  "files\\702340fd2e8fadfa\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T11:48:34.8204160Z",
+                                           "Snapshot":  "files\\702340fd2e8fadfa\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]

@@ -1,0 +1,89 @@
+// GPT-DESC: Keeps TextureOverlayStore GPU overlay export/dirty compatibility on the material-bake path.
+#include "TextureOverlayInternal.h"
+
+#include <mutex>
+
+namespace TextureOverlay {
+
+void TextureOverlayStore::recordDirtyGPUCellLocked(int lod,
+                                                   const glm::ivec3& lodCoord,
+                                                   VoxelTextureData data) {
+    (void)lod;
+    (void)lodCoord;
+    (void)data;
+
+    // Phase 3 material-bake path:
+    //
+    // The paint brush must not grow the fragment-time global material overlay.
+    // That overlay was the bottleneck: millions of painted voxel-face cells were
+    // uploaded into one large random-access SSBO/hash table, then cube.frag had
+    // to probe it from the terrain/light pass.
+    //
+    // Painted material remains canonical in this CPU TextureOverlayStore. The
+    // renderable representation is produced by remeshing the touched chunks and
+    // packing the material into Vertex::material, which is the shader fast path.
+    //
+    // Force one empty full-upload so any old/stale overlay cells are removed
+    // from the GPU table, but never enqueue per-cell GPU deltas here.
+    if (!m_dirtyGPUFullUpload) {
+        m_dirtyGPUCells.clear();
+        m_dirtyGPUFullUpload = true;
+    }
+}
+
+void TextureOverlayStore::requestFullGPUUploadLocked() {
+    m_dirtyGPUCells.clear();
+    m_dirtyGPUFullUpload = true;
+}
+
+size_t TextureOverlayStore::exportGPUCells(std::vector<GPUCell>& out, size_t maxCells) const {
+    (void)maxCells;
+
+    // Disabled by design.
+    //
+    // The old path exported every painted voxel face into a global GPU hash
+    // table. With millions of brush cells this becomes a terrain/light-pass
+    // tax even when the world itself can render fully textured at native speed.
+    //
+    // Painting now stays in the CPU sparse store and is made visible by rebaking
+    // affected chunks into the compact per-vertex material stream. Returning
+    // zero here keeps the shader overlay table empty, so unbaked/normal terrain
+    // remains on the procedural/native fast path.
+    out.clear();
+    return 0;
+}
+
+size_t TextureOverlayStore::exportGPUCellsForLOD(int lod,
+                                                 std::vector<GPUCell>& out,
+                                                 size_t maxCells) const {
+    (void)lod;
+    (void)maxCells;
+
+    // Same as exportGPUCells(): no per-cell material overlay is uploaded to the
+    // GPU. LOD-specific painted data is still stored for persistence/tools and
+    // for chunk material rebake, but it must not become a fragment shader hash
+    // table.
+    out.clear();
+    return 0;
+}
+
+size_t TextureOverlayStore::consumeDirtyGPUCells(std::vector<GPUCell>& out,
+                                                 size_t maxCells,
+                                                 bool& requiresFullUpload) {
+    out.clear();
+    requiresFullUpload = false;
+
+    std::unique_lock lock(m_mutex);
+    if (m_dirtyGPUFullUpload || m_dirtyGPUCells.size() > maxCells) {
+        requiresFullUpload = true;
+        m_dirtyGPUCells.clear();
+        m_dirtyGPUFullUpload = false;
+        return 0;
+    }
+
+    out.swap(m_dirtyGPUCells);
+    m_dirtyGPUCells.clear();
+    return out.size();
+}
+
+} // namespace TextureOverlay
