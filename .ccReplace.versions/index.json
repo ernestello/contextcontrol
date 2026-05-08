@@ -2903,6 +2903,206 @@
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
+                  },
+                  {
+                      "Path":  "tools/convert_heightmap_to_meshes.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\convert_heightmap_to_meshes.cpp",
+                      "Key":  "bda612ad8867575c",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:05:21.7953140Z",
+                                           "Snapshot":  "files\\bda612ad8867575c\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T13:05:21.8168855Z",
+                                           "Snapshot":  "files\\bda612ad8867575c\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/heightmap_mesh/HeightmapMeshInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\heightmap_mesh\\HeightmapMeshInternal.h",
+                      "Key":  "ad7573d2f4f1d443",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:05:21.8402650Z",
+                                           "Snapshot":  "files\\ad7573d2f4f1d443\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T13:08:41.9009317Z",
+                                           "Snapshot":  "files\\ad7573d2f4f1d443\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/heightmap_mesh/HeightmapMeshTool.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\heightmap_mesh\\HeightmapMeshTool.cpp",
+                      "Key":  "9d5d15f8a824a64f",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:05:21.8638191Z",
+                                           "Snapshot":  "files\\9d5d15f8a824a64f\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/heightmap_mesh/HeightmapIO.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\heightmap_mesh\\HeightmapIO.cpp",
+                      "Key":  "8e7d691dacfe5ac4",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:05:21.8849167Z",
+                                           "Snapshot":  "files\\8e7d691dacfe5ac4\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T13:08:41.9270334Z",
+                                           "Snapshot":  "files\\8e7d691dacfe5ac4\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/heightmap_mesh/VoxelChunkBuilder.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\heightmap_mesh\\VoxelChunkBuilder.cpp",
+                      "Key":  "7a7546b2281e3002",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:05:21.9079747Z",
+                                           "Snapshot":  "files\\7a7546b2281e3002\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T13:08:41.9537114Z",
+                                           "Snapshot":  "files\\7a7546b2281e3002\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/heightmap_mesh/GreedyMesher.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\heightmap_mesh\\GreedyMesher.cpp",
+                      "Key":  "b5ab181a42b124b1",
+                      "CurrentVersion":  4,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:05:21.9564780Z",
+                                           "Snapshot":  "files\\b5ab181a42b124b1\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T13:08:41.9827958Z",
+                                           "Snapshot":  "files\\b5ab181a42b124b1\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-08T13:08:42.0870625Z",
+                                           "Snapshot":  "files\\b5ab181a42b124b1\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-08T13:08:42.3050792Z",
+                                           "Snapshot":  "files\\b5ab181a42b124b1\\v000004.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/heightmap_mesh/HeightfieldMesher.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\heightmap_mesh\\HeightfieldMesher.cpp",
+                      "Key":  "2091c35942bde600",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:05:21.9801564Z",
+                                           "Snapshot":  "files\\2091c35942bde600\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T13:08:42.3336741Z",
+                                           "Snapshot":  "files\\2091c35942bde600\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/heightmap_mesh/MeshOptimization.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\heightmap_mesh\\MeshOptimization.cpp",
+                      "Key":  "d5de40fac6b247c9",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:05:22.0041970Z",
+                                           "Snapshot":  "files\\d5de40fac6b247c9\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/heightmap_mesh/TerrainFileWriter.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\heightmap_mesh\\TerrainFileWriter.cpp",
+                      "Key":  "a5dfa215c8906031",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:05:22.0287415Z",
+                                           "Snapshot":  "files\\a5dfa215c8906031\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T13:08:42.3643482Z",
+                                           "Snapshot":  "files\\a5dfa215c8906031\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "tools/CMakeLists.txt",
+                      "FullPath":  "D:\\projects\\vulkanas\\tools\\CMakeLists.txt",
+                      "Key":  "bcdc8f8e8af5d5b2",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:05:22.0528322Z",
+                                           "Snapshot":  "files\\bcdc8f8e8af5d5b2\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T13:05:22.0743673Z",
+                                           "Snapshot":  "files\\bcdc8f8e8af5d5b2\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
                   }
               ]
 }

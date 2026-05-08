@@ -1,0 +1,318 @@
+#include "HeightmapMeshInternal.h"
+
+// GPT-DESC: Generates RTIN heightfield terrain meshes and casing seam geometry for DCCM output.
+
+HeightfieldMesher::HeightfieldMesher(const std::vector<float>& heightmap, int mapWidth, int mapHeight,
+                                     int chunkX, int chunkZ, int numChunksX, int numChunksZ)
+    : m_heightmap(heightmap), m_mapWidth(mapWidth), m_mapHeight(mapHeight),
+      m_chunkX(chunkX), m_chunkZ(chunkZ),
+      m_numChunksX(numChunksX), m_numChunksZ(numChunksZ) {}
+
+ChunkMeshWithSeams HeightfieldMesher::generateMesh(int lodLevel) {
+        ChunkMeshWithSeams result;
+        int step = 1 << lodLevel;
+        int gridW = CHUNK_SIZE / step;  // cells along X
+        int gridH = CHUNK_SIZE / step;  // cells along Z
+        int cW = gridW + 1;             // vertex columns (one more than cells)
+        int cH = gridH + 1;             // vertex rows
+
+        // -----------------------------------------------------------
+        // 1. Build vertex height grid via DIRECT heightmap sampling.
+        //    Each vertex at grid position (vx, vz) gets the height at
+        //    world position (chunkX*128 + vx*step, chunkZ*128 + vz*step).
+        //    No MAX inflation, no neighbor blending - clean point samples.
+        // -----------------------------------------------------------
+        std::vector<int> vtxH(cW * cH, 0);
+        for (int vz = 0; vz < cH; ++vz)
+            for (int vx = 0; vx < cW; ++vx) {
+                int worldX = m_chunkX * CHUNK_SIZE + vx * step;
+                int worldZ = m_chunkZ * CHUNK_SIZE + vz * step;
+                vtxH[vz * cW + vx] = sampleHeight(worldX, worldZ);
+            }
+
+        // -----------------------------------------------------------
+        // 2. Shared vertex index grid (lazy creation).
+        //    Vertices are created on first use and shared by all
+        //    adjacent triangles. This eliminates T-junction cracks
+        //    caused by duplicate vertices at different memory locations.
+        // -----------------------------------------------------------
+        std::vector<uint32_t> vtxIdx(cW * cH, UINT32_MAX);
+
+        auto getOrCreateVtx = [&](int vx, int vz) -> uint32_t {
+            int i = vz * cW + vx;
+            if (vtxIdx[i] == UINT32_MAX) {
+                vtxIdx[i] = addVtx(result.mainMesh, vx, vz, vtxH[i], step, FACE_POS_Y, 0);
+            }
+            return vtxIdx[i];
+        };
+
+        // -----------------------------------------------------------
+        // 3. RTIN (Right-Triangulated Irregular Network) meshing.
+        //
+        //    Adaptive binary-triangle-tree triangulation that merges
+        //    flat areas AND slopes into a minimal triangle mesh.
+        //
+        //    T-junction free by construction: two triangles sharing
+        //    a hypotenuse always see the same error at their shared
+        //    midpoint (stored in the same grid cell) and make the
+        //    same split/no-split decision.
+        //
+        //    Error threshold 0.5: for integer heightmaps, the
+        //    interpolation error at a midpoint between heights H
+        //    and H+1 is exactly 0.5 — at the threshold, so no split.
+        //    This turns flat+slope+flat into one smooth ramp.
+        // -----------------------------------------------------------
+        constexpr float RTIN_MAX_ERROR = 0.5f;
+
+        // Error grid: max height deviation at each position when used
+        // as a triangle split point. Includes propagated child errors.
+        std::vector<float> rtinErrors(cW * cH, 0.0f);
+
+        // Bottom-up error computation.
+        //
+        // Triangle convention: (apex, left, right) where left→right
+        // is the hypotenuse. Splitting at midpoint M creates:
+        //   Left child:  (M, apex, left)
+        //   Right child: (M, right, apex)
+        //
+        // Error at midpoint = max(interpolation_error, child_errors).
+        // Grid uses max-accumulation so cross-tree contributions merge.
+        std::function<float(int,int, int,int, int,int)> computeRTINErrors;
+        // Compute LOCAL interpolation error at every interior grid
+        // position. Each position (mx,mz) can be the midpoint of a
+        // triangle whose hypotenuse connects two specific endpoints.
+        // We compute the error for ALL possible midpoint roles by
+        // traversing both root trees.
+        //
+        // NOTE: We store only LOCAL error (no child propagation).
+        // This avoids the "split halo" effect where a single rough
+        // feature forces all ancestor triangles to split, dragging
+        // nearby flat areas into full-detail tessellation.
+        // The trade-off: a parent triangle may not split even if a
+        // child would need to (the child never gets created). This
+        // means we sacrifice detail at isolated rough features in
+        // favor of dramatically fewer triangles overall.
+        computeRTINErrors = [&](int ax, int az, int lx, int lz,
+                                int rx, int rz) -> float {
+            int mx = (lx + rx) >> 1;
+            int mz = (lz + rz) >> 1;
+
+            // Base case: midpoint collapsed to endpoint (integer div)
+            if ((mx == lx && mz == lz) || (mx == rx && mz == rz))
+                return 0.0f;
+
+            // Recurse into children
+            computeRTINErrors(mx, mz, ax, az, lx, lz);
+            computeRTINErrors(mx, mz, rx, rz, ax, az);
+
+            // LOCAL interpolation error at midpoint
+            float interp = (vtxH[lz * cW + lx] + vtxH[rz * cW + rx])
+                         * 0.5f;
+            float localErr = std::abs(
+                static_cast<float>(vtxH[mz * cW + mx]) - interp);
+
+            // Max-accumulate (handles both root trees at shared pos)
+            rtinErrors[mz * cW + mx] = std::max(
+                rtinErrors[mz * cW + mx], localErr);
+
+            return rtinErrors[mz * cW + mx];
+        };
+
+        // Compute errors for both root triangles:
+        //   Root A: apex=(gridW,0), hyp (0,0)→(gridW,gridH)
+        //   Root B: apex=(0,gridH), hyp (gridW,gridH)→(0,0)
+        computeRTINErrors(gridW, 0,   0, 0,        gridW, gridH);
+        computeRTINErrors(0, gridH,   gridW, gridH, 0, 0);
+
+        // Top-down mesh generation.
+        // Split when error > threshold, emit leaf triangles.
+        // Winding: (apex, left, right) is clockwise in XZ → +Y normal.
+        std::function<void(int,int, int,int, int,int)> emitRTIN;
+        emitRTIN = [&](int ax, int az, int lx, int lz,
+                       int rx, int rz) {
+            int mx = (lx + rx) >> 1;
+            int mz = (lz + rz) >> 1;
+
+            // Can split only if midpoint is distinct from endpoints
+            bool canSplit = !((mx == lx && mz == lz) ||
+                             (mx == rx && mz == rz));
+
+            if (canSplit && rtinErrors[mz * cW + mx] > RTIN_MAX_ERROR) {
+                emitRTIN(mx, mz, ax, az, lx, lz);  // left child
+                emitRTIN(mx, mz, rx, rz, ax, az);  // right child
+            } else {
+                // Skip empty triangles (all vertices at height 0)
+                int ha = vtxH[az * cW + ax];
+                int hl = vtxH[lz * cW + lx];
+                int hr = vtxH[rz * cW + rx];
+                if (ha == 0 && hl == 0 && hr == 0) return;
+
+                uint32_t va = getOrCreateVtx(ax, az);
+                uint32_t vl = getOrCreateVtx(lx, lz);
+                uint32_t vr = getOrCreateVtx(rx, rz);
+                result.mainMesh.indices.push_back(va);
+                result.mainMesh.indices.push_back(vl);
+                result.mainMesh.indices.push_back(vr);
+            }
+        };
+
+        emitRTIN(gridW, 0,   0, 0,        gridW, gridH);
+        emitRTIN(0, gridH,   gridW, gridH, 0, 0);
+
+        // Casing side faces: vertical walls along each chunk edge.
+        // Uses the RTIN vtxIdx to find actual edge vertices, so the
+        // casing top edge perfectly matches the RTIN triangle surface
+        // (no gaps from RTIN simplification).
+        generateCasingSideFaces(vtxIdx, vtxH, cW, cH, gridW, gridH, step, result);
+
+        return result;
+    }
+
+int HeightfieldMesher::sampleHeight(int worldX, int worldZ) const {
+        int fx = m_mapWidth  - 1 - worldX;
+        int fz = m_mapHeight - 1 - worldZ;
+        if (fx < 0 || fx >= m_mapWidth || fz < 0 || fz >= m_mapHeight) return 0;
+        int h = static_cast<int>(m_heightmap[fz * m_mapWidth + fx]);
+        return std::min(h, (int)CHUNK_HEIGHT);
+    }
+
+uint32_t HeightfieldMesher::addVtx(ChunkMesh& mesh, int cx, int cz, int height,
+                                      int step, uint8_t face, uint8_t ao) {
+        uint32_t idx = static_cast<uint32_t>(mesh.vertices.size());
+        uint8_t  px = static_cast<uint8_t>(std::min(cx * step, (int)CHUNK_SIZE));
+        uint16_t py = static_cast<uint16_t>(std::max(0, height));
+        uint8_t  pz = static_cast<uint8_t>(std::min(cz * step, (int)CHUNK_SIZE));
+        mesh.vertices.emplace_back(px, py, pz, face, ao);
+        return idx;
+    }
+
+void HeightfieldMesher::generateCasingSideFaces(const std::vector<uint32_t>& vtxIdx,
+                                                   const std::vector<int>& vtxH,
+                                                   int cW, int cH,
+                                                   int gridW, int gridH,
+                                                   int step,
+                                                   ChunkMeshWithSeams& result) {
+        (void)cH;
+
+        // Emit a vertical quad from terrain surface down to Y=0.
+        auto emitCasingQuad = [&](ChunkMesh& mesh,
+                                  int x0, int yTop0, int z0,
+                                  int x1, int yTop1, int z1,
+                                  uint8_t face, bool reverseWinding) {
+            if (yTop0 <= 0 && yTop1 <= 0) return;
+
+            constexpr int Y_BASE = 0;
+            uint32_t baseIdx = static_cast<uint32_t>(mesh.vertices.size());
+
+            mesh.vertices.emplace_back(
+                static_cast<uint8_t>(x0), static_cast<uint16_t>(Y_BASE),
+                static_cast<uint8_t>(z0), face, static_cast<uint8_t>(0));
+            mesh.vertices.emplace_back(
+                static_cast<uint8_t>(x1), static_cast<uint16_t>(Y_BASE),
+                static_cast<uint8_t>(z1), face, static_cast<uint8_t>(0));
+            mesh.vertices.emplace_back(
+                static_cast<uint8_t>(x1), static_cast<uint16_t>(std::max(0, yTop1)),
+                static_cast<uint8_t>(z1), face, static_cast<uint8_t>(0));
+            mesh.vertices.emplace_back(
+                static_cast<uint8_t>(x0), static_cast<uint16_t>(std::max(0, yTop0)),
+                static_cast<uint8_t>(z0), face, static_cast<uint8_t>(0));
+
+            if (reverseWinding) {
+                mesh.indices.push_back(baseIdx + 0);
+                mesh.indices.push_back(baseIdx + 2);
+                mesh.indices.push_back(baseIdx + 1);
+                mesh.indices.push_back(baseIdx + 0);
+                mesh.indices.push_back(baseIdx + 3);
+                mesh.indices.push_back(baseIdx + 2);
+            } else {
+                mesh.indices.push_back(baseIdx + 0);
+                mesh.indices.push_back(baseIdx + 1);
+                mesh.indices.push_back(baseIdx + 2);
+                mesh.indices.push_back(baseIdx + 0);
+                mesh.indices.push_back(baseIdx + 2);
+                mesh.indices.push_back(baseIdx + 3);
+            }
+        };
+
+        // Helper: collect RTIN-created vertex positions along one edge.
+        // Returns sorted list of (grid_index, height) pairs for vertices
+        // that actually exist in the RTIN mesh (vtxIdx != UINT32_MAX).
+        // Always includes the two corner vertices (they always exist).
+        auto collectEdgeVertices = [&](bool isXEdge, bool isMaxEdge)
+            -> std::vector<std::pair<int, int>> {
+            std::vector<std::pair<int, int>> verts;
+            if (isXEdge) {
+                // Walk along Z at fixed X (x=0 or x=gridW)
+                int vx = isMaxEdge ? gridW : 0;
+                for (int vz = 0; vz <= gridH; ++vz) {
+                    int idx = vz * cW + vx;
+                    if (vtxIdx[idx] != UINT32_MAX) {
+                        verts.push_back({vz, vtxH[idx]});
+                    }
+                }
+                // Ensure corners are present
+                if (verts.empty() || verts.front().first != 0)
+                    verts.insert(verts.begin(), {0, vtxH[0 * cW + vx]});
+                if (verts.back().first != gridH)
+                    verts.push_back({gridH, vtxH[gridH * cW + vx]});
+            } else {
+                // Walk along X at fixed Z (z=0 or z=gridH)
+                int vz = isMaxEdge ? gridH : 0;
+                for (int vx = 0; vx <= gridW; ++vx) {
+                    int idx = vz * cW + vx;
+                    if (vtxIdx[idx] != UINT32_MAX) {
+                        verts.push_back({vx, vtxH[idx]});
+                    }
+                }
+                if (verts.empty() || verts.front().first != 0)
+                    verts.insert(verts.begin(), {0, vtxH[vz * cW + 0]});
+                if (verts.back().first != gridW)
+                    verts.push_back({gridW, vtxH[vz * cW + gridW]});
+            }
+            return verts;
+        };
+
+        // EDGE_NEG_X (West): X=0, walk along Z, normal -X
+        {
+            auto ev = collectEdgeVertices(true, false);
+            for (size_t i = 0; i + 1 < ev.size(); ++i) {
+                emitCasingQuad(result.edgeSeams[EDGE_NEG_X],
+                    0, ev[i].second,   ev[i].first   * step,
+                    0, ev[i+1].second, ev[i+1].first * step,
+                    FACE_NEG_X, false);
+            }
+        }
+
+        // EDGE_POS_X (East): X=CHUNK_SIZE, walk along Z, normal +X
+        {
+            auto ev = collectEdgeVertices(true, true);
+            for (size_t i = 0; i + 1 < ev.size(); ++i) {
+                emitCasingQuad(result.edgeSeams[EDGE_POS_X],
+                    CHUNK_SIZE, ev[i].second,   ev[i].first   * step,
+                    CHUNK_SIZE, ev[i+1].second, ev[i+1].first * step,
+                    FACE_POS_X, true);
+            }
+        }
+
+        // EDGE_NEG_Z (South): Z=0, walk along X, normal -Z
+        {
+            auto ev = collectEdgeVertices(false, false);
+            for (size_t i = 0; i + 1 < ev.size(); ++i) {
+                emitCasingQuad(result.edgeSeams[EDGE_NEG_Z],
+                    ev[i].first   * step, ev[i].second,   0,
+                    ev[i+1].first * step, ev[i+1].second, 0,
+                    FACE_NEG_Z, true);
+            }
+        }
+
+        // EDGE_POS_Z (North): Z=CHUNK_SIZE, walk along X, normal +Z
+        {
+            auto ev = collectEdgeVertices(false, true);
+            for (size_t i = 0; i + 1 < ev.size(); ++i) {
+                emitCasingQuad(result.edgeSeams[EDGE_POS_Z],
+                    ev[i].first   * step, ev[i].second,   CHUNK_SIZE,
+                    ev[i+1].first * step, ev[i+1].second, CHUNK_SIZE,
+                    FACE_POS_Z, false);
+            }
+        }
+    }

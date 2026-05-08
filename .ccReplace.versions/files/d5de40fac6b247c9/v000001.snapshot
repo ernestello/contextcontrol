@@ -1,0 +1,275 @@
+#include "HeightmapMeshInternal.h"
+
+// GPT-DESC: Optimizes generated heightmap meshes and splits them into 16-bit upload chunks.
+
+std::atomic<uint64_t> g_totalVertsBefore{0};
+std::atomic<uint64_t> g_totalVertsAfter{0};
+std::atomic<uint64_t> g_totalMeshesDeduplicated{0};
+std::atomic<uint64_t> g_affineMergeQuads{0};
+std::atomic<uint64_t> g_affineMergeCellsSaved{0};
+
+static constexpr int VERTEX_CACHE_SIZE = 32; // Modern GPUs: typically 16-32
+
+std::vector<SubChunk> splitMeshToSubChunks(const ChunkMesh& mesh) {
+    std::vector<SubChunk> subChunks;
+    
+    if (mesh.isEmpty()) {
+        return subChunks;
+    }
+    
+    // If mesh fits in one SubChunk, just convert indices to 16-bit
+    if (mesh.vertices.size() <= MAX_VERTICES_PER_SUBCHUNK) {
+        SubChunk sub;
+        sub.vertices = mesh.vertices;
+        sub.indices.reserve(mesh.indices.size());
+        for (uint32_t idx : mesh.indices) {
+            sub.indices.push_back(static_cast<uint16_t>(idx));
+        }
+        subChunks.push_back(std::move(sub));
+        return subChunks;
+    }
+    
+    // Need to split - process triangles and track which vertices are used
+    SubChunk currentSub;
+    std::unordered_map<uint32_t, uint32_t> vertexRemap; // old index -> new index in current sub
+
+    // Helper to finalize current SubChunk
+    auto finalizeSub = [&]() {
+        if (!currentSub.isEmpty()) {
+            subChunks.push_back(std::move(currentSub));
+            currentSub = SubChunk();
+            vertexRemap.clear();
+        }
+    };
+    
+    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+        uint32_t i0 = mesh.indices[i];
+        uint32_t i1 = mesh.indices[i + 1];
+        uint32_t i2 = mesh.indices[i + 2];
+        
+        // Check if adding this triangle would exceed limit
+        size_t newVertices = 0;
+        if (vertexRemap.find(i0) == vertexRemap.end()) newVertices++;
+        if (vertexRemap.find(i1) == vertexRemap.end()) newVertices++;
+        if (vertexRemap.find(i2) == vertexRemap.end()) newVertices++;
+        
+        if (currentSub.vertices.size() + newVertices > MAX_VERTICES_PER_SUBCHUNK) {
+            finalizeSub();
+        }
+        
+        // Add vertices and remap indices
+        auto addVertex = [&](uint32_t oldIdx) -> uint16_t {
+            auto it = vertexRemap.find(oldIdx);
+            if (it != vertexRemap.end()) {
+                return static_cast<uint16_t>(it->second);
+            }
+            uint32_t newIdx = static_cast<uint32_t>(currentSub.vertices.size());
+            currentSub.vertices.push_back(mesh.vertices[oldIdx]);
+            vertexRemap[oldIdx] = newIdx;
+            return static_cast<uint16_t>(newIdx);
+        };
+        
+        currentSub.indices.push_back(addVertex(i0));
+        currentSub.indices.push_back(addVertex(i1));
+        currentSub.indices.push_back(addVertex(i2));
+    }
+    
+    // Finalize last SubChunk
+    finalizeSub();
+    
+    // Warn if we had to split
+    if (subChunks.size() > 1) {
+        static std::atomic<int> splitCount{0};
+        int count = ++splitCount;
+        if (count <= 10) {
+            std::cout << "[SubChunk] Split large mesh into " << subChunks.size() 
+                      << " SubChunks (" << mesh.vertices.size() << " vertices -> "
+                      << subChunks.size() << " draw calls)" << std::endl;
+        } else if (count == 11) {
+            std::cout << "[SubChunk] (suppressing further split messages)" << std::endl;
+        }
+    }
+    
+    // ERROR if we exceed MAX_SUBCHUNKS - data will be lost!
+    if (subChunks.size() > MAX_SUBCHUNKS) {
+        std::cerr << "[ERROR] Mesh requires " << subChunks.size() 
+                  << " SubChunks but MAX_SUBCHUNKS=" << MAX_SUBCHUNKS 
+                  << "! Data will be truncated! (" << mesh.vertices.size() << " vertices)" << std::endl;
+        subChunks.resize(MAX_SUBCHUNKS);
+    }
+    
+    return subChunks;
+}
+
+void deduplicateVertices(ChunkMesh& mesh) {
+    if (mesh.isEmpty()) return;
+    
+    const size_t origVertCount = mesh.vertices.size();
+    
+    // Map: packed value -> new index in deduplicated array
+    std::unordered_map<uint32_t, uint32_t> seen;
+    seen.reserve(origVertCount);
+    
+    std::vector<PackedVertex> newVerts;
+    newVerts.reserve(origVertCount);
+    
+    // Build remap table
+    std::vector<uint32_t> remap(origVertCount);
+    for (size_t i = 0; i < origVertCount; ++i) {
+        uint32_t key = mesh.vertices[i].packed;
+        auto [it, inserted] = seen.try_emplace(key, static_cast<uint32_t>(newVerts.size()));
+        if (inserted) {
+            newVerts.push_back(mesh.vertices[i]);
+        }
+        remap[i] = it->second;
+    }
+    
+    // Remap all indices
+    for (auto& idx : mesh.indices) {
+        idx = remap[idx];
+    }
+    
+    mesh.vertices = std::move(newVerts);
+    
+    // Track stats
+    g_totalVertsBefore.fetch_add(origVertCount, std::memory_order_relaxed);
+    g_totalVertsAfter.fetch_add(mesh.vertices.size(), std::memory_order_relaxed);
+    g_totalMeshesDeduplicated.fetch_add(1, std::memory_order_relaxed);
+}
+
+void reorderVerticesForFetch(ChunkMesh& mesh) {
+    if (mesh.isEmpty()) return;
+    
+    const size_t vertCount = mesh.vertices.size();
+    std::vector<uint32_t> remap(vertCount, UINT32_MAX);
+    std::vector<PackedVertex> newVerts;
+    newVerts.reserve(vertCount);
+    
+    uint32_t nextId = 0;
+    for (auto& idx : mesh.indices) {
+        if (remap[idx] == UINT32_MAX) {
+            remap[idx] = nextId++;
+            newVerts.push_back(mesh.vertices[idx]);
+        }
+        idx = remap[idx];
+    }
+    
+    // Append any unreferenced vertices (shouldn't happen after dedup, but be safe)
+    for (size_t i = 0; i < vertCount; ++i) {
+        if (remap[i] == UINT32_MAX) {
+            newVerts.push_back(mesh.vertices[i]);
+        }
+    }
+    
+    mesh.vertices = std::move(newVerts);
+}
+
+void optimizeTriangleOrder(ChunkMesh& mesh) {
+    if (mesh.isEmpty()) return;
+    const size_t triCount = mesh.indices.size() / 3;
+    if (triCount <= 1) return;
+    const size_t vertCount = mesh.vertices.size();
+
+    // Build adjacency: for each vertex, list of triangles using it
+    std::vector<std::vector<uint32_t>> vertToTris(vertCount);
+    for (size_t t = 0; t < triCount; ++t) {
+        vertToTris[mesh.indices[t * 3 + 0]].push_back(static_cast<uint32_t>(t));
+        vertToTris[mesh.indices[t * 3 + 1]].push_back(static_cast<uint32_t>(t));
+        vertToTris[mesh.indices[t * 3 + 2]].push_back(static_cast<uint32_t>(t));
+    }
+
+    // LRU cache (FIFO ring buffer)
+    std::vector<uint32_t> cache(VERTEX_CACHE_SIZE, UINT32_MAX);
+    std::vector<bool> inCache(vertCount, false);
+    int cachePos = 0;
+
+    auto pushCache = [&](uint32_t v) {
+        if (inCache[v]) return;
+        uint32_t evicted = cache[cachePos];
+        if (evicted != UINT32_MAX) inCache[evicted] = false;
+        cache[cachePos] = v;
+        inCache[v] = true;
+        cachePos = (cachePos + 1) % VERTEX_CACHE_SIZE;
+    };
+
+    std::vector<bool> emitted(triCount, false);
+    std::vector<uint32_t> newIndices;
+    newIndices.reserve(mesh.indices.size());
+
+    // Seed: emit triangle 0
+    auto emitTri = [&](uint32_t t) {
+        emitted[t] = true;
+        uint32_t v0 = mesh.indices[t * 3 + 0];
+        uint32_t v1 = mesh.indices[t * 3 + 1];
+        uint32_t v2 = mesh.indices[t * 3 + 2];
+        newIndices.push_back(v0);
+        newIndices.push_back(v1);
+        newIndices.push_back(v2);
+        pushCache(v0);
+        pushCache(v1);
+        pushCache(v2);
+    };
+
+    emitTri(0);
+
+    for (size_t emittedCount = 1; emittedCount < triCount; ) {
+        // Find best candidate: triangle with most vertices already in cache
+        uint32_t bestTri = UINT32_MAX;
+        int bestScore = -1;
+
+        // Only search triangles adjacent to cached vertices (locality)
+        for (int ci = 0; ci < VERTEX_CACHE_SIZE; ++ci) {
+            uint32_t cv = cache[ci];
+            if (cv == UINT32_MAX) continue;
+            for (uint32_t t : vertToTris[cv]) {
+                if (emitted[t]) continue;
+                int score = 0;
+                if (inCache[mesh.indices[t * 3 + 0]]) ++score;
+                if (inCache[mesh.indices[t * 3 + 1]]) ++score;
+                if (inCache[mesh.indices[t * 3 + 2]]) ++score;
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestTri = t;
+                    if (score == 3) break; // Can't do better
+                }
+            }
+            if (bestScore == 3) break;
+        }
+
+        // Fallback: if no cached neighbor found, pick first unemitted
+        if (bestTri == UINT32_MAX) {
+            for (size_t t = 0; t < triCount; ++t) {
+                if (!emitted[t]) { bestTri = static_cast<uint32_t>(t); break; }
+            }
+        }
+
+        emitTri(bestTri);
+        ++emittedCount;
+    }
+
+    mesh.indices = std::move(newIndices);
+}
+
+void optimizeMesh(ChunkMesh& mesh) {
+    deduplicateVertices(mesh);
+    optimizeTriangleOrder(mesh);
+    reorderVerticesForFetch(mesh);
+}
+
+void printDedupStats() {
+    uint64_t before = g_totalVertsBefore.load();
+    uint64_t after  = g_totalVertsAfter.load();
+    uint64_t meshes = g_totalMeshesDeduplicated.load();
+    if (before == 0) return;
+    
+    double pct = 100.0 * (1.0 - static_cast<double>(after) / static_cast<double>(before));
+    double savedMB = static_cast<double>(before - after) * sizeof(PackedVertex) / (1024.0 * 1024.0);
+    
+    std::cout << "\n[Vertex Dedup] " << meshes << " meshes optimized"
+              << "\n  Vertices: " << before << " -> " << after 
+              << " (removed " << (before - after) << ", -" << std::fixed << std::setprecision(1) << pct << "%)"
+              << "\n  VB savings: " << std::setprecision(2) << savedMB << " MB"
+              << "\n  Affine AO merges: " << g_affineMergeQuads.load()
+              << " quads, +" << g_affineMergeCellsSaved.load() << " cells collapsed"
+              << std::endl;
+}

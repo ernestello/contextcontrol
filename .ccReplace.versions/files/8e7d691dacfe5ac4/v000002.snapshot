@@ -1,0 +1,77 @@
+#include "HeightmapMeshInternal.h"
+
+// GPT-DESC: Loads heightmap CSV input and resolves the tool maps directory.
+
+std::vector<float> loadHeightmapCSV(const std::string& path, int& outWidth, int& outHeight) {
+    std::ios_base::sync_with_stdio(false);
+    
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) return {};
+    
+    // Get file size and read entire file into memory
+    file.seekg(0, std::ios::end);
+    size_t fileSize = file.tellg();
+    file.seekg(0, std::ios::beg);
+    
+    std::vector<char> buffer(fileSize);
+    file.read(buffer.data(), fileSize);
+    file.close();
+    
+    std::vector<float> heights;
+    heights.reserve(20480 * 20480);
+    
+    const char* ptr = buffer.data();
+    const char* end = ptr + fileSize;
+    
+    // Skip BOM
+    if (fileSize >= 3 && (unsigned char)ptr[0] == 0xEF && (unsigned char)ptr[1] == 0xBB && (unsigned char)ptr[2] == 0xBF) {
+        ptr += 3;
+    }
+    
+    int rowCount = 0;
+    int colCount = 0;
+    int currentCol = 0;
+    
+    // Ultra-fast parsing: no validation, direct atof
+    while (ptr < end) {
+        // Parse number
+        float height = static_cast<float>(std::atof(ptr));
+        heights.push_back(height);
+        ++currentCol;
+        
+        // Skip to next comma or newline
+        while (ptr < end && *ptr != ',' && *ptr != '\n' && *ptr != '\r') ++ptr;
+        
+        if (ptr < end && *ptr == ',') {
+            ++ptr; // Skip comma
+        } else {
+            // End of line
+            if (rowCount == 0) colCount = currentCol;
+            currentCol = 0;
+            while (ptr < end && (*ptr == '\n' || *ptr == '\r')) ++ptr;
+            ++rowCount;
+        }
+    }
+    
+    outWidth = colCount;
+    outHeight = rowCount;
+    return heights;
+}
+
+std::string getMapsBasePath() {
+    // Try relative to executable first
+    std::filesystem::path cwd = std::filesystem::current_path();
+    std::filesystem::path mapsPath = cwd / "maps";
+    if (std::filesystem::exists(mapsPath)) {
+        return mapsPath.string();
+    }
+    
+    // Try project root
+    std::filesystem::path projectPath = "D:/Projects/vulkanas/maps";
+    if (std::filesystem::exists(projectPath)) {
+        return projectPath.string();
+    }
+    
+    // Default to relative
+    return "maps";
+}
