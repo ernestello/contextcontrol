@@ -1,0 +1,436 @@
+#version 450
+
+// Input from vertex shader
+layout(location = 0) in vec3 fragWorldPos;
+layout(location = 1) in vec3 fragNormal;
+layout(location = 2) in vec3 fragColor;
+layout(location = 3) in float fragAOLevel;
+layout(location = 4) in vec2 fragUV;
+layout(location = 5) in flat vec3 fragChunkOrigin;  // Chunk origin for voxel coord calculation
+layout(location = 6) in flat uint fragFace;
+layout(location = 7) in flat vec3 fragFlatPos;  // Provoking vertex pos (constant per tri)
+layout(location = 8) in flat float fragFlatAO;  // Provoking vertex AO (constant per tri)
+layout(location = 9) in flat uint fragMaterial;
+
+// Output
+layout(location = 0) out vec4 outColor;
+
+#include "../common/terrain_bindings.glsl"
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shared includes: dither/hash/noise utilities, lighting, shadow sampling
+// ═══════════════════════════════════════════════════════════════════════════
+#include "../common/dither_utils.glsl"
+#include "../common/shadow_sampling.glsl"
+#include "../common/clustered_lighting.glsl"
+#include "../common/sky_enclosure.glsl"
+#include "../common/terrain_materials.glsl"
+#include "../common/terrain_ao.glsl"
+
+void main() {
+    vec3 normal = normalize(fragNormal);
+    uint material = lookupMaterialOverlay(fragWorldPos, normal, fragFace, fragMaterial);
+    vec3 baseColor = sampleVoxelMaterial(fragWorldPos, fragFace, material, fragColor);
+    
+    uint face = fragFace;
+    if (face == 6u) {
+        discard;
+    }
+
+    // === VOXEL TERRAIN ===
+    float AO_PIXEL_SIZE = ao.shadowTint1.w;
+    vec3 aoMul = vec3(1.0);
+    baseColor = applyVoxelTerrainAO(baseColor, fragAOLevel, fragWorldPos, face, aoMul);
+    
+    // Start with ambient lighting - base illumination for all faces.
+    // Modulate by "sky enclosure" so deep pits / cave mouths / behind-wall
+    // pixels genuinely darken (places sky light cannot reach). Open ground
+    // is unaffected because raw enclosure ≈ 0 there → multiplier = 1.
+    // The same multiplier is applied to the sun-direct contribution below
+    // so a fragment that is geometrically buried gets darkened regardless
+    // of whether the sun shadow map happens to cover it (this fixes the
+    // sun-area-fade leak that lit caves in the distance).
+    // Compute sun shadow up-front so the enclosure can react to actual sun
+    // reach ("shadows dissolve from light"). Cheap: same shadow tap we'd do
+    // anyway, just hoisted above the visualize/ambient block.
+    float sunIntensity = shadow.shadowConfig.x;
+    float sunShadow = 1.0;
+    if (lighting.sunDirection.w > 0.0 && sunIntensity > 0.001) {
+        float rawShadow = sampleSunShadow(fragWorldPos, normal);
+        float sunAreaRadius = shadow.diagConfig.z;
+        if (sunAreaRadius > 0.0) {
+            float horizDist = length(fragWorldPos.xz - camera.cameraPos.xz);
+            float fade = smoothstep(sunAreaRadius * 0.85, sunAreaRadius, horizDist);
+            rawShadow = mix(rawShadow, 1.0, fade);
+        }
+        sunShadow = 1.0 - sunIntensity * (1.0 - rawShadow);
+    }
+    float sunReach = sunShadow * lighting.sunDirection.w;
+
+    // Ambient enclosure: NO dissolve → deep holes go fully dark at night /
+    // when no sun rays hit them, exactly as before.
+    float ambientEnclosure = computeSkyEnclosure(fragWorldPos, normal, 0.0);
+    vec3 finalColor = baseColor * lighting.sunColor.xyz * lighting.sunColor.w * ambientEnclosure;
+    if (skyEnclosureVisualizeEnabled()) {
+        outColor = vec4(skyEnclosureDebugColor(fragWorldPos, normal, sunReach), 1.0);
+        return;
+    }
+
+    // Add directional light (sun/moon) with face-aware adjustment
+    // Since we have proper AO now, we use softer directional shading
+    // to avoid side faces being too dark
+    if (lighting.sunDirection.w > 0.0) {
+        // Sun shadow debug visualization (diagConfig.y > 0)
+        vec4 sunDebug = debugSunShadow(fragWorldPos, normal);
+        if (sunDebug.a > 0.5) {
+            outColor = sunDebug;
+            return;
+        }
+
+        vec3 sunDir = normalize(lighting.sunDirection.xyz);
+        float rawDiffuse = max(dot(normal, -sunDir), 0.0);
+
+        // Lift the minimum diffuse to 0.5 so side faces aren't too dark
+        // This gives a more stylized, cartoon look that works with our AO
+        float liftedDiffuse = mix(0.5, 1.0, rawDiffuse);
+
+        // Still apply quantization for retro look
+        float diffuse = quantizeLight(liftedDiffuse, 5);
+
+        // Sun-direct enclosure: dissolved by sunReach. Where the sun hits,
+        // the geometric darkness softens (red → yellow / green) which
+        // simulates light dispelling shadow without losing the deep-hole
+        // darkness in unreached areas.
+        float sunEnclosure = computeSkyEnclosure(fragWorldPos, normal, sunReach);
+        finalColor += baseColor * lighting.sunColor.xyz * diffuse * lighting.sunDirection.w * sunShadow * sunEnclosure;
+    }
+    
+    // Add point lights (accumulate-then-quantize for organic light blending)
+    float totalBrightnessRawForAO = 0.0;
+
+    // Night-only cosmetic: screen-space edge dithering fades out during day
+    // where ambient sunlight makes dissolve patterns look unnatural.
+    float nightStrength = 1.0 - smoothstep(0.08, 0.45, lighting.sunDirection.w);
+
+    {
+        vec3  totalLightContrib = vec3(0.0);
+        vec3  totalLightContribRaw = vec3(0.0);
+        float totalBrightness  = 0.0;
+        float totalBrightnessRaw = 0.0;
+        float peakBrightnessRaw = 0.0;
+        float shadowEvidence = 0.0;
+        float pulseEvidence = 0.0;
+        bool diagEnabled = (shadow.diagConfig.x > 0.5);
+        uvec2 diagPix = uvec2(gl_FragCoord.xy);
+        bool diagSample = diagEnabled && ((diagPix.x & 7u) == 0u) && ((diagPix.y & 7u) == 0u);
+        const uint DIAG_SCALE = 64u;
+        // --- Clustered lighting: fetch bitmask for this fragment's cluster ---
+        uint clTileX = min(uint(gl_FragCoord.x / clusters.clusterTileDims.x), clusters.clusterGridDims.x - 1u);
+        uint clTileY = min(uint(gl_FragCoord.y / clusters.clusterTileDims.y), clusters.clusterGridDims.y - 1u);
+        float clViewDist = length(fragWorldPos - camera.cameraPos);
+        uint clSlice = clamp(uint(log(clViewDist / clusters.clusterZParams.x) * clusters.clusterZParams.w),
+                             0u, clusters.clusterGridDims.z - 1u);
+        uint clIdx = (clTileY * clusters.clusterGridDims.x + clTileX) * clusters.clusterGridDims.z + clSlice;
+        uint lightMask = (clIdx < clusters.clusterGridDims.w) ? clusters.clusterLightMasks[clIdx] : 0u;
+
+        while (lightMask != 0u) {
+            uint i = findLSB(lightMask);
+            lightMask &= lightMask - 1u; // clear lowest set bit
+
+            vec4 contrib = calculatePointLightSmooth(fragWorldPos, normal, baseColor, i, face);
+            if (contrib.a <= MIN_LIGHT_BRIGHTNESS) continue;
+            if (diagSample && i < 32u) {
+                atomicAdd(shadow.pointShadowDiag[i].y, DIAG_SCALE);
+            }
+            totalLightContribRaw += contrib.rgb;
+            totalBrightnessRaw += contrib.a;
+            peakBrightnessRaw = max(peakBrightnessRaw, contrib.a);
+            float pulseStrengthNow = clamp(lighting.lightPulseData[i].x, 0.0, 1.0);
+            float breathPulseNow = clamp((lighting.lightPulseData[i].y - 1.0) / 0.45, 0.0, 1.0);
+            pulseEvidence = max(pulseEvidence, max(pulseStrengthNow, breathPulseNow));
+
+            // Check point light shadow before expensive light calculation
+            float ptShadow = 1.0;
+            if (shadow.shadowConfig.y > 0.0 &&
+                i < 32u &&
+                shadow.pointShadowInfo[i].w > 0.0 &&
+                contrib.a >= MIN_SHADOW_BRIGHTNESS) {
+                if (diagSample) {
+                    atomicAdd(shadow.pointShadowDiag[i].x, DIAG_SCALE);
+                }
+                ptShadow = samplePointShadow(fragWorldPos, normal, i);
+                shadowEvidence = max(shadowEvidence, 1.0 - ptShadow);
+                if (ptShadow <= 0.0) {
+                    if (diagSample) {
+                        atomicAdd(shadow.pointShadowDiag[i].z, DIAG_SCALE);
+                    }
+                    continue; // Fully shadowed, skip this light
+                }
+            }
+
+            totalLightContrib += contrib.rgb * ptShadow;
+            totalBrightness  += contrib.a * ptShadow;
+            if (diagSample && i < 32u) {
+                atomicAdd(shadow.pointShadowDiag[i].w, DIAG_SCALE);
+            }
+        }
+
+        totalBrightnessRawForAO = totalBrightness;
+
+        if (totalBrightnessRaw > 0.001) {
+            // Bring back pixel-art pulse styling, but only near strong orb cores.
+            float clampedBright = clamp(totalBrightness, 0.0, 2.0);
+            float clampedBrightRaw = clamp(totalBrightnessRaw, 0.0, 2.0);
+            bool verticalFaceLighting = (face != 2u && face != 3u);
+            float shadowOcclusion = 0.0;
+            if (clampedBrightRaw > 0.001) {
+                shadowOcclusion = clamp(1.0 - (clampedBright / clampedBrightRaw), 0.0, 1.0);
+            }
+
+            // Light-eats-shadow: only RECEIVED light (post shadow-map)
+            // washes out shadows. Stepped for retro feel — bright light
+            // punches through cast shadows in discrete bands, not smooth.
+            {
+                float brightNorm = clamp(clampedBright / 2.0, 0.0, 1.0);
+                // 3-level step: shadow fully eaten above ~0.33 brightness
+                float shadowEat = floor(brightNorm * 3.0 + 0.5) / 3.0;
+                float shadowRetain = 1.0 - shadowEat;
+
+                totalLightContrib = mix(totalLightContribRaw, totalLightContrib, shadowRetain);
+                clampedBright = mix(clampedBrightRaw, clampedBright, shadowRetain);
+                shadowEvidence *= shadowRetain;
+                shadowOcclusion *= shadowRetain;
+            }
+
+            if (clampedBright > 0.0001) {
+                const float LIGHT_BANDS = 8.0;
+                const float MAX_STYLIZED_BRIGHT = 2.0;
+                if (verticalFaceLighting) {
+                    // Stabilize vertical bands against tiny per-fragment shadow variance.
+                    clampedBright = floor(clampedBright * 256.0 + 0.5) / 256.0;
+                }
+
+                // Slightly bias high brightness upward so bright bands feel more dominant
+                // without breaking accumulate-then-quantize light merging.
+                float brightNorm = clamp(clampedBright / MAX_STYLIZED_BRIGHT, 0.0, 1.0);
+                float brightBoost = smoothstep(0.35, 1.0, brightNorm) * 0.24;
+                float bandInput = min(clampedBright * (1.0 + brightBoost), MAX_STYLIZED_BRIGHT);
+
+                // Keep 8 visible light bands (excluding pure darkness), then handle
+                // the final dissolve-to-dark separately so there is no dead strip.
+                float scaledRaw = (bandInput / MAX_STYLIZED_BRIGHT) * LIGHT_BANDS;
+                float quantScaled = clamp(max(scaledRaw, 1.0), 1.0, LIGHT_BANDS);
+                float baseBandIdx = floor(quantScaled - 1.0);
+                float bandFrac = fract(quantScaled);
+
+                float loBand = ((baseBandIdx + 1.0) / LIGHT_BANDS) * MAX_STYLIZED_BRIGHT;
+                float hiBand = min(((baseBandIdx + 2.0) / LIGHT_BANDS) * MAX_STYLIZED_BRIGHT,
+                                   MAX_STYLIZED_BRIGHT);
+                float shadowMask = max(shadowOcclusion, shadowEvidence);
+
+                // When multiple lights have different shadow states (one shadows
+                // while another illuminates), preserve dithered band transitions
+                // so color morphing between differently-colored lights works.
+                float shadowConflict = clamp(shadowEvidence - shadowOcclusion, 0.0, 1.0);
+                float shadowEdgeNoiseGate = 1.0 - smoothstep(0.02, 0.20, shadowMask) * (1.0 - shadowConflict);
+
+                // World-space pixel cell for band transitions:
+                // 1/64m cells => 16x16 grid per 0.250m terrain piece.
+                // Use the same phase/snap as point-light evaluation to prevent broken pixels.
+                vec3 pixWorldBand = snapGridCenterOffset(
+                    fragWorldPos,
+                    LIGHT_GRID_CELL_SIZE,
+                    LIGHT_GRID_PHASE_OFFSET_CELLS);
+                vec2 cellCoord = floor(faceCell(pixWorldBand, face) / LIGHT_GRID_CELL_SIZE + 0.01);
+
+                // ── Pixel-art diffusion at band edges ──────────────────────
+                float diffZoneWidth = 0.125;
+                float diffStart = 0.5 - diffZoneWidth;
+                float diffEnd   = 0.5 + diffZoneWidth;
+
+                float naturalBand;
+                if (bandFrac < diffStart) {
+                    naturalBand = loBand;
+                } else if (bandFrac > diffEnd) {
+                    naturalBand = hiBand;
+                } else {
+                    float t = (bandFrac - diffStart) / (diffEnd - diffStart);
+
+                    vec2 orderedCell = mod(mod(cellCoord, 8.0) + 8.0, 8.0);
+                    float ordered = bayerDither8x8(orderedCell);
+
+                    float heldNoise = bandBlendHeldNoiseCell(
+                        cellCoord + vec2(13.7, 29.3),
+                        lighting.time,
+                        0.22,
+                        0.58);
+                    float driftNoise = bandBlendNoiseCell(
+                        cellCoord * 1.19 + vec2(5.1, 47.3),
+                        lighting.time,
+                        0.48);
+                    float randPattern = clamp(heldNoise * 0.72 + driftNoise * 0.28, 0.0, 1.0);
+                    float localBias = (hash12(cellCoord + vec2(3.7, 91.1)) - 0.5) * 0.05;
+                    float shimmerAmp = 0.09;
+                    float shimmeredT = clamp(
+                        t + localBias + (randPattern - 0.5) * shimmerAmp,
+                        0.0,
+                        1.0);
+
+                    float transitionMask = clamp(ordered * 0.62 + randPattern * 0.38, 0.0, 1.0);
+                    naturalBand = (transitionMask < shimmeredT) ? hiBand : loBand;
+                }
+                float stableBand = quantizeBandsStepped(
+                    bandInput,
+                    LIGHT_BANDS,
+                    MAX_STYLIZED_BRIGHT,
+                    0.0,
+                    0.08);
+                // With dithered binary shadows, shadow edges are already
+                // retro-patterned; only deep full-shadow needs band stabilization.
+                float stableShadowWeight = smoothstep(0.45, 0.85, shadowMask) * (1.0 - shadowConflict);
+                naturalBand = mix(naturalBand, stableBand, stableShadowWeight);
+
+                // ── Dither the darkest band toward the darkness boundary ─────
+                const float SCREEN_DITHER_BAND_LIMIT = 2.0;
+                float ditherPixSize = max(AO_PIXEL_SIZE * 1.5, 3.0);
+                float shadowAwareNight = nightStrength * shadowEdgeNoiseGate;
+                if (shadowAwareNight > 0.001 && scaledRaw < SCREEN_DITHER_BAND_LIMIT && naturalBand > 0.0) {
+                    float ditherT = 1.0 - (scaledRaw / SCREEN_DITHER_BAND_LIMIT);
+                    ditherT = ditherT * ditherT * (3.0 - 2.0 * ditherT);
+                    ditherT *= shadowAwareNight;
+
+                    vec2 ditherCell = floor(gl_FragCoord.xy / ditherPixSize);
+                    float bayer = bayerDither4x4(ditherCell);
+                    float breathe = sin(lighting.time * 0.25 + bayer * 3.14159) * 0.015;
+                    float threshold = clamp(bayer + breathe, 0.0, 1.0);
+
+                    float coverage = ditherT * 0.65;
+                    if (threshold < coverage) {
+                        naturalBand = 0.0;
+                    }
+                }
+
+                // Replace the previous gap before darkness with sparse dark pixels
+                // that get denser toward the edge, then converge to full dark.
+                float darkScatter = (1.0 - smoothstep(0.08, 1.55, scaledRaw)) * shadowEdgeNoiseGate;
+                if (darkScatter > 0.001 && naturalBand > 0.0001) {
+                    vec2 orderedCell = mod(mod(cellCoord, 8.0) + 8.0, 8.0);
+                    float ordered = bayerDither8x8(orderedCell);
+                    float darkNoiseA = bandBlendNoiseCell(cellCoord + vec2(23.7, 79.1), lighting.time + 1.3, 0.30);
+                    float darkNoiseB = bandBlendNoiseCell(cellCoord * 1.33 + vec2(61.9, 5.7), lighting.time, 0.19);
+                    float darkPattern = clamp(ordered * 0.50 + darkNoiseA * 0.35 + darkNoiseB * 0.15, 0.0, 1.0);
+
+                    float scatterCoverage = darkScatter * darkScatter * 0.90;
+                    float scatterMask = smoothstep(1.0 - scatterCoverage - 0.11,
+                                                   1.0 - scatterCoverage + 0.11,
+                                                   darkPattern);
+                    float darknessStrength = mix(0.28, 0.95, darkScatter);
+                    naturalBand = mix(naturalBand, 0.0, scatterMask * darknessStrength);
+                }
+
+                // Very outermost edge should end in solid darkness (no lingering dither).
+                float hardDarkEdge = 1.0 - smoothstep(0.015, 0.11, scaledRaw);
+                if (hardDarkEdge > 0.001) {
+                    naturalBand *= (1.0 - hardDarkEdge);
+                    if (scaledRaw < 0.02) {
+                        naturalBand = 0.0;
+                    }
+                }
+
+                float scale = naturalBand / max(clampedBright, 0.001);
+                totalLightContrib *= scale;
+            }
+
+            finalColor += totalLightContrib;
+        }
+    }
+
+    // AO wash-out from light orbs — aggressive stepped recovery.
+    // Point light brightness determines how much AO darkening to undo.
+    // Uses sqrt curve so even moderate light visibly eats into AO shadows,
+    // matching the retro feel where light orbs punch through dark corners.
+    if (totalBrightnessRawForAO > 0.001 && any(lessThan(aoMul, vec3(0.999)))) {
+        float bandForAO = floor(clamp(totalBrightnessRawForAO / 2.0, 0.0, 1.0) * 8.0);
+        // Sqrt curve: band 1→35%, band 2→50%, band 4→71%, band 8→100%
+        // Much more responsive than linear (band 1 was only 12.5% before).
+        float aoFade = sqrt(clamp(bandForAO / 8.0, 0.0, 1.0));
+        if (aoFade > 0.0) {
+            vec3 aoRecovery = vec3(1.0) / max(aoMul, vec3(0.001));
+            finalColor *= mix(vec3(1.0), aoRecovery, aoFade);
+        }
+    }
+    
+    // Apply simple distance fog
+    float fogDensity = lighting.skyColor.w;
+    if (fogDensity > 0.0) {
+        float distance = length(fragWorldPos - camera.cameraPos);
+        float fogFactor = exp(-fogDensity * distance);
+        fogFactor = clamp(fogFactor, 0.0, 1.0);
+        
+        vec3 skyColor = lighting.skyColor.xyz;
+        finalColor = mix(skyColor, finalColor, fogFactor);
+    }
+    
+    // DEBUG: Extract debug flags from ao.ditherWarmTint.w (bit-cast from uint)
+    uint debugFlags = floatBitsToUint(ao.ditherWarmTint.w);
+    const uint DEBUG_SHOW_CHUNK_BOUNDS = 1u;
+    const uint DEBUG_SHOW_FACE_BOUNDS = 2u;
+    
+    // DEBUG: Highlight chunk boundaries to identify crack locations
+    if ((debugFlags & DEBUG_SHOW_CHUNK_BOUNDS) != 0u) {
+        vec3 chunkRelPos = fragWorldPos - fragChunkOrigin;
+        
+        // Distance from each chunk edge (chunk is 32m)
+        float edgeX_min = chunkRelPos.x;
+        float edgeX_max = 32.0 - chunkRelPos.x;
+        float edgeZ_min = chunkRelPos.z;
+        float edgeZ_max = 32.0 - chunkRelPos.z;
+        
+        float minEdgeDist = min(min(edgeX_min, edgeX_max), min(edgeZ_min, edgeZ_max));
+        
+        // Color code based on edge proximity (within 0.5m of edge)
+        if (minEdgeDist < 0.5) {
+            float intensity = 1.0 - (minEdgeDist / 0.5);
+            
+            // Determine which edge we're near for color coding
+            vec3 edgeColor = vec3(1.0, 0.0, 0.0);  // Default red
+            
+            if (edgeX_min < 0.25) edgeColor = vec3(1.0, 0.0, 0.0);      // -X edge: Red
+            else if (edgeX_max < 0.25) edgeColor = vec3(0.0, 1.0, 0.0); // +X edge: Green
+            else if (edgeZ_min < 0.25) edgeColor = vec3(0.0, 0.0, 1.0); // -Z edge: Blue
+            else if (edgeZ_max < 0.25) edgeColor = vec3(1.0, 1.0, 0.0); // +Z edge: Yellow
+            
+            finalColor = mix(finalColor, edgeColor, intensity * 0.8);
+        }
+        
+        // VERY CLOSE to edge (within 0.1m / ~half voxel) - mark as bright magenta
+        if (minEdgeDist < 0.1) {
+            finalColor = mix(finalColor, vec3(1.0, 0.0, 1.0), 0.7);  // Magenta
+        }
+    }
+    
+    // DEBUG: Highlight face/quad boundaries within chunks (greedy meshing boundaries)
+    // These appear at fractional voxel positions where merged quads meet
+    if ((debugFlags & DEBUG_SHOW_FACE_BOUNDS) != 0u) {
+        vec3 chunkRelPos = fragWorldPos - fragChunkOrigin;
+        
+        // Check distance to any voxel grid line (0.25m spacing)
+        // Faces should align to voxel boundaries
+        vec3 voxelPos = chunkRelPos * 4.0;  // Convert to voxel units
+        vec3 fracPart = fract(voxelPos);
+        
+        // Distance to nearest voxel boundary
+        vec3 distToBoundary = min(fracPart, 1.0 - fracPart);
+        float minDist = min(distToBoundary.x, min(distToBoundary.y, distToBoundary.z));
+        
+        // Highlight pixels very close to voxel boundaries (potential crack source)
+        if (minDist < 0.05) {
+            // Cyan for voxel boundaries
+            float intensity = 1.0 - (minDist / 0.05);
+            finalColor = mix(finalColor, vec3(0.0, 1.0, 1.0), intensity * 0.6);
+        }
+    }
+    
+    // Output final color
+    outColor = vec4(finalColor, 1.0);
+}

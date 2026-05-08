@@ -1,0 +1,105 @@
+// GPT-DESC: Provides voxel terrain AO pixel-centering and retro banded AO shading helpers.
+
+float sampleAOPixelCenter(float aoValue, vec2 faceCoord, vec2 cellCenterCoord) {
+    vec2 faceDx = dFdx(faceCoord);
+    vec2 faceDy = dFdy(faceCoord);
+    float aoDx = dFdx(aoValue);
+    float aoDy = dFdy(aoValue);
+
+    vec2 deltaFace = cellCenterCoord - faceCoord;
+    float det = faceDx.x * faceDy.y - faceDx.y * faceDy.x;
+    if (abs(det) < 1e-6) {
+        return aoValue;
+    }
+
+    vec2 deltaScreen = vec2(
+        (deltaFace.x * faceDy.y - deltaFace.y * faceDy.x) / det,
+        (faceDx.x * deltaFace.y - faceDx.y * deltaFace.x) / det);
+    return aoValue + aoDx * deltaScreen.x + aoDy * deltaScreen.y;
+}
+
+vec3 applyVoxelTerrainAO(vec3 baseColor,
+                         float fragAOLevelValue,
+                         vec3 worldPos,
+                         uint face,
+                         out vec3 aoMul) {
+    // Keep AO driven by the mesher's interpolated per-vertex field only.
+    // That preserves the "tri-side" wedge created by the chosen quad diagonal,
+    // while the shader just pixelates and bands it on a world-aligned grid.
+    float aoPixelRes = clamp(ao.scatterAmounts.w, 1.0, 64.0);
+
+    vec2 faceVoxelCoord = faceCell(worldPos * 4.0 + vec3(0.0001), face);
+    vec2 voxelPixelCoord = floor(faceVoxelCoord * aoPixelRes + 0.0001);
+    vec2 voxelPixelCenter = (voxelPixelCoord + 0.5) / aoPixelRes;
+
+    float aoInterp = clamp(fragAOLevelValue, 0.0, 1.0);
+    float aoCell = clamp(sampleAOPixelCenter(aoInterp, faceVoxelCoord, voxelPixelCenter), 0.0, 1.0);
+    float aoInset = mix(0.010, 0.032, smoothstep(0.35, 1.0, aoCell));
+    float aoLevel = max(aoCell - aoInset, 0.0);
+    float originalAO = aoLevel;
+    aoMul = vec3(1.0);
+
+    if (aoLevel > 0.0) {
+        float aoPowerCurve = max(ao.shadowTint0.w, 0.0001);
+        aoLevel = pow(aoLevel, aoPowerCurve);
+
+        float brightnessBands[4] = float[](
+            ao.brightnessLevels.x,
+            ao.brightnessLevels.y,
+            ao.brightnessLevels.z,
+            ao.brightnessLevels.w
+        );
+        vec3 shadowTints[4] = vec3[](
+            ao.shadowTint0.xyz,
+            ao.shadowTint1.xyz,
+            ao.shadowTint2.xyz,
+            ao.shadowTint3.xyz
+        );
+        vec3 ditherWarmTint = ao.ditherWarmTint.xyz;
+
+        float bandThreshold1 = max(ao.shadowTint2.w, 0.0001);
+        float bandThreshold2 = max(ao.shadowTint3.w, bandThreshold1 + 0.0001);
+        float midRange = max(bandThreshold2 - bandThreshold1, 0.0001);
+        float darkRange = max(1.0 - bandThreshold2, 0.0001);
+
+        float scaledAO;
+        if (aoLevel < bandThreshold1) {
+            scaledAO = aoLevel / bandThreshold1;
+        } else if (aoLevel < bandThreshold2) {
+            scaledAO = 1.0 + (aoLevel - bandThreshold1) / midRange;
+        } else {
+            scaledAO = 2.0 + (aoLevel - bandThreshold2) / darkRange;
+        }
+        scaledAO = clamp(scaledAO, 0.0, 3.0);
+
+        int lowerBand = int(floor(scaledAO));
+        int upperBand = min(lowerBand + 1, 3);
+        float bandPosition = fract(scaledAO);
+
+        float ordered = bayerDither8x8(mod(voxelPixelCoord, 8.0));
+        float chunky = segaDither2x2(voxelPixelCoord);
+        float scatterStrength = ao.scatterAmounts.x;
+        if (aoLevel >= bandThreshold2) {
+            scatterStrength = ao.scatterAmounts.z;
+        } else if (aoLevel >= bandThreshold1) {
+            scatterStrength = ao.scatterAmounts.y;
+        }
+        float scatter = (hash12(voxelPixelCoord + vec2(17.0, 59.0)) - 0.5) * scatterStrength;
+        float transition = clamp(ordered + scatter, 0.0, 1.0);
+        int selectedBand = (transition < bandPosition) ? upperBand : lowerBand;
+
+        float brightness = brightnessBands[selectedBand];
+        vec3 tint = shadowTints[selectedBand];
+
+        float warmMask = step(0.5, chunky) * smoothstep(0.32, 1.0, aoLevel);
+        tint *= mix(vec3(1.0), ditherWarmTint, warmMask * 0.35);
+
+        // Apply the stylized shading wherever the mesher actually says AO exists,
+        // including the lighter one-side corners that were getting suppressed.
+        float aoCoverage = smoothstep(0.01, 0.16, originalAO);
+        aoMul = mix(vec3(1.0), vec3(brightness) * tint, aoCoverage);
+        baseColor *= aoMul;
+    }
+
+    return baseColor;
+}

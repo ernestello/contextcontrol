@@ -1,0 +1,95 @@
+// GPT-DESC: Declares shared terrain fragment shader descriptor bindings and constants.
+
+struct PointLight {
+    vec4 positionRadius;  // xyz = position, w = radius
+    vec4 colorIntensity;  // xyz = color, w = intensity
+};
+
+const uint MAX_SHADER_LIGHTS = 32u;
+const uint MAX_SUN_SHADOW_CASCADES = 6u;
+const float LIGHT_GRID_WORLD_METERS = 0.250;
+const float LIGHT_GRID_CELLS = 16.0;
+const float LIGHT_GRID_CELL_SIZE = LIGHT_GRID_WORLD_METERS / LIGHT_GRID_CELLS; // 1/64m
+const float LIGHT_GRID_PHASE_OFFSET_CELLS = 0.5;
+const float MIN_LIGHT_BRIGHTNESS = 0.0030;
+const float MIN_SHADOW_BRIGHTNESS = 0.0200;
+
+// Lighting data storage buffer (SSBO for >32 light capacity)
+layout(std430, set = 0, binding = 2) readonly buffer LightingData {
+    // Directional light (sun/moon)
+    vec4 sunDirection;      // xyz = direction, w = intensity
+    vec4 sunColor;          // xyz = color, w = ambient strength
+
+    // Sky/atmosphere
+    vec4 skyColor;          // xyz = sky color, w = fog density
+
+    // Point lights
+    PointLight pointLights[4096];
+
+    uint numPointLights;
+    float time;
+    uint _pad0;
+    uint _pad1;
+
+    // Per-light pulse data (synced with glow billboard system on CPU)
+    // x = pulseStrength, y = breathScale, z = flickerAmount, w = flickerSpeed
+    vec4 lightPulseData[4096];
+} lighting;
+
+// Camera position for fog calculation
+layout(set = 0, binding = 3) uniform CameraData {
+    vec3 cameraPos;
+} camera;
+
+// AO settings for real-time adjustment
+layout(set = 0, binding = 4) uniform AOData {
+    // Voxel AO (7 vec4s)
+    vec4 brightnessLevels;    // x=L0, y=L1, z=L2, w=L3
+    vec4 shadowTint0;         // xyz=tint0, w=aoPowerCurve
+    vec4 shadowTint1;         // xyz=tint1, w=aoPixelSize
+    vec4 shadowTint2;         // xyz=tint2, w=bandThreshold1
+    vec4 shadowTint3;         // xyz=tint3, w=bandThreshold2
+    vec4 ditherWarmTint;      // xyz=ditherWarmTint, w=debugFlags
+    vec4 scatterAmounts;      // x=light, y=medium, z=dark, w=unused
+    // DCCM AO (5 vec4s)
+    vec4 dccmBrightness;      // 4 brightness bands
+    vec4 dccmShadowTintCfg;   // xyz=tint, w=powerCurve
+    vec4 dccmConfig;          // x=pixelSize, y=ditherStrength, z=wireThickness, w=flags
+    vec4 dccmFillCol;         // xyz=fill color
+    vec4 dccmLineCol;         // xyz=line color
+} ao;
+
+// Shadow data SSBO (sun + point light shadow matrices and config + diagnostics)
+layout(std430, set = 0, binding = 5) buffer ShadowData {
+    mat4 sunLightVP[MAX_SUN_SHADOW_CASCADES];
+    vec4 sunCascadeParams[MAX_SUN_SHADOW_CASCADES]; // x=halfExtent, y=texelMeters
+    vec4 sunDirTexelSize;            // xyz=sun direction (towards ground), w=world-space texel footprint
+    vec4 shadowConfig;           // x=sunEnabled, y=pointEnabled, z=sunMapSize, w=pointMapSize
+    vec4 shadowConfig2;          // x=sunCascadeCount, y=cascadeBlendFrac, z=maxCastRadius
+    vec4 pointShadowInfo[32];    // x=near, y=far, z=radius, w=enabled
+    // x=pointShadowSamples, y=lightEvalFragments, z=fullyOccludedFragments, w=litContribFragments
+    uvec4 pointShadowDiag[32];
+    vec4 diagConfig;             // x=enableDetailedDiagnostics
+    // Sky enclosure: x=intensity, y=minAmbient, z=probeMaxHeight (m), w=mode (0=off,1=on,2=visualize)
+    vec4 skyEnclosureParams;
+    // Sky-vis static heightmap mapping:
+    // x=worldOriginXMeters, y=worldOriginZMeters,
+    // z=metersPerTexel (square), w=valueScaleToWorldYMeters (0 = disabled)
+    vec4 skyHeightmapInfo;
+} shadow;
+
+// Shadow map samplers (hardware depth comparison, nearest filter for pixel art)
+layout(set = 0, binding = 6) uniform sampler2DArrayShadow sunShadowMap;
+layout(set = 0, binding = 7) uniform samplerCubeArrayShadow pointShadowMaps;
+
+// Clustered lighting bitmask SSBO
+layout(std430, set = 0, binding = 8) readonly buffer ClusterData {
+    uvec4 clusterGridDims;   // x=tilesX, y=tilesY, z=numSlices, w=totalClusters
+    vec4  clusterZParams;    // x=near, y=far, z=logRatio, w=sliceScale
+    vec4  clusterTileDims;   // x=tileSizeX, y=tileSizeY, z=screenW, w=screenH
+    uint  clusterLightMasks[];
+} clusters;
+
+// Sky-vis static heightmap (sun-independent zenith occlusion source).
+// Stored as R16F voxel-height values; multiply by shadow.skyHeightmapInfo.w to get world Y in meters.
+layout(set = 0, binding = 9) uniform sampler2D skyHeightmap;

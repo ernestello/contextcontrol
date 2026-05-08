@@ -4,7 +4,7 @@
                       "Path":  "shaders/terrain/cube.frag",
                       "FullPath":  "D:\\projects\\vulkanas\\shaders\\terrain\\cube.frag",
                       "Key":  "c8be980eadeddfda",
-                      "CurrentVersion":  8,
+                      "CurrentVersion":  9,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -53,6 +53,12 @@
                                            "Timestamp":  "2026-05-05T21:00:39.7432485Z",
                                            "Snapshot":  "files\\c8be980eadeddfda\\v000008.snapshot",
                                            "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  9,
+                                           "Timestamp":  "2026-05-08T13:20:04.6876435Z",
+                                           "Snapshot":  "files\\c8be980eadeddfda\\v000009.snapshot",
+                                           "Reason":  "applied whole_file"
                                        }
                                    ]
                   },
@@ -1188,7 +1194,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  15,
+                      "CurrentVersion":  16,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1278,6 +1284,12 @@
                                            "Version":  15,
                                            "Timestamp":  "2026-05-08T12:55:50.2746373Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000015.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  16,
+                                           "Timestamp":  "2026-05-08T13:20:04.7718036Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000016.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -3196,6 +3208,68 @@
                                            "Version":  2,
                                            "Timestamp":  "2026-05-08T13:13:38.0019071Z",
                                            "Snapshot":  "files\\8db4e33a35b3f845\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "shaders/common/terrain_bindings.glsl",
+                      "FullPath":  "D:\\projects\\vulkanas\\shaders\\common\\terrain_bindings.glsl",
+                      "Key":  "2c07987b5b63009b",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:20:04.6091485Z",
+                                           "Snapshot":  "files\\2c07987b5b63009b\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "shaders/common/terrain_materials.glsl",
+                      "FullPath":  "D:\\projects\\vulkanas\\shaders\\common\\terrain_materials.glsl",
+                      "Key":  "71fcdbbf681ccd4b",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:20:04.6342009Z",
+                                           "Snapshot":  "files\\71fcdbbf681ccd4b\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "shaders/common/terrain_ao.glsl",
+                      "FullPath":  "D:\\projects\\vulkanas\\shaders\\common\\terrain_ao.glsl",
+                      "Key":  "1eef2e8c5318d838",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:20:04.6572932Z",
+                                           "Snapshot":  "files\\1eef2e8c5318d838\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "shaders/terrain/dccm_terrain.frag",
+                      "FullPath":  "D:\\projects\\vulkanas\\shaders\\terrain\\dccm_terrain.frag",
+                      "Key":  "1c135d65dda6e90c",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T13:20:04.7157863Z",
+                                           "Snapshot":  "files\\1c135d65dda6e90c\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T13:20:04.7426778Z",
+                                           "Snapshot":  "files\\1c135d65dda6e90c\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
