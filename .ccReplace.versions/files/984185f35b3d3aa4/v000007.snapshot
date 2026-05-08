@@ -1,0 +1,1234 @@
+// GPT-DESC: Implements texture paint brush authoring, diagnostics, and debounced material rebake scheduling.
+#include "ui/debug_menu/world/TexturePaintTool.h"
+
+#include <algorithm>
+#include <cmath>
+#include <string>
+#include <climits>
+#include <cstdio>
+#include <queue>
+#include <unordered_set>
+
+#include <imgui.h>
+#include <glm/gtc/matrix_transform.hpp>
+
+#include "world/World.h"
+#include "world/edit/TerrainEditTypes.h"
+
+using TextureOverlay::TextureOverlayStore;
+using TextureOverlay::TextureType;
+using TextureOverlay::LODTextureConfig;
+using TextureOverlay::VoxelTextureData;
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr float PREVIEW_FADE_SEC = 1.5f;
+constexpr int MAX_SURFACE_BRUSH_FACES = 300000;
+constexpr int64_t MAX_SURFACE_BRUSH_SCAN_VOXELS = 16000000;
+
+// Same screen-ray construction as TerrainEditTool.
+glm::vec3 screenToWorldRay(double mouseX, double mouseY,
+                           int viewportW, int viewportH,
+                           const glm::mat4& invViewProj) {
+    const float ndcX =  (2.0f * static_cast<float>(mouseX)) / static_cast<float>(viewportW) - 1.0f;
+    const float ndcY = 1.0f - (2.0f * static_cast<float>(mouseY)) / static_cast<float>(viewportH);
+    glm::vec4 nearP = invViewProj * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+    glm::vec4 farP  = invViewProj * glm::vec4(ndcX, ndcY, 0.01f, 1.0f);
+    nearP /= nearP.w;
+    farP  /= farP.w;
+    return glm::normalize(glm::vec3(farP) - glm::vec3(nearP));
+}
+
+const ImVec4 kAccent = ImVec4(0.95f, 0.55f, 0.10f, 1.0f);
+const ImVec4 kHeading = ImVec4(0.55f, 0.85f, 1.0f, 1.0f);
+
+ImU32 colorFromVec3(const glm::vec3& c, uint8_t alpha = 220u) {
+    const uint8_t r = static_cast<uint8_t>(std::clamp(c.x, 0.0f, 1.0f) * 255.0f);
+    const uint8_t g = static_cast<uint8_t>(std::clamp(c.y, 0.0f, 1.0f) * 255.0f);
+    const uint8_t b = static_cast<uint8_t>(std::clamp(c.z, 0.0f, 1.0f) * 255.0f);
+    return IM_COL32(r, g, b, alpha);
+}
+
+glm::ivec3 faceNormalI(uint8_t face) {
+    switch (face % 6u) {
+        case 0: return glm::ivec3(-1, 0, 0);
+        case 1: return glm::ivec3( 1, 0, 0);
+        case 2: return glm::ivec3(0, -1, 0);
+        case 3: return glm::ivec3(0,  1, 0);
+        case 4: return glm::ivec3(0, 0, -1);
+        default: return glm::ivec3(0, 0,  1);
+    }
+}
+
+glm::vec3 faceCenterWorld(const glm::ivec3& voxel, uint8_t face) {
+    glm::vec3 p = glm::vec3(voxel) + glm::vec3(0.5f);
+    p += glm::vec3(faceNormalI(face)) * 0.5f;
+    return p * WorldConfig::VOXEL_SIZE_M;
+}
+
+struct PaintFaceKey {
+    glm::ivec3 voxel{0};
+    uint8_t face{0};
+    bool operator==(const PaintFaceKey& other) const noexcept {
+        return voxel == other.voxel && face == other.face;
+    }
+};
+
+struct PaintFaceKeyHash {
+    size_t operator()(const PaintFaceKey& key) const noexcept {
+        uint64_t h = static_cast<uint32_t>(key.voxel.x) * 73856093ull;
+        h ^= static_cast<uint32_t>(key.voxel.y) * 19349663ull;
+        h ^= static_cast<uint32_t>(key.voxel.z) * 83492791ull;
+        h ^= static_cast<uint64_t>(key.face) * 2654435761ull;
+        h ^= h >> 33;
+        return static_cast<size_t>(h);
+    }
+};
+
+} // namespace
+
+TextureOverlayStore& TexturePaintTool::getStore() {
+    static TextureOverlayStore fallback;
+    return m_world ? m_world->getTextureMaterialStore() : fallback;
+}
+
+const TextureOverlayStore& TexturePaintTool::getStore() const {
+    static TextureOverlayStore fallback;
+    return m_world ? m_world->getTextureMaterialStore() : fallback;
+}
+
+float TexturePaintTool::getPaintRepeatIntervalSec() const {
+    const int radius = std::max(1, m_radiusVoxelsLod0);
+    const int side = radius * 2 + 1;
+    const int64_t approxFaceCells = (m_shape == BrushShape::Sphere)
+        ? static_cast<int64_t>(3.14159265f * static_cast<float>(radius) * static_cast<float>(radius))
+        : static_cast<int64_t>(side) * static_cast<int64_t>(side);
+
+    // Small brushes feel like a normal paint brush. Huge brushes become
+    // stamp tools; repeating them at 20 Hz creates identical store writes and
+    // remesh storms with no visual benefit.
+    if (approxFaceCells <= 4096)   return 0.05f;
+    if (approxFaceCells <= 16384)  return 0.08f;
+    if (approxFaceCells <= 65536)  return 0.12f;
+    if (approxFaceCells <= 180000) return 0.18f;
+    return 0.25f;
+}
+
+size_t TexturePaintTool::flushPendingTextureDirtyChunks(bool force) {
+    if (!m_world || m_pendingTextureDirtyChunks.empty()) {
+        return 0u;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && m_lastTextureDirtyFlushTime.time_since_epoch().count() != 0) {
+        const float elapsed = std::chrono::duration<float>(now - m_lastTextureDirtyFlushTime).count();
+        if (elapsed < m_textureDirtyFlushIntervalSec &&
+            static_cast<int>(m_pendingTextureDirtyChunks.size()) > m_immediateTextureDirtyChunkCap) {
+            return 0u;
+        }
+    }
+
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet chunks;
+    chunks.swap(m_pendingTextureDirtyChunks);
+    const size_t flushed = chunks.size();
+
+    // Canonical texture paint is baked into normal chunk material data.
+    // This is deliberately not the live-stamp path: once face cells are written,
+    // only the touched chunks are remeshed so Vertex::material becomes the same
+    // fast path as default terrain material.
+    m_world->markTextureMaterialsDirty(chunks);
+    m_lastTextureDirtyFlushTime = now;
+    return flushed;
+}
+
+void TexturePaintTool::recordPaintDiagnostic(const PaintOpDiagnostic& diag) {
+    PaintOpDiagnostic stored = diag;
+    stored.serial = ++m_paintDiagSerial;
+
+    m_paintDiagHistory[static_cast<size_t>(m_paintDiagWriteIndex)] = stored;
+    m_paintDiagWriteIndex = (m_paintDiagWriteIndex + 1) % PAINT_DIAG_HISTORY;
+    if (m_paintDiagCount < PAINT_DIAG_HISTORY) {
+        ++m_paintDiagCount;
+    }
+}
+
+std::string TexturePaintTool::buildPaintDiagnosticsReport() const {
+    std::string out;
+    out.reserve(32768);
+
+    auto appendLine = [&](const char* text) {
+        out += text;
+        out += '\n';
+    };
+
+    struct VisualStatus {
+        float firstMs{0.0f};
+        float completeMs{0.0f};
+        int totalChunks{0};
+        int readyChunks{0};
+        int pendingChunks{0};
+        uint64_t uploadBytes{0};
+        bool complete{false};
+    };
+
+    auto sameCoord = [](const glm::ivec3& a, const glm::ivec3& b) {
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    };
+
+    auto computeVisualStatus = [&](const PaintOpDiagnostic& d) {
+        VisualStatus s{};
+        s.totalChunks = static_cast<int>(d.visualChunks.size());
+        s.pendingChunks = s.totalChunks;
+
+        if (!m_world || d.visualChunks.empty() || d.visualStartSec <= 0.0) {
+            return s;
+        }
+
+        std::vector<uint8_t> seen(d.visualChunks.size(), 0u);
+        const auto& history = m_world->getChunkVisualHistory();
+        const size_t scanCount = std::min(history.count, World::ChunkVisualHistory::CAPACITY);
+
+        bool anyReady = false;
+        for (size_t i = 0; i < scanCount; ++i) {
+            const auto& e = history.getFromEnd(i);
+            const double entrySec = static_cast<double>(e.timestampSec);
+
+            // ChunkVisualHistory stores timestampSec as float seconds from the
+            // same steady_clock epoch. Keep a small negative tolerance so float
+            // quantization does not hide first-frame completions.
+            if (entrySec + 0.020 < d.visualStartSec) {
+                continue;
+            }
+
+            for (size_t chunkIdx = 0; chunkIdx < d.visualChunks.size(); ++chunkIdx) {
+                if (seen[chunkIdx] != 0u || !sameCoord(e.chunkCoord, d.visualChunks[chunkIdx])) {
+                    continue;
+                }
+
+                seen[chunkIdx] = 1u;
+                ++s.readyChunks;
+                s.uploadBytes += e.uploadBytes;
+
+                float ms = static_cast<float>((entrySec - d.visualStartSec) * 1000.0);
+                if (ms < 0.0f) ms = 0.0f;
+                if (!anyReady) {
+                    s.firstMs = ms;
+                    s.completeMs = ms;
+                    anyReady = true;
+                } else {
+                    s.firstMs = std::min(s.firstMs, ms);
+                    s.completeMs = std::max(s.completeMs, ms);
+                }
+                break;
+            }
+        }
+
+        s.pendingChunks = std::max(0, s.totalChunks - s.readyChunks);
+        s.complete = s.totalChunks > 0 && s.readyChunks >= s.totalChunks;
+        return s;
+    };
+
+    appendLine("VulkanVX Texture Paint Brush Diagnostics");
+    appendLine("serial,total_ms,collect_ms,store_ms,cascade_ms,touched_ms,schedule_ms,"
+               "visual_stamp,visual_first_ms,visual_complete_ms,visual_chunks_total,"
+               "visual_chunks_ready,visual_chunks_pending,visual_complete,visual_upload_bytes,"
+               "radius_voxels,radius_m,shape,material,variant,lod,faces,changed,unchanged,"
+               "cascaded,touched_chunks,flushed_chunks,pending_chunks_after,hold_repeat,"
+               "center_x,center_y,center_z");
+
+    char line[1024];
+    for (int i = 0; i < m_paintDiagCount; ++i) {
+        const int idx = (m_paintDiagWriteIndex - m_paintDiagCount + i + PAINT_DIAG_HISTORY)
+            % PAINT_DIAG_HISTORY;
+        const PaintOpDiagnostic& d = m_paintDiagHistory[static_cast<size_t>(idx)];
+        const VisualStatus visual = computeVisualStatus(d);
+
+        std::snprintf(
+            line, sizeof(line),
+            "%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%.4f,%.4f,%d,%d,%d,%d,%llu,%d,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f",
+            static_cast<unsigned long long>(d.serial),
+            d.totalMs,
+            d.collectMs,
+            d.storeMs,
+            d.cascadeMs,
+            d.touchedMs,
+            d.scheduleMs,
+            d.visualStampOrder,
+            visual.firstMs,
+            visual.completeMs,
+            visual.totalChunks,
+            visual.readyChunks,
+            visual.pendingChunks,
+            visual.complete ? 1 : 0,
+            static_cast<unsigned long long>(visual.uploadBytes),
+            d.radiusVoxels,
+            d.radiusM,
+            d.shape,
+            d.material,
+            d.variant,
+            d.paintLod,
+            d.facesCollected,
+            d.cellsPainted,
+            d.facesUnchanged,
+            d.cellsCascaded,
+            d.touchedChunks,
+            d.flushedChunks,
+            d.pendingChunksAfter,
+            d.holdRepeat ? 1 : 0,
+            d.center.x,
+            d.center.y,
+            d.center.z);
+        appendLine(line);
+    }
+
+    return out;
+}
+
+
+// ---------------------------------------------------------------------------
+// Hit / LOD resolution
+// ---------------------------------------------------------------------------
+
+void TexturePaintTool::resolveHitLOD() {
+    m_hasPlacementContext = false;
+    m_hitLod = 0;
+    m_hitVoxelSizeM = WorldConfig::VOXEL_SIZE_M;
+    if (!m_world || !m_hasHit) return;
+
+    const auto ctx = m_world->getTerrainEditPlacementContext(m_hitPos);
+    if (!ctx.valid) return;
+
+    m_hasPlacementContext = true;
+    m_hitLod        = ctx.previewLodLevel;
+    m_hitVoxelSizeM = ctx.voxelSizeM;
+}
+
+int TexturePaintTool::getActivePaintLOD() const {
+    if (m_lodMode == LODMode::Manual) return m_manualLod;
+    return m_hasPlacementContext ? m_hitLod : 0;
+}
+
+int TexturePaintTool::getHitNormalAxis() const {
+    const glm::vec3 a = glm::abs(m_hitNormal);
+    if (a.y >= a.x && a.y >= a.z) return 1;
+    if (a.x >= a.y && a.x >= a.z) return 0;
+    return 2;
+}
+
+uint8_t TexturePaintTool::getHitFaceId() const {
+    const int axis = getHitNormalAxis();
+    const float sign = (axis == 0) ? m_hitNormal.x
+                     : (axis == 1) ? m_hitNormal.y
+                                   : m_hitNormal.z;
+    return static_cast<uint8_t>(axis * 2 + (sign >= 0.0f ? 1 : 0));
+}
+
+bool TexturePaintTool::isSolidLOD0(const glm::ivec3& voxelCoord) const {
+    if (!m_world) return false;
+    const auto& field = m_world->getTerrainFieldSource();
+    const int32_t scale = TerrainEdit::EDIT_CELLS_PER_VOXEL;
+    const TerrainEdit::GridCoord sampleCoord(
+        voxelCoord.x * scale + scale / 2,
+        voxelCoord.y * scale + scale / 2,
+        voxelCoord.z * scale + scale / 2);
+    return field.sample(sampleCoord).value.solid;
+}
+
+int TexturePaintTool::collectExposedSurfaceFacesLOD0(
+    std::vector<TextureOverlayStore::SurfaceFaceStamp>& outFaces) const {
+    outFaces.clear();
+    if (!m_world || !m_hasHit || m_radiusVoxelsLod0 <= 0) return 0;
+
+    const float invVoxel = static_cast<float>(WorldConfig::VOXELS_PER_METER);
+    const glm::vec3 insidePos = m_hitPos - m_hitNormal * 0.01f;
+    const glm::ivec3 startVoxel(
+        static_cast<int>(std::floor(insidePos.x * invVoxel)),
+        static_cast<int>(std::floor(insidePos.y * invVoxel)),
+        static_cast<int>(std::floor(insidePos.z * invVoxel)));
+    const uint8_t startFace = getHitFaceId();
+
+    auto isExposed = [&](const glm::ivec3& voxel, uint8_t face) {
+        return isSolidLOD0(voxel) && !isSolidLOD0(voxel + faceNormalI(face));
+    };
+
+    const float radiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
+    const float radiusSq = radiusM * radiusM;
+
+    auto insideBrush = [&](const glm::ivec3& voxel, uint8_t face) {
+        const glm::vec3 center = faceCenterWorld(voxel, face);
+        const glm::vec3 d = center - m_hitPos;
+
+        if (m_shape == BrushShape::Sphere) {
+            return glm::dot(d, d) <= radiusSq + 1e-5f;
+        }
+
+        return std::abs(d.x) <= radiusM + 1e-5f &&
+               std::abs(d.y) <= radiusM + 1e-5f &&
+               std::abs(d.z) <= radiusM + 1e-5f;
+    };
+
+    std::unordered_set<PaintFaceKey, PaintFaceKeyHash> emitted;
+    emitted.reserve(static_cast<size_t>(std::min(
+        MAX_SURFACE_BRUSH_FACES,
+        std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
+
+    auto appendFace = [&](const glm::ivec3& voxel, uint8_t face) -> bool {
+        PaintFaceKey key{voxel, static_cast<uint8_t>(face % 6u)};
+        if (emitted.find(key) != emitted.end()) {
+            return true;
+        }
+
+        emitted.insert(key);
+        outFaces.push_back(TextureOverlayStore::SurfaceFaceStamp{voxel, key.face});
+        return static_cast<int>(outFaces.size()) < MAX_SURFACE_BRUSH_FACES;
+    };
+
+    // Exact small/medium-brush path:
+    // sample local occupancy once, then collect every exposed face whose face
+    // center is inside the 3D brush volume. This catches top, bottom, and
+    // vertical voxel faces equally.
+    {
+        const int pad = m_radiusVoxelsLod0 + 2;
+        const glm::ivec3 scanMin = startVoxel - glm::ivec3(pad);
+        const glm::ivec3 scanMax = startVoxel + glm::ivec3(pad);
+        const int dimX = scanMax.x - scanMin.x + 1;
+        const int dimY = scanMax.y - scanMin.y + 1;
+        const int dimZ = scanMax.z - scanMin.z + 1;
+        const int64_t volume =
+            static_cast<int64_t>(dimX) *
+            static_cast<int64_t>(dimY) *
+            static_cast<int64_t>(dimZ);
+
+        if (dimX > 2 && dimY > 2 && dimZ > 2 &&
+            volume > 0 && volume <= MAX_SURFACE_BRUSH_SCAN_VOXELS) {
+            std::vector<uint8_t> solid(static_cast<size_t>(volume), 0u);
+
+            auto indexOf = [&](const glm::ivec3& voxel) -> size_t {
+                const int x = voxel.x - scanMin.x;
+                const int y = voxel.y - scanMin.y;
+                const int z = voxel.z - scanMin.z;
+                return static_cast<size_t>((z * dimY + y) * dimX + x);
+            };
+
+            for (int z = scanMin.z; z <= scanMax.z; ++z) {
+                for (int y = scanMin.y; y <= scanMax.y; ++y) {
+                    for (int x = scanMin.x; x <= scanMax.x; ++x) {
+                        const glm::ivec3 voxel(x, y, z);
+                        solid[indexOf(voxel)] = isSolidLOD0(voxel) ? 1u : 0u;
+                    }
+                }
+            }
+
+            auto solidAt = [&](const glm::ivec3& voxel) -> bool {
+                return solid[indexOf(voxel)] != 0u;
+            };
+
+            outFaces.reserve(static_cast<size_t>(std::min(
+                MAX_SURFACE_BRUSH_FACES,
+                std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
+
+            const glm::ivec3 candidateMin = scanMin + glm::ivec3(1);
+            const glm::ivec3 candidateMax = scanMax - glm::ivec3(1);
+
+            for (int z = candidateMin.z; z <= candidateMax.z; ++z) {
+                for (int y = candidateMin.y; y <= candidateMax.y; ++y) {
+                    for (int x = candidateMin.x; x <= candidateMax.x; ++x) {
+                        const glm::ivec3 voxel(x, y, z);
+                        if (!solidAt(voxel)) {
+                            continue;
+                        }
+
+                        for (uint8_t face = 0; face < 6; ++face) {
+                            if (solidAt(voxel + faceNormalI(face)) ||
+                                !insideBrush(voxel, face)) {
+                                continue;
+                            }
+
+                            if (!appendFace(voxel, face)) {
+                                return static_cast<int>(outFaces.size());
+                            }
+                        }
+                    }
+                }
+            }
+
+            return static_cast<int>(outFaces.size());
+        }
+    }
+
+    // Large top-hit acceleration:
+    // use heightmap columns to emit obvious top faces and simple heightmap
+    // cliff sides. Do NOT return after this path. Edited voxel geometry and
+    // non-heightmap vertical faces still need the connected crawl below.
+    if (startFace == 3u) {
+        const auto& heightmap = m_world->getHeightmapSampler();
+        if (heightmap.isLoaded()) {
+            const int pad = m_radiusVoxelsLod0 + 1;
+            constexpr int kEditedSurfaceSearch = 24;
+
+            outFaces.reserve(static_cast<size_t>(std::min(
+                MAX_SURFACE_BRUSH_FACES,
+                std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
+
+            auto tryAddTopFace = [&](int x, int z, int centerY) -> bool {
+                for (int delta = 0; delta <= kEditedSurfaceSearch; ++delta) {
+                    const int signs[2] = {1, -1};
+                    for (int signIdx = 0; signIdx < (delta == 0 ? 1 : 2); ++signIdx) {
+                        const int y = centerY + delta * signs[signIdx];
+                        const glm::ivec3 voxel(x, y, z);
+                        if (!insideBrush(voxel, startFace) ||
+                            !isExposed(voxel, startFace)) {
+                            continue;
+                        }
+                        return appendFace(voxel, startFace);
+                    }
+                }
+                return true;
+            };
+
+            auto addFaceIfValid = [&](const glm::ivec3& voxel, uint8_t face) -> bool {
+                if (!insideBrush(voxel, face) || !isExposed(voxel, face)) {
+                    return true;
+                }
+                return appendFace(voxel, face);
+            };
+
+            struct SideNeighbor {
+                int dx;
+                int dz;
+                uint8_t face;
+            };
+            constexpr SideNeighbor sideNeighbors[4] = {
+                {-1,  0, 0u},
+                { 1,  0, 1u},
+                { 0, -1, 4u},
+                { 0,  1, 5u},
+            };
+
+            for (int z = startVoxel.z - pad; z <= startVoxel.z + pad; ++z) {
+                for (int x = startVoxel.x - pad; x <= startVoxel.x + pad; ++x) {
+                    if (static_cast<int>(outFaces.size()) >= MAX_SURFACE_BRUSH_FACES) {
+                        return static_cast<int>(outFaces.size());
+                    }
+
+                    const int height = heightmap.getHeightAtVoxel(x, z);
+                    const int heightTopY = height - 1;
+
+                    bool keepGoing = tryAddTopFace(x, z, heightTopY);
+                    if (!keepGoing) {
+                        return static_cast<int>(outFaces.size());
+                    }
+
+                    if (std::abs(startVoxel.y - heightTopY) > kEditedSurfaceSearch) {
+                        keepGoing = tryAddTopFace(x, z, startVoxel.y);
+                        if (!keepGoing) {
+                            return static_cast<int>(outFaces.size());
+                        }
+                    }
+
+                    // Heightmap cliff/wall faces where this column is taller
+                    // than a neighboring column.
+                    for (const SideNeighbor& n : sideNeighbors) {
+                        const int neighborHeight = heightmap.getHeightAtVoxel(x + n.dx, z + n.dz);
+                        if (height <= neighborHeight) {
+                            continue;
+                        }
+
+                        const int y0 = std::max(neighborHeight, startVoxel.y - pad);
+                        const int y1 = std::min(height - 1, startVoxel.y + pad);
+                        for (int y = y0; y <= y1; ++y) {
+                            const glm::ivec3 voxel(x, y, z);
+                            if (!addFaceIfValid(voxel, n.face)) {
+                                return static_cast<int>(outFaces.size());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Connected exposed-surface fallback:
+    // essential after the large heightmap path. The heightmap path is only an
+    // acceleration for obvious top/cliff faces; this crawl catches edited voxel
+    // walls, cut sides, holes, caves, and arbitrary vertical faces connected to
+    // the hit surface.
+    if (!isExposed(startVoxel, startFace) || !insideBrush(startVoxel, startFace)) {
+        return static_cast<int>(outFaces.size());
+    }
+
+    std::queue<PaintFaceKey> pending;
+    std::unordered_set<PaintFaceKey, PaintFaceKeyHash> visited;
+    visited.reserve(static_cast<size_t>(std::min(
+        MAX_SURFACE_BRUSH_FACES,
+        std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
+
+    const PaintFaceKey start{startVoxel, startFace};
+    pending.push(start);
+    visited.insert(start);
+
+    constexpr glm::ivec3 kVoxelNeighbors[7] = {
+        glm::ivec3(0, 0, 0),
+        glm::ivec3( 1, 0, 0), glm::ivec3(-1, 0, 0),
+        glm::ivec3( 0, 1, 0), glm::ivec3( 0,-1, 0),
+        glm::ivec3( 0, 0, 1), glm::ivec3( 0, 0,-1),
+    };
+
+    while (!pending.empty() && static_cast<int>(outFaces.size()) < MAX_SURFACE_BRUSH_FACES) {
+        const PaintFaceKey current = pending.front();
+        pending.pop();
+
+        if (!isExposed(current.voxel, current.face) ||
+            !insideBrush(current.voxel, current.face)) {
+            continue;
+        }
+
+        if (!appendFace(current.voxel, current.face)) {
+            return static_cast<int>(outFaces.size());
+        }
+
+        for (const glm::ivec3& dv : kVoxelNeighbors) {
+            const glm::ivec3 voxel = current.voxel + dv;
+            for (uint8_t face = 0; face < 6; ++face) {
+                PaintFaceKey next{voxel, face};
+                if (visited.find(next) != visited.end()) continue;
+                if (!insideBrush(voxel, face)) continue;
+                if (!isExposed(voxel, face)) continue;
+                visited.insert(next);
+                pending.push(next);
+            }
+        }
+    }
+
+    return static_cast<int>(outFaces.size());
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame update
+// ---------------------------------------------------------------------------
+
+void TexturePaintTool::update(double mouseX, double mouseY,
+                              int viewportW, int viewportH,
+                              const glm::mat4& view, const glm::mat4& proj,
+                              const glm::vec3& cameraPos,
+                              bool leftClickPressed,
+                              float viewportOffsetX, float viewportOffsetY) {
+    if (!m_active || !m_raycastFn) {
+        flushPendingTextureDirtyChunks(true);
+        m_hasHit = false;
+        m_hasPlacementContext = false;
+        m_leftClickWasPressed = false;
+        return;
+    }
+
+    const glm::mat4 invViewProj = glm::inverse(proj * view);
+    const glm::vec3 rayDir = screenToWorldRay(mouseX, mouseY,
+                                              viewportW, viewportH,
+                                              invViewProj);
+
+    glm::vec3 hitPos, hitNormal;
+    m_hasHit = m_raycastFn(cameraPos, rayDir, 10000.0f, hitPos, hitNormal);
+
+    if (m_hasHit) {
+        m_hitPos = hitPos;
+        m_hitNormal = hitNormal;
+        resolveHitLOD();
+
+        // Cache preview screen position for label rendering.
+        const glm::vec4 clip = (proj * view) * glm::vec4(m_hitPos, 1.0f);
+        if (clip.w > 0.01f) {
+            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
+            m_previewScreenX = viewportOffsetX + (ndc.x * 0.5f + 0.5f) * static_cast<float>(viewportW);
+            m_previewScreenY = viewportOffsetY + (1.0f - (ndc.y * 0.5f + 0.5f)) * static_cast<float>(viewportH);
+        }
+    }
+
+    // Click + auto-repeat. The repeat interval now scales with brush footprint:
+    // small brushes behave like paint; huge brushes behave like stamps so they
+    // do not enqueue 20 huge authoring/rebake waves per second.
+    if (leftClickPressed && m_hasHit) {
+        const auto now = std::chrono::steady_clock::now();
+        if (!m_leftClickWasPressed) {
+            m_holdRepeatStarted = false;
+            place();
+            m_lastPlaceTime = now;
+            m_holdStartTime = now;
+        } else {
+            const float held = std::chrono::duration<float>(now - m_holdStartTime).count();
+            if (held >= 0.15f) {
+                const float since = std::chrono::duration<float>(now - m_lastPlaceTime).count();
+                const float repeatInterval = getPaintRepeatIntervalSec();
+                if (since >= repeatInterval) {
+                    m_holdRepeatStarted = true;
+                    place();
+                    m_lastPlaceTime = now;
+                }
+            }
+        }
+
+        // During long holds, flush large pending rebakes at a fixed low rate.
+        // Small strokes flush immediately inside place().
+        flushPendingTextureDirtyChunks(false);
+    } else {
+        // Mouse release / no hit: force the latest authored material to be
+        // scheduled for rebake. This keeps visual latency bounded without
+        // flooding remesh while the brush is actively spamming.
+        if (m_leftClickWasPressed) {
+            flushPendingTextureDirtyChunks(true);
+        } else {
+            flushPendingTextureDirtyChunks(false);
+        }
+        m_holdRepeatStarted = false;
+    }
+
+    m_leftClickWasPressed = leftClickPressed;
+}
+
+// ---------------------------------------------------------------------------
+// Apply paint
+// ---------------------------------------------------------------------------
+
+void TexturePaintTool::place() {
+    if (!m_hasHit) return;
+
+    constexpr int lod = 0;
+    TextureOverlayStore& store = getStore();
+    const auto cfg = store.getLODConfig(lod);
+    if (!cfg.enabled) {
+        m_lastFacesCollected = 0;
+        m_lastFacesUnchanged = 0;
+        m_lastCellsPainted = 0;
+        m_lastCellsCascaded = 0;
+        return;
+    }
+
+    // Texture painting is authored world state. If the user paints while
+    // viewing base terrain, branch into a normal editable snapshot first.
+    if (m_world && !m_world->hasActiveEditableSnapshot()) {
+        if (!m_world->createSnapshot()) {
+            return;
+        }
+    }
+
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+
+    std::vector<TextureOverlayStore::SurfaceFaceStamp> faces;
+    const int facesCollected = collectExposedSurfaceFacesLOD0(faces);
+    const auto tCollect = Clock::now();
+
+    if (facesCollected <= 0 || faces.empty()) {
+        m_lastPaintMs = std::chrono::duration<float, std::milli>(tCollect - t0).count();
+        m_lastFacesCollected = 0;
+        m_lastFacesUnchanged = 0;
+        m_lastCellsPainted = 0;
+        m_lastCellsCascaded = 0;
+        m_lastPaintLod = lod;
+        m_lastPaintWorldCenter = m_hitPos;
+        m_lastPaintRadiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
+        m_previewStartTime = tCollect;
+        return;
+    }
+
+    const int writtenLOD0 = store.paintSurfaceFaces(faces, lod, m_textureType, m_variant);
+    const auto tStore = Clock::now();
+
+    // Always adapt the authored material to every enabled coarser LOD.
+    // LOD meshes must not fall back to procedural/default grass/mud just
+    // because the stroke was made while LOD0 was visible.
+    int cascaded = 0;
+    for (int targetLod = lod + 1; targetLod < TextureOverlayStore::LOD_COUNT; ++targetLod) {
+        if (!store.getLODConfig(targetLod).enabled) {
+            continue;
+        }
+
+        std::vector<TextureOverlayStore::SurfaceFaceStamp> lodFaces;
+        lodFaces.reserve(faces.size());
+
+        std::unordered_set<PaintFaceKey, PaintFaceKeyHash> seen;
+        seen.reserve(faces.size());
+
+        for (const TextureOverlayStore::SurfaceFaceStamp& faceStamp : faces) {
+            PaintFaceKey key{};
+            key.voxel = TextureOverlayStore::lod0ToLOD(faceStamp.lodCoord, targetLod);
+            key.face = static_cast<uint8_t>(faceStamp.face % 6u);
+
+            if (seen.insert(key).second) {
+                lodFaces.push_back(TextureOverlayStore::SurfaceFaceStamp{key.voxel, key.face});
+            }
+        }
+
+        cascaded += store.paintSurfaceFaces(lodFaces, targetLod, m_textureType, m_variant);
+    }
+    const auto tCascade = Clock::now();
+
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet touchedChunks;
+    for (const TextureOverlayStore::SurfaceFaceStamp& faceStamp : faces) {
+        const glm::ivec3 voxel = faceStamp.lodCoord;
+        touchedChunks.insert(WorldConfig::microVoxelToChunk(voxel));
+
+        // Conservative seam ownership: if the painted face lies on a chunk
+        // border, the neighbor chunk may need a material-only rebake too.
+        const glm::ivec3 neighbor = voxel + faceNormalI(faceStamp.face);
+        touchedChunks.insert(WorldConfig::microVoxelToChunk(neighbor));
+    }
+
+    std::vector<glm::ivec3> visualChunks;
+    visualChunks.reserve(touchedChunks.size());
+    for (const glm::ivec3& chunk : touchedChunks) {
+        visualChunks.push_back(chunk);
+        m_pendingTextureDirtyChunks.insert(chunk);
+    }
+
+    const int touchedChunkCount = static_cast<int>(touchedChunks.size());
+    const auto tTouched = Clock::now();
+
+    // Small strokes can be dispatched immediately. Huge brush spam is still
+    // debounced by flushPendingTextureDirtyChunks(false), but it now debounces
+    // canonical material rebakes, not temporary live-stamp overlays.
+    const bool immediateFlush =
+        touchedChunkCount <= m_immediateTextureDirtyChunkCap ||
+        !m_holdRepeatStarted;
+    const size_t flushed = flushPendingTextureDirtyChunks(immediateFlush);
+    const auto tSchedule = Clock::now();
+
+    if (m_world && (writtenLOD0 > 0 || cascaded > 0)) {
+        m_world->markSnapshotDirty();
+    }
+
+    m_lastPaintMs = std::chrono::duration<float, std::milli>(tSchedule - t0).count();
+    m_lastFacesCollected = facesCollected;
+    m_lastFacesUnchanged = std::max(0, facesCollected - writtenLOD0);
+    m_lastCellsPainted  = writtenLOD0;
+    m_lastCellsCascaded = cascaded;
+    m_lastPaintLod      = lod;
+    m_lastPaintWorldCenter = m_hitPos;
+    m_lastPaintRadiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
+    m_previewStartTime = tSchedule;
+
+    PaintOpDiagnostic diag{};
+    diag.radiusVoxels = m_radiusVoxelsLod0;
+    diag.shape = static_cast<int>(m_shape);
+    diag.material = static_cast<int>(m_textureType);
+    diag.variant = static_cast<int>(m_variant);
+    diag.paintLod = lod;
+    diag.facesCollected = facesCollected;
+    diag.facesUnchanged = m_lastFacesUnchanged;
+    diag.cellsPainted = writtenLOD0;
+    diag.cellsCascaded = cascaded;
+    diag.touchedChunks = touchedChunkCount;
+    diag.flushedChunks = static_cast<int>(flushed);
+    diag.pendingChunksAfter = static_cast<int>(m_pendingTextureDirtyChunks.size());
+    diag.collectMs = std::chrono::duration<float, std::milli>(tCollect - t0).count();
+    diag.storeMs = std::chrono::duration<float, std::milli>(tStore - tCollect).count();
+    diag.cascadeMs = std::chrono::duration<float, std::milli>(tCascade - tStore).count();
+    diag.touchedMs = std::chrono::duration<float, std::milli>(tTouched - tCascade).count();
+    diag.scheduleMs = std::chrono::duration<float, std::milli>(tSchedule - tTouched).count();
+    diag.totalMs = m_lastPaintMs;
+    diag.visualStartSec = std::chrono::duration<double>(t0.time_since_epoch()).count();
+    diag.visualStampOrder = 0u;
+    diag.visualChunks = std::move(visualChunks);
+    diag.radiusM = m_lastPaintRadiusM;
+    diag.center = m_hitPos;
+    diag.holdRepeat = m_holdRepeatStarted;
+    recordPaintDiagnostic(diag);
+}
+
+// ---------------------------------------------------------------------------
+// Debug window
+// ---------------------------------------------------------------------------
+
+void TexturePaintTool::renderUI() {
+    ImGui::TextColored(kAccent, "Texture Paint Brush");
+    ImGui::Separator();
+
+    ImGui::Checkbox("Brush Active", &m_active);
+    if (!m_active) {
+        ImGui::TextDisabled("Enable to paint pixel-art textures onto terrain");
+    }
+
+    // ---------------- Brush shape + radius ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Brush");
+
+    const bool isSphere = (m_shape == BrushShape::Sphere);
+    if (isSphere) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26f, 0.59f, 0.98f, 0.80f));
+    }
+    if (ImGui::Button("Sphere")) m_shape = BrushShape::Sphere;
+    if (isSphere) ImGui::PopStyleColor();
+    ImGui::SameLine();
+    const bool isBox = (m_shape == BrushShape::Box);
+    if (isBox) {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26f, 0.59f, 0.98f, 0.80f));
+    }
+    if (ImGui::Button("Box")) m_shape = BrushShape::Box;
+    if (isBox) ImGui::PopStyleColor();
+
+    ImGui::SetNextItemWidth(180.0f);
+    int radius = m_radiusVoxelsLod0;
+    if (ImGui::SliderInt("Radius (LOD-0 voxels)", &radius, 1, 256)) {
+        setBrushRadiusVoxels(radius);
+    }
+    const int side = radius * 2 + 1;
+    const int approxCells = (m_shape == BrushShape::Sphere)
+        ? static_cast<int>(3.14159265f * radius * radius)
+        : side * side;
+    ImGui::TextDisabled("  -> %.3f m at LOD 0, approx %d face cells, repeat %.0f ms",
+                        radius * WorldConfig::VOXEL_SIZE_M,
+                        std::max(1, approxCells),
+                        getPaintRepeatIntervalSec() * 1000.0f);
+
+    // ---------------- Texture type + variant ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Material");
+    static const char* TYPE_NAMES[] = { "Grass", "Mud", "Dirt", "Sand" };
+    int typeIdx = static_cast<int>(m_textureType);
+    if (ImGui::Combo("Type", &typeIdx, TYPE_NAMES, IM_ARRAYSIZE(TYPE_NAMES))) {
+        m_textureType = static_cast<TextureType>(typeIdx);
+    }
+
+    int variant = m_variant;
+    if (ImGui::SliderInt("Variant seed", &variant, 0, 7)) {
+        setVariant(static_cast<uint8_t>(variant));
+    }
+
+    const size_t activeIdx = static_cast<size_t>(m_textureType);
+    ImGui::TextColored(kHeading, "Type Color Parameters");
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::ColorEdit3("Base", &m_typeBaseColors[activeIdx].x);
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::ColorEdit3("Highlight", &m_typeHighlightColors[activeIdx].x);
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::ColorEdit3("Shadow", &m_typeShadowColors[activeIdx].x);
+    ImGui::SetNextItemWidth(220.0f);
+    ImGui::ColorEdit3("Accent", &m_typeAccentColors[activeIdx].x);
+
+    // ---------------- LOD targeting ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "LOD Targeting");
+
+    int modeIdx = static_cast<int>(m_lodMode);
+    ImGui::RadioButton("Auto from hit chunk", &modeIdx, 0); ImGui::SameLine();
+    ImGui::RadioButton("Manual",              &modeIdx, 1);
+    m_lodMode = static_cast<LODMode>(modeIdx);
+
+    if (m_lodMode == LODMode::Manual) {
+        int lod = m_manualLod;
+        if (ImGui::SliderInt("Target LOD", &lod, 0,
+                             TextureOverlayStore::LOD_COUNT - 1)) {
+            setManualLOD(lod);
+        }
+    } else {
+        if (m_hasPlacementContext) {
+            ImGui::Text("Hit LOD: %d  (voxel %.3f m)", m_hitLod, m_hitVoxelSizeM);
+        } else {
+            ImGui::TextDisabled("Hover terrain to resolve hit LOD");
+        }
+    }
+
+    ImGui::Checkbox("Cascade paint to coarser LODs", &m_cascadeToCoarser);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("When enabled, the same stroke also paints into all "
+                          "LOD levels coarser than the source LOD, so the "
+                          "texture stays visible after a chunk LOD swap.");
+    }
+    ImGui::TextDisabled("Shader material preview LOD: %d (final pixels are shaded in terrain)",
+                        getPreviewLOD());
+
+    // ---------------- Per-LOD resolution config ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Per-LOD Texture Resolution");
+    ImGui::TextDisabled("Texels per voxel face edge.  Adapt: each LOD step "
+                        "is 2x bigger voxels / 1/8 the cells.");
+
+    if (ImGui::BeginTable("perLodCfg", 4,
+                          ImGuiTableFlags_BordersInnerV |
+                          ImGuiTableFlags_RowBg |
+                          ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("LOD", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("Voxel size", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("Resolution", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Enabled", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableHeadersRow();
+
+        for (int lod = 0; lod < TextureOverlayStore::LOD_COUNT; ++lod) {
+            ImGui::TableNextRow();
+            ImGui::PushID(lod);
+
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("LOD %d", lod);
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%.3f m", WorldConfig::getLODVoxelSizeM(lod));
+
+            ImGui::TableSetColumnIndex(2);
+            LODTextureConfig cfg = getStore().getLODConfig(lod);
+            int currentIdx = 0;
+            for (int i = 0; i < TextureOverlayStore::RES_OPTION_COUNT; ++i) {
+                if (TextureOverlayStore::RES_OPTIONS[i] == cfg.pixelsPerVoxel) {
+                    currentIdx = i; break;
+                }
+            }
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::Combo("##res",
+                             &currentIdx,
+                             TextureOverlayStore::RES_OPTION_LABELS,
+                             TextureOverlayStore::RES_OPTION_COUNT)) {
+                cfg.pixelsPerVoxel = TextureOverlayStore::RES_OPTIONS[currentIdx];
+                getStore().setLODConfig(lod, cfg);
+            }
+
+            ImGui::TableSetColumnIndex(3);
+            bool enabled = cfg.enabled;
+            if (ImGui::Checkbox("##en", &enabled)) {
+                cfg.enabled = enabled;
+                getStore().setLODConfig(lod, cfg);
+            }
+
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    // ---------------- Live hit preview info ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Hit Preview");
+    if (!m_hasHit) {
+        ImGui::TextDisabled("Move mouse over terrain to preview");
+    } else {
+        ImGui::Text("Hit:    (%.3f, %.3f, %.3f)", m_hitPos.x, m_hitPos.y, m_hitPos.z);
+        ImGui::Text("Normal: (%.2f, %.2f, %.2f)", m_hitNormal.x, m_hitNormal.y, m_hitNormal.z);
+        const int lod = getActivePaintLOD();
+        const auto cfg = getStore().getLODConfig(lod);
+        ImGui::Text("Source paint LOD: 0 (%dx%d px/face)%s",
+                    getStore().getLODConfig(0).pixelsPerVoxel,
+                    getStore().getLODConfig(0).pixelsPerVoxel,
+                    getStore().getLODConfig(0).enabled ? "" : "  [DISABLED]");
+        ImGui::Text("Render-preview LOD: %d (%dx%d px/face)%s",
+                    lod, cfg.pixelsPerVoxel, cfg.pixelsPerVoxel,
+                    cfg.enabled ? "" : "  [DISABLED]");
+        const int rLod = (m_radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
+        ImGui::Text("Effective surface radius: %d voxel%s at LOD %d",
+                    rLod, rLod == 1 ? "" : "s", lod);
+    }
+
+    // ---------------- Last paint diagnostics ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Last Paint");
+    if (m_lastFacesCollected == 0 && m_lastCellsPainted == 0 && m_lastCellsCascaded == 0) {
+        ImGui::TextDisabled("Left click to paint");
+    } else {
+        ImGui::Text("Surface faces found: %d", m_lastFacesCollected);
+        ImGui::Text("Face cells changed: %d (LOD %d)", m_lastCellsPainted, m_lastPaintLod);
+        if (m_lastFacesUnchanged > 0) {
+            ImGui::TextDisabled("Unchanged/no-op: %d", m_lastFacesUnchanged);
+        }
+        if (m_cascadeToCoarser) {
+            ImGui::Text("Cascaded to coarser: %d cells", m_lastCellsCascaded);
+        }
+        ImGui::Text("Time: %.3f ms", m_lastPaintMs);
+        ImGui::TextDisabled("Pending material-rebake chunks: %zu", m_pendingTextureDirtyChunks.size());
+    }
+
+    if (ImGui::TreeNode("Last 50 Brush Edit Diagnostics")) {
+        ImGui::TextDisabled("Copy this table when brush spam still tanks FPS.");
+        if (ImGui::Button("Copy Last 50 Paint Stats")) {
+            m_lastDiagnosticsExport = buildPaintDiagnosticsReport();
+            ImGui::SetClipboardText(m_lastDiagnosticsExport.c_str());
+        }
+        if (!m_lastDiagnosticsExport.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("copied %zu bytes", m_lastDiagnosticsExport.size());
+        }
+
+        if (ImGui::BeginTable("paintDiagHistory", 9,
+                              ImGuiTableFlags_BordersInnerV |
+                              ImGuiTableFlags_RowBg |
+                              ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 38.0f);
+            ImGui::TableSetupColumn("total");
+            ImGui::TableSetupColumn("collect");
+            ImGui::TableSetupColumn("store");
+            ImGui::TableSetupColumn("sched");
+            ImGui::TableSetupColumn("faces");
+            ImGui::TableSetupColumn("changed");
+            ImGui::TableSetupColumn("flush");
+            ImGui::TableSetupColumn("pending");
+            ImGui::TableHeadersRow();
+
+            for (int i = 0; i < m_paintDiagCount; ++i) {
+                const int idx = (m_paintDiagWriteIndex - m_paintDiagCount + i + PAINT_DIAG_HISTORY)
+                    % PAINT_DIAG_HISTORY;
+                const PaintOpDiagnostic& d = m_paintDiagHistory[static_cast<size_t>(idx)];
+
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0); ImGui::Text("%llu", static_cast<unsigned long long>(d.serial));
+                ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", d.totalMs);
+                ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", d.collectMs);
+                ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", d.storeMs);
+                ImGui::TableSetColumnIndex(4); ImGui::Text("%.2f", d.scheduleMs);
+                ImGui::TableSetColumnIndex(5); ImGui::Text("%d", d.facesCollected);
+                ImGui::TableSetColumnIndex(6); ImGui::Text("%d", d.cellsPainted);
+                ImGui::TableSetColumnIndex(7); ImGui::Text("%d", d.flushedChunks);
+                ImGui::TableSetColumnIndex(8); ImGui::Text("%d", d.pendingChunksAfter);
+            }
+            ImGui::EndTable();
+        }
+        ImGui::TreePop();
+    }
+
+    // ---------------- Store stats ----------------
+    ImGui::Spacing();
+    ImGui::TextColored(kHeading, "Voxel Material Store");
+    const auto stats = getStore().getStats();
+    ImGui::Text("Total: %zu bricks  %zu cells  (gen %zu)",
+                stats.totalBricks, stats.totalCells, stats.generation);
+    if (ImGui::TreeNode("Per-LOD breakdown")) {
+        for (int lod = 0; lod < TextureOverlayStore::LOD_COUNT; ++lod) {
+            ImGui::Text("  LOD %d: %zu bricks  %zu cells",
+                        lod, stats.bricksByLOD[lod], stats.cellsByLOD[lod]);
+        }
+        ImGui::TreePop();
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button("Clear All Textures")) {
+        getStore().clear();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear Hit LOD")) {
+        getStore().clearLOD(getActivePaintLOD());
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Copy Last 50 Paint Stats##bottom")) {
+        m_lastDiagnosticsExport = buildPaintDiagnosticsReport();
+        ImGui::SetClipboardText(m_lastDiagnosticsExport.c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// World-space brush preview
+// ---------------------------------------------------------------------------
+
+void TexturePaintTool::renderPreviewOverlay(const glm::mat4& viewProj,
+                                            int viewportW, int viewportH,
+                                            float viewportOffsetX,
+                                            float viewportOffsetY) {
+    if (!m_active || !m_hasHit) return;
+
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+
+    const ImU32 col = colorFromVec3(getTypeBaseColor(m_textureType));
+    const ImU32 fill = (col & 0x00FFFFFFu) | 0x33000000u;
+
+    const float vpW = static_cast<float>(viewportW);
+    const float vpH = static_cast<float>(viewportH);
+
+    auto project = [&](const glm::vec3& wp, ImVec2& out) -> bool {
+        glm::vec4 c = viewProj * glm::vec4(wp, 1.0f);
+        if (c.w <= 0.01f) return false;
+        glm::vec3 ndc = glm::vec3(c) / c.w;
+        out.x = viewportOffsetX + (ndc.x * 0.5f + 0.5f) * vpW;
+        out.y = viewportOffsetY + (1.0f - (ndc.y * 0.5f + 0.5f)) * vpH;
+        return true;
+    };
+
+    const int lod = getActivePaintLOD();
+    const float voxelSize = WorldConfig::getLODVoxelSizeM(lod);
+    const float radiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
+
+    if (m_shape == BrushShape::Sphere) {
+        // 3 great circles, like TerrainEditTool's fallback path.
+        auto drawCircle = [&](int a0, int a1, int aN) {
+            constexpr int SEG = 32;
+            ImVec2 pts[SEG]; bool vis[SEG];
+            for (int i = 0; i < SEG; ++i) {
+                float ang = 6.28318530f * float(i) / float(SEG);
+                glm::vec3 p = m_hitPos;
+                p[a0] = m_hitPos[a0] + std::cos(ang) * radiusM;
+                p[a1] = m_hitPos[a1] + std::sin(ang) * radiusM;
+                p[aN] = m_hitPos[aN];
+                vis[i] = project(p, pts[i]);
+            }
+            for (int i = 0; i < SEG; ++i) {
+                int j = (i + 1) % SEG;
+                if (vis[i] && vis[j]) dl->AddLine(pts[i], pts[j], col, 2.0f);
+            }
+        };
+        drawCircle(0, 1, 2);
+        drawCircle(0, 2, 1);
+        drawCircle(1, 2, 0);
+    } else {
+        // Box wireframe
+        const glm::vec3 lo = m_hitPos - glm::vec3(radiusM);
+        const glm::vec3 hi = m_hitPos + glm::vec3(radiusM);
+        const glm::vec3 corners[8] = {
+            {lo.x,lo.y,lo.z}, {hi.x,lo.y,lo.z},
+            {hi.x,hi.y,lo.z}, {lo.x,hi.y,lo.z},
+            {lo.x,lo.y,hi.z}, {hi.x,lo.y,hi.z},
+            {hi.x,hi.y,hi.z}, {lo.x,hi.y,hi.z},
+        };
+        ImVec2 sp[8]; bool vis[8];
+        for (int i = 0; i < 8; ++i) vis[i] = project(corners[i], sp[i]);
+        constexpr int E[12][2] = {
+            {0,1},{1,2},{2,3},{3,0},
+            {4,5},{5,6},{6,7},{7,4},
+            {0,4},{1,5},{2,6},{3,7}
+        };
+        for (auto& e : E) {
+            if (vis[e[0]] && vis[e[1]]) dl->AddLine(sp[e[0]], sp[e[1]], col, 2.0f);
+        }
+        // Light fill on the dominant face for readability
+        constexpr int F[6][4] = {
+            {0,1,2,3},{4,5,6,7},
+            {3,2,6,7},{0,1,5,4},
+            {0,3,7,4},{1,2,6,5}
+        };
+        for (auto& f : F) {
+            if (vis[f[0]] && vis[f[1]] && vis[f[2]] && vis[f[3]]) {
+                dl->AddQuadFilled(sp[f[0]], sp[f[1]], sp[f[2]], sp[f[3]], fill);
+            }
+        }
+    }
+
+    // Mark the hit point
+    ImVec2 hitScreen;
+    if (project(m_hitPos, hitScreen)) {
+        dl->AddCircleFilled(hitScreen, 3.0f, col);
+        // Label: type + variant + active LOD + resolution
+        const auto cfg = getStore().getLODConfig(lod);
+        char label[160];
+        std::snprintf(label, sizeof(label),
+                      "%s v%u  LOD %d  %dx%d px/face  r=%.3fm  vox=%.3fm",
+                      TextureOverlay::textureTypeName(m_textureType),
+                      static_cast<unsigned>(m_variant),
+                      lod,
+                      cfg.pixelsPerVoxel, cfg.pixelsPerVoxel,
+                      radiusM,
+                      voxelSize);
+        dl->AddText(ImVec2(hitScreen.x + 12.0f, hitScreen.y - 8.0f), col, label);
+    }
+
+    // Last-paint floating ms readout (fades over PREVIEW_FADE_SEC)
+    if (m_lastPaintMs > 0.0f) {
+        const float t = std::chrono::duration<float>(
+            std::chrono::steady_clock::now() - m_previewStartTime).count();
+        if (t < PREVIEW_FADE_SEC) {
+            const float a = std::clamp(1.0f - t / PREVIEW_FADE_SEC, 0.0f, 1.0f);
+            ImVec2 sp;
+            if (project(m_lastPaintWorldCenter, sp)) {
+                char ms[64];
+                std::snprintf(ms, sizeof(ms), "+%d/%d cells (%.2f ms)",
+                              m_lastCellsPainted, m_lastFacesCollected, m_lastPaintMs);
+                ImU32 c = (col & 0x00FFFFFFu) |
+                          (static_cast<uint32_t>(a * 255.0f) << 24);
+                dl->AddText(ImVec2(sp.x, sp.y - 24.0f), c, ms);
+            }
+        }
+    }
+}

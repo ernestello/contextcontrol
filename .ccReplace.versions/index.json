@@ -258,7 +258,7 @@
                       "Path":  "src/world/edit/TextureOverlayStore.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\TextureOverlayStore.cpp",
                       "Key":  "b7ce26efdbfc487f",
-                      "CurrentVersion":  3,
+                      "CurrentVersion":  8,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -276,6 +276,36 @@
                                            "Version":  3,
                                            "Timestamp":  "2026-05-07T17:23:48.0125826Z",
                                            "Snapshot":  "files\\b7ce26efdbfc487f\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-07T17:58:57.6143123Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000004.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-07T17:58:57.8416659Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000005.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-07T18:16:15.2565838Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000006.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  7,
+                                           "Timestamp":  "2026-05-07T18:39:41.8864856Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000007.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  8,
+                                           "Timestamp":  "2026-05-07T18:48:15.6921327Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000008.snapshot",
                                            "Reason":  "applied function"
                                        }
                                    ]
@@ -868,7 +898,7 @@
                       "Path":  "src/ui/debug_menu/world/TexturePaintTool.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\TexturePaintTool.cpp",
                       "Key":  "984185f35b3d3aa4",
-                      "CurrentVersion":  3,
+                      "CurrentVersion":  8,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -886,6 +916,140 @@
                                            "Version":  3,
                                            "Timestamp":  "2026-05-07T17:23:47.9941950Z",
                                            "Snapshot":  "files\\984185f35b3d3aa4\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-07T17:58:57.5922302Z",
+                                           "Snapshot":  "files\\984185f35b3d3aa4\\v000004.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-07T18:00:42.4159179Z",
+                                           "Snapshot":  "files\\984185f35b3d3aa4\\v000005.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-07T18:16:15.0567353Z",
+                                           "Snapshot":  "files\\984185f35b3d3aa4\\v000006.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  7,
+                                           "Timestamp":  "2026-05-07T18:16:15.2353171Z",
+                                           "Snapshot":  "files\\984185f35b3d3aa4\\v000007.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  8,
+                                           "Timestamp":  "2026-05-07T18:39:41.8521196Z",
+                                           "Snapshot":  "files\\984185f35b3d3aa4\\v000008.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/world/World.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\World.h",
+                      "Key":  "dde35833d8ad2bf6",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-07T17:58:57.5601474Z",
+                                           "Snapshot":  "files\\dde35833d8ad2bf6\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-07T17:58:57.5731893Z",
+                                           "Snapshot":  "files\\dde35833d8ad2bf6\\v000002.snapshot",
+                                           "Reason":  "applied insert_after_function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/WorldSnapshots.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\WorldSnapshots.cpp",
+                      "Key":  "f033b602e05c74a0",
+                      "CurrentVersion":  6,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-07T17:58:57.8551790Z",
+                                           "Snapshot":  "files\\f033b602e05c74a0\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-07T17:58:57.8711110Z",
+                                           "Snapshot":  "files\\f033b602e05c74a0\\v000002.snapshot",
+                                           "Reason":  "applied insert_after_function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-07T17:58:58.0179850Z",
+                                           "Snapshot":  "files\\f033b602e05c74a0\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-07T17:58:58.1722951Z",
+                                           "Snapshot":  "files\\f033b602e05c74a0\\v000004.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-07T17:58:58.3513279Z",
+                                           "Snapshot":  "files\\f033b602e05c74a0\\v000005.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-07T17:58:58.5343378Z",
+                                           "Snapshot":  "files\\f033b602e05c74a0\\v000006.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/World.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\World.cpp",
+                      "Key":  "1fa53f96b5bd88f4",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-07T18:39:41.9375755Z",
+                                           "Snapshot":  "files\\1fa53f96b5bd88f4\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-07T18:39:42.0169844Z",
+                                           "Snapshot":  "files\\1fa53f96b5bd88f4\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/TerrainEditMesher.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\TerrainEditMesher.cpp",
+                      "Key":  "a1855b7b052ee009",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-07T18:48:15.6510104Z",
+                                           "Snapshot":  "files\\a1855b7b052ee009\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-07T18:48:15.6680550Z",
+                                           "Snapshot":  "files\\a1855b7b052ee009\\v000002.snapshot",
                                            "Reason":  "applied function"
                                        }
                                    ]

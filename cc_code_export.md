@@ -20,3084 +20,5259 @@ Minimal rules for this turn:
 Default CMake build, when applicable: cmake --build build --config Release -j
 
 
-## src\ui\debug_menu\world\TexturePaintTool.cpp
+## src\world\edit\TerrainEditMesher.cpp
 
-Description: No CC-DESC found. C++ struct 'PaintFaceKey'.
+Description: No CC-DESC found. C++ struct 'BaseCacheKey'.
 
 ````cpp
-// GPT-DESC: Implements texture paint brush authoring, diagnostics, and debounced material rebake scheduling.
-#include "ui/debug_menu/world/TexturePaintTool.h"
-
+// GPT-DESC: Runtime greedy mesher for edited terrain chunks and baked voxel-face materials.
+#include "world/edit/TerrainEditMesher.h"
+#include "world/edit/VoxelBaseSampler.h"
+#include "world/config/WorldConfig.h"
 #include <algorithm>
+#include <chrono>
 #include <cmath>
-#include <string>
-#include <climits>
-#include <cstdio>
-#include <queue>
-#include <unordered_set>
+#include <iostream>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 
-#include <imgui.h>
-#include <glm/gtc/matrix_transform.hpp>
+namespace TerrainEdit {
 
-#include "world/World.h"
-#include "world/edit/TerrainEditTypes.h"
+// ---------------------------------------------------------------------------
+// Incremental base cache: stores the heightmap-only solid data so that
+// subsequent remeshes of the same chunk skip the heightmap column fill.
+// Thread-safe (multiple background mesher threads read/write concurrently).
+// ---------------------------------------------------------------------------
 
-using TextureOverlay::TextureOverlayStore;
-using TextureOverlay::TextureType;
-using TextureOverlay::LODTextureConfig;
-using TextureOverlay::VoxelTextureData;
+struct BaseCacheKey {
+    int chunkX, chunkZ;
+    int baseVoxelX, baseVoxelZ;
+    int cacheMinY, cacheDimXZ, cacheDimY;
+
+    bool operator==(const BaseCacheKey& o) const {
+        return chunkX == o.chunkX && chunkZ == o.chunkZ &&
+               baseVoxelX == o.baseVoxelX && baseVoxelZ == o.baseVoxelZ &&
+               cacheMinY == o.cacheMinY && cacheDimXZ == o.cacheDimXZ &&
+               cacheDimY == o.cacheDimY;
+    }
+};
+
+struct BaseCacheKeyHash {
+    size_t operator()(const BaseCacheKey& k) const {
+        // Simple hash combine
+        size_t h = std::hash<int>{}(k.chunkX);
+        h ^= std::hash<int>{}(k.chunkZ) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.cacheMinY) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.cacheDimY) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct BaseCacheEntry {
+    std::vector<uint8_t> heightmapBase;   // Pure heightmap data (no overlay)
+    std::vector<uint8_t> appliedResult;   // heightmap + overlay combined
+    size_t overlayGeneration = 0;         // Generation when appliedResult was built
+};
+
+static std::shared_mutex s_baseCacheMutex;
+static std::unordered_map<BaseCacheKey, BaseCacheEntry, BaseCacheKeyHash> s_baseCache;
+// Raised from 256 to 4096: under intense LOD spam, 4 workers × multiple LODs ×
+// multiple chunks blew through 256 entries quickly, triggering s_baseCache.clear()
+// and forcing 10M-voxel native cache rebuilds (216 ms each). 4096 entries at
+// ~50-200 KB each = ~200-800 MB worst case but typical working set is far smaller.
+static constexpr size_t BASE_CACHE_MAX_ENTRIES = 4096;
+
+// ---------------------------------------------------------------------------
+// Tier A.1 — downsample cache. Stores the result of the expensive overlay-aware
+// LOD downsample loop (LOD>0 only). Keyed per (chunk, lod) plus the geometry
+// params that determine the cache layout. On overlay-generation mismatch with a
+// known dirty AABB, we copy the cached cacheData and re-downsample only LOD
+// voxels intersecting the dirty region (region recompute). Without a dirty
+// AABB we fall back to a full downsample.
+// ---------------------------------------------------------------------------
+struct DownsampleCacheKey {
+    int chunkX, chunkY, chunkZ, lodLevel;
+    int cacheBaseX, cacheBaseZ, cacheMinY, cacheDimXZ, cacheDimY;
+
+    bool operator==(const DownsampleCacheKey& o) const {
+        return chunkX == o.chunkX && chunkY == o.chunkY && chunkZ == o.chunkZ &&
+               lodLevel == o.lodLevel &&
+               cacheBaseX == o.cacheBaseX && cacheBaseZ == o.cacheBaseZ &&
+               cacheMinY == o.cacheMinY &&
+               cacheDimXZ == o.cacheDimXZ && cacheDimY == o.cacheDimY;
+    }
+};
+struct DownsampleCacheKeyHash {
+    size_t operator()(const DownsampleCacheKey& k) const {
+        size_t h = std::hash<int>{}(k.chunkX);
+        h ^= std::hash<int>{}(k.chunkY) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.chunkZ) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.lodLevel) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.cacheMinY) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+struct DownsampleCacheEntry {
+    std::vector<uint8_t> cacheData;
+    size_t overlayGeneration{0};
+};
+static std::shared_mutex s_downsampleCacheMutex;
+static std::unordered_map<DownsampleCacheKey, DownsampleCacheEntry,
+                          DownsampleCacheKeyHash> s_downsampleCache;
+static constexpr size_t DOWNSAMPLE_CACHE_MAX_ENTRIES = 8192;
+
+inline bool wasCancelled(const RemeshCancellationToken* token) {
+    return token && token->isCancelled();
+}
+
+// ---------------------------------------------------------------------------
+// Post-process: vertex dedup + Forsyth triangle reorder + fetch reorder
+// ---------------------------------------------------------------------------
+
+static constexpr int RT_VERTEX_CACHE_SIZE = 32;
+static constexpr size_t MAX_VERTS_PER_SUBMESH = 65535;
+static constexpr size_t MAX_RUNTIME_SUBMESHES = 64; // Keep in sync with MAX_SUBCHUNKS in Chunk.h
+// FAST-path compaction is only worth it for truly huge edit meshes. Medium
+// meshes were paying 15-50 ms of dedup work to save only a few milliseconds of
+// upload, which inflated shown latency during normal brush use. Prefer raw
+// uploads until the mesh is so large that it would explode submesh count or
+// memory pressure.
+static constexpr size_t FAST_COMPACT_VERT_THRESHOLD = 450000;
+static constexpr size_t FAST_COMPACT_INDEX_THRESHOLD = 700000;
+static constexpr size_t FAST_COMPACT_SUBMESH_THRESHOLD = 8;
+
+static void optimizeTriangleOrderRT(TerrainEditMesher::MeshResult& mesh) {
+    if (mesh.empty()) return;
+    const size_t triCount = mesh.indices.size() / 3;
+    if (triCount <= 1) return;
+    const size_t vertCount = mesh.vertices.size();
+
+    std::vector<std::vector<uint32_t>> vertToTris(vertCount);
+    for (size_t t = 0; t < triCount; ++t) {
+        vertToTris[mesh.indices[t*3+0]].push_back(static_cast<uint32_t>(t));
+        vertToTris[mesh.indices[t*3+1]].push_back(static_cast<uint32_t>(t));
+        vertToTris[mesh.indices[t*3+2]].push_back(static_cast<uint32_t>(t));
+    }
+
+    std::vector<uint32_t> cache(RT_VERTEX_CACHE_SIZE, UINT32_MAX);
+    std::vector<bool> inCache(vertCount, false);
+    int cachePos = 0;
+
+    auto pushCache = [&](uint32_t v) {
+        if (inCache[v]) return;
+        uint32_t evicted = cache[cachePos];
+        if (evicted != UINT32_MAX) inCache[evicted] = false;
+        cache[cachePos] = v;
+        inCache[v] = true;
+        cachePos = (cachePos + 1) % RT_VERTEX_CACHE_SIZE;
+    };
+
+    std::vector<bool> emitted(triCount, false);
+    std::vector<uint32_t> newIndices;
+    newIndices.reserve(mesh.indices.size());
+
+    auto emitTri = [&](size_t t) {
+        emitted[t] = true;
+        uint32_t v0 = mesh.indices[t*3+0], v1 = mesh.indices[t*3+1], v2 = mesh.indices[t*3+2];
+        newIndices.push_back(v0); newIndices.push_back(v1); newIndices.push_back(v2);
+        pushCache(v0); pushCache(v1); pushCache(v2);
+    };
+
+    emitTri(0);
+    for (size_t ec = 1; ec < triCount; ) {
+        size_t bestTri = SIZE_MAX;
+        int bestScore = -1;
+        for (int ci = 0; ci < RT_VERTEX_CACHE_SIZE && bestScore < 3; ++ci) {
+            uint32_t cv = cache[ci];
+            if (cv == UINT32_MAX) continue;
+            for (uint32_t t : vertToTris[cv]) {
+                if (emitted[t]) continue;
+                int score = 0;
+                if (inCache[mesh.indices[t*3+0]]) ++score;
+                if (inCache[mesh.indices[t*3+1]]) ++score;
+                if (inCache[mesh.indices[t*3+2]]) ++score;
+                if (score > bestScore) { bestScore = score; bestTri = t; }
+                if (score == 3) break;
+            }
+        }
+        if (bestTri == SIZE_MAX) {
+            for (size_t t = 0; t < triCount; ++t)
+                if (!emitted[t]) { bestTri = t; break; }
+        }
+        emitTri(bestTri);
+        ++ec;
+    }
+    mesh.indices = std::move(newIndices);
+}
+
+static void deduplicateMeshVertices(TerrainEditMesher::MeshResult& mesh) {
+    if (mesh.empty()) return;
+
+    const size_t origCount = mesh.vertices.size();
+
+    struct VertexKey {
+        uint32_t packed{0};
+        uint32_t material{0};
+        bool operator==(const VertexKey& o) const noexcept {
+            return packed == o.packed && material == o.material;
+        }
+    };
+    struct VertexKeyHash {
+        size_t operator()(const VertexKey& k) const noexcept {
+            uint64_t h = static_cast<uint64_t>(k.packed);
+            h ^= static_cast<uint64_t>(k.material) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            return static_cast<size_t>(h);
+        }
+    };
+
+    std::unordered_map<VertexKey, uint32_t, VertexKeyHash> seen;
+    seen.reserve(origCount);
+    std::vector<Vertex> newVerts;
+    newVerts.reserve(origCount);
+    std::vector<uint32_t> remap(origCount);
+
+    for (size_t i = 0; i < origCount; ++i) {
+        VertexKey key{mesh.vertices[i].packed, mesh.vertices[i].material};
+        auto [it, inserted] = seen.try_emplace(key, static_cast<uint32_t>(newVerts.size()));
+        if (inserted) newVerts.push_back(mesh.vertices[i]);
+        remap[i] = it->second;
+    }
+    for (auto& idx : mesh.indices)
+        idx = remap[idx];
+    mesh.vertices = std::move(newVerts);
+}
+
+static void deduplicateAndReorderMesh(TerrainEditMesher::MeshResult& mesh) {
+    if (mesh.empty()) return;
+
+    deduplicateMeshVertices(mesh);
+
+    // Forsyth triangle reorder
+    optimizeTriangleOrderRT(mesh);
+
+    // Vertex fetch reorder: sequential IDs in draw order
+    const size_t vc = mesh.vertices.size();
+    std::vector<uint32_t> fetchRemap(vc, UINT32_MAX);
+    std::vector<Vertex> ordered;
+    ordered.reserve(vc);
+    uint32_t nextId = 0;
+    for (auto& idx : mesh.indices) {
+        if (fetchRemap[idx] == UINT32_MAX) {
+            fetchRemap[idx] = nextId++;
+            ordered.push_back(mesh.vertices[idx]);
+        }
+        idx = fetchRemap[idx];
+    }
+    for (size_t i = 0; i < vc; ++i) {
+        if (fetchRemap[i] == UINT32_MAX)
+            ordered.push_back(mesh.vertices[i]);
+    }
+    mesh.vertices = std::move(ordered);
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-namespace {
-
-constexpr float PREVIEW_FADE_SEC = 1.5f;
-constexpr int MAX_SURFACE_BRUSH_FACES = 300000;
-constexpr int64_t MAX_SURFACE_BRUSH_SCAN_VOXELS = 16000000;
-
-// Same screen-ray construction as TerrainEditTool.
-glm::vec3 screenToWorldRay(double mouseX, double mouseY,
-                           int viewportW, int viewportH,
-                           const glm::mat4& invViewProj) {
-    const float ndcX =  (2.0f * static_cast<float>(mouseX)) / static_cast<float>(viewportW) - 1.0f;
-    const float ndcY = 1.0f - (2.0f * static_cast<float>(mouseY)) / static_cast<float>(viewportH);
-    glm::vec4 nearP = invViewProj * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
-    glm::vec4 farP  = invViewProj * glm::vec4(ndcX, ndcY, 0.01f, 1.0f);
-    nearP /= nearP.w;
-    farP  /= farP.w;
-    return glm::normalize(glm::vec3(farP) - glm::vec3(nearP));
+bool TerrainEditMesher::isSolid(const TerrainFieldSource& field,
+                                 int wx, int wy, int wz) {
+    // Convert world-voxel coordinate to edit grid coordinate.
+    // One voxel = 0.25 m = 8 edit cells, but the base sampler in
+    // TerrainFieldSource already operates in edit-grid space
+    // (EDIT_CELLS_PER_VOXEL cells per voxel).
+    // We query at the cell centre of the voxel.
+    const int32_t cellX = wx * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2;
+    const int32_t cellY = wy * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2;
+    const int32_t cellZ = wz * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2;
+    const FieldSample s = field.sample(GridCoord(cellX, cellY, cellZ));
+    return s.value.solid;
 }
 
-const ImVec4 kAccent = ImVec4(0.95f, 0.55f, 0.10f, 1.0f);
-const ImVec4 kHeading = ImVec4(0.55f, 0.85f, 1.0f, 1.0f);
-
-ImU32 colorFromVec3(const glm::vec3& c, uint8_t alpha = 220u) {
-    const uint8_t r = static_cast<uint8_t>(std::clamp(c.x, 0.0f, 1.0f) * 255.0f);
-    const uint8_t g = static_cast<uint8_t>(std::clamp(c.y, 0.0f, 1.0f) * 255.0f);
-    const uint8_t b = static_cast<uint8_t>(std::clamp(c.z, 0.0f, 1.0f) * 255.0f);
-    return IM_COL32(r, g, b, alpha);
+static float materialHash01(int x, int z, uint32_t salt)
+{
+    uint32_t h = static_cast<uint32_t>(x) * 0x9E3779B9u;
+    h ^= static_cast<uint32_t>(z) * 0x85EBCA6Bu;
+    h ^= salt * 0xC2B2AE35u;
+    h ^= h >> 16;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15;
+    return static_cast<float>(h & 0x00FFFFFFu) * (1.0f / 16777216.0f);
 }
 
-glm::ivec3 faceNormalI(uint8_t face) {
-    switch (face % 6u) {
-        case 0: return glm::ivec3(-1, 0, 0);
-        case 1: return glm::ivec3( 1, 0, 0);
-        case 2: return glm::ivec3(0, -1, 0);
-        case 3: return glm::ivec3(0,  1, 0);
-        case 4: return glm::ivec3(0, 0, -1);
-        default: return glm::ivec3(0, 0,  1);
+static uint32_t canonicalBlockMaterial(int wx, int wy, int wz, uint8_t face,
+                                       uint16_t pixelsPerVoxel)
+{
+    // Same material layer as painted faces: not a fragment-time overlay.
+    // Top faces get terrain-biome materials; side/bottom faces default to dirt.
+    // Variant is intentionally fixed to 0 so greedy meshing can merge broad
+    // faces. The shader still produces per-texel variation from world position.
+    uint8_t type = (face == 3u) ? 0u : 2u; // top = grass, sides/bottom = dirt
+
+    if (face == 3u) {
+        const float worldY = static_cast<float>(wy) * WorldConfig::VOXEL_SIZE_M;
+        const float biomeNoise = materialHash01(wx >> 2, wz >> 2, 71u);
+        if (worldY < 5.0f) {
+            type = 3u; // sand-like low areas
+        } else if (biomeNoise > 0.82f) {
+            type = 1u; // muddy patches
+        }
+    }
+
+    return VertexPacking::packMaterial(type, 0u, 0u, pixelsPerVoxel);
+}
+
+// ---------------------------------------------------------------------------
+// AO (matches the offline tool: side + corner heuristic)
+// ---------------------------------------------------------------------------
+
+TerrainEditMesher::FaceAO TerrainEditMesher::calcAO(
+        const TerrainFieldSource& field,
+        int wx, int wy, int wz,
+        int axis, int direction)
+{
+    auto solid = [&](int dx, int dy, int dz) -> bool {
+        return isSolid(field, wx + dx, wy + dy, wz + dz);
+    };
+
+    auto vertexAO = [](bool s1, bool s2, bool corner) -> uint8_t {
+        if (s1 && s2) return 3;
+        if (s1 || s2) return corner ? 2u : 1u;
+        return corner ? 1u : 0u;
+    };
+
+    FaceAO ao;
+
+    if (axis == 0) { // X-axis faces (u=Z, v=Y)
+        int nx = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(nx, 0, -1), solid(nx, -1,  0), solid(nx, -1, -1));
+        ao.br = vertexAO(solid(nx, 0,  1), solid(nx, -1,  0), solid(nx, -1,  1));
+        ao.tr = vertexAO(solid(nx, 0,  1), solid(nx,  1,  0), solid(nx,  1,  1));
+        ao.tl = vertexAO(solid(nx, 0, -1), solid(nx,  1,  0), solid(nx,  1, -1));
+    } else if (axis == 1) { // Y-axis faces (u=X, v=Z)
+        int ny = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(-1, ny, 0), solid(0, ny, -1), solid(-1, ny, -1));
+        ao.br = vertexAO(solid( 1, ny, 0), solid(0, ny, -1), solid( 1, ny, -1));
+        ao.tr = vertexAO(solid( 1, ny, 0), solid(0, ny,  1), solid( 1, ny,  1));
+        ao.tl = vertexAO(solid(-1, ny, 0), solid(0, ny,  1), solid(-1, ny,  1));
+    } else { // Z-axis faces (u=X, v=Y)
+        int nz = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(-1, 0, nz), solid(0, -1, nz), solid(-1, -1, nz));
+        ao.br = vertexAO(solid( 1, 0, nz), solid(0, -1, nz), solid( 1, -1, nz));
+        ao.tr = vertexAO(solid( 1, 0, nz), solid(0,  1, nz), solid( 1,  1, nz));
+        ao.tl = vertexAO(solid(-1, 0, nz), solid(0,  1, nz), solid(-1,  1, nz));
+    }
+    return ao;
+}
+
+// ---------------------------------------------------------------------------
+// Quad emission (matches offline tool format exactly)
+// ---------------------------------------------------------------------------
+
+void TerrainEditMesher::addQuad(MeshResult& out,
+                                int axis, int slicePos,
+                                int u, int v,
+                                int quadW, int quadH,
+                                int direction, uint8_t face,
+                                uint32_t material,
+                                const FaceAO& ao)
+{
+    uint16_t x0, y0, z0;
+    uint16_t x1, y1, z1;
+    uint16_t x2, y2, z2;
+    uint16_t x3, y3, z3;
+
+    if (axis == 0) { // X face
+        uint16_t x = static_cast<uint16_t>(slicePos + (direction == 1 ? 1 : 0));
+        x0 = x; y0 = static_cast<uint16_t>(v);             z0 = static_cast<uint16_t>(u);
+        x1 = x; y1 = static_cast<uint16_t>(v);             z1 = static_cast<uint16_t>(u + quadW);
+        x2 = x; y2 = static_cast<uint16_t>(v + quadH);     z2 = static_cast<uint16_t>(u + quadW);
+        x3 = x; y3 = static_cast<uint16_t>(v + quadH);     z3 = static_cast<uint16_t>(u);
+    } else if (axis == 1) { // Y face
+        uint16_t y = static_cast<uint16_t>(slicePos + (direction == 1 ? 1 : 0));
+        x0 = static_cast<uint16_t>(u);         y0 = y; z0 = static_cast<uint16_t>(v);
+        x1 = static_cast<uint16_t>(u + quadW); y1 = y; z1 = static_cast<uint16_t>(v);
+        x2 = static_cast<uint16_t>(u + quadW); y2 = y; z2 = static_cast<uint16_t>(v + quadH);
+        x3 = static_cast<uint16_t>(u);         y3 = y; z3 = static_cast<uint16_t>(v + quadH);
+    } else { // Z face
+        uint16_t z = static_cast<uint16_t>(slicePos + (direction == 1 ? 1 : 0));
+        x0 = static_cast<uint16_t>(u);         y0 = static_cast<uint16_t>(v);         z0 = z;
+        x1 = static_cast<uint16_t>(u + quadW); y1 = static_cast<uint16_t>(v);         z1 = z;
+        x2 = static_cast<uint16_t>(u + quadW); y2 = static_cast<uint16_t>(v + quadH); z2 = z;
+        x3 = static_cast<uint16_t>(u);         y3 = static_cast<uint16_t>(v + quadH); z3 = z;
+    }
+
+    // Pack vertices into engine format: X(8)|Y(10)|Z(8)|face(3)|AO(3)
+    // Y is stored directly (0-512 range fits in 10 bits)
+    auto pack = [face, material](uint16_t px, uint16_t py, uint16_t pz, uint8_t aoVal) -> Vertex {
+        uint32_t packed =
+            (static_cast<uint32_t>(px)       <<  0) |
+            (static_cast<uint32_t>(py)       <<  8) |
+            (static_cast<uint32_t>(pz)       << 18) |
+            (static_cast<uint32_t>(face & 7) << 26) |
+            (static_cast<uint32_t>(aoVal & 7) << 29);
+        return {packed, material};
+    };
+
+    auto baseIdx = static_cast<uint32_t>(out.vertices.size());
+    out.vertices.push_back(pack(x0, y0, z0, ao.bl));
+    out.vertices.push_back(pack(x1, y1, z1, ao.br));
+    out.vertices.push_back(pack(x2, y2, z2, ao.tr));
+    out.vertices.push_back(pack(x3, y3, z3, ao.tl));
+
+    // Update tight AABB in chunk-local METRES (matching precomputed pipeline).
+    // The vertex shader reconstructs: worldVoxel = chunkCoord*(128,512,128) + (ux, uy, uz)
+    // then metres = worldVoxel * 0.25.  In chunk-local space that's just (px, py, pz) * 0.25.
+    constexpr float VS = 0.25f; // WorldConfig::VOXEL_SIZE_M
+    auto updateBB = [&](uint16_t px, uint16_t py, uint16_t pz) {
+        glm::vec3 m(float(px) * VS, float(py) * VS, float(pz) * VS);
+        out.aabbMin = glm::min(out.aabbMin, m);
+        out.aabbMax = glm::max(out.aabbMax, m);
+    };
+    updateBB(x0, y0, z0);
+    updateBB(x1, y1, z1);
+    updateBB(x2, y2, z2);
+    updateBB(x3, y3, z3);
+
+    // Winding order + AO-based diagonal flip (matching offline tool)
+    bool useReversedWinding = (axis == 2) ? (direction == 0) : (direction == 1);
+    bool flipDiag = (ao.bl + ao.tr) > (ao.br + ao.tl);
+
+    if (useReversedWinding) {
+        if (flipDiag) {
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 3); out.indices.push_back(baseIdx + 1);
+            out.indices.push_back(baseIdx + 1); out.indices.push_back(baseIdx + 3); out.indices.push_back(baseIdx + 2);
+        } else {
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 2); out.indices.push_back(baseIdx + 1);
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 3); out.indices.push_back(baseIdx + 2);
+        }
+    } else {
+        if (flipDiag) {
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 1); out.indices.push_back(baseIdx + 3);
+            out.indices.push_back(baseIdx + 1); out.indices.push_back(baseIdx + 2); out.indices.push_back(baseIdx + 3);
+        } else {
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 1); out.indices.push_back(baseIdx + 2);
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 2); out.indices.push_back(baseIdx + 3);
+        }
     }
 }
 
-glm::vec3 faceCenterWorld(const glm::ivec3& voxel, uint8_t face) {
-    glm::vec3 p = glm::vec3(voxel) + glm::vec3(0.5f);
-    p += glm::vec3(faceNormalI(face)) * 0.5f;
-    return p * WorldConfig::VOXEL_SIZE_M;
-}
+// ---------------------------------------------------------------------------
+// Cache-based AO (matches the offline tool: side + corner heuristic)
+// ---------------------------------------------------------------------------
 
-struct PaintFaceKey {
-    glm::ivec3 voxel{0};
-    uint8_t face{0};
-    bool operator==(const PaintFaceKey& other) const noexcept {
-        return voxel == other.voxel && face == other.face;
+TerrainEditMesher::FaceAO TerrainEditMesher::calcAOCached(
+        const SolidCache& cache,
+        int wx, int wy, int wz,
+        int axis, int direction)
+{
+    // All AO probes are within the 1-voxel padded cache bounds —
+    // skip bounds checks for ~8× fewer branches per face.
+    auto solid = [&](int dx, int dy, int dz) -> bool {
+        return cache.getUnchecked(wx + dx, wy + dy, wz + dz);
+    };
+
+    auto vertexAO = [](bool s1, bool s2, bool corner) -> uint8_t {
+        if (s1 && s2) return 3;
+        if (s1 || s2) return corner ? 2u : 1u;
+        return corner ? 1u : 0u;
+    };
+
+    FaceAO ao;
+
+    if (axis == 0) {
+        int nx = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(nx, 0, -1), solid(nx, -1,  0), solid(nx, -1, -1));
+        ao.br = vertexAO(solid(nx, 0,  1), solid(nx, -1,  0), solid(nx, -1,  1));
+        ao.tr = vertexAO(solid(nx, 0,  1), solid(nx,  1,  0), solid(nx,  1,  1));
+        ao.tl = vertexAO(solid(nx, 0, -1), solid(nx,  1,  0), solid(nx,  1, -1));
+    } else if (axis == 1) {
+        int ny = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(-1, ny, 0), solid(0, ny, -1), solid(-1, ny, -1));
+        ao.br = vertexAO(solid( 1, ny, 0), solid(0, ny, -1), solid( 1, ny, -1));
+        ao.tr = vertexAO(solid( 1, ny, 0), solid(0, ny,  1), solid( 1, ny,  1));
+        ao.tl = vertexAO(solid(-1, ny, 0), solid(0, ny,  1), solid(-1, ny,  1));
+    } else {
+        int nz = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(-1, 0, nz), solid(0, -1, nz), solid(-1, -1, nz));
+        ao.br = vertexAO(solid( 1, 0, nz), solid(0, -1, nz), solid( 1, -1, nz));
+        ao.tr = vertexAO(solid( 1, 0, nz), solid(0,  1, nz), solid( 1,  1, nz));
+        ao.tl = vertexAO(solid(-1, 0, nz), solid(0,  1, nz), solid(-1,  1, nz));
     }
-};
-
-struct PaintFaceKeyHash {
-    size_t operator()(const PaintFaceKey& key) const noexcept {
-        uint64_t h = static_cast<uint32_t>(key.voxel.x) * 73856093ull;
-        h ^= static_cast<uint32_t>(key.voxel.y) * 19349663ull;
-        h ^= static_cast<uint32_t>(key.voxel.z) * 83492791ull;
-        h ^= static_cast<uint64_t>(key.face) * 2654435761ull;
-        h ^= h >> 33;
-        return static_cast<size_t>(h);
-    }
-};
-
-} // namespace
-
-TextureOverlayStore& TexturePaintTool::getStore() {
-    static TextureOverlayStore fallback;
-    return m_world ? m_world->getTextureMaterialStore() : fallback;
+    return ao;
 }
 
-const TextureOverlayStore& TexturePaintTool::getStore() const {
-    static TextureOverlayStore fallback;
-    return m_world ? m_world->getTextureMaterialStore() : fallback;
-}
+// ---------------------------------------------------------------------------
+// Build solid cache — single pass over heightmap + single-lock overlay apply
+// ---------------------------------------------------------------------------
 
-float TexturePaintTool::getPaintRepeatIntervalSec() const {
-    const int radius = std::max(1, m_radiusVoxelsLod0);
-    const int side = radius * 2 + 1;
-    const int64_t approxFaceCells = (m_shape == BrushShape::Sphere)
-        ? static_cast<int64_t>(3.14159265f * static_cast<float>(radius) * static_cast<float>(radius))
-        : static_cast<int64_t>(side) * static_cast<int64_t>(side);
+std::vector<uint8_t> TerrainEditMesher::buildSolidCache(
+        const TerrainFieldSource& field,
+        const HeightmapBaseSampler& heightmap,
+        int baseVoxelX, int baseVoxelZ,
+        int cacheMinY, int cacheDimXZ, int cacheDimY,
+        const RemeshCancellationToken* cancelToken)
+{
+    const size_t totalSize = static_cast<size_t>(cacheDimY) * cacheDimXZ * cacheDimXZ;
 
-    // Small brushes feel like a normal paint brush. Huge brushes become
-    // stamp tools; repeating them at 20 Hz creates identical store writes and
-    // remesh storms with no visual benefit.
-    if (approxFaceCells <= 4096)   return 0.05f;
-    if (approxFaceCells <= 16384)  return 0.08f;
-    if (approxFaceCells <= 65536)  return 0.12f;
-    if (approxFaceCells <= 180000) return 0.18f;
-    return 0.25f;
-}
+    const int chunkX = floorDiv(baseVoxelX + 1, 128);  // +1 compensates for the -1 padding
+    const int chunkZ = floorDiv(baseVoxelZ + 1, 128);
+    const BaseCacheKey key{chunkX, chunkZ, baseVoxelX, baseVoxelZ, cacheMinY, cacheDimXZ, cacheDimY};
 
-size_t TexturePaintTool::flushPendingTextureDirtyChunks(bool force) {
-    if (!m_world || m_pendingTextureDirtyChunks.empty()) {
-        return 0;
-    }
+    const auto* overlay = field.getOverlay();
+    const size_t currentGen = (overlay && overlay->hasAnyEdits())
+        ? overlay->getOverlayGeneration() : 0;
 
-    const auto now = std::chrono::steady_clock::now();
-    const size_t pending = m_pendingTextureDirtyChunks.size();
-    const size_t immediateCap = static_cast<size_t>(std::max(0, m_immediateTextureDirtyChunkCap));
+    // --- Three-tier cache lookup ---
+    {
+        std::shared_lock<std::shared_mutex> rlock(s_baseCacheMutex);
+        auto it = s_baseCache.find(key);
+        if (it != s_baseCache.end()) {
+            const auto& entry = it->second;
 
-    if (!force && pending > immediateCap) {
-        // Debounce repeated large brush stamps, but never delay the first dirty
-        // wave.  The old path initialized m_lastTextureDirtyFlushTime and
-        // returned 0, so a max-radius click could be authored in <0.1 ms while
-        // its visible material rebake was not even scheduled until a later
-        // timer/release flush.
-        if (m_lastTextureDirtyFlushTime.time_since_epoch().count() != 0) {
-            const float elapsed = std::chrono::duration<float>(
-                now - m_lastTextureDirtyFlushTime).count();
-            if (elapsed < m_textureDirtyFlushIntervalSec) {
-                return 0;
+            // Full hit: overlay generation matches → skip ALL work.
+            if (entry.overlayGeneration == currentGen
+                && entry.appliedResult.size() == totalSize) {
+                return entry.appliedResult;
+            }
+
+            // Partial hit: heightmap base is valid, re-apply overlay only.
+            if (entry.heightmapBase.size() == totalSize) {
+                std::vector<uint8_t> cache = entry.heightmapBase;
+                rlock.unlock();
+
+                if (overlay && overlay->hasAnyEdits()) {
+                    overlay->bulkApplyToSolidCache(
+                        cache.data(), baseVoxelX, baseVoxelZ,
+                        cacheMinY, cacheDimXZ, cacheDimY, cancelToken);
+                    if (wasCancelled(cancelToken)) {
+                        return {};
+                    }
+                }
+
+                // Update the applied result for next time.
+                {
+                    std::unique_lock<std::shared_mutex> wlock(s_baseCacheMutex);
+                    auto& e = s_baseCache[key];
+                    e.appliedResult = cache;
+                    e.overlayGeneration = currentGen;
+                }
+                return cache;
             }
         }
     }
 
-    TerrainEdit::TerrainEditOverlayStore::ChunkSet toFlush;
-    toFlush.swap(m_pendingTextureDirtyChunks);
+    // Full miss: build from heightmap.
+    std::vector<uint8_t> cache(totalSize, 0);
 
-    // Material-only rebuild request. World::markTextureMaterialsDirty is kept
-    // responsible for scheduler ownership, but we debounce repeated large calls
-    // here so brush spam cannot enqueue a full remesh/upload wave every 50 ms.
-    // The first dirty wave is still sent immediately so the screen catches up
-    // as soon as the remesh/upload/finalize pipeline can process it.
-    m_world->markTextureMaterialsDirty(toFlush);
-    m_lastTextureDirtyFlushTime = now;
-    return toFlush.size();
-}
+    const int mapW = heightmap.getMapWidth();
+    const int mapH = heightmap.getMapHeight();
 
-void TexturePaintTool::recordPaintDiagnostic(const PaintOpDiagnostic& diag) {
-    PaintOpDiagnostic stored = diag;
-    stored.serial = ++m_paintDiagSerial;
-
-    m_paintDiagHistory[static_cast<size_t>(m_paintDiagWriteIndex)] = stored;
-    m_paintDiagWriteIndex = (m_paintDiagWriteIndex + 1) % PAINT_DIAG_HISTORY;
-    if (m_paintDiagCount < PAINT_DIAG_HISTORY) {
-        ++m_paintDiagCount;
-    }
-}
-
-std::string TexturePaintTool::buildPaintDiagnosticsReport() const {
-    std::string out;
-    out.reserve(32768);
-
-    auto appendLine = [&](const char* text) {
-        out += text;
-        out += '\n';
-    };
-
-    struct VisualStatus {
-        float firstMs{0.0f};
-        float completeMs{0.0f};
-        int totalChunks{0};
-        int readyChunks{0};
-        int pendingChunks{0};
-        uint64_t uploadBytes{0};
-        bool complete{false};
-    };
-
-    auto sameCoord = [](const glm::ivec3& a, const glm::ivec3& b) {
-        return a.x == b.x && a.y == b.y && a.z == b.z;
-    };
-
-    auto computeVisualStatus = [&](const PaintOpDiagnostic& d) {
-        VisualStatus s{};
-        s.totalChunks = static_cast<int>(d.visualChunks.size());
-        s.pendingChunks = s.totalChunks;
-
-        if (!m_world || d.visualChunks.empty() || d.visualStartSec <= 0.0) {
-            return s;
+    for (int cz = 0; cz < cacheDimXZ; ++cz) {
+        if (wasCancelled(cancelToken)) {
+            return {};
         }
+        const int wz = baseVoxelZ + cz;
+        for (int cx = 0; cx < cacheDimXZ; ++cx) {
+            const int wx = baseVoxelX + cx;
 
-        std::vector<uint8_t> seen(d.visualChunks.size(), 0u);
-        const auto& history = m_world->getChunkVisualHistory();
-        const size_t scanCount = std::min(history.count, World::ChunkVisualHistory::CAPACITY);
-
-        bool anyReady = false;
-        for (size_t i = 0; i < scanCount; ++i) {
-            const auto& e = history.getFromEnd(i);
-            const double entrySec = static_cast<double>(e.timestampSec);
-
-            // ChunkVisualHistory stores timestampSec as float seconds from the
-            // same steady_clock epoch. Keep a small negative tolerance so float
-            // quantization does not hide first-frame completions.
-            if (entrySec + 0.020 < d.visualStartSec) {
-                continue;
+            int height = 0;
+            if (wx >= 0 && wx < mapW && wz >= 0 && wz < mapH) {
+                height = heightmap.getHeightAtVoxel(wx, wz);
             }
 
-            for (size_t chunkIdx = 0; chunkIdx < d.visualChunks.size(); ++chunkIdx) {
-                if (seen[chunkIdx] != 0u || !sameCoord(e.chunkCoord, d.visualChunks[chunkIdx])) {
+            const int fillMinY = cacheMinY;
+            const int fillMaxY = std::min(height, cacheMinY + cacheDimY);
+            for (int wy = fillMinY; wy < fillMaxY; ++wy) {
+                const int cy = wy - cacheMinY;
+                cache[static_cast<size_t>((cy * cacheDimXZ + cz) * cacheDimXZ + cx)] = 1;
+            }
+        }
+    }
+
+    // Save heightmap base, then apply overlay for the applied result.
+    std::vector<uint8_t> heightmapBase = cache;
+
+    if (overlay && overlay->hasAnyEdits()) {
+        overlay->bulkApplyToSolidCache(
+            cache.data(), baseVoxelX, baseVoxelZ,
+            cacheMinY, cacheDimXZ, cacheDimY, cancelToken);
+        if (wasCancelled(cancelToken)) {
+            return {};
+        }
+    }
+
+    // Store both layers in cache.
+    {
+        std::unique_lock<std::shared_mutex> wlock(s_baseCacheMutex);
+        if (s_baseCache.size() >= BASE_CACHE_MAX_ENTRIES) {
+            // Evict ~half the entries instead of clear(); keeps recent working
+            // set warm so worker threads under spam don't all hit cold misses.
+            const size_t target = BASE_CACHE_MAX_ENTRIES / 2;
+            size_t toRemove = s_baseCache.size() - target;
+            for (auto it = s_baseCache.begin(); it != s_baseCache.end() && toRemove > 0; ) {
+                it = s_baseCache.erase(it);
+                --toRemove;
+            }
+        }
+        auto& entry = s_baseCache[key];
+        entry.heightmapBase = std::move(heightmapBase);
+        entry.appliedResult = cache;
+        entry.overlayGeneration = currentGen;
+    }
+
+    return cache;
+}
+
+
+// ---------------------------------------------------------------------------
+// Build solid cache for 3D voxel base (overhangs / floating islands)
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> TerrainEditMesher::buildSolidCacheVoxelBase(
+        const TerrainFieldSource& field,
+        const VoxelBaseSampler& voxelBase,
+        int baseVoxelX, int baseVoxelZ,
+        int cacheMinY, int cacheDimXZ, int cacheDimY)
+{
+    const size_t totalSize = static_cast<size_t>(cacheDimY) * cacheDimXZ * cacheDimXZ;
+    std::vector<uint8_t> cache(totalSize, 0);
+
+    // Bulk-apply the voxel base store (solid/air overrides from base_voxels.bin).
+    voxelBase.getStore().bulkApplyToSolidCache(
+        cache.data(), baseVoxelX, baseVoxelZ,
+        cacheMinY, cacheDimXZ, cacheDimY);
+
+    // Layer edit overlay on top (snapshot edits).
+    const auto* overlay = field.getOverlay();
+    if (overlay && overlay->hasAnyEdits()) {
+        overlay->bulkApplyToSolidCache(
+            cache.data(), baseVoxelX, baseVoxelZ,
+            cacheMinY, cacheDimXZ, cacheDimY);
+    }
+
+    return cache;
+}
+
+// ---------------------------------------------------------------------------
+// Main greedy meshing entry point
+// ---------------------------------------------------------------------------
+
+TerrainEditMesher::MeshResult TerrainEditMesher::meshChunk(
+        const TerrainFieldSource& field,
+        const glm::ivec3& chunkCoord,
+        int chunkSizeVoxels,
+        int chunkHeightVoxels,
+        float /*voxelSize*/,
+        int hintMinY,
+        int hintMaxY,
+        const HeightmapBaseSampler* heightmap,
+        int lodLevel,
+        bool skipPostProcess,
+        bool skipAmbientOcclusion,
+        const RemeshCancellationToken* cancelToken,
+        const VoxelBaseSampler* voxelBase,
+        const glm::ivec3* editDirtyVoxelMin,
+        const glm::ivec3* editDirtyVoxelMax,
+        int bandLocalYMin,
+        int bandLocalYMax)
+{
+    using Clock = std::chrono::steady_clock;
+    MeshResult result;
+    // Tier B Phase 1: record requested band so diagnostics can compare against
+    // the eventually-wired band-clipped path. No-op on the meshing loop today.
+    result.stats.bandLocalYMin = bandLocalYMin;
+    result.stats.bandLocalYMax = bandLocalYMax;
+    result.stats.bandActive    = false;
+
+    // LOD downsampling: at LOD > 0, operate on a coarser voxel grid.
+    // step = 2^lodLevel.  The mesher runs at lodRes = chunkSize/step resolution,
+    // then vertex positions are scaled back to native range after meshing.
+    const int step = (lodLevel > 0) ? (1 << lodLevel) : 1;
+    const int nativeChunkSize = chunkSizeVoxels;
+    const int nativeChunkHeight = chunkHeightVoxels;
+    const bool hasHeightHints = !(hintMinY == -1 && hintMaxY == -1);
+    if (step > 1) {
+        chunkSizeVoxels /= step;
+        chunkHeightVoxels /= step;
+        // Convert height hints from native to LOD voxel units
+        if (hasHeightHints) {
+            hintMinY = floorDiv(hintMinY, step);
+            hintMaxY = floorDiv(hintMaxY + step - 1, step);
+        }
+    }
+
+    // World-voxel origin of this chunk (in LOD voxel units at LOD > 0)
+    const int baseX = chunkCoord.x * chunkSizeVoxels;
+    const int baseY = chunkCoord.y * chunkHeightVoxels;
+    const int baseZ = chunkCoord.z * chunkSizeVoxels;
+
+    // Determine vertical extent of solid voxels in absolute world-voxel units.
+    int minY, maxY;
+    if (hasHeightHints) {
+        minY = std::max(baseY, hintMinY - 1);
+        maxY = std::min(baseY + chunkHeightVoxels - 1, hintMaxY + 1);
+    } else {
+        // Fallback: scan at native resolution, convert to LOD units.
+        const int nBaseX = chunkCoord.x * nativeChunkSize;
+        const int nBaseY = chunkCoord.y * nativeChunkHeight;
+        const int nBaseZ = chunkCoord.z * nativeChunkSize;
+        int nMinY = nBaseY + nativeChunkHeight;
+        int nMaxY = nBaseY - 1;
+        for (int z = 0; z < nativeChunkSize; ++z) {
+            if (wasCancelled(cancelToken)) {
+                return result;
+            }
+            for (int x = 0; x < nativeChunkSize; ++x) {
+                for (int y = 0; y < nativeChunkHeight; ++y) {
+                    const int wy = nBaseY + y;
+                    if (isSolid(field, nBaseX + x, wy, nBaseZ + z)) {
+                        nMinY = std::min(nMinY, wy);
+                        nMaxY = std::max(nMaxY, wy);
+                    }
+                }
+            }
+        }
+        if (nMaxY < nMinY) {
+            return result;
+        }
+        minY = floorDiv(nMinY, step);
+        maxY = floorDiv(nMaxY + step - 1, step);
+    }
+
+    if (minY > maxY) {
+        return result;
+    }
+
+    const int scanMinY = std::max(baseY, minY);
+    const int scanMaxY = std::min(baseY + chunkHeightVoxels - 1, maxY);
+    if (scanMinY > scanMaxY) {
+        return result;
+    }
+    const int scanMinLocalY = scanMinY - baseY;
+    const int scanMaxLocalY = scanMaxY - baseY;
+
+    // --- Build solid cache with 1-voxel padding for neighbor/AO lookups ---
+    auto tCacheBuild = Clock::now();
+    const int cacheDimXZ = chunkSizeVoxels + 2;
+    // Quantize cache Y range so the downsample-cache key (LOD>0) and the
+    // base-cache key (LOD0) remain stable across edits that nudge scanMinY
+    // by a few voxels. Without this, every brush click that grows or shrinks
+    // the solid extent shifts cacheMinY/cacheDimY → key MISS → 5-30 ms of
+    // recompute per chunk per click. Quantum of 16 LOD-voxels means the cache
+    // only changes shape when terrain Y extent crosses a 16-voxel boundary.
+    constexpr int kCacheYQuantize = 16;
+    auto floorQuant = [&](int v) {
+        return (v >= 0)
+            ? (v / kCacheYQuantize) * kCacheYQuantize
+            : -(((-v + kCacheYQuantize - 1) / kCacheYQuantize) * kCacheYQuantize);
+    };
+    auto ceilQuant = [&](int v) {
+        return (v >= 0)
+            ? ((v + kCacheYQuantize - 1) / kCacheYQuantize) * kCacheYQuantize
+            : -((-v / kCacheYQuantize) * kCacheYQuantize);
+    };
+    const int cacheMinY  = floorQuant(scanMinY - 1);
+    const int cacheMaxY  = ceilQuant(scanMaxY + 2);
+    const int cacheDimY  = cacheMaxY - cacheMinY;
+    const int cacheBaseX = baseX - 1;
+    const int cacheBaseZ = baseZ - 1;
+
+    std::vector<uint8_t> cacheData;
+
+    if (step > 1) {
+        // LOD > 0: compute downsampled solid cache.
+        // Two paths depending on whether overlay edits exist:
+        //   - No overlay: O(LOD_voxels) from heightmap directly (~0.1 ms)
+        //   - Overlay:    build native cache + optimized downsample (~14 ms)
+        const auto* overlay = field.getOverlay();
+        const bool hasOverlay = overlay && overlay->hasAnyEdits();
+
+        if (!hasOverlay && heightmap && heightmap->isLoaded()) {
+            // FAST PATH: no overlay edits, compute LOD directly from heightmap.
+            // Matches offline LOD: solid = (nativeBaseWY < baseHeight) at corner.
+            cacheData.resize(static_cast<size_t>(cacheDimY) * cacheDimXZ * cacheDimXZ, 0);
+            for (int lcz = 0; lcz < cacheDimXZ; ++lcz) {
+                if (wasCancelled(cancelToken)) {
+                    return result;
+                }
+                for (int lcx = 0; lcx < cacheDimXZ; ++lcx) {
+                    const int nativeBaseWX = (cacheBaseX + lcx) * step;
+                    const int nativeBaseWZ = (cacheBaseZ + lcz) * step;
+                    const int baseHeight = heightmap->getHeightAtVoxel(nativeBaseWX, nativeBaseWZ);
+                    for (int lcy = 0; lcy < cacheDimY; ++lcy) {
+                        const int nativeBaseWY = (cacheMinY + lcy) * step;
+                        if (nativeBaseWY < baseHeight)
+                            cacheData[static_cast<size_t>((lcy * cacheDimXZ + lcz) * cacheDimXZ + lcx)] = 1;
+                    }
+                }
+            }
+        } else {
+            // OVERLAY PATH: build native cache then downsample.
+            // Optimization: removed per-native-voxel heightmap comparison
+            // from downsample loop.  Uses pure occupancy count + single
+            // heightmap check per LOD voxel for boundary alignment.
+            const int nBaseX = chunkCoord.x * nativeChunkSize;
+            const int nBaseZ = chunkCoord.z * nativeChunkSize;
+            const int nPad = step;
+            const int nDimXZ = nativeChunkSize + 2 * nPad;
+            const int nCacheBaseX = nBaseX - nPad;
+            const int nCacheBaseZ = nBaseZ - nPad;
+            // Quantize Y range to multiples of (step * 16) so that small
+            // changes in height hints between edits don't invalidate the
+            // buildSolidCache key.  Without this, every edit changes
+            // nCacheMinY → full cache miss → 30 ms rebuild.
+            const int yQuantize = step * 16;
+            const int rawNMinY = scanMinY * step - nPad;
+            const int rawNMaxY = (scanMaxY + 1) * step + nPad;
+            const int nCacheMinY = (rawNMinY < 0)
+                ? -(((-rawNMinY + yQuantize - 1) / yQuantize) * yQuantize)
+                : (rawNMinY / yQuantize) * yQuantize;
+            const int nCacheMaxY = ((rawNMaxY + yQuantize - 1) / yQuantize) * yQuantize;
+            const int nDimY = nCacheMaxY - nCacheMinY;
+
+            std::vector<uint8_t> nativeCacheData;
+            if (heightmap && heightmap->isLoaded()) {
+                nativeCacheData = buildSolidCache(field, *heightmap,
+                                                  nCacheBaseX, nCacheBaseZ,
+                                                  nCacheMinY, nDimXZ, nDimY, cancelToken);
+                if (wasCancelled(cancelToken)) {
+                    return result;
+                }
+            } else if (voxelBase && voxelBase->isLoaded()) {
+                nativeCacheData = buildSolidCacheVoxelBase(field, *voxelBase,
+                                                           nCacheBaseX, nCacheBaseZ,
+                                                           nCacheMinY, nDimXZ, nDimY);
+                if (wasCancelled(cancelToken)) {
+                    return result;
+                }
+            } else {
+                nativeCacheData.resize(static_cast<size_t>(nDimY) * nDimXZ * nDimXZ, 0);
+                for (int cz = 0; cz < nDimXZ; ++cz) {
+                    if (wasCancelled(cancelToken)) {
+                        return result;
+                    }
+                    for (int cx = 0; cx < nDimXZ; ++cx) {
+                        const int wx = nCacheBaseX + cx;
+                        const int wz = nCacheBaseZ + cz;
+                        for (int cy = 0; cy < nDimY; ++cy) {
+                            const int wy = nCacheMinY + cy;
+                            if (isSolid(field, wx, wy, wz))
+                                nativeCacheData[static_cast<size_t>((cy * nDimXZ + cz) * nDimXZ + cx)] = 1;
+                        }
+                    }
+                }
+            }
+
+            // Downsample: count solid native voxels per LOD block.
+            // All downsample coordinates are within the padded native cache,
+            // so we use raw array access (no bounds checks).
+            //
+            // Tier A.1 cache: keyed by (chunk, lod, padding params), invalidated
+            // by overlay generation. Three outcomes:
+            //   FULL HIT  — overlayGen matches → reuse cacheData entirely (skip work).
+            //   PARTIAL   — overlayGen mismatch + dirty AABB known → copy old
+            //               cacheData, recompute only LOD voxels intersecting the
+            //               (dirty AABB / step), expanded by 1 for AO border.
+            //   MISS      — recompute every LOD voxel.
+            const auto tDownsampleStart = Clock::now();
+            const auto* overlayPtr = field.getOverlay();
+            const size_t currentOverlayGen = (overlayPtr && overlayPtr->hasAnyEdits())
+                ? overlayPtr->getOverlayGeneration() : 0;
+            const DownsampleCacheKey dsKey{chunkCoord.x, chunkCoord.y, chunkCoord.z, lodLevel,
+                                           cacheBaseX, cacheBaseZ, cacheMinY,
+                                           cacheDimXZ, cacheDimY};
+
+            int dirtyLodMinX = 0, dirtyLodMaxX = cacheDimXZ - 1;
+            int dirtyLodMinY = 0, dirtyLodMaxY = cacheDimY  - 1;
+            int dirtyLodMinZ = 0, dirtyLodMaxZ = cacheDimXZ - 1;
+            const bool hasDirtyAabb = (editDirtyVoxelMin && editDirtyVoxelMax);
+            int dirtyLocalMinX = dirtyLodMinX, dirtyLocalMaxX = dirtyLodMaxX;
+            int dirtyLocalMinY = dirtyLodMinY, dirtyLocalMaxY = dirtyLodMaxY;
+            int dirtyLocalMinZ = dirtyLodMinZ, dirtyLocalMaxZ = dirtyLodMaxZ;
+            if (hasDirtyAabb) {
+                // Convert native dirty voxel AABB → LOD voxel range, expand
+                // by 1 LOD voxel for AO border (since neighbouring solidity
+                // affects this LOD voxel's downsample result via padding cell).
+                const int lminX = floorDiv(editDirtyVoxelMin->x, step) - 1;
+                const int lmaxX = floorDiv(editDirtyVoxelMax->x, step) + 1;
+                const int lminY = floorDiv(editDirtyVoxelMin->y, step) - 1;
+                const int lmaxY = floorDiv(editDirtyVoxelMax->y, step) + 1;
+                const int lminZ = floorDiv(editDirtyVoxelMin->z, step) - 1;
+                const int lmaxZ = floorDiv(editDirtyVoxelMax->z, step) + 1;
+                dirtyLocalMinX = std::max(0, lminX - cacheBaseX);
+                dirtyLocalMaxX = std::min(cacheDimXZ - 1, lmaxX - cacheBaseX);
+                dirtyLocalMinY = std::max(0, lminY - cacheMinY);
+                dirtyLocalMaxY = std::min(cacheDimY  - 1, lmaxY - cacheMinY);
+                dirtyLocalMinZ = std::max(0, lminZ - cacheBaseZ);
+                dirtyLocalMaxZ = std::min(cacheDimXZ - 1, lmaxZ - cacheBaseZ);
+            }
+
+            bool didRecomputeFull = true;
+            bool runDownsampleLoop = true;
+            const size_t expectedSize = static_cast<size_t>(cacheDimY) * cacheDimXZ * cacheDimXZ;
+            {
+                std::shared_lock<std::shared_mutex> rlock(s_downsampleCacheMutex);
+                auto it = s_downsampleCache.find(dsKey);
+                if (it != s_downsampleCache.end() && it->second.cacheData.size() == expectedSize) {
+                    if (it->second.overlayGeneration == currentOverlayGen) {
+                        // FULL HIT — reuse cached data wholesale, skip loop entirely.
+                        cacheData = it->second.cacheData;
+                        result.stats.downsampleCacheState = 1;
+                        didRecomputeFull = false;
+                        runDownsampleLoop = false;
+                    } else if (hasDirtyAabb &&
+                               dirtyLocalMinX <= dirtyLocalMaxX &&
+                               dirtyLocalMinY <= dirtyLocalMaxY &&
+                               dirtyLocalMinZ <= dirtyLocalMaxZ) {
+                        // PARTIAL HIT — copy old, recompute dirty region only.
+                        cacheData = it->second.cacheData;
+                        result.stats.downsampleCacheState = 2;
+                        didRecomputeFull = false;
+                        dirtyLodMinX = dirtyLocalMinX; dirtyLodMaxX = dirtyLocalMaxX;
+                        dirtyLodMinY = dirtyLocalMinY; dirtyLodMaxY = dirtyLocalMaxY;
+                        dirtyLodMinZ = dirtyLocalMinZ; dirtyLodMaxZ = dirtyLocalMaxZ;
+                    }
+                }
+            }
+            if (didRecomputeFull) {
+                cacheData.assign(expectedSize, 0);
+            }
+
+            const int nativeSamplesPerLodVoxel = step * step * step;
+            const int solidThreshold = nativeSamplesPerLodVoxel / 2;
+            const int stepSq = step * step;
+
+            // ---------- Edit-aware partial-block disambiguation ----------
+            // A partial-fill LOD voxel (sc != 0 && sc != stepXY*stepZ) can occur
+            // either because the unedited heightmap varies across the block
+            // (no edit — must keep offline corner rule for boundary alignment
+            // with neighboring precomputed terrain.bin LODs), or because an
+            // overlay edit altered some native cells in the block (must use
+            // the actual majority so the edit is faithfully visualized).
+            //
+            // We disambiguate by reconstructing what the count WOULD be in the
+            // absence of edits. Heightmap-only solid count for native cell
+            // (wx, wy, wz) = (wy < heightmap(wx, wz)). Pre-fetch the step*step
+            // heightmap values per (lcx, lcz) once; the inner Y loop then sums
+            // clamp(h - nativeBaseWY, 0, step) — O(step^2) per LOD voxel.
+            //
+            // When sc == expectedUneditedSc the block is unedited → offline
+            // corner rule. Otherwise → majority of actual count.
+            const bool useEditAwareRule = heightmap && heightmap->isLoaded();
+            std::vector<int> heightSamples;
+            if (useEditAwareRule) {
+                heightSamples.resize(static_cast<size_t>(stepSq));
+            }
+
+            if (runDownsampleLoop) {
+            for (int lcz = dirtyLodMinZ; lcz <= dirtyLodMaxZ; ++lcz) {
+                if (wasCancelled(cancelToken)) {
+                    return result;
+                }
+                for (int lcx = dirtyLodMinX; lcx <= dirtyLodMaxX; ++lcx) {
+                    const int lodWX = cacheBaseX + lcx;
+                    const int lodWZ = cacheBaseZ + lcz;
+                    const int nativeBaseWX = lodWX * step;
+                    const int nativeBaseWZ = lodWZ * step;
+
+                    // Pre-fetch the heightmap samples covering this LOD column
+                    // once per (lcx, lcz) so the inner Y loop has no overlay-
+                    // store / heightmap calls. This is the unedited reference.
+                    if (useEditAwareRule) {
+                        for (int dz = 0; dz < step; ++dz) {
+                            for (int dx = 0; dx < step; ++dx) {
+                                heightSamples[dz * step + dx] =
+                                    heightmap->getHeightAtVoxel(
+                                        nativeBaseWX + dx,
+                                        nativeBaseWZ + dz);
+                            }
+                        }
+                    }
+
+                    for (int lcy = dirtyLodMinY; lcy <= dirtyLodMaxY; ++lcy) {
+                        const int lodWY = cacheMinY + lcy;
+                        const int nativeBaseWY = lodWY * step;
+
+                        // Count solid native voxels using raw array access
+                        int sc = 0;
+                        for (int dy = 0; dy < step; ++dy) {
+                            const int cy = nativeBaseWY + dy - nCacheMinY;
+                            for (int dz = 0; dz < step; ++dz) {
+                                const int cz = nativeBaseWZ + dz - nCacheBaseZ;
+                                const size_t rowBase = static_cast<size_t>((cy * nDimXZ + cz) * nDimXZ
+                                                                          + (nativeBaseWX - nCacheBaseX));
+                                for (int dx = 0; dx < step; ++dx) {
+                                    sc += nativeCacheData[rowBase + dx];
+                                }
+                            }
+                        }
+
+                        bool solid;
+                        if (sc == 0) {
+                            solid = false;
+                        } else if (sc == nativeSamplesPerLodVoxel) {
+                            solid = true;
+                        } else if (useEditAwareRule) {
+                            // Compute the unedited reference count from the
+                            // pre-fetched heightmap samples. Each native column
+                            // contributes clamp(h - nativeBaseWY, 0, step).
+                            int expectedUneditedSc = 0;
+                            for (int i = 0; i < stepSq; ++i) {
+                                const int delta = heightSamples[i] - nativeBaseWY;
+                                if (delta >= step) {
+                                    expectedUneditedSc += step;
+                                } else if (delta > 0) {
+                                    expectedUneditedSc += delta;
+                                }
+                            }
+
+                            if (sc == expectedUneditedSc) {
+                                // Unedited: keep the offline corner rule so
+                                // this LOD chunk seam-matches neighboring
+                                // unedited chunks loaded from terrain.bin.
+                                solid = nativeBaseWY < heightSamples[0];
+                            } else {
+                                // Edited block: flip the unedited base only
+                                // when the edit delta crosses half the LOD
+                                // voxel's native volume. This makes the LOD
+                                // silhouette/volume track the edit faithfully
+                                // (no per-face fattening from a single added
+                                // native cell). Sub-LOD-resolution edits
+                                // (delta below half threshold) keep the base
+                                // result and may not appear at coarse LODs —
+                                // unavoidable cost of volume fidelity.
+                                const bool baseSolid = nativeBaseWY < heightSamples[0];
+                                const int delta = sc - expectedUneditedSc;
+                                if (delta >= solidThreshold) {
+                                    solid = true;   // BUILD majority
+                                } else if (-delta >= solidThreshold) {
+                                    solid = false;  // DIG majority
+                                } else {
+                                    solid = baseSolid;  // Sub-threshold: keep base
+                                }
+                            }
+                        } else {
+                            solid = sc >= solidThreshold;
+                        }
+
+                        // Tier A.1: write unconditionally so PARTIAL HIT path
+                        // can clear LOD voxels that were solid in the cached
+                        // copy but became air after the edit (and vice versa).
+                        cacheData[static_cast<size_t>((lcy * cacheDimXZ + lcz) * cacheDimXZ + lcx)] =
+                            solid ? 1 : 0;
+                    }
+                }
+            }
+            }  // end if (runDownsampleLoop)
+
+            // Tier A.1: store recomputed cacheData under the new overlayGen.
+            // Skip on FULL HIT — cache already holds an identical copy.
+            if (runDownsampleLoop) {
+                std::unique_lock<std::shared_mutex> wlock(s_downsampleCacheMutex);
+                if (s_downsampleCache.size() >= DOWNSAMPLE_CACHE_MAX_ENTRIES) {
+                    // Evict half instead of clear() — same reasoning as s_baseCache.
+                    const size_t target = DOWNSAMPLE_CACHE_MAX_ENTRIES / 2;
+                    size_t toRemove = s_downsampleCache.size() - target;
+                    for (auto it = s_downsampleCache.begin();
+                         it != s_downsampleCache.end() && toRemove > 0; ) {
+                        it = s_downsampleCache.erase(it);
+                        --toRemove;
+                    }
+                }
+                auto& entry = s_downsampleCache[dsKey];
+                entry.cacheData = cacheData;
+                entry.overlayGeneration = currentOverlayGen;
+            }
+            result.stats.downsampleMs = std::chrono::duration<float, std::milli>(
+                Clock::now() - tDownsampleStart).count();
+        }
+    } else if (heightmap && heightmap->isLoaded()) {
+        // LOD 0 fast path: build cache from heightmap + overlay
+        cacheData = buildSolidCache(field, *heightmap,
+                                    cacheBaseX, cacheBaseZ,
+                                    cacheMinY, cacheDimXZ, cacheDimY, cancelToken);
+        if (wasCancelled(cancelToken)) {
+            return result;
+        }
+    } else if (voxelBase && voxelBase->isLoaded()) {
+        // LOD 0 fast path: build cache from 3D voxel base + overlay
+        cacheData = buildSolidCacheVoxelBase(field, *voxelBase,
+                                             cacheBaseX, cacheBaseZ,
+                                             cacheMinY, cacheDimXZ, cacheDimY);
+        if (wasCancelled(cancelToken)) {
+            return result;
+        }
+    } else {
+        // LOD 0 fallback: build cache via isSolid()
+        cacheData.resize(static_cast<size_t>(cacheDimY) * cacheDimXZ * cacheDimXZ, 0);
+        for (int cz = 0; cz < cacheDimXZ; ++cz) {
+            if (wasCancelled(cancelToken)) {
+                return result;
+            }
+            for (int cx = 0; cx < cacheDimXZ; ++cx) {
+                const int wx = cacheBaseX + cx;
+                const int wz = cacheBaseZ + cz;
+                for (int cy = 0; cy < cacheDimY; ++cy) {
+                    const int wy = cacheMinY + cy;
+                    if (isSolid(field, wx, wy, wz)) {
+                        cacheData[static_cast<size_t>((cy * cacheDimXZ + cz) * cacheDimXZ + cx)] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    SolidCache cache{};
+    cache.data  = cacheData.data();
+    cache.baseX = cacheBaseX;
+    cache.baseZ = cacheBaseZ;
+    cache.minY  = cacheMinY;
+    cache.dimXZ = cacheDimXZ;
+    cache.dimY  = cacheDimY;
+
+    auto tCacheDone = Clock::now();
+
+    // Count solid voxels in the cache for diagnostics
+    uint32_t solidCount = 0;
+    for (uint8_t b : cacheData) solidCount += b;
+    result.stats.cacheVoxels = static_cast<uint32_t>(cacheData.size());
+    result.stats.solidVoxels = solidCount;
+    result.stats.scanYRange  = scanMaxY - scanMinY + 1;
+    result.stats.cacheDimXZ  = cacheDimXZ;
+    result.stats.monolithicWorkVoxels = static_cast<uint64_t>(chunkSizeVoxels)
+        * static_cast<uint64_t>(chunkSizeVoxels)
+        * static_cast<uint64_t>(std::max(result.stats.scanYRange, 0));
+
+    // --- Pre-compute per-Y-level occupancy and per-column Y bounds ---
+    // Used to skip entirely-air Y layers and tighten face scan per column.
+    const int yLevels = scanMaxLocalY - scanMinLocalY + 1;
+
+    // Per-column (x,z) min/max local Y of solid voxels.
+    // Layout: colMinY[z * chunkSizeVoxels + x], indexed by chunk-local coords.
+    const size_t colCount = static_cast<size_t>(chunkSizeVoxels) * chunkSizeVoxels;
+    std::vector<int> colMinY(colCount, scanMaxLocalY + 1);
+    std::vector<int> colMaxY(colCount, scanMinLocalY - 1);
+
+    for (int cz = 1; cz <= chunkSizeVoxels; ++cz) {
+        if (wasCancelled(cancelToken)) {
+            return result;
+        }
+        const int lz = cz - 1;   // chunk-local z
+        for (int cx = 1; cx <= chunkSizeVoxels; ++cx) {
+            const int lx = cx - 1; // chunk-local x
+            const size_t colIdx = static_cast<size_t>(lz * chunkSizeVoxels + lx);
+            for (int ly = scanMinLocalY; ly <= scanMaxLocalY; ++ly) {
+                // Cache coords: cy = (baseY + ly) - cacheMinY, cacheZ = cz, cacheX = cx
+                const int cy = baseY + ly - cacheMinY;
+                if (cacheData[static_cast<size_t>((cy * cacheDimXZ + cz) * cacheDimXZ + cx)] != 0) {
+                    if (ly < colMinY[colIdx]) colMinY[colIdx] = ly;
+                    if (ly > colMaxY[colIdx]) colMaxY[colIdx] = ly;
+                }
+            }
+        }
+    }
+
+    // ---- Adaptive localized meshing ----
+    // Heavy edited chunks keep one shared solid cache, but greedy meshing
+    // now subdivides expensive regions into smaller X/Y/Z work units.
+
+    uint32_t facesEmitted = 0;
+
+    constexpr uint8_t FACE_NEG_X = 0;
+    constexpr uint8_t FACE_POS_X = 1;
+    constexpr uint8_t FACE_NEG_Y = 2;
+    constexpr uint8_t FACE_POS_Y = 3;
+    constexpr uint8_t FACE_NEG_Z = 4;
+    constexpr uint8_t FACE_POS_Z = 5;
+
+    const auto* textureStore = field.getTextureMaterialStore();
+    const bool hasTextureMaterials = textureStore &&
+        textureStore->hasSurfaceTexturesInBox(
+            glm::ivec3(baseX, baseY, baseZ),
+            glm::ivec3(baseX + chunkSizeVoxels,
+                       baseY + chunkHeightVoxels,
+                       baseZ + chunkSizeVoxels),
+            lodLevel);
+    const uint16_t texturePixelsPerVoxel = textureStore
+        ? textureStore->getLODConfig(lodLevel).pixelsPerVoxel
+        : uint16_t{16};
+    auto sampleFaceMaterial = [&](int wx, int wy, int wz, uint8_t face) -> uint32_t {
+        const uint32_t baseMaterial =
+            canonicalBlockMaterial(wx, wy, wz, face, texturePixelsPerVoxel);
+
+        if (!textureStore || !hasTextureMaterials) {
+            return baseMaterial;
+        }
+
+        const auto tex = textureStore->getSurfaceTexture(glm::ivec3(wx, wy, wz), lodLevel, face);
+        if (tex.isEmpty()) {
+            return baseMaterial;
+        }
+
+        // Brush paint now lives in the same baked material word as the block
+        // texture. It replaces the canonical face material for this voxel face;
+        // it is not drawn as a second render-time overlay layer.
+        // Variant stays procedural in the shader from world position. Keeping
+        // it out of the mesh key lets broad regions merge by material class
+        // instead of exploding into one quad per hashed face.
+        return VertexPacking::packMaterial(
+            static_cast<uint8_t>(tex.getType()),
+            0u,
+            tex.getEdgeMask(),
+            texturePixelsPerVoxel);
+    };
+
+    struct SurfaceFace {
+        int16_t u{0};
+        int16_t v{0};
+        FaceAO ao{};
+        uint32_t material{0};
+    };
+
+    struct MeshingRegion {
+        int minX{0};
+        int maxX{0}; // exclusive
+        int minY{0}; // inclusive
+        int maxY{0}; // inclusive
+        int minZ{0};
+        int maxZ{0}; // exclusive
+        int depth{0};
+    };
+
+    auto computeRegionYBounds = [&](const MeshingRegion& region,
+                                    int& outMinY,
+                                    int& outMaxY) -> bool {
+        outMinY = region.maxY;
+        outMaxY = region.minY - 1;
+        for (int lz = region.minZ; lz < region.maxZ; ++lz) {
+            for (int lx = region.minX; lx < region.maxX; ++lx) {
+                const size_t colIdx = static_cast<size_t>(lz * chunkSizeVoxels + lx);
+                const int colLo = std::max(colMinY[colIdx], region.minY);
+                const int colHi = std::min(colMaxY[colIdx], region.maxY);
+                if (colLo > colHi) {
+                    continue;
+                }
+                if (colLo < outMinY) outMinY = colLo;
+                if (colHi > outMaxY) outMaxY = colHi;
+            }
+        }
+        return outMaxY >= outMinY;
+    };
+
+    auto meshRegionLeaf = [&](const MeshingRegion& region) {
+        if (region.minX >= region.maxX || region.minZ >= region.maxZ || region.minY > region.maxY) {
+            return;
+        }
+
+        const int regionWidth = region.maxX - region.minX;
+        const int regionDepth = region.maxZ - region.minZ;
+        const int regionHeight = region.maxY - region.minY + 1;
+        if (regionWidth <= 0 || regionDepth <= 0 || regionHeight <= 0) {
+            return;
+        }
+
+        ++result.stats.adaptiveLeafRegions;
+        result.stats.adaptiveMaxDepth = std::max(
+            result.stats.adaptiveMaxDepth,
+            static_cast<uint32_t>(region.depth));
+        const uint32_t regionWork = static_cast<uint32_t>(regionWidth * regionDepth * regionHeight);
+        result.stats.adaptiveWorkVoxels += static_cast<uint64_t>(regionWork);
+        result.stats.adaptivePeakRegionVoxels = std::max(
+            result.stats.adaptivePeakRegionVoxels,
+            regionWork);
+        result.stats.adaptivePeakYRange = std::max(
+            result.stats.adaptivePeakYRange,
+            static_cast<uint32_t>(regionHeight));
+
+        std::vector<std::vector<SurfaceFace>> faceBins[6];
+        faceBins[FACE_NEG_X].resize(regionWidth);
+        faceBins[FACE_POS_X].resize(regionWidth);
+        faceBins[FACE_NEG_Y].resize(regionHeight);
+        faceBins[FACE_POS_Y].resize(regionHeight);
+        faceBins[FACE_NEG_Z].resize(regionDepth);
+        faceBins[FACE_POS_Z].resize(regionDepth);
+
+        for (int lz = region.minZ; lz < region.maxZ; ++lz) {
+            if (wasCancelled(cancelToken)) {
+                return;
+            }
+            for (int lx = region.minX; lx < region.maxX; ++lx) {
+                const size_t colIdx = static_cast<size_t>(lz * chunkSizeVoxels + lx);
+                const int yStart = std::max(colMinY[colIdx], region.minY);
+                const int yEnd = std::min(colMaxY[colIdx], region.maxY);
+                if (yStart > yEnd) {
                     continue;
                 }
 
-                seen[chunkIdx] = 1u;
-                ++s.readyChunks;
-                s.uploadBytes += e.uploadBytes;
+                for (int ly = yStart; ly <= yEnd; ++ly) {
+                    const int wx = baseX + lx;
+                    const int wy = baseY + ly;
+                    const int wz = baseZ + lz;
 
-                float ms = static_cast<float>((entrySec - d.visualStartSec) * 1000.0);
-                if (ms < 0.0f) ms = 0.0f;
-                if (!anyReady) {
-                    s.firstMs = ms;
-                    s.completeMs = ms;
-                    anyReady = true;
-                } else {
-                    s.firstMs = std::min(s.firstMs, ms);
-                    s.completeMs = std::max(s.completeMs, ms);
+                    if (!cache.getUnchecked(wx, wy, wz)) {
+                        continue;
+                    }
+
+                    const int localX = lx - region.minX;
+                    const int localY = ly - region.minY;
+                    const int localZ = lz - region.minZ;
+
+                    if (!cache.getUnchecked(wx - 1, wy, wz)) {
+                        faceBins[FACE_NEG_X][localX].push_back({static_cast<int16_t>(localZ),
+                                                                static_cast<int16_t>(localY),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 0, 0),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_NEG_X)});
+                        ++facesEmitted;
+                    }
+                    if (!cache.getUnchecked(wx + 1, wy, wz)) {
+                        faceBins[FACE_POS_X][localX].push_back({static_cast<int16_t>(localZ),
+                                                                static_cast<int16_t>(localY),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 0, 1),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_POS_X)});
+                        ++facesEmitted;
+                    }
+                    if (!cache.getUnchecked(wx, wy - 1, wz)) {
+                        faceBins[FACE_NEG_Y][localY].push_back({static_cast<int16_t>(localX),
+                                                                static_cast<int16_t>(localZ),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 1, 0),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_NEG_Y)});
+                        ++facesEmitted;
+                    }
+                    if (!cache.getUnchecked(wx, wy + 1, wz)) {
+                        faceBins[FACE_POS_Y][localY].push_back({static_cast<int16_t>(localX),
+                                                                static_cast<int16_t>(localZ),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 1, 1),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_POS_Y)});
+                        ++facesEmitted;
+                    }
+                    if (!cache.getUnchecked(wx, wy, wz - 1)) {
+                        faceBins[FACE_NEG_Z][localZ].push_back({static_cast<int16_t>(localX),
+                                                                static_cast<int16_t>(localY),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 2, 0),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_NEG_Z)});
+                        ++facesEmitted;
+                    }
+                    if (!cache.getUnchecked(wx, wy, wz + 1)) {
+                        faceBins[FACE_POS_Z][localZ].push_back({static_cast<int16_t>(localX),
+                                                                static_cast<int16_t>(localY),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 2, 1),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_POS_Z)});
+                        ++facesEmitted;
+                    }
                 }
-                break;
             }
         }
 
-        s.pendingChunks = std::max(0, s.totalChunks - s.readyChunks);
-        s.complete = s.totalChunks > 0 && s.readyChunks >= s.totalChunks;
-        return s;
+        const size_t maxSliceSize = std::max({
+            static_cast<size_t>(regionDepth) * regionHeight,
+            static_cast<size_t>(regionWidth) * regionHeight,
+            static_cast<size_t>(regionWidth) * regionDepth});
+        std::vector<uint8_t> mask(maxSliceSize, 0);
+        std::vector<FaceAO> aoMask(maxSliceSize);
+        std::vector<uint32_t> materialMask(maxSliceSize, 0u);
+        std::vector<uint8_t> visited(maxSliceSize, 0);
+
+        for (int faceId = 0; faceId < 6; ++faceId) {
+            if (wasCancelled(cancelToken)) {
+                return;
+            }
+
+            const int axis = faceId / 2;
+            const int dir = faceId % 2;
+            const uint8_t face = static_cast<uint8_t>(faceId);
+
+            int uDim = 0;
+            int uOffset = 0;
+            int vOffset = 0;
+            if (axis == 0) {
+                uDim = regionDepth;
+                uOffset = region.minZ;
+                vOffset = region.minY;
+            } else if (axis == 1) {
+                uDim = regionWidth;
+                uOffset = region.minX;
+                vOffset = region.minZ;
+            } else {
+                uDim = regionWidth;
+                uOffset = region.minX;
+                vOffset = region.minY;
+            }
+
+            for (size_t sliceIdx = 0; sliceIdx < faceBins[faceId].size(); ++sliceIdx) {
+                if (wasCancelled(cancelToken)) {
+                    return;
+                }
+
+                auto& entries = faceBins[faceId][sliceIdx];
+                if (entries.empty()) {
+                    continue;
+                }
+
+                const int n = (axis == 0)
+                    ? region.minX + static_cast<int>(sliceIdx)
+                    : (axis == 1)
+                        ? region.minY + static_cast<int>(sliceIdx)
+                        : region.minZ + static_cast<int>(sliceIdx);
+
+                int minV = INT_MAX;
+                int maxV = INT_MIN;
+                for (const auto& sf : entries) {
+                    const size_t idx = static_cast<size_t>(sf.u + sf.v * uDim);
+                    mask[idx] = 1;
+                    aoMask[idx] = sf.ao;
+                    materialMask[idx] = sf.material;
+                    if (sf.v < minV) minV = sf.v;
+                    if (sf.v > maxV) maxV = sf.v;
+                }
+
+                const int mergeVLimit = maxV + 1;
+                for (int j = minV; j <= maxV; ++j) {
+                    for (int i = 0; i < uDim; ++i) {
+                        const int idx = i + j * uDim;
+                        if (!mask[static_cast<size_t>(idx)] || visited[static_cast<size_t>(idx)]) continue;
+
+                        const FaceAO curAO = aoMask[static_cast<size_t>(idx)];
+                        const uint32_t curMaterial = materialMask[static_cast<size_t>(idx)];
+                        const int planeBl = static_cast<int>(curAO.bl);
+                        const int planeDu = static_cast<int>(curAO.br) - planeBl;
+                        const int planeDv = static_cast<int>(curAO.tl) - planeBl;
+                        const bool planeValid = static_cast<int>(curAO.tr) == (planeBl + planeDu + planeDv);
+
+                        auto matchesPlane = [&](const FaceAO& ao, int relU, int relV) -> bool {
+                            const int base = planeBl + planeDu * relU + planeDv * relV;
+                            const int expectedBl = base;
+                            const int expectedBr = base + planeDu;
+                            const int expectedTl = base + planeDv;
+                            const int expectedTr = base + planeDu + planeDv;
+
+                            auto inRange = [](int v) { return v >= 0 && v <= 3; };
+                            if (!inRange(expectedBl) || !inRange(expectedBr)
+                                || !inRange(expectedTl) || !inRange(expectedTr)) {
+                                return false;
+                            }
+
+                            return static_cast<int>(ao.bl) == expectedBl
+                                && static_cast<int>(ao.br) == expectedBr
+                                && static_cast<int>(ao.tl) == expectedTl
+                                && static_cast<int>(ao.tr) == expectedTr;
+                        };
+
+                        auto growExact = [&]() -> std::pair<int, int> {
+                            int qwLocal = 1;
+                            while (i + qwLocal < uDim) {
+                                const int ni = idx + qwLocal;
+                                if (!mask[static_cast<size_t>(ni)] || visited[static_cast<size_t>(ni)]
+                                    || aoMask[static_cast<size_t>(ni)] != curAO
+                                    || materialMask[static_cast<size_t>(ni)] != curMaterial) {
+                                    break;
+                                }
+                                ++qwLocal;
+                            }
+
+                            int qhLocal = 1;
+                            bool canExpand = true;
+                            while (canExpand && j + qhLocal < mergeVLimit) {
+                                for (int di = 0; di < qwLocal; ++di) {
+                                    const int ci = (i + di) + (j + qhLocal) * uDim;
+                                    if (!mask[static_cast<size_t>(ci)] || visited[static_cast<size_t>(ci)]
+                                        || aoMask[static_cast<size_t>(ci)] != curAO
+                                        || materialMask[static_cast<size_t>(ci)] != curMaterial) {
+                                        canExpand = false;
+                                        break;
+                                    }
+                                }
+                                if (canExpand) ++qhLocal;
+                            }
+                            return {qwLocal, qhLocal};
+                        };
+
+                        auto growAffine = [&]() -> std::pair<int, int> {
+                            if (!planeValid) {
+                                return {1, 1};
+                            }
+
+                            int qwLocal = 1;
+                            while (i + qwLocal < uDim) {
+                                const int ni = idx + qwLocal;
+                                if (!mask[static_cast<size_t>(ni)] || visited[static_cast<size_t>(ni)]
+                                    || !matchesPlane(aoMask[static_cast<size_t>(ni)], qwLocal, 0)
+                                    || materialMask[static_cast<size_t>(ni)] != curMaterial) {
+                                    break;
+                                }
+                                ++qwLocal;
+                            }
+
+                            int qhLocal = 1;
+                            bool canExpand = true;
+                            while (canExpand && j + qhLocal < mergeVLimit) {
+                                for (int di = 0; di < qwLocal; ++di) {
+                                    const int ci = (i + di) + (j + qhLocal) * uDim;
+                                    if (!mask[static_cast<size_t>(ci)] || visited[static_cast<size_t>(ci)]
+                                        || !matchesPlane(aoMask[static_cast<size_t>(ci)], di, qhLocal)
+                                        || materialMask[static_cast<size_t>(ci)] != curMaterial) {
+                                        canExpand = false;
+                                        break;
+                                    }
+                                }
+                                if (canExpand) ++qhLocal;
+                            }
+                            return {qwLocal, qhLocal};
+                        };
+
+                        auto [exactW, exactH] = growExact();
+                        auto [affineW, affineH] = growAffine();
+                        const int exactArea = exactW * exactH;
+                        const int affineArea = affineW * affineH;
+                        const bool useAffine = planeValid && affineArea > exactArea && affineArea > 1;
+                        const int qw = useAffine ? affineW : exactW;
+                        const int qh = useAffine ? affineH : exactH;
+
+                        FaceAO emitAO = curAO;
+                        if (useAffine) {
+                            const int bl = planeBl;
+                            const int br = planeBl + planeDu * qw;
+                            const int tl = planeBl + planeDv * qh;
+                            const int tr = planeBl + planeDu * qw + planeDv * qh;
+                            emitAO.bl = static_cast<uint8_t>(std::clamp(bl, 0, 3));
+                            emitAO.br = static_cast<uint8_t>(std::clamp(br, 0, 3));
+                            emitAO.tl = static_cast<uint8_t>(std::clamp(tl, 0, 3));
+                            emitAO.tr = static_cast<uint8_t>(std::clamp(tr, 0, 3));
+                        }
+
+                        for (int dj = 0; dj < qh; ++dj) {
+                            for (int di = 0; di < qw; ++di) {
+                                visited[static_cast<size_t>((i + di) + (j + dj) * uDim)] = true;
+                            }
+                        }
+
+                        addQuad(result, axis, n, uOffset + i, vOffset + j, qw, qh, dir, face, curMaterial, emitAO);
+                    }
+                }
+
+                for (int j = minV; j <= maxV; ++j) {
+                    std::fill_n(&mask[static_cast<size_t>(j * uDim)], uDim, uint8_t(0));
+                    std::fill_n(&materialMask[static_cast<size_t>(j * uDim)], uDim, uint32_t(0));
+                    std::fill_n(&visited[static_cast<size_t>(j * uDim)], uDim, uint8_t(0));
+                }
+            }
+        }
     };
 
-    appendLine("VulkanVX Texture Paint Brush Diagnostics");
-    appendLine("serial,total_ms,collect_ms,store_ms,cascade_ms,touched_ms,schedule_ms,"
-               "visual_stamp,visual_first_ms,visual_complete_ms,visual_chunks_total,"
-               "visual_chunks_ready,visual_chunks_pending,visual_complete,visual_upload_bytes,"
-               "radius_voxels,radius_m,shape,material,variant,lod,faces,changed,unchanged,"
-               "cascaded,touched_chunks,flushed_chunks,pending_chunks_after,hold_repeat,"
-               "center_x,center_y,center_z");
+    constexpr int ADAPTIVE_TARGET_XZ = 32;
+    constexpr int ADAPTIVE_TARGET_Y = 128;
+    constexpr int ADAPTIVE_MIN_XZ = 8;
+    constexpr int ADAPTIVE_MIN_Y = 32;
+    constexpr int MAX_ADAPTIVE_DEPTH = 3;
 
-    char line[1024];
-    for (int i = 0; i < m_paintDiagCount; ++i) {
-        const int idx = (m_paintDiagWriteIndex - m_paintDiagCount + i + PAINT_DIAG_HISTORY)
-            % PAINT_DIAG_HISTORY;
-        const PaintOpDiagnostic& d = m_paintDiagHistory[static_cast<size_t>(idx)];
-        const VisualStatus visual = computeVisualStatus(d);
+    auto shouldSplitRegion = [&](const MeshingRegion& region) -> bool {
+        if (region.depth >= MAX_ADAPTIVE_DEPTH) {
+            return false;
+        }
 
-        std::snprintf(
-            line, sizeof(line),
-            "%llu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%u,%.4f,%.4f,%d,%d,%d,%d,%llu,%d,%.4f,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%.4f,%.4f,%.4f",
-            static_cast<unsigned long long>(d.serial),
-            d.totalMs,
-            d.collectMs,
-            d.storeMs,
-            d.cascadeMs,
-            d.touchedMs,
-            d.scheduleMs,
-            d.visualStampOrder,
-            visual.firstMs,
-            visual.completeMs,
-            visual.totalChunks,
-            visual.readyChunks,
-            visual.pendingChunks,
-            visual.complete ? 1 : 0,
-            static_cast<unsigned long long>(visual.uploadBytes),
-            d.radiusVoxels,
-            d.radiusM,
-            d.shape,
-            d.material,
-            d.variant,
-            d.paintLod,
-            d.facesCollected,
-            d.cellsPainted,
-            d.facesUnchanged,
-            d.cellsCascaded,
-            d.touchedChunks,
-            d.flushedChunks,
-            d.pendingChunksAfter,
-            d.holdRepeat ? 1 : 0,
-            d.center.x,
-            d.center.y,
-            d.center.z);
-        appendLine(line);
+        const int sizeX = region.maxX - region.minX;
+        const int sizeZ = region.maxZ - region.minZ;
+        const int yRange = region.maxY - region.minY + 1;
+        const bool splitX = sizeX > ADAPTIVE_TARGET_XZ;
+        const bool splitZ = sizeZ > ADAPTIVE_TARGET_XZ;
+        const bool splitY = yRange > ADAPTIVE_TARGET_Y;
+        if (!splitX && !splitZ && !splitY) {
+            return false;
+        }
+
+        const int64_t approxWork = static_cast<int64_t>(sizeX) * sizeZ * yRange;
+        return approxWork > (static_cast<int64_t>(ADAPTIVE_TARGET_XZ) * ADAPTIVE_TARGET_XZ * 96)
+            || splitY;
+    };
+
+    const bool useAdaptivePartition = step == 1
+        && (result.stats.scanYRange > 96 || solidCount > 350000u);
+
+    const MeshingRegion rootRegion{
+        0,
+        chunkSizeVoxels,
+        scanMinLocalY,
+        scanMaxLocalY,
+        0,
+        chunkSizeVoxels,
+        0};
+
+    if (useAdaptivePartition) {
+        auto processRegion = [&](auto&& self, const MeshingRegion& region) -> void {
+            if (wasCancelled(cancelToken)) {
+                return;
+            }
+
+            int actualMinY = region.minY;
+            int actualMaxY = region.maxY;
+            if (!computeRegionYBounds(region, actualMinY, actualMaxY)) {
+                return;
+            }
+
+            MeshingRegion tightened = region;
+            tightened.minY = actualMinY;
+            tightened.maxY = actualMaxY;
+
+            if (!shouldSplitRegion(tightened)) {
+                meshRegionLeaf(tightened);
+                return;
+            }
+
+            const int sizeX = tightened.maxX - tightened.minX;
+            const int sizeZ = tightened.maxZ - tightened.minZ;
+            const int yRange = tightened.maxY - tightened.minY + 1;
+
+            const bool splitX = sizeX > ADAPTIVE_TARGET_XZ && sizeX > ADAPTIVE_MIN_XZ;
+            const bool splitZ = sizeZ > ADAPTIVE_TARGET_XZ && sizeZ > ADAPTIVE_MIN_XZ;
+            const bool splitY = yRange > ADAPTIVE_TARGET_Y && yRange > ADAPTIVE_MIN_Y;
+
+            if (!splitX && !splitZ && !splitY) {
+                meshRegionLeaf(tightened);
+                return;
+            }
+
+            result.stats.adaptiveEnabled = true;
+            ++result.stats.adaptiveSplitRegions;
+            result.stats.adaptiveMaxDepth = std::max(
+                result.stats.adaptiveMaxDepth,
+                static_cast<uint32_t>(tightened.depth + 1));
+
+            const int xMid = splitX ? (tightened.minX + sizeX / 2) : tightened.maxX;
+            const int zMid = splitZ ? (tightened.minZ + sizeZ / 2) : tightened.maxZ;
+            const int yMid = splitY ? (tightened.minY + yRange / 2) : tightened.maxY;
+
+            const int xParts = splitX ? 2 : 1;
+            const int zParts = splitZ ? 2 : 1;
+            const int yParts = splitY ? 2 : 1;
+
+            for (int yi = 0; yi < yParts; ++yi) {
+                const int childMinY = splitY ? (yi == 0 ? tightened.minY : yMid + 1) : tightened.minY;
+                const int childMaxY = splitY ? (yi == 0 ? yMid : tightened.maxY) : tightened.maxY;
+                if (childMinY > childMaxY) {
+                    continue;
+                }
+
+                for (int zi = 0; zi < zParts; ++zi) {
+                    const int childMinZ = splitZ ? (zi == 0 ? tightened.minZ : zMid) : tightened.minZ;
+                    const int childMaxZ = splitZ ? (zi == 0 ? zMid : tightened.maxZ) : tightened.maxZ;
+                    if (childMinZ >= childMaxZ) {
+                        continue;
+                    }
+
+                    for (int xi = 0; xi < xParts; ++xi) {
+                        const int childMinX = splitX ? (xi == 0 ? tightened.minX : xMid) : tightened.minX;
+                        const int childMaxX = splitX ? (xi == 0 ? xMid : tightened.maxX) : tightened.maxX;
+                        if (childMinX >= childMaxX) {
+                            continue;
+                        }
+
+                        self(self, MeshingRegion{
+                            childMinX,
+                            childMaxX,
+                            childMinY,
+                            childMaxY,
+                            childMinZ,
+                            childMaxZ,
+                            tightened.depth + 1});
+                    }
+                }
+            }
+        };
+
+        processRegion(processRegion, rootRegion);
+    } else {
+        meshRegionLeaf(rootRegion);
+    }
+
+    // LOD vertex rescaling: expand LOD-resolution positions to native range
+    auto tGreedyDone = Clock::now();
+    if (step > 1 && !result.empty()) {
+        for (auto& v : result.vertices) {
+            uint32_t p = v.packed;
+            uint32_t x  = p & 0xFFu;
+            uint32_t ys = (p >> 8) & 0x3FFu;   // stored Y = actual Y (10 bits)
+            uint32_t z  = (p >> 18) & 0xFFu;
+            uint32_t hi = p & 0xFC000000u;      // face(3) + AO(3)
+
+            x  *= static_cast<uint32_t>(step);
+            ys *= static_cast<uint32_t>(step);  // scale Y directly
+            z  *= static_cast<uint32_t>(step);
+
+            v.packed = (x & 0xFFu) | ((ys & 0x3FFu) << 8) | ((z & 0xFFu) << 18) | hi;
+        }
+        const float fStep = static_cast<float>(step);
+        result.aabbMin *= fStep;
+        result.aabbMax *= fStep;
+    }
+
+    if (!result.empty()) {
+        const float lodVoxelSize = 0.25f * static_cast<float>(step);
+        const float pad = lodVoxelSize * 0.5f;
+        result.aabbMin -= pad;
+        result.aabbMax += pad;
+    }
+
+    // Post-process:
+    //  - Quality mode does full dedup + reorder for best draw efficiency.
+    //  - Fast edit mode usually skips it for latency, but very large edited
+    //    meshes still get a lightweight dedup pass so upload/finalize does
+    //    not dominate the visible latency.
+    auto tPostStart = Clock::now();
+    if (!skipPostProcess) {
+        deduplicateAndReorderMesh(result);
+    } else {
+        const size_t rawLinearSubmeshEstimate =
+            (result.vertices.size() + MAX_VERTS_PER_SUBMESH - 1) / MAX_VERTS_PER_SUBMESH;
+        const bool shouldFastCompact =
+            rawLinearSubmeshEstimate > FAST_COMPACT_SUBMESH_THRESHOLD ||
+            result.vertices.size() >= FAST_COMPACT_VERT_THRESHOLD ||
+            result.indices.size() >= FAST_COMPACT_INDEX_THRESHOLD;
+        if (shouldFastCompact) {
+        deduplicateMeshVertices(result);
+        }
+    }
+    auto tPostDone = Clock::now();
+
+    auto toMs = [](auto a, auto b) {
+        return std::chrono::duration<float, std::milli>(b - a).count();
+    };
+    result.stats.cacheBuildMs  = toMs(tCacheBuild, tCacheDone);
+    result.stats.greedyMeshMs  = toMs(tCacheDone, tGreedyDone);
+    result.stats.postProcessMs = toMs(tPostStart, tPostDone);
+    result.stats.facesEmitted  = facesEmitted;
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Split a large mesh into GPU-uploadable sub-meshes (each ≤ 65535 verts)
+// ---------------------------------------------------------------------------
+static uint32_t decodePackedX(const Vertex& v) {
+    return v.packed & 0xFFu;
+}
+
+static uint32_t decodePackedZ(const Vertex& v) {
+    return (v.packed >> 18) & 0xFFu;
+}
+
+static uint32_t decodePackedY(const Vertex& v) {
+    return (v.packed >> 8) & 0x3FFu;
+}
+
+struct OctRegion {
+    int minX{0};
+    int maxX{128};
+    int minY{0};
+    int maxY{512};
+    int minZ{0};
+    int maxZ{128};
+};
+
+static std::vector<TerrainEditMesher::SubMesh> splitLinearlyToSubMeshes(
+        const TerrainEditMesher::MeshResult& mesh)
+{
+    std::vector<TerrainEditMesher::SubMesh> out;
+    if (mesh.empty()) return out;
+
+    if (mesh.vertices.size() <= MAX_VERTS_PER_SUBMESH) {
+        TerrainEditMesher::SubMesh sub;
+        sub.vertices = mesh.vertices;
+        sub.indices.reserve(mesh.indices.size());
+        for (uint32_t idx : mesh.indices)
+            sub.indices.push_back(static_cast<uint16_t>(idx));
+        out.push_back(std::move(sub));
+        return out;
+    }
+
+    TerrainEditMesher::SubMesh current;
+    std::unordered_map<uint32_t, uint32_t> remap;
+
+    auto finalize = [&]() {
+        if (!current.vertices.empty()) {
+            out.push_back(std::move(current));
+            current = TerrainEditMesher::SubMesh{};
+            remap.clear();
+        }
+    };
+
+    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+        const uint32_t i0 = mesh.indices[i + 0];
+        const uint32_t i1 = mesh.indices[i + 1];
+        const uint32_t i2 = mesh.indices[i + 2];
+
+        size_t newVerts = 0;
+        if (remap.find(i0) == remap.end()) ++newVerts;
+        if (remap.find(i1) == remap.end()) ++newVerts;
+        if (remap.find(i2) == remap.end()) ++newVerts;
+
+        if (current.vertices.size() + newVerts > MAX_VERTS_PER_SUBMESH) {
+            finalize();
+        }
+
+        auto addVert = [&](uint32_t oldIdx) -> uint16_t {
+            auto it = remap.find(oldIdx);
+            if (it != remap.end())
+                return static_cast<uint16_t>(it->second);
+            const uint32_t newIdx = static_cast<uint32_t>(current.vertices.size());
+            current.vertices.push_back(mesh.vertices[oldIdx]);
+            remap[oldIdx] = newIdx;
+            return static_cast<uint16_t>(newIdx);
+        };
+
+        current.indices.push_back(addVert(i0));
+        current.indices.push_back(addVert(i1));
+        current.indices.push_back(addVert(i2));
+    }
+
+    finalize();
+    return out;
+}
+
+static std::array<TerrainEditMesher::MeshResult, 8> splitMeshIntoOctants(
+        const TerrainEditMesher::MeshResult& mesh,
+        const OctRegion& region)
+{
+    struct CellBuilder {
+        TerrainEditMesher::MeshResult mesh;
+        std::unordered_map<uint32_t, uint32_t> remap;
+    };
+
+    std::vector<CellBuilder> cells(8);
+    const int midX = region.minX + (region.maxX - region.minX) / 2;
+    const int midY = region.minY + (region.maxY - region.minY) / 2;
+    const int midZ = region.minZ + (region.maxZ - region.minZ) / 2;
+
+    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+        const uint32_t i0 = mesh.indices[i + 0];
+        const uint32_t i1 = mesh.indices[i + 1];
+        const uint32_t i2 = mesh.indices[i + 2];
+
+        const Vertex& v0 = mesh.vertices[i0];
+        const Vertex& v1 = mesh.vertices[i1];
+        const Vertex& v2 = mesh.vertices[i2];
+
+        const float centroidX =
+            (static_cast<float>(decodePackedX(v0)) +
+             static_cast<float>(decodePackedX(v1)) +
+             static_cast<float>(decodePackedX(v2))) / 3.0f;
+        const float centroidY =
+            (static_cast<float>(decodePackedY(v0)) +
+             static_cast<float>(decodePackedY(v1)) +
+             static_cast<float>(decodePackedY(v2))) / 3.0f;
+        const float centroidZ =
+            (static_cast<float>(decodePackedZ(v0)) +
+             static_cast<float>(decodePackedZ(v1)) +
+             static_cast<float>(decodePackedZ(v2))) / 3.0f;
+
+        const bool east = centroidX >= static_cast<float>(midX);
+        const bool top = centroidY >= static_cast<float>(midY);
+        const bool north = centroidZ >= static_cast<float>(midZ);
+        const int octant = (east ? 1 : 0) + (top ? 2 : 0) + (north ? 4 : 0);
+        CellBuilder& cell = cells[static_cast<size_t>(octant)];
+
+        auto addVert = [&](uint32_t oldIdx) -> uint32_t {
+            auto it = cell.remap.find(oldIdx);
+            if (it != cell.remap.end()) {
+                return it->second;
+            }
+            const uint32_t newIdx = static_cast<uint32_t>(cell.mesh.vertices.size());
+            cell.mesh.vertices.push_back(mesh.vertices[oldIdx]);
+            cell.remap[oldIdx] = newIdx;
+            return newIdx;
+        };
+
+        cell.mesh.indices.push_back(addVert(i0));
+        cell.mesh.indices.push_back(addVert(i1));
+        cell.mesh.indices.push_back(addVert(i2));
+    }
+
+    std::array<TerrainEditMesher::MeshResult, 8> out{};
+    for (int q = 0; q < 8; ++q) {
+        out[static_cast<size_t>(q)] = std::move(cells[static_cast<size_t>(q)].mesh);
+    }
+    return out;
+}
+
+static bool canSplitOctants(const OctRegion& region) {
+    return (region.maxX - region.minX) > 1 &&
+           (region.maxY - region.minY) > 1 &&
+           (region.maxZ - region.minZ) > 1;
+}
+
+static std::array<OctRegion, 8> childOctants(const OctRegion& region) {
+    const int midX = region.minX + (region.maxX - region.minX) / 2;
+    const int midY = region.minY + (region.maxY - region.minY) / 2;
+    const int midZ = region.minZ + (region.maxZ - region.minZ) / 2;
+    std::array<OctRegion, 8> out{};
+    for (int oct = 0; oct < 8; ++oct) {
+        const bool east = (oct & 1) != 0;
+        const bool top = (oct & 2) != 0;
+        const bool north = (oct & 4) != 0;
+        out[static_cast<size_t>(oct)] = OctRegion{
+            east ? midX : region.minX,
+            east ? region.maxX : midX,
+            top ? midY : region.minY,
+            top ? region.maxY : midY,
+            north ? midZ : region.minZ,
+            north ? region.maxZ : midZ
+        };
+    }
+    return out;
+}
+
+static std::vector<TerrainEditMesher::SubMesh> splitMeshOctreeSelective(
+        const TerrainEditMesher::MeshResult& mesh,
+        const OctRegion& region,
+        size_t remainingBudget)
+{
+    std::vector<TerrainEditMesher::SubMesh> out;
+
+    if (mesh.empty()) {
+        return out;
+    }
+
+    // Leaf: fits in one submesh or can't subdivide further
+    if (mesh.vertices.size() <= MAX_VERTS_PER_SUBMESH || !canSplitOctants(region)) {
+        return splitLinearlyToSubMeshes(mesh);
+    }
+
+    auto childRegions = childOctants(region);
+    auto childMeshes = splitMeshIntoOctants(mesh, region);
+
+    int nonEmptyCount = 0;
+    for (int q = 0; q < 8; ++q) {
+        if (!childMeshes[static_cast<size_t>(q)].empty()) ++nonEmptyCount;
+    }
+    if (nonEmptyCount == 0) {
+        return out;
+    }
+
+    for (int q = 0; q < 8; ++q) {
+        auto& childMesh = childMeshes[static_cast<size_t>(q)];
+        if (childMesh.empty()) continue;
+
+        const size_t budgetForChild = (remainingBudget > out.size())
+            ? (remainingBudget - out.size()) : 0;
+
+        std::vector<TerrainEditMesher::SubMesh> childSubs;
+        if (childMesh.vertices.size() > MAX_VERTS_PER_SUBMESH &&
+            canSplitOctants(childRegions[static_cast<size_t>(q)]) &&
+            budgetForChild >= 2) {
+            childSubs = splitMeshOctreeSelective(
+                childMesh,
+                childRegions[static_cast<size_t>(q)],
+                budgetForChild);
+            // If recursion produced nothing useful, fall back to linear
+            if (childSubs.empty()) {
+                childSubs = splitLinearlyToSubMeshes(childMesh);
+            }
+        } else {
+            childSubs = splitLinearlyToSubMeshes(childMesh);
+        }
+
+        for (auto& sub : childSubs) {
+            out.push_back(std::move(sub));
+        }
+
+        if (remainingBudget > 0 && out.size() >= remainingBudget) {
+            break;
+        }
     }
 
     return out;
 }
 
-
-// ---------------------------------------------------------------------------
-// Hit / LOD resolution
-// ---------------------------------------------------------------------------
-
-void TexturePaintTool::resolveHitLOD() {
-    m_hasPlacementContext = false;
-    m_hitLod = 0;
-    m_hitVoxelSizeM = WorldConfig::VOXEL_SIZE_M;
-    if (!m_world || !m_hasHit) return;
-
-    const auto ctx = m_world->getTerrainEditPlacementContext(m_hitPos);
-    if (!ctx.valid) return;
-
-    m_hasPlacementContext = true;
-    m_hitLod        = ctx.previewLodLevel;
-    m_hitVoxelSizeM = ctx.voxelSizeM;
-}
-
-int TexturePaintTool::getActivePaintLOD() const {
-    if (m_lodMode == LODMode::Manual) return m_manualLod;
-    return m_hasPlacementContext ? m_hitLod : 0;
-}
-
-int TexturePaintTool::getHitNormalAxis() const {
-    const glm::vec3 a = glm::abs(m_hitNormal);
-    if (a.y >= a.x && a.y >= a.z) return 1;
-    if (a.x >= a.y && a.x >= a.z) return 0;
-    return 2;
-}
-
-uint8_t TexturePaintTool::getHitFaceId() const {
-    const int axis = getHitNormalAxis();
-    const float sign = (axis == 0) ? m_hitNormal.x
-                     : (axis == 1) ? m_hitNormal.y
-                                   : m_hitNormal.z;
-    return static_cast<uint8_t>(axis * 2 + (sign >= 0.0f ? 1 : 0));
-}
-
-bool TexturePaintTool::isSolidLOD0(const glm::ivec3& voxelCoord) const {
-    if (!m_world) return false;
-    const auto& field = m_world->getTerrainFieldSource();
-    const int32_t scale = TerrainEdit::EDIT_CELLS_PER_VOXEL;
-    const TerrainEdit::GridCoord sampleCoord(
-        voxelCoord.x * scale + scale / 2,
-        voxelCoord.y * scale + scale / 2,
-        voxelCoord.z * scale + scale / 2);
-    return field.sample(sampleCoord).value.solid;
-}
-
-int TexturePaintTool::collectExposedSurfaceFacesLOD0(
-    std::vector<TextureOverlayStore::SurfaceFaceStamp>& outFaces) const {
-    outFaces.clear();
-    if (!m_world || !m_hasHit || m_radiusVoxelsLod0 <= 0) return 0;
-
-    const float invVoxel = static_cast<float>(WorldConfig::VOXELS_PER_METER);
-    const glm::vec3 insidePos = m_hitPos - m_hitNormal * 0.01f;
-    const glm::ivec3 startVoxel(
-        static_cast<int>(std::floor(insidePos.x * invVoxel)),
-        static_cast<int>(std::floor(insidePos.y * invVoxel)),
-        static_cast<int>(std::floor(insidePos.z * invVoxel)));
-    const uint8_t startFace = getHitFaceId();
-
-    auto isExposed = [&](const glm::ivec3& voxel, uint8_t face) {
-        return isSolidLOD0(voxel) && !isSolidLOD0(voxel + faceNormalI(face));
-    };
-
-    const float radiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
-    const float radiusSq = radiusM * radiusM;
-
-    auto insideBrush = [&](const glm::ivec3& voxel, uint8_t face) {
-        const glm::vec3 center = faceCenterWorld(voxel, face);
-        const glm::vec3 d = center - m_hitPos;
-
-        if (m_shape == BrushShape::Sphere) {
-            return glm::dot(d, d) <= radiusSq + 1e-5f;
-        }
-
-        return std::abs(d.x) <= radiusM + 1e-5f &&
-               std::abs(d.y) <= radiusM + 1e-5f &&
-               std::abs(d.z) <= radiusM + 1e-5f;
-    };
-
-    std::unordered_set<PaintFaceKey, PaintFaceKeyHash> emitted;
-    emitted.reserve(static_cast<size_t>(std::min(
-        MAX_SURFACE_BRUSH_FACES,
-        std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
-
-    auto appendFace = [&](const glm::ivec3& voxel, uint8_t face) -> bool {
-        PaintFaceKey key{voxel, static_cast<uint8_t>(face % 6u)};
-        if (emitted.find(key) != emitted.end()) {
-            return true;
-        }
-
-        emitted.insert(key);
-        outFaces.push_back(TextureOverlayStore::SurfaceFaceStamp{voxel, key.face});
-        return static_cast<int>(outFaces.size()) < MAX_SURFACE_BRUSH_FACES;
-    };
-
-    // Exact small/medium-brush path:
-    // sample local occupancy once, then collect every exposed face whose face
-    // center is inside the 3D brush volume. This catches top, bottom, and
-    // vertical voxel faces equally.
-    {
-        const int pad = m_radiusVoxelsLod0 + 2;
-        const glm::ivec3 scanMin = startVoxel - glm::ivec3(pad);
-        const glm::ivec3 scanMax = startVoxel + glm::ivec3(pad);
-        const int dimX = scanMax.x - scanMin.x + 1;
-        const int dimY = scanMax.y - scanMin.y + 1;
-        const int dimZ = scanMax.z - scanMin.z + 1;
-        const int64_t volume =
-            static_cast<int64_t>(dimX) *
-            static_cast<int64_t>(dimY) *
-            static_cast<int64_t>(dimZ);
-
-        if (dimX > 2 && dimY > 2 && dimZ > 2 &&
-            volume > 0 && volume <= MAX_SURFACE_BRUSH_SCAN_VOXELS) {
-            std::vector<uint8_t> solid(static_cast<size_t>(volume), 0u);
-
-            auto indexOf = [&](const glm::ivec3& voxel) -> size_t {
-                const int x = voxel.x - scanMin.x;
-                const int y = voxel.y - scanMin.y;
-                const int z = voxel.z - scanMin.z;
-                return static_cast<size_t>((z * dimY + y) * dimX + x);
-            };
-
-            for (int z = scanMin.z; z <= scanMax.z; ++z) {
-                for (int y = scanMin.y; y <= scanMax.y; ++y) {
-                    for (int x = scanMin.x; x <= scanMax.x; ++x) {
-                        const glm::ivec3 voxel(x, y, z);
-                        solid[indexOf(voxel)] = isSolidLOD0(voxel) ? 1u : 0u;
-                    }
-                }
-            }
-
-            auto solidAt = [&](const glm::ivec3& voxel) -> bool {
-                return solid[indexOf(voxel)] != 0u;
-            };
-
-            outFaces.reserve(static_cast<size_t>(std::min(
-                MAX_SURFACE_BRUSH_FACES,
-                std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
-
-            const glm::ivec3 candidateMin = scanMin + glm::ivec3(1);
-            const glm::ivec3 candidateMax = scanMax - glm::ivec3(1);
-
-            for (int z = candidateMin.z; z <= candidateMax.z; ++z) {
-                for (int y = candidateMin.y; y <= candidateMax.y; ++y) {
-                    for (int x = candidateMin.x; x <= candidateMax.x; ++x) {
-                        const glm::ivec3 voxel(x, y, z);
-                        if (!solidAt(voxel)) {
-                            continue;
-                        }
-
-                        for (uint8_t face = 0; face < 6; ++face) {
-                            if (solidAt(voxel + faceNormalI(face)) ||
-                                !insideBrush(voxel, face)) {
-                                continue;
-                            }
-
-                            if (!appendFace(voxel, face)) {
-                                return static_cast<int>(outFaces.size());
-                            }
-                        }
-                    }
-                }
-            }
-
-            return static_cast<int>(outFaces.size());
-        }
+// Merge two submeshes into one. Requires combined vertex count ≤ 65535.
+static void mergeSubMesh(TerrainEditMesher::SubMesh& dst,
+                         TerrainEditMesher::SubMesh&& src)
+{
+    const uint16_t base = static_cast<uint16_t>(dst.vertices.size());
+    dst.vertices.insert(dst.vertices.end(),
+                        std::make_move_iterator(src.vertices.begin()),
+                        std::make_move_iterator(src.vertices.end()));
+    dst.indices.reserve(dst.indices.size() + src.indices.size());
+    for (uint16_t idx : src.indices) {
+        dst.indices.push_back(static_cast<uint16_t>(idx + base));
     }
+}
 
-    // Large top-hit acceleration:
-    // use heightmap columns to emit obvious top faces and simple heightmap
-    // cliff sides. Do NOT return after this path. Edited voxel geometry and
-    // non-heightmap vertical faces still need the connected crawl below.
-    if (startFace == 3u) {
-        const auto& heightmap = m_world->getHeightmapSampler();
-        if (heightmap.isLoaded()) {
-            const int pad = m_radiusVoxelsLod0 + 1;
-            constexpr int kEditedSurfaceSearch = 24;
-
-            outFaces.reserve(static_cast<size_t>(std::min(
-                MAX_SURFACE_BRUSH_FACES,
-                std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
-
-            auto tryAddTopFace = [&](int x, int z, int centerY) -> bool {
-                for (int delta = 0; delta <= kEditedSurfaceSearch; ++delta) {
-                    const int signs[2] = {1, -1};
-                    for (int signIdx = 0; signIdx < (delta == 0 ? 1 : 2); ++signIdx) {
-                        const int y = centerY + delta * signs[signIdx];
-                        const glm::ivec3 voxel(x, y, z);
-                        if (!insideBrush(voxel, startFace) ||
-                            !isExposed(voxel, startFace)) {
-                            continue;
-                        }
-                        return appendFace(voxel, startFace);
-                    }
-                }
-                return true;
-            };
-
-            auto addFaceIfValid = [&](const glm::ivec3& voxel, uint8_t face) -> bool {
-                if (!insideBrush(voxel, face) || !isExposed(voxel, face)) {
-                    return true;
-                }
-                return appendFace(voxel, face);
-            };
-
-            struct SideNeighbor {
-                int dx;
-                int dz;
-                uint8_t face;
-            };
-            constexpr SideNeighbor sideNeighbors[4] = {
-                {-1,  0, 0u},
-                { 1,  0, 1u},
-                { 0, -1, 4u},
-                { 0,  1, 5u},
-            };
-
-            for (int z = startVoxel.z - pad; z <= startVoxel.z + pad; ++z) {
-                for (int x = startVoxel.x - pad; x <= startVoxel.x + pad; ++x) {
-                    if (static_cast<int>(outFaces.size()) >= MAX_SURFACE_BRUSH_FACES) {
-                        return static_cast<int>(outFaces.size());
-                    }
-
-                    const int height = heightmap.getHeightAtVoxel(x, z);
-                    const int heightTopY = height - 1;
-
-                    bool keepGoing = tryAddTopFace(x, z, heightTopY);
-                    if (!keepGoing) {
-                        return static_cast<int>(outFaces.size());
-                    }
-
-                    if (std::abs(startVoxel.y - heightTopY) > kEditedSurfaceSearch) {
-                        keepGoing = tryAddTopFace(x, z, startVoxel.y);
-                        if (!keepGoing) {
-                            return static_cast<int>(outFaces.size());
-                        }
-                    }
-
-                    // Heightmap cliff/wall faces where this column is taller
-                    // than a neighboring column.
-                    for (const SideNeighbor& n : sideNeighbors) {
-                        const int neighborHeight = heightmap.getHeightAtVoxel(x + n.dx, z + n.dz);
-                        if (height <= neighborHeight) {
-                            continue;
-                        }
-
-                        const int y0 = std::max(neighborHeight, startVoxel.y - pad);
-                        const int y1 = std::min(height - 1, startVoxel.y + pad);
-                        for (int y = y0; y <= y1; ++y) {
-                            const glm::ivec3 voxel(x, y, z);
-                            if (!addFaceIfValid(voxel, n.face)) {
-                                return static_cast<int>(outFaces.size());
-                            }
-                        }
-                    }
+// Consolidate a submesh list that exceeds budget by merging the smallest
+// pairs until we fit within MAX_RUNTIME_SUBMESHES.
+static void consolidateSubmeshes(std::vector<TerrainEditMesher::SubMesh>& subs,
+                                 size_t maxCount)
+{
+    while (subs.size() > maxCount) {
+        // Find the two smallest submeshes that can be merged (combined ≤ 65535)
+        size_t bestA = SIZE_MAX, bestB = SIZE_MAX;
+        size_t bestCombined = SIZE_MAX;
+        for (size_t i = 0; i < subs.size(); ++i) {
+            for (size_t j = i + 1; j < subs.size(); ++j) {
+                size_t combined = subs[i].vertices.size() + subs[j].vertices.size();
+                if (combined <= MAX_VERTS_PER_SUBMESH && combined < bestCombined) {
+                    bestA = i;
+                    bestB = j;
+                    bestCombined = combined;
                 }
             }
         }
-    }
-
-    // Connected exposed-surface fallback:
-    // essential after the large heightmap path. The heightmap path is only an
-    // acceleration for obvious top/cliff faces; this crawl catches edited voxel
-    // walls, cut sides, holes, caves, and arbitrary vertical faces connected to
-    // the hit surface.
-    if (!isExposed(startVoxel, startFace) || !insideBrush(startVoxel, startFace)) {
-        return static_cast<int>(outFaces.size());
-    }
-
-    std::queue<PaintFaceKey> pending;
-    std::unordered_set<PaintFaceKey, PaintFaceKeyHash> visited;
-    visited.reserve(static_cast<size_t>(std::min(
-        MAX_SURFACE_BRUSH_FACES,
-        std::max(64, m_radiusVoxelsLod0 * m_radiusVoxelsLod0 * 8))));
-
-    const PaintFaceKey start{startVoxel, startFace};
-    pending.push(start);
-    visited.insert(start);
-
-    constexpr glm::ivec3 kVoxelNeighbors[7] = {
-        glm::ivec3(0, 0, 0),
-        glm::ivec3( 1, 0, 0), glm::ivec3(-1, 0, 0),
-        glm::ivec3( 0, 1, 0), glm::ivec3( 0,-1, 0),
-        glm::ivec3( 0, 0, 1), glm::ivec3( 0, 0,-1),
-    };
-
-    while (!pending.empty() && static_cast<int>(outFaces.size()) < MAX_SURFACE_BRUSH_FACES) {
-        const PaintFaceKey current = pending.front();
-        pending.pop();
-
-        if (!isExposed(current.voxel, current.face) ||
-            !insideBrush(current.voxel, current.face)) {
-            continue;
+        if (bestA == SIZE_MAX) {
+            // No mergeable pair found — can't reduce further
+            break;
         }
-
-        if (!appendFace(current.voxel, current.face)) {
-            return static_cast<int>(outFaces.size());
-        }
-
-        for (const glm::ivec3& dv : kVoxelNeighbors) {
-            const glm::ivec3 voxel = current.voxel + dv;
-            for (uint8_t face = 0; face < 6; ++face) {
-                PaintFaceKey next{voxel, face};
-                if (visited.find(next) != visited.end()) continue;
-                if (!insideBrush(voxel, face)) continue;
-                if (!isExposed(voxel, face)) continue;
-                visited.insert(next);
-                pending.push(next);
-            }
-        }
-    }
-
-    return static_cast<int>(outFaces.size());
-}
-
-// ---------------------------------------------------------------------------
-// Per-frame update
-// ---------------------------------------------------------------------------
-
-void TexturePaintTool::update(double mouseX, double mouseY,
-                              int viewportW, int viewportH,
-                              const glm::mat4& view, const glm::mat4& proj,
-                              const glm::vec3& cameraPos,
-                              bool leftClickPressed,
-                              float viewportOffsetX, float viewportOffsetY) {
-    if (!m_active || !m_raycastFn) {
-        flushPendingTextureDirtyChunks(true);
-        m_hasHit = false;
-        m_hasPlacementContext = false;
-        m_leftClickWasPressed = false;
-        return;
-    }
-
-    const glm::mat4 invViewProj = glm::inverse(proj * view);
-    const glm::vec3 rayDir = screenToWorldRay(mouseX, mouseY,
-                                              viewportW, viewportH,
-                                              invViewProj);
-
-    glm::vec3 hitPos, hitNormal;
-    m_hasHit = m_raycastFn(cameraPos, rayDir, 10000.0f, hitPos, hitNormal);
-
-    if (m_hasHit) {
-        m_hitPos = hitPos;
-        m_hitNormal = hitNormal;
-        resolveHitLOD();
-
-        // Cache preview screen position for label rendering.
-        const glm::vec4 clip = (proj * view) * glm::vec4(m_hitPos, 1.0f);
-        if (clip.w > 0.01f) {
-            const glm::vec3 ndc = glm::vec3(clip) / clip.w;
-            m_previewScreenX = viewportOffsetX + (ndc.x * 0.5f + 0.5f) * static_cast<float>(viewportW);
-            m_previewScreenY = viewportOffsetY + (1.0f - (ndc.y * 0.5f + 0.5f)) * static_cast<float>(viewportH);
-        }
-    }
-
-    // Click + auto-repeat. The repeat interval now scales with brush footprint:
-    // small brushes behave like paint; huge brushes behave like stamps so they
-    // do not enqueue 20 huge authoring/rebake waves per second.
-    if (leftClickPressed && m_hasHit) {
-        const auto now = std::chrono::steady_clock::now();
-        if (!m_leftClickWasPressed) {
-            m_holdRepeatStarted = false;
-            place();
-            m_lastPlaceTime = now;
-            m_holdStartTime = now;
-        } else {
-            const float held = std::chrono::duration<float>(now - m_holdStartTime).count();
-            if (held >= 0.15f) {
-                const float since = std::chrono::duration<float>(now - m_lastPlaceTime).count();
-                const float repeatInterval = getPaintRepeatIntervalSec();
-                if (since >= repeatInterval) {
-                    m_holdRepeatStarted = true;
-                    place();
-                    m_lastPlaceTime = now;
-                }
-            }
-        }
-
-        // During long holds, flush large pending rebakes at a fixed low rate.
-        // Small strokes flush immediately inside place().
-        flushPendingTextureDirtyChunks(false);
-    } else {
-        // Mouse release / no hit: force the latest authored material to be
-        // scheduled for rebake. This keeps visual latency bounded without
-        // flooding remesh while the brush is actively spamming.
-        if (m_leftClickWasPressed) {
-            flushPendingTextureDirtyChunks(true);
-        } else {
-            flushPendingTextureDirtyChunks(false);
-        }
-        m_holdRepeatStarted = false;
-    }
-
-    m_leftClickWasPressed = leftClickPressed;
-}
-
-// ---------------------------------------------------------------------------
-// Apply paint
-// ---------------------------------------------------------------------------
-
-void TexturePaintTool::place() {
-    if (!m_hasHit) return;
-
-    const int lod = 0;
-    const auto cfg = getStore().getLODConfig(lod);
-    if (!cfg.enabled) {
-        m_lastFacesCollected = 0;
-        m_lastFacesUnchanged = 0;
-        m_lastCellsPainted = 0;
-        m_lastCellsCascaded = 0;
-        return;
-    }
-
-    using Clock = std::chrono::steady_clock;
-    const auto t0 = Clock::now();
-
-    const uint8_t sourceFace = getHitFaceId();
-    const float invVoxel = static_cast<float>(WorldConfig::VOXELS_PER_METER);
-
-    // The ray hit is a floating point position on a large greedy quad.  Anchor
-    // the authoring stamp to the exact owning LOD0 voxel face centre so the
-    // brush, store, and rebake path all share one deterministic coordinate
-    // contract:
-    //     owning solid voxel + face id -> snapped face centre.
-    const glm::vec3 insidePos = m_hitPos - m_hitNormal * 0.01f;
-    const glm::ivec3 ownerVoxel(
-        static_cast<int>(std::floor(insidePos.x * invVoxel)),
-        static_cast<int>(std::floor(insidePos.y * invVoxel)),
-        static_cast<int>(std::floor(insidePos.z * invVoxel)));
-    const glm::vec3 stampCenterWorld = faceCenterWorld(ownerVoxel, sourceFace);
-
-    // One interactive click becomes one deferred 3D surface-volume stamp.
-    // During chunk material rebake, every exposed face whose face centre is
-    // inside this sphere/box can sample the stamp.  This keeps O(1) authoring
-    // while fixing large brushes on uneven terrain: the brush is no longer
-    // locked to only the height/plane where the mouse was clicked.
-    const TextureOverlay::SurfaceBrushShape stampShape = (m_shape == BrushShape::Sphere)
-        ? TextureOverlay::SurfaceBrushShape::Disc
-        : TextureOverlay::SurfaceBrushShape::Rect;
-    const uint32_t stampOrder = getStore().appendSurfacePaintStamp(
-        stampCenterWorld,
-        m_radiusVoxelsLod0,
-        stampShape,
-        m_textureType,
-        m_variant,
-        sourceFace);
-
-    const auto tStore = Clock::now();
-
-    std::vector<glm::ivec3> visualChunks;
-    int touchedChunkCount = 0;
-    if (m_world && stampOrder != 0u) {
-        const glm::vec3 centerVoxel = stampCenterWorld * invVoxel;
-        const float r = static_cast<float>(std::max(1, m_radiusVoxelsLod0)) + 2.0f;
-
-        const glm::ivec3 mn(
-            static_cast<int>(std::floor(centerVoxel.x - r)),
-            static_cast<int>(std::floor(centerVoxel.y - r)),
-            static_cast<int>(std::floor(centerVoxel.z - r)));
-        const glm::ivec3 mx(
-            static_cast<int>(std::ceil(centerVoxel.x + r)),
-            static_cast<int>(std::ceil(centerVoxel.y + r)),
-            static_cast<int>(std::ceil(centerVoxel.z + r)));
-
-        const glm::ivec3 c0 = WorldConfig::microVoxelToChunk(mn);
-        const glm::ivec3 c1 = WorldConfig::microVoxelToChunk(mx);
-
-        const int minX = std::min(c0.x, c1.x);
-        const int maxX = std::max(c0.x, c1.x);
-        const int minY = std::min(c0.y, c1.y);
-        const int maxY = std::max(c0.y, c1.y);
-        const int minZ = std::min(c0.z, c1.z);
-        const int maxZ = std::max(c0.z, c1.z);
-        const int64_t reserveCount =
-            static_cast<int64_t>(maxX - minX + 1) *
-            static_cast<int64_t>(maxY - minY + 1) *
-            static_cast<int64_t>(maxZ - minZ + 1);
-        if (reserveCount > 0 && reserveCount <= 4096) {
-            visualChunks.reserve(static_cast<size_t>(reserveCount));
-        }
-
-        // Dirty the complete 3D stamp volume.  The previous face-plane dirty
-        // clamp only rebuilt the chunk slice on the clicked plane, so surfaces
-        // above/below the hit height could correctly match the brush but never
-        // receive a material rebake.
-        for (int z = minZ; z <= maxZ; ++z) {
-            for (int y = minY; y <= maxY; ++y) {
-                for (int x = minX; x <= maxX; ++x) {
-                    const glm::ivec3 chunkCoord(x, y, z);
-                    m_pendingTextureDirtyChunks.insert(chunkCoord);
-                    visualChunks.push_back(chunkCoord);
-                }
-            }
-        }
-        touchedChunkCount = static_cast<int>(visualChunks.size());
-    }
-
-    const auto tTouched = Clock::now();
-
-    // First click/stamp must schedule the visual material rebake immediately.
-    // Only held-repeat stamps are debounced, because those are the ones that
-    // can create redundant remesh waves while the user drags or holds LMB.
-    const bool forceVisualFlush = !m_holdRepeatStarted;
-    const size_t flushed = flushPendingTextureDirtyChunks(forceVisualFlush);
-    const auto tSchedule = Clock::now();
-
-    const int logicalChanged = (stampOrder != 0u) ? 1 : 0;
-    m_lastPaintMs = std::chrono::duration<float, std::milli>(tSchedule - t0).count();
-    m_lastFacesCollected = logicalChanged;  // now means stamp commands authored
-    m_lastFacesUnchanged = 0;
-    m_lastCellsPainted  = logicalChanged;
-    m_lastCellsCascaded = 0;
-    m_lastPaintLod      = lod;
-    m_lastPaintWorldCenter = stampCenterWorld;
-    m_lastPaintRadiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
-    m_previewStartTime = tSchedule;
-
-    PaintOpDiagnostic diag{};
-    diag.radiusVoxels = m_radiusVoxelsLod0;
-    diag.shape = static_cast<int>(m_shape);
-    diag.material = static_cast<int>(m_textureType);
-    diag.variant = static_cast<int>(m_variant);
-    diag.paintLod = lod;
-    diag.facesCollected = logicalChanged;
-    diag.facesUnchanged = 0;
-    diag.cellsPainted = logicalChanged;
-    diag.cellsCascaded = 0;
-    diag.touchedChunks = touchedChunkCount;
-    diag.flushedChunks = static_cast<int>(flushed);
-    diag.pendingChunksAfter = static_cast<int>(m_pendingTextureDirtyChunks.size());
-    diag.collectMs = 0.0f;
-    diag.storeMs = std::chrono::duration<float, std::milli>(tStore - t0).count();
-    diag.cascadeMs = 0.0f;
-    diag.touchedMs = std::chrono::duration<float, std::milli>(tTouched - tStore).count();
-    diag.scheduleMs = std::chrono::duration<float, std::milli>(tSchedule - tTouched).count();
-    diag.totalMs = m_lastPaintMs;
-    diag.visualStartSec = std::chrono::duration<double>(t0.time_since_epoch()).count();
-    diag.visualStampOrder = stampOrder;
-    diag.visualChunks = std::move(visualChunks);
-    diag.radiusM = m_lastPaintRadiusM;
-    diag.center = stampCenterWorld;
-    diag.holdRepeat = m_holdRepeatStarted;
-    recordPaintDiagnostic(diag);
-}
-
-// ---------------------------------------------------------------------------
-// Debug window
-// ---------------------------------------------------------------------------
-
-void TexturePaintTool::renderUI() {
-    ImGui::TextColored(kAccent, "Texture Paint Brush");
-    ImGui::Separator();
-
-    ImGui::Checkbox("Brush Active", &m_active);
-    if (!m_active) {
-        ImGui::TextDisabled("Enable to paint pixel-art textures onto terrain");
-    }
-
-    // ---------------- Brush shape + radius ----------------
-    ImGui::Spacing();
-    ImGui::TextColored(kHeading, "Brush");
-
-    const bool isSphere = (m_shape == BrushShape::Sphere);
-    if (isSphere) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26f, 0.59f, 0.98f, 0.80f));
-    }
-    if (ImGui::Button("Sphere")) m_shape = BrushShape::Sphere;
-    if (isSphere) ImGui::PopStyleColor();
-    ImGui::SameLine();
-    const bool isBox = (m_shape == BrushShape::Box);
-    if (isBox) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.26f, 0.59f, 0.98f, 0.80f));
-    }
-    if (ImGui::Button("Box")) m_shape = BrushShape::Box;
-    if (isBox) ImGui::PopStyleColor();
-
-    ImGui::SetNextItemWidth(180.0f);
-    int radius = m_radiusVoxelsLod0;
-    if (ImGui::SliderInt("Radius (LOD-0 voxels)", &radius, 1, 256)) {
-        setBrushRadiusVoxels(radius);
-    }
-    const int side = radius * 2 + 1;
-    const int approxCells = (m_shape == BrushShape::Sphere)
-        ? static_cast<int>(3.14159265f * radius * radius)
-        : side * side;
-    ImGui::TextDisabled("  -> %.3f m at LOD 0, approx %d face cells, repeat %.0f ms",
-                        radius * WorldConfig::VOXEL_SIZE_M,
-                        std::max(1, approxCells),
-                        getPaintRepeatIntervalSec() * 1000.0f);
-
-    // ---------------- Texture type + variant ----------------
-    ImGui::Spacing();
-    ImGui::TextColored(kHeading, "Material");
-    static const char* TYPE_NAMES[] = { "Grass", "Mud", "Dirt", "Sand" };
-    int typeIdx = static_cast<int>(m_textureType);
-    if (ImGui::Combo("Type", &typeIdx, TYPE_NAMES, IM_ARRAYSIZE(TYPE_NAMES))) {
-        m_textureType = static_cast<TextureType>(typeIdx);
-    }
-
-    int variant = m_variant;
-    if (ImGui::SliderInt("Variant seed", &variant, 0, 7)) {
-        setVariant(static_cast<uint8_t>(variant));
-    }
-
-    const size_t activeIdx = static_cast<size_t>(m_textureType);
-    ImGui::TextColored(kHeading, "Type Color Parameters");
-    ImGui::SetNextItemWidth(220.0f);
-    ImGui::ColorEdit3("Base", &m_typeBaseColors[activeIdx].x);
-    ImGui::SetNextItemWidth(220.0f);
-    ImGui::ColorEdit3("Highlight", &m_typeHighlightColors[activeIdx].x);
-    ImGui::SetNextItemWidth(220.0f);
-    ImGui::ColorEdit3("Shadow", &m_typeShadowColors[activeIdx].x);
-    ImGui::SetNextItemWidth(220.0f);
-    ImGui::ColorEdit3("Accent", &m_typeAccentColors[activeIdx].x);
-
-    // ---------------- LOD targeting ----------------
-    ImGui::Spacing();
-    ImGui::TextColored(kHeading, "LOD Targeting");
-
-    int modeIdx = static_cast<int>(m_lodMode);
-    ImGui::RadioButton("Auto from hit chunk", &modeIdx, 0); ImGui::SameLine();
-    ImGui::RadioButton("Manual",              &modeIdx, 1);
-    m_lodMode = static_cast<LODMode>(modeIdx);
-
-    if (m_lodMode == LODMode::Manual) {
-        int lod = m_manualLod;
-        if (ImGui::SliderInt("Target LOD", &lod, 0,
-                             TextureOverlayStore::LOD_COUNT - 1)) {
-            setManualLOD(lod);
-        }
-    } else {
-        if (m_hasPlacementContext) {
-            ImGui::Text("Hit LOD: %d  (voxel %.3f m)", m_hitLod, m_hitVoxelSizeM);
-        } else {
-            ImGui::TextDisabled("Hover terrain to resolve hit LOD");
-        }
-    }
-
-    ImGui::Checkbox("Cascade paint to coarser LODs", &m_cascadeToCoarser);
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("When enabled, the same stroke also paints into all "
-                          "LOD levels coarser than the source LOD, so the "
-                          "texture stays visible after a chunk LOD swap.");
-    }
-    ImGui::TextDisabled("Shader material preview LOD: %d (final pixels are shaded in terrain)",
-                        getPreviewLOD());
-
-    // ---------------- Per-LOD resolution config ----------------
-    ImGui::Spacing();
-    ImGui::TextColored(kHeading, "Per-LOD Texture Resolution");
-    ImGui::TextDisabled("Texels per voxel face edge.  Adapt: each LOD step "
-                        "is 2x bigger voxels / 1/8 the cells.");
-
-    if (ImGui::BeginTable("perLodCfg", 4,
-                          ImGuiTableFlags_BordersInnerV |
-                          ImGuiTableFlags_RowBg |
-                          ImGuiTableFlags_SizingStretchProp)) {
-        ImGui::TableSetupColumn("LOD", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGui::TableSetupColumn("Voxel size", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("Resolution", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Enabled", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableHeadersRow();
-
-        for (int lod = 0; lod < TextureOverlayStore::LOD_COUNT; ++lod) {
-            ImGui::TableNextRow();
-            ImGui::PushID(lod);
-
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Text("LOD %d", lod);
-
-            ImGui::TableSetColumnIndex(1);
-            ImGui::Text("%.3f m", WorldConfig::getLODVoxelSizeM(lod));
-
-            ImGui::TableSetColumnIndex(2);
-            LODTextureConfig cfg = getStore().getLODConfig(lod);
-            int currentIdx = 0;
-            for (int i = 0; i < TextureOverlayStore::RES_OPTION_COUNT; ++i) {
-                if (TextureOverlayStore::RES_OPTIONS[i] == cfg.pixelsPerVoxel) {
-                    currentIdx = i; break;
-                }
-            }
-            ImGui::SetNextItemWidth(-FLT_MIN);
-            if (ImGui::Combo("##res",
-                             &currentIdx,
-                             TextureOverlayStore::RES_OPTION_LABELS,
-                             TextureOverlayStore::RES_OPTION_COUNT)) {
-                cfg.pixelsPerVoxel = TextureOverlayStore::RES_OPTIONS[currentIdx];
-                getStore().setLODConfig(lod, cfg);
-            }
-
-            ImGui::TableSetColumnIndex(3);
-            bool enabled = cfg.enabled;
-            if (ImGui::Checkbox("##en", &enabled)) {
-                cfg.enabled = enabled;
-                getStore().setLODConfig(lod, cfg);
-            }
-
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
-
-    // ---------------- Live hit preview info ----------------
-    ImGui::Spacing();
-    ImGui::TextColored(kHeading, "Hit Preview");
-    if (!m_hasHit) {
-        ImGui::TextDisabled("Move mouse over terrain to preview");
-    } else {
-        ImGui::Text("Hit:    (%.3f, %.3f, %.3f)", m_hitPos.x, m_hitPos.y, m_hitPos.z);
-        ImGui::Text("Normal: (%.2f, %.2f, %.2f)", m_hitNormal.x, m_hitNormal.y, m_hitNormal.z);
-        const int lod = getActivePaintLOD();
-        const auto cfg = getStore().getLODConfig(lod);
-        ImGui::Text("Source paint LOD: 0 (%dx%d px/face)%s",
-                    getStore().getLODConfig(0).pixelsPerVoxel,
-                    getStore().getLODConfig(0).pixelsPerVoxel,
-                    getStore().getLODConfig(0).enabled ? "" : "  [DISABLED]");
-        ImGui::Text("Render-preview LOD: %d (%dx%d px/face)%s",
-                    lod, cfg.pixelsPerVoxel, cfg.pixelsPerVoxel,
-                    cfg.enabled ? "" : "  [DISABLED]");
-        const int rLod = (m_radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
-        ImGui::Text("Effective surface radius: %d voxel%s at LOD %d",
-                    rLod, rLod == 1 ? "" : "s", lod);
-    }
-
-    // ---------------- Last paint diagnostics ----------------
-    ImGui::Spacing();
-    ImGui::TextColored(kHeading, "Last Paint");
-    if (m_lastFacesCollected == 0 && m_lastCellsPainted == 0 && m_lastCellsCascaded == 0) {
-        ImGui::TextDisabled("Left click to paint");
-    } else {
-        ImGui::Text("Surface faces found: %d", m_lastFacesCollected);
-        ImGui::Text("Face cells changed: %d (LOD %d)", m_lastCellsPainted, m_lastPaintLod);
-        if (m_lastFacesUnchanged > 0) {
-            ImGui::TextDisabled("Unchanged/no-op: %d", m_lastFacesUnchanged);
-        }
-        if (m_cascadeToCoarser) {
-            ImGui::Text("Cascaded to coarser: %d cells", m_lastCellsCascaded);
-        }
-        ImGui::Text("Time: %.3f ms", m_lastPaintMs);
-        ImGui::TextDisabled("Pending material-rebake chunks: %zu", m_pendingTextureDirtyChunks.size());
-    }
-
-    if (ImGui::TreeNode("Last 50 Brush Edit Diagnostics")) {
-        ImGui::TextDisabled("Copy this table when brush spam still tanks FPS.");
-        if (ImGui::Button("Copy Last 50 Paint Stats")) {
-            m_lastDiagnosticsExport = buildPaintDiagnosticsReport();
-            ImGui::SetClipboardText(m_lastDiagnosticsExport.c_str());
-        }
-        if (!m_lastDiagnosticsExport.empty()) {
-            ImGui::SameLine();
-            ImGui::TextDisabled("copied %zu bytes", m_lastDiagnosticsExport.size());
-        }
-
-        if (ImGui::BeginTable("paintDiagHistory", 9,
-                              ImGuiTableFlags_BordersInnerV |
-                              ImGuiTableFlags_RowBg |
-                              ImGuiTableFlags_SizingStretchProp)) {
-            ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 38.0f);
-            ImGui::TableSetupColumn("total");
-            ImGui::TableSetupColumn("collect");
-            ImGui::TableSetupColumn("store");
-            ImGui::TableSetupColumn("sched");
-            ImGui::TableSetupColumn("faces");
-            ImGui::TableSetupColumn("changed");
-            ImGui::TableSetupColumn("flush");
-            ImGui::TableSetupColumn("pending");
-            ImGui::TableHeadersRow();
-
-            for (int i = 0; i < m_paintDiagCount; ++i) {
-                const int idx = (m_paintDiagWriteIndex - m_paintDiagCount + i + PAINT_DIAG_HISTORY)
-                    % PAINT_DIAG_HISTORY;
-                const PaintOpDiagnostic& d = m_paintDiagHistory[static_cast<size_t>(idx)];
-
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0); ImGui::Text("%llu", static_cast<unsigned long long>(d.serial));
-                ImGui::TableSetColumnIndex(1); ImGui::Text("%.2f", d.totalMs);
-                ImGui::TableSetColumnIndex(2); ImGui::Text("%.2f", d.collectMs);
-                ImGui::TableSetColumnIndex(3); ImGui::Text("%.2f", d.storeMs);
-                ImGui::TableSetColumnIndex(4); ImGui::Text("%.2f", d.scheduleMs);
-                ImGui::TableSetColumnIndex(5); ImGui::Text("%d", d.facesCollected);
-                ImGui::TableSetColumnIndex(6); ImGui::Text("%d", d.cellsPainted);
-                ImGui::TableSetColumnIndex(7); ImGui::Text("%d", d.flushedChunks);
-                ImGui::TableSetColumnIndex(8); ImGui::Text("%d", d.pendingChunksAfter);
-            }
-            ImGui::EndTable();
-        }
-        ImGui::TreePop();
-    }
-
-    // ---------------- Store stats ----------------
-    ImGui::Spacing();
-    ImGui::TextColored(kHeading, "Voxel Material Store");
-    const auto stats = getStore().getStats();
-    ImGui::Text("Total: %zu bricks  %zu cells  (gen %zu)",
-                stats.totalBricks, stats.totalCells, stats.generation);
-    if (ImGui::TreeNode("Per-LOD breakdown")) {
-        for (int lod = 0; lod < TextureOverlayStore::LOD_COUNT; ++lod) {
-            ImGui::Text("  LOD %d: %zu bricks  %zu cells",
-                        lod, stats.bricksByLOD[lod], stats.cellsByLOD[lod]);
-        }
-        ImGui::TreePop();
-    }
-
-    ImGui::Spacing();
-    if (ImGui::Button("Clear All Textures")) {
-        getStore().clear();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Clear Hit LOD")) {
-        getStore().clearLOD(getActivePaintLOD());
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Copy Last 50 Paint Stats##bottom")) {
-        m_lastDiagnosticsExport = buildPaintDiagnosticsReport();
-        ImGui::SetClipboardText(m_lastDiagnosticsExport.c_str());
+        mergeSubMesh(subs[bestA], std::move(subs[bestB]));
+        subs.erase(subs.begin() + static_cast<ptrdiff_t>(bestB));
     }
 }
 
-// ---------------------------------------------------------------------------
-// World-space brush preview
-// ---------------------------------------------------------------------------
+std::vector<TerrainEditMesher::SubMesh> TerrainEditMesher::splitToSubMeshes(
+        const MeshResult& mesh)
+{
+    std::vector<SubMesh> out;
+    if (mesh.empty()) return out;
 
-void TexturePaintTool::renderPreviewOverlay(const glm::mat4& viewProj,
-                                            int viewportW, int viewportH,
-                                            float viewportOffsetX,
-                                            float viewportOffsetY) {
-    if (!m_active || !m_hasHit) return;
-
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
-
-    const ImU32 col = colorFromVec3(getTypeBaseColor(m_textureType));
-    const ImU32 fill = (col & 0x00FFFFFFu) | 0x33000000u;
-
-    const float vpW = static_cast<float>(viewportW);
-    const float vpH = static_cast<float>(viewportH);
-
-    auto project = [&](const glm::vec3& wp, ImVec2& out) -> bool {
-        glm::vec4 c = viewProj * glm::vec4(wp, 1.0f);
-        if (c.w <= 0.01f) return false;
-        glm::vec3 ndc = glm::vec3(c) / c.w;
-        out.x = viewportOffsetX + (ndc.x * 0.5f + 0.5f) * vpW;
-        out.y = viewportOffsetY + (1.0f - (ndc.y * 0.5f + 0.5f)) * vpH;
-        return true;
-    };
-
-    const int lod = getActivePaintLOD();
-    const float voxelSize = WorldConfig::getLODVoxelSizeM(lod);
-    const float radiusM = static_cast<float>(m_radiusVoxelsLod0) * WorldConfig::VOXEL_SIZE_M;
-
-    if (m_shape == BrushShape::Sphere) {
-        // 3 great circles, like TerrainEditTool's fallback path.
-        auto drawCircle = [&](int a0, int a1, int aN) {
-            constexpr int SEG = 32;
-            ImVec2 pts[SEG]; bool vis[SEG];
-            for (int i = 0; i < SEG; ++i) {
-                float ang = 6.28318530f * float(i) / float(SEG);
-                glm::vec3 p = m_hitPos;
-                p[a0] = m_hitPos[a0] + std::cos(ang) * radiusM;
-                p[a1] = m_hitPos[a1] + std::sin(ang) * radiusM;
-                p[aN] = m_hitPos[aN];
-                vis[i] = project(p, pts[i]);
-            }
-            for (int i = 0; i < SEG; ++i) {
-                int j = (i + 1) % SEG;
-                if (vis[i] && vis[j]) dl->AddLine(pts[i], pts[j], col, 2.0f);
-            }
-        };
-        drawCircle(0, 1, 2);
-        drawCircle(0, 2, 1);
-        drawCircle(1, 2, 0);
-    } else {
-        // Box wireframe
-        const glm::vec3 lo = m_hitPos - glm::vec3(radiusM);
-        const glm::vec3 hi = m_hitPos + glm::vec3(radiusM);
-        const glm::vec3 corners[8] = {
-            {lo.x,lo.y,lo.z}, {hi.x,lo.y,lo.z},
-            {hi.x,hi.y,lo.z}, {lo.x,hi.y,lo.z},
-            {lo.x,lo.y,hi.z}, {hi.x,lo.y,hi.z},
-            {hi.x,hi.y,hi.z}, {lo.x,hi.y,hi.z},
-        };
-        ImVec2 sp[8]; bool vis[8];
-        for (int i = 0; i < 8; ++i) vis[i] = project(corners[i], sp[i]);
-        constexpr int E[12][2] = {
-            {0,1},{1,2},{2,3},{3,0},
-            {4,5},{5,6},{6,7},{7,4},
-            {0,4},{1,5},{2,6},{3,7}
-        };
-        for (auto& e : E) {
-            if (vis[e[0]] && vis[e[1]]) dl->AddLine(sp[e[0]], sp[e[1]], col, 2.0f);
-        }
-        // Light fill on the dominant face for readability
-        constexpr int F[6][4] = {
-            {0,1,2,3},{4,5,6,7},
-            {3,2,6,7},{0,1,5,4},
-            {0,3,7,4},{1,2,6,5}
-        };
-        for (auto& f : F) {
-            if (vis[f[0]] && vis[f[1]] && vis[f[2]] && vis[f[3]]) {
-                dl->AddQuadFilled(sp[f[0]], sp[f[1]], sp[f[2]], sp[f[3]], fill);
-            }
-        }
+    auto linearSubs = splitLinearlyToSubMeshes(mesh);
+    if (linearSubs.size() <= MAX_RUNTIME_SUBMESHES) {
+        return linearSubs;
     }
 
-    // Mark the hit point
-    ImVec2 hitScreen;
-    if (project(m_hitPos, hitScreen)) {
-        dl->AddCircleFilled(hitScreen, 3.0f, col);
-        // Label: type + variant + active LOD + resolution
-        const auto cfg = getStore().getLODConfig(lod);
-        char label[160];
-        std::snprintf(label, sizeof(label),
-                      "%s v%u  LOD %d  %dx%d px/face  r=%.3fm  vox=%.3fm",
-                      TextureOverlay::textureTypeName(m_textureType),
-                      static_cast<unsigned>(m_variant),
-                      lod,
-                      cfg.pixelsPerVoxel, cfg.pixelsPerVoxel,
-                      radiusM,
-                      voxelSize);
-        dl->AddText(ImVec2(hitScreen.x + 12.0f, hitScreen.y - 8.0f), col, label);
+    // Only try octree fallback when the minimal linear path still exceeds the
+    // runtime submesh budget. Subchunks are not culled independently, so extra
+    // spatial splits hurt upload/render cost without giving visibility wins.
+    auto octreeSubs = splitMeshOctreeSelective(
+        mesh,
+        OctRegion{
+            0,
+            WorldConfig::CHUNK_SIZE,
+            0,
+            WorldConfig::CHUNK_HEIGHT,
+            0,
+            WorldConfig::CHUNK_SIZE
+        },
+        MAX_RUNTIME_SUBMESHES);
+
+    // Pick whichever produced fewer, then merge to fit budget.
+    auto& best = (octreeSubs.size() > 0 && octreeSubs.size() < linearSubs.size())
+        ? octreeSubs : linearSubs;
+
+    std::cout << "[TerrainEditMesher] WARNING: Mesh with " << mesh.vertices.size()
+              << " vertices produced " << best.size()
+              << " submeshes (max " << MAX_RUNTIME_SUBMESHES
+              << "). Consolidating by merging smallest pairs." << std::endl;
+
+    consolidateSubmeshes(best, MAX_RUNTIME_SUBMESHES);
+
+    if (best.size() > MAX_RUNTIME_SUBMESHES) {
+        std::cerr << "[TerrainEditMesher] CRITICAL: Could not consolidate to "
+                  << MAX_RUNTIME_SUBMESHES << " submeshes (still "
+                  << best.size() << "). ChunkUploadSystem will TRUNCATE \u2014 "
+                  << "expect stretched/missing triangles. Bump MAX_SUBCHUNKS "
+                  << "(Chunk.h / GPUCullingSystem.h / shader #defines / this file)."
+                  << std::endl;
     }
 
-    // Last-paint floating ms readout (fades over PREVIEW_FADE_SEC)
-    if (m_lastPaintMs > 0.0f) {
-        const float t = std::chrono::duration<float>(
-            std::chrono::steady_clock::now() - m_previewStartTime).count();
-        if (t < PREVIEW_FADE_SEC) {
-            const float a = std::clamp(1.0f - t / PREVIEW_FADE_SEC, 0.0f, 1.0f);
-            ImVec2 sp;
-            if (project(m_lastPaintWorldCenter, sp)) {
-                char ms[64];
-                std::snprintf(ms, sizeof(ms), "+%d/%d cells (%.2f ms)",
-                              m_lastCellsPainted, m_lastFacesCollected, m_lastPaintMs);
-                ImU32 c = (col & 0x00FFFFFFu) |
-                          (static_cast<uint32_t>(a * 255.0f) << 24);
-                dl->AddText(ImVec2(sp.x, sp.y - 24.0f), c, ms);
-            }
-        }
-    }
-}
-
-````
-
-## src\world\edit\TextureOverlayStore.cpp
-
-Description: No CC-DESC found. C++ struct 'TextureOverlayIvec3Hash'.
-
-````cpp
-#include "world/edit/TextureOverlayStore.h"
-
-#include <algorithm>
-#include <cstring>
-#include <fstream>
-#include <cmath>
-
-namespace TextureOverlay {
-
-namespace {
-constexpr glm::ivec3 kNeighborDirs[6] = {
-    glm::ivec3( 1, 0, 0), glm::ivec3(-1, 0, 0),
-    glm::ivec3( 0, 1, 0), glm::ivec3( 0,-1, 0),
-    glm::ivec3( 0, 0, 1), glm::ivec3( 0, 0,-1)
-};
-uint32_t hashPaintCoord(const glm::ivec3& coord, uint8_t face, uint32_t salt) {
-    uint32_t h = static_cast<uint32_t>(coord.x) * 0x9E3779B9u;
-    h ^= static_cast<uint32_t>(coord.y) * 0x85EBCA6Bu;
-    h ^= static_cast<uint32_t>(coord.z) * 0xC2B2AE35u;
-    h ^= static_cast<uint32_t>(face) * 0x27D4EB2Du;
-    h ^= salt * 0x165667B1u;
-    h ^= h >> 16;
-    h *= 0x7FEB352Du;
-    h ^= h >> 15;
-    return h;
-}
-
-uint8_t variedVariant(const glm::ivec3& coord,
-                      uint8_t face,
-                      TextureType type,
-                      uint8_t seed) {
-    const uint32_t h = hashPaintCoord(coord, face, static_cast<uint32_t>(type));
-    return static_cast<uint8_t>((seed + (h & 0x7u)) & 0x7u);
-}
-
-constexpr uint32_t GPU_OVERLAY_CHUNK_SENTINEL_FACE = 7u;
-constexpr uint32_t GPU_OVERLAY_CHUNK_SENTINEL_MATERIAL = 0x40000000u;
-
-glm::ivec3 materialOverlayChunkSentinelCoord(const glm::ivec3& lod0Coord) {
-    return WorldConfig::microVoxelToChunk(lod0Coord);
-}
-
-TextureOverlayStore::GPUCell makeChunkSentinelGPUCell(const glm::ivec3& lod0Coord) {
-    const glm::ivec3 chunk = materialOverlayChunkSentinelCoord(lod0Coord);
-
-    TextureOverlayStore::GPUCell sentinel{};
-    sentinel.x = chunk.x;
-    sentinel.y = chunk.y;
-    sentinel.z = chunk.z;
-    sentinel.lod = 0u;
-    sentinel.packed = GPU_OVERLAY_CHUNK_SENTINEL_MATERIAL;
-    sentinel.face = GPU_OVERLAY_CHUNK_SENTINEL_FACE;
-    return sentinel;
-}
-
-struct TextureOverlayIvec3Hash {
-    size_t operator()(const glm::ivec3& v) const noexcept {
-        uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(v.x)) * 73856093ull;
-        h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.y)) * 19349663ull;
-        h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.z)) * 83492791ull;
-        h ^= h >> 33;
-        h *= 0xff51afd7ed558ccdull;
-        h ^= h >> 33;
-        return static_cast<size_t>(h);
-    }
-};
-
-
-
-void facePlaneAxes(uint8_t face, int& uAxis, int& vAxis) {
-    face %= 6u;
-    if (face <= 1u) {
-        uAxis = 1; // Y
-        vAxis = 2; // Z
-    } else if (face <= 3u) {
-        uAxis = 0; // X
-        vAxis = 2; // Z
-    } else {
-        uAxis = 0; // X
-        vAxis = 1; // Y
-    }
-}
-
-using IVec3Hash = TextureOverlayIvec3Hash;
-
-} // namespace
-
-// ---------------------------------------------------------------------------
-// Static resolution options (advertised to the UI)
-// ---------------------------------------------------------------------------
-
-const uint16_t TextureOverlayStore::RES_OPTIONS[RES_OPTION_COUNT] = {
-    2, 4, 8, 16, 32, 64, 128, 256, 512, 1024
-};
-const char* TextureOverlayStore::RES_OPTION_LABELS[RES_OPTION_COUNT] = {
-    "2x2", "4x4", "8x8", "16x16", "32x32", "64x64",
-    "128x128", "256x256", "512x512", "1024x1024"
-};
-
-// ---------------------------------------------------------------------------
-// Construction / config
-// ---------------------------------------------------------------------------
-
-TextureOverlayStore::TextureOverlayStore() {
-    // Default cascade: finer voxels get more pixels.  At LOD 0 a 0.25m voxel
-    // gets 16x16 px (= 64 px/m).  Each coarser LOD halves the pixel density
-    // so the perceived texel size on screen stays roughly constant.
-    m_lodConfigs[0] = LODTextureConfig{16, true};
-    if (LOD_COUNT > 1) m_lodConfigs[1] = LODTextureConfig{8, true};
-    if (LOD_COUNT > 2) m_lodConfigs[2] = LODTextureConfig{4, true};
-    if (LOD_COUNT > 3) m_lodConfigs[3] = LODTextureConfig{2, true};
-    if (LOD_COUNT > 4) m_lodConfigs[4] = LODTextureConfig{2, true};
-}
-
-void TextureOverlayStore::setLODConfig(int lod, const LODTextureConfig& cfg) {
-    if (!isLodValid(lod)) return;
-    std::unique_lock lock(m_mutex);
-    LODTextureConfig clamped = cfg;
-    // Clamp pixelsPerVoxel to a power of two in [2, 1024].
-    uint16_t v = clamped.pixelsPerVoxel;
-    if (v < 2) v = 2;
-    if (v > 1024) v = 1024;
-    // Round down to nearest power of two.
-    uint16_t pow2 = 2;
-    while ((pow2 << 1) <= v) pow2 <<= 1;
-    clamped.pixelsPerVoxel = pow2;
-    m_lodConfigs[lod] = clamped;
-    if (lod == 0) {
-        requestFullGPUUploadLocked();
-    }
-    m_generation.fetch_add(1, std::memory_order_release);
-}
-
-LODTextureConfig TextureOverlayStore::getLODConfig(int lod) const {
-    if (!isLodValid(lod)) return {};
-    std::shared_lock lock(m_mutex);
-    return m_lodConfigs[lod];
-}
-
-// ---------------------------------------------------------------------------
-// Coordinate helpers
-// ---------------------------------------------------------------------------
-
-TextureOverlayStore::BrickKey
-TextureOverlayStore::voxelToBrick(const glm::ivec3& v) {
-    // Arithmetic shift (>>3) gives floor-divide-by-8 for negative coords too.
-    return BrickKey{ v.x >> 3, v.y >> 3, v.z >> 3 };
-}
-
-glm::ivec3 TextureOverlayStore::voxelLocalInBrick(const glm::ivec3& v) {
-    // & 0x7 wraps correctly for negative coords (two's complement).
-    return glm::ivec3(v.x & 0x7, v.y & 0x7, v.z & 0x7);
-}
-
-glm::ivec3 TextureOverlayStore::encodeFaceCoord(const glm::ivec3& voxelCoord,
-                                                uint8_t face) {
-    return glm::ivec3(voxelCoord.x, voxelCoord.y,
-                      voxelCoord.z * 6 + static_cast<int>(face % 6u));
-}
-
-glm::ivec3 TextureOverlayStore::decodeFaceCoord(const glm::ivec3& storageCoord,
-                                                uint8_t& face) {
-    int z = storageCoord.z / 6;
-    int rem = storageCoord.z % 6;
-    if (rem < 0) {
-        rem += 6;
-        --z;
-    }
-    face = static_cast<uint8_t>(rem);
-    return glm::ivec3(storageCoord.x, storageCoord.y, z);
-}
-
-// ---------------------------------------------------------------------------
-// Brick access (caller holds appropriate lock)
-// ---------------------------------------------------------------------------
-
-TextureBrick*
-TextureOverlayStore::getOrCreateBrickLocked(BrickMap& map, int lod, BrickKey key) {
-    auto it = map.find(key);
-    if (it == map.end()) {
-        auto [newIt, _] = map.emplace(key, std::make_unique<TextureBrick>());
-        if (isLodValid(lod)) {
-            ++m_brickCountsByLOD[lod];
-        }
-        return newIt->second.get();
-    }
-    return it->second.get();
-}
-
-const TextureBrick*
-TextureOverlayStore::getBrickLocked(const BrickMap& map, BrickKey key) const {
-    auto it = map.find(key);
-    return (it != map.end()) ? it->second.get() : nullptr;
-}
-
-TextureBrick*
-TextureOverlayStore::getBrickLocked(BrickMap& map, BrickKey key) {
-    auto it = map.find(key);
-    return (it != map.end()) ? it->second.get() : nullptr;
-}
-
-void TextureOverlayStore::writeCellLocked(BrickMap& map,
-                                          int lod,
-                                          BrickKey key,
-                                          const glm::ivec3& local,
-                                          VoxelTextureData data) {
-    TextureBrick* brick = getBrickLocked(map, key);
-    if (!brick) {
-        if (data.isEmpty()) {
-            return;
-        }
-        brick = getOrCreateBrickLocked(map, lod, key);
-    }
-    int idx = TextureBrick::toIndex(local.x, local.y, local.z);
-    VoxelTextureData& slot = brick->cells[idx];
-    const bool wasActive = !slot.isEmpty();
-    const bool willBeActive = !data.isEmpty();
-    slot = data;
-    if (wasActive && !willBeActive) {
-        --brick->activeCount;
-        if (isLodValid(lod) && m_cellCountsByLOD[lod] > 0u) {
-            --m_cellCountsByLOD[lod];
-        }
-    } else if (!wasActive && willBeActive) {
-        ++brick->activeCount;
-        if (isLodValid(lod)) {
-            ++m_cellCountsByLOD[lod];
-        }
-    }
-    // Note: empty bricks intentionally retained after an active cell is erased.
-    // Paint operations are bursty, and the next stroke usually re-fills the
-    // same brick. Missing bricks are not created for empty/no-op writes.
-}
-
-uint8_t TextureOverlayStore::classifyTransitionEdge(TextureType a,
-                                                    TextureType b,
-                                                    const glm::ivec3& lodCoord) {
-    if (a == b) {
-        return static_cast<uint8_t>(TransitionEdgeStyle::None);
-    }
-
-    const bool hasGrass = (a == TextureType::Grass || b == TextureType::Grass);
-    const bool hasMud = (a == TextureType::Mud || b == TextureType::Mud);
-    const bool hasDirt = (a == TextureType::Dirt || b == TextureType::Dirt);
-    const bool hasSand = (a == TextureType::Sand || b == TextureType::Sand);
-
-    // Cheap deterministic coordinate hash for transition variation.
-    const uint32_t hx = static_cast<uint32_t>(lodCoord.x) * 0x9E3779B9u;
-    const uint32_t hy = static_cast<uint32_t>(lodCoord.y) * 0x85EBCA6Bu;
-    const uint32_t hz = static_cast<uint32_t>(lodCoord.z) * 0xC2B2AE35u;
-    uint32_t h = hx ^ hy ^ hz;
-    h ^= h >> 16;
-
-    if (hasGrass && hasMud) {
-        return static_cast<uint8_t>((h & 1u) ? TransitionEdgeStyle::Leafy
-                                             : TransitionEdgeStyle::Sloppy);
-    }
-    if (hasGrass) {
-        return static_cast<uint8_t>(TransitionEdgeStyle::Leafy);
-    }
-    if (hasMud) {
-        if (hasSand) {
-            return static_cast<uint8_t>((h & 1u) ? TransitionEdgeStyle::Sloppy
-                                                 : TransitionEdgeStyle::Grainy);
-        }
-        if (hasDirt) {
-            return static_cast<uint8_t>((h & 3u) == 0u ? TransitionEdgeStyle::Grainy
-                                                        : TransitionEdgeStyle::Sloppy);
-        }
-        return static_cast<uint8_t>(TransitionEdgeStyle::Sloppy);
-    }
-
-    return static_cast<uint8_t>(TransitionEdgeStyle::Grainy);
-}
-
-uint8_t TextureOverlayStore::mergeEdgeStyle(uint8_t lhs, uint8_t rhs) {
-    auto priority = [](uint8_t style) -> uint8_t {
-        switch (static_cast<TransitionEdgeStyle>(style & 0x3u)) {
-            case TransitionEdgeStyle::Sloppy: return 3u;
-            case TransitionEdgeStyle::Leafy:  return 2u;
-            case TransitionEdgeStyle::Grainy: return 1u;
-            case TransitionEdgeStyle::None:
-            default: return 0u;
-        }
-    };
-    return (priority(rhs) >= priority(lhs)) ? (rhs & 0x3u) : (lhs & 0x3u);
-}
-
-void TextureOverlayStore::recordDirtyGPUCellLocked(int lod,
-                                                   const glm::ivec3& lodCoord,
-                                                   VoxelTextureData data) {
-    (void)lod;
-    (void)lodCoord;
-    (void)data;
-
-    // Phase 3 material-bake path:
-    //
-    // The paint brush must not grow the fragment-time global material overlay.
-    // That overlay was the bottleneck: millions of painted voxel-face cells were
-    // uploaded into one large random-access SSBO/hash table, then cube.frag had
-    // to probe it from the terrain/light pass.
-    //
-    // Painted material remains canonical in this CPU TextureOverlayStore. The
-    // renderable representation is produced by remeshing the touched chunks and
-    // packing the material into Vertex::material, which is the shader fast path.
-    //
-    // Force one empty full-upload so any old/stale overlay cells are removed
-    // from the GPU table, but never enqueue per-cell GPU deltas here.
-    if (!m_dirtyGPUFullUpload) {
-        m_dirtyGPUCells.clear();
-        m_dirtyGPUFullUpload = true;
-    }
-}
-
-void TextureOverlayStore::requestFullGPUUploadLocked() {
-    m_dirtyGPUCells.clear();
-    m_dirtyGPUFullUpload = true;
-}
-
-void TextureOverlayStore::refreshTransitionEdgesAroundCellLocked(BrickMap& map,
-                                                                 int lod,
-                                                                 const glm::ivec3& lodCoord) {
-    TextureBrick* brick = getBrickLocked(map, voxelToBrick(lodCoord));
-    if (!brick) return;
-    const glm::ivec3 local = voxelLocalInBrick(lodCoord);
-    const int idx = TextureBrick::toIndex(local.x, local.y, local.z);
-    VoxelTextureData center = brick->cells[idx];
-    if (center.isEmpty()) return;
-
-    const TextureType centerType = center.getType();
-    uint8_t centerEdge = static_cast<uint8_t>(TransitionEdgeStyle::None);
-
-    for (const glm::ivec3& d : kNeighborDirs) {
-        const glm::ivec3 ncoord = lodCoord + d;
-        TextureBrick* nbrick = getBrickLocked(map, voxelToBrick(ncoord));
-        if (!nbrick) continue;
-
-        const glm::ivec3 nlocal = voxelLocalInBrick(ncoord);
-        const int nidx = TextureBrick::toIndex(nlocal.x, nlocal.y, nlocal.z);
-        VoxelTextureData neighbor = nbrick->cells[nidx];
-        if (neighbor.isEmpty()) continue;
-
-        const TextureType neighborType = neighbor.getType();
-        if (neighborType == centerType) continue;
-
-        const uint8_t centerStyle = classifyTransitionEdge(centerType, neighborType, lodCoord);
-        centerEdge = mergeEdgeStyle(centerEdge, centerStyle);
-
-        const uint8_t neighborStyle = classifyTransitionEdge(neighborType, centerType, ncoord);
-        const uint8_t mergedNeighborEdge = mergeEdgeStyle(neighbor.getEdgeMask(), neighborStyle);
-        if (mergedNeighborEdge != neighbor.getEdgeMask()) {
-            const VoxelTextureData updated = neighbor.withEdgeMask(mergedNeighborEdge);
-            nbrick->cells[nidx] = updated;
-            recordDirtyGPUCellLocked(lod, ncoord, updated);
-        }
-    }
-
-    if (centerEdge != center.getEdgeMask()) {
-        const VoxelTextureData updated = center.withEdgeMask(centerEdge);
-        brick->cells[idx] = updated;
-        recordDirtyGPUCellLocked(lod, lodCoord, updated);
-    }
-}
-
-void TextureOverlayStore::refreshTransitionEdgesAroundFaceLocked(BrickMap& map,
-                                                                 int lod,
-                                                                 const glm::ivec3& lodCoord,
-                                                                 uint8_t face) {
-    face %= 6u;
-    const glm::ivec3 storageCoord = encodeFaceCoord(lodCoord, face);
-    TextureBrick* brick = getBrickLocked(map, voxelToBrick(storageCoord));
-    if (!brick) return;
-
-    const glm::ivec3 local = voxelLocalInBrick(storageCoord);
-    const int idx = TextureBrick::toIndex(local.x, local.y, local.z);
-    VoxelTextureData center = brick->cells[idx];
-    if (center.isEmpty()) return;
-
-    const TextureType centerType = center.getType();
-    uint8_t centerEdge = static_cast<uint8_t>(TransitionEdgeStyle::None);
-
-    int uAxis = 0;
-    int vAxis = 1;
-    facePlaneAxes(face, uAxis, vAxis);
-    glm::ivec3 neighborOffsets[4]{};
-    neighborOffsets[0][uAxis] =  1;
-    neighborOffsets[1][uAxis] = -1;
-    neighborOffsets[2][vAxis] =  1;
-    neighborOffsets[3][vAxis] = -1;
-
-    for (const glm::ivec3& offset : neighborOffsets) {
-        const glm::ivec3 ncoord = lodCoord + offset;
-        const glm::ivec3 nstorage = encodeFaceCoord(ncoord, face);
-        TextureBrick* nbrick = getBrickLocked(map, voxelToBrick(nstorage));
-        if (!nbrick) continue;
-
-        const glm::ivec3 nlocal = voxelLocalInBrick(nstorage);
-        const int nidx = TextureBrick::toIndex(nlocal.x, nlocal.y, nlocal.z);
-        VoxelTextureData neighbor = nbrick->cells[nidx];
-        if (neighbor.isEmpty()) continue;
-
-        const TextureType neighborType = neighbor.getType();
-        if (neighborType == centerType) continue;
-
-        const uint8_t centerStyle = classifyTransitionEdge(centerType, neighborType, lodCoord);
-        centerEdge = mergeEdgeStyle(centerEdge, centerStyle);
-
-        const uint8_t neighborStyle = classifyTransitionEdge(neighborType, centerType, ncoord);
-        const uint8_t mergedNeighborEdge = mergeEdgeStyle(neighbor.getEdgeMask(), neighborStyle);
-        if (mergedNeighborEdge != neighbor.getEdgeMask()) {
-            const VoxelTextureData updated = neighbor.withEdgeMask(mergedNeighborEdge);
-            nbrick->cells[nidx] = updated;
-            recordDirtyGPUCellLocked(lod, ncoord, updated);
-        }
-    }
-
-    if (centerEdge != center.getEdgeMask()) {
-        const VoxelTextureData updated = center.withEdgeMask(centerEdge);
-        brick->cells[idx] = updated;
-        recordDirtyGPUCellLocked(lod, lodCoord, updated);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Single-cell access
-// ---------------------------------------------------------------------------
-
-void TextureOverlayStore::setTexture(const glm::ivec3& lodCoord,
-                                     int lod,
-                                     VoxelTextureData data) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return;
-    std::unique_lock lock(m_mutex);
-    BrickKey key = voxelToBrick(lodCoord);
-    glm::ivec3 local = voxelLocalInBrick(lodCoord);
-    writeCellLocked(m_lodMaps[lod], lod, key, local, data);
-    if (data.isEmpty()) {
-        requestFullGPUUploadLocked();
-    } else {
-        recordDirtyGPUCellLocked(lod, lodCoord, data);
-    }
-    auto& map = m_lodMaps[lod];
-    if (!data.isEmpty()) {
-        refreshTransitionEdgesAroundCellLocked(map, lod, lodCoord);
-        for (const glm::ivec3& d : kNeighborDirs) {
-            refreshTransitionEdgesAroundCellLocked(map, lod, lodCoord + d);
-        }
-    } else {
-        for (const glm::ivec3& d : kNeighborDirs) {
-            refreshTransitionEdgesAroundCellLocked(map, lod, lodCoord + d);
-        }
-    }
-    m_generation.fetch_add(1, std::memory_order_release);
-}
-
-VoxelTextureData
-TextureOverlayStore::getTexture(const glm::ivec3& lodCoord, int lod) const {
-    if (!isLodValid(lod)) return {};
-    std::shared_lock lock(m_mutex);
-    BrickKey key = voxelToBrick(lodCoord);
-    glm::ivec3 local = voxelLocalInBrick(lodCoord);
-    const TextureBrick* brick = getBrickLocked(m_lodMaps[lod], key);
-    if (!brick) return {};
-    return brick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
-}
-
-VoxelTextureData
-TextureOverlayStore::getSurfaceTexture(const glm::ivec3& lodCoord,
-                                       int lod,
-                                       uint8_t face) const {
-    if (!isLodValid(lod)) return {};
-
-    const uint8_t queryFace = static_cast<uint8_t>(face % 6u);
-    const glm::ivec3 storageCoord = encodeFaceCoord(lodCoord, queryFace);
-
-    std::shared_lock lock(m_mutex);
-
-    // Exact expanded/saved per-face cells win over deferred brush stamps.
-    {
-        const BrickKey key = voxelToBrick(storageCoord);
-        const glm::ivec3 local = voxelLocalInBrick(storageCoord);
-        const TextureBrick* brick = getBrickLocked(m_lodMaps[lod], key);
-        if (brick) {
-            const VoxelTextureData cell =
-                brick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
-            if (!cell.isEmpty()) {
-                return cell;
-            }
-        }
-    }
-
-    return sampleSurfacePaintStampsLocked(lodCoord, lod, queryFace);
-}
-
-bool TextureOverlayStore::hasSurfaceTexturesInBox(const glm::ivec3& minLodCoord,
-                                                  const glm::ivec3& maxExclusiveLodCoord,
-                                                  int lod) const {
-    if (!isLodValid(lod)) return false;
-    if (minLodCoord.x >= maxExclusiveLodCoord.x ||
-        minLodCoord.y >= maxExclusiveLodCoord.y ||
-        minLodCoord.z >= maxExclusiveLodCoord.z) {
-        return false;
-    }
-
-    const glm::ivec3 storageMin(minLodCoord.x,
-                                minLodCoord.y,
-                                minLodCoord.z * 6);
-    const glm::ivec3 storageMax(maxExclusiveLodCoord.x - 1,
-                                maxExclusiveLodCoord.y - 1,
-                                (maxExclusiveLodCoord.z - 1) * 6 + 5);
-    const BrickKey minBrick = voxelToBrick(storageMin);
-    const BrickKey maxBrick = voxelToBrick(storageMax);
-
-    std::shared_lock lock(m_mutex);
-    const auto& map = m_lodMaps[lod];
-    const int64_t brickVolume =
-        int64_t(maxBrick.bx - minBrick.bx + 1) *
-        int64_t(maxBrick.by - minBrick.by + 1) *
-        int64_t(maxBrick.bz - minBrick.bz + 1);
-
-    if (brickVolume > 0 && static_cast<uint64_t>(brickVolume) < map.size()) {
-        for (int32_t bz = minBrick.bz; bz <= maxBrick.bz; ++bz)
-        for (int32_t by = minBrick.by; by <= maxBrick.by; ++by)
-        for (int32_t bx = minBrick.bx; bx <= maxBrick.bx; ++bx) {
-            auto it = map.find(BrickKey{bx, by, bz});
-            if (it != map.end() && it->second && it->second->activeCount > 0) {
-                return true;
-            }
-        }
-    } else {
-        for (const auto& [key, brick] : map) {
-            if (!brick || brick->activeCount == 0) {
-                continue;
-            }
-            if (key.bx >= minBrick.bx && key.bx <= maxBrick.bx &&
-                key.by >= minBrick.by && key.by <= maxBrick.by &&
-                key.bz >= minBrick.bz && key.bz <= maxBrick.bz) {
-                return true;
-            }
-        }
-    }
-
-    if (!m_surfacePaintStamps.empty()) {
-        const int step = (lod > 0) ? (1 << lod) : 1;
-        const glm::ivec3 minLod0 = lodToLOD0(minLodCoord, lod);
-        const glm::ivec3 maxLod0 =
-            lodToLOD0(maxExclusiveLodCoord - glm::ivec3(1), lod) + glm::ivec3(step - 1);
-
-        for (const SurfacePaintStamp& stamp : m_surfacePaintStamps) {
-            if (surfaceStampTouchesBox(stamp, minLod0, maxLod0)) {
-                return true;
-            }
-        }
-    }
-
-    return false;
-}
-
-void TextureOverlayStore::clearTexture(const glm::ivec3& lodCoord, int lod) {
-    setTexture(lodCoord, lod, VoxelTextureData{});
-}
-
-// ---------------------------------------------------------------------------
-// Brush paint operations
-//
-// Strategy: we work in the *target LOD's voxel grid*.  The brush bounding box
-// is converted from LOD-0 to the target LOD once, and we iterate that
-// (smaller) volume directly.  This is dramatically cheaper than the previous
-// "iterate every LOD-0 voxel" approach for high LOD levels.
-// ---------------------------------------------------------------------------
-
-int TextureOverlayStore::paintSphere(const glm::ivec3& centerLod0,
-                                     int radiusVoxelsLod0,
-                                     int lod,
-                                     TextureType type,
-                                     uint8_t variant) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
-    if (radiusVoxelsLod0 <= 0) return 0;
-
-    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
-    // Ceiling-divide so a radius that doesn't divide evenly still covers
-    // every LOD cell touched by the LOD-0 sphere.
-    const int shift = lod;
-    const int rLod = (radiusVoxelsLod0 + (1 << shift) - 1) >> shift;
-    if (rLod <= 0) return 0;
-    const int rSq = rLod * rLod;
-
-    VoxelTextureData data(type, variant);
-    int written = 0;
-
-    std::unique_lock lock(m_mutex);
-    auto& map = m_lodMaps[lod];
-
-    for (int dz = -rLod; dz <= rLod; ++dz) {
-        for (int dy = -rLod; dy <= rLod; ++dy) {
-            for (int dx = -rLod; dx <= rLod; ++dx) {
-                if (dx*dx + dy*dy + dz*dz > rSq) continue;
-                glm::ivec3 v = centerLod + glm::ivec3(dx, dy, dz);
-                BrickKey key = voxelToBrick(v);
-                glm::ivec3 local = voxelLocalInBrick(v);
-                writeCellLocked(map, lod, key, local, data);
-                recordDirtyGPUCellLocked(lod, v, data);
-                refreshTransitionEdgesAroundCellLocked(map, lod, v);
-                for (const glm::ivec3& d : kNeighborDirs) {
-                    refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
-                }
-                ++written;
-            }
-        }
-    }
-    if (written) m_generation.fetch_add(1, std::memory_order_release);
-    return written;
-}
-
-int TextureOverlayStore::paintBox(const glm::ivec3& minLod0,
-                                  const glm::ivec3& maxLod0,
-                                  int lod,
-                                  TextureType type,
-                                  uint8_t variant) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
-
-    glm::ivec3 a = lod0ToLOD(minLod0, lod);
-    glm::ivec3 b = lod0ToLOD(maxLod0, lod);
-    glm::ivec3 mn(std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z));
-    glm::ivec3 mx(std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z));
-
-    VoxelTextureData data(type, variant);
-    int written = 0;
-
-    std::unique_lock lock(m_mutex);
-    auto& map = m_lodMaps[lod];
-
-    for (int z = mn.z; z <= mx.z; ++z) {
-        for (int y = mn.y; y <= mx.y; ++y) {
-            for (int x = mn.x; x <= mx.x; ++x) {
-                glm::ivec3 v(x, y, z);
-                writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v), data);
-                recordDirtyGPUCellLocked(lod, v, data);
-                refreshTransitionEdgesAroundCellLocked(map, lod, v);
-                for (const glm::ivec3& d : kNeighborDirs) {
-                    refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
-                }
-                ++written;
-            }
-        }
-    }
-    if (written) m_generation.fetch_add(1, std::memory_order_release);
-    return written;
-}
-
-int TextureOverlayStore::paintFaceDisc(const glm::ivec3& centerLod0,
-                                       int radiusVoxelsLod0,
-                                       int normalAxis,
-                                       int lod,
-                                       TextureType type,
-                                       uint8_t variant,
-                                       uint8_t face,
-                                       int maxCells) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
-    if (radiusVoxelsLod0 <= 0 || maxCells <= 0) return 0;
-
-    face = static_cast<uint8_t>(face % 6u);
-    normalAxis = std::clamp(normalAxis, 0, 2);
-    const int uAxis = (normalAxis == 0) ? 1 : 0;
-    const int vAxis = (normalAxis == 2) ? 1 : 2;
-    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
-    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
-    if (rLod <= 0) return 0;
-
-    const int rSq = rLod * rLod;
-    int candidateCells = 0;
-    for (int v = -rLod; v <= rLod; ++v) {
-        for (int u = -rLod; u <= rLod; ++u) {
-            if (u * u + v * v <= rSq) ++candidateCells;
-        }
-    }
-    if (candidateCells > maxCells) return 0;
-
-    int written = 0;
-    std::unique_lock lock(m_mutex);
-    auto& map = m_lodMaps[lod];
-
-    for (int v = -rLod; v <= rLod; ++v) {
-        for (int u = -rLod; u <= rLod; ++u) {
-            if (u * u + v * v > rSq) continue;
-            glm::ivec3 coord = centerLod;
-            coord[uAxis] += u;
-            coord[vAxis] += v;
-            VoxelTextureData data(type, variedVariant(coord, face, type, variant), 0, face);
-            const glm::ivec3 storageCoord = encodeFaceCoord(coord, face);
-            writeCellLocked(map, lod, voxelToBrick(storageCoord), voxelLocalInBrick(storageCoord), data);
-            recordDirtyGPUCellLocked(lod, coord, data);
-            ++written;
-        }
-    }
-
-    const int inner = std::max(0, rLod - 1);
-    const int innerSq = inner * inner;
-    const int outer = rLod + 1;
-    const int outerSq = outer * outer;
-    for (int v = -outer; v <= outer; ++v) {
-        for (int u = -outer; u <= outer; ++u) {
-            const int dSq = u * u + v * v;
-            if (dSq > outerSq || dSq < innerSq) continue;
-            glm::ivec3 coord = centerLod;
-            coord[uAxis] += u;
-            coord[vAxis] += v;
-            refreshTransitionEdgesAroundFaceLocked(map, lod, coord, face);
-        }
-    }
-
-    if (written) m_generation.fetch_add(1, std::memory_order_release);
-    return written;
-}
-
-int TextureOverlayStore::paintFaceRect(const glm::ivec3& centerLod0,
-                                       int radiusVoxelsLod0,
-                                       int normalAxis,
-                                       int lod,
-                                       TextureType type,
-                                       uint8_t variant,
-                                       uint8_t face,
-                                       int maxCells) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
-    if (radiusVoxelsLod0 <= 0 || maxCells <= 0) return 0;
-
-    face = static_cast<uint8_t>(face % 6u);
-    normalAxis = std::clamp(normalAxis, 0, 2);
-    const int uAxis = (normalAxis == 0) ? 1 : 0;
-    const int vAxis = (normalAxis == 2) ? 1 : 2;
-    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
-    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
-    if (rLod <= 0) return 0;
-
-    const int side = rLod * 2 + 1;
-    const int64_t candidateCells = static_cast<int64_t>(side) * static_cast<int64_t>(side);
-    if (candidateCells > maxCells) return 0;
-
-    int written = 0;
-    std::unique_lock lock(m_mutex);
-    auto& map = m_lodMaps[lod];
-
-    for (int v = -rLod; v <= rLod; ++v) {
-        for (int u = -rLod; u <= rLod; ++u) {
-            glm::ivec3 coord = centerLod;
-            coord[uAxis] += u;
-            coord[vAxis] += v;
-            VoxelTextureData data(type, variedVariant(coord, face, type, variant), 0, face);
-            const glm::ivec3 storageCoord = encodeFaceCoord(coord, face);
-            writeCellLocked(map, lod, voxelToBrick(storageCoord), voxelLocalInBrick(storageCoord), data);
-            recordDirtyGPUCellLocked(lod, coord, data);
-            ++written;
-        }
-    }
-
-    const int outer = rLod + 1;
-    const int inner = std::max(0, rLod - 1);
-    for (int v = -outer; v <= outer; ++v) {
-        for (int u = -outer; u <= outer; ++u) {
-            if (std::abs(u) < inner && std::abs(v) < inner) continue;
-            glm::ivec3 coord = centerLod;
-            coord[uAxis] += u;
-            coord[vAxis] += v;
-            refreshTransitionEdgesAroundFaceLocked(map, lod, coord, face);
-        }
-    }
-
-    if (written) m_generation.fetch_add(1, std::memory_order_release);
-    return written;
-}
-
-int TextureOverlayStore::paintSurfaceFaces(const std::vector<SurfaceFaceStamp>& faces,
-                                           int lod,
-                                           TextureType type,
-                                           uint8_t variant) {
-    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled || faces.empty()) return 0;
-
-    // Huge brush stamps must be authoring-fast. Transition edge masks are
-    // cosmetic material-boundary metadata; refreshing them through an
-    // unordered_set for every changed cell is exactly the wrong cost model for
-    // 50k-300k cell stamps. Large stamps skip transition refresh in the
-    // interactive path. The procedural material remains correct; only fancy
-    // edge blending may be absent until a future offline/idle edge pass.
-    constexpr size_t kLargeInteractiveStampThreshold = 32768u;
-    const bool fastLargeStamp = faces.size() >= kLargeInteractiveStampThreshold;
-
-    int written = 0;
-
-    std::unique_lock lock(m_mutex);
-    auto& map = m_lodMaps[lod];
-
-    if (fastLargeStamp) {
-        for (const SurfaceFaceStamp& faceStamp : faces) {
-            const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
-            const VoxelTextureData data(type, variedVariant(faceStamp.lodCoord, face, type, variant), 0, face);
-            const glm::ivec3 storageCoord = encodeFaceCoord(faceStamp.lodCoord, face);
-
-            if (const TextureBrick* existingBrick = getBrickLocked(map, voxelToBrick(storageCoord))) {
-                const glm::ivec3 local = voxelLocalInBrick(storageCoord);
-                const VoxelTextureData existing =
-                    existingBrick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
-                if (!existing.isEmpty() &&
-                    existing.getType() == data.getType() &&
-                    existing.getVariant() == data.getVariant() &&
-                    existing.getFace() == data.getFace()) {
-                    continue;
-                }
-            }
-
-            writeCellLocked(map,
-                            lod,
-                            voxelToBrick(storageCoord),
-                            voxelLocalInBrick(storageCoord),
-                            data);
-            recordDirtyGPUCellLocked(lod, faceStamp.lodCoord, data);
-            ++written;
-        }
-
-        if (written) m_generation.fetch_add(1, std::memory_order_release);
-        return written;
-    }
-
-    std::vector<SurfaceFaceStamp> changedFaces;
-    changedFaces.reserve(faces.size());
-
-    // Boundary-only transition refresh acceleration. For one brush stroke,
-    // every changed face is usually painted to the same material. Interior
-    // changed-vs-changed neighbors cannot form a transition boundary, so there
-    // is no reason to refresh all 5 cells around every painted face.
-    std::unordered_set<glm::ivec3, IVec3Hash> changedStorageCoords;
-    changedStorageCoords.reserve(faces.size() * 2u + 16u);
-
-    for (const SurfaceFaceStamp& faceStamp : faces) {
-        const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
-        const VoxelTextureData data(type, variedVariant(faceStamp.lodCoord, face, type, variant), 0, face);
-        const glm::ivec3 storageCoord = encodeFaceCoord(faceStamp.lodCoord, face);
-
-        if (const TextureBrick* existingBrick = getBrickLocked(map, voxelToBrick(storageCoord))) {
-            const glm::ivec3 local = voxelLocalInBrick(storageCoord);
-            const VoxelTextureData existing =
-                existingBrick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
-            if (!existing.isEmpty() &&
-                existing.getType() == data.getType() &&
-                existing.getVariant() == data.getVariant() &&
-                existing.getFace() == data.getFace()) {
-                continue;
-            }
-        }
-
-        writeCellLocked(map,
-                        lod,
-                        voxelToBrick(storageCoord),
-                        voxelLocalInBrick(storageCoord),
-                        data);
-        recordDirtyGPUCellLocked(lod, faceStamp.lodCoord, data);
-        changedFaces.push_back(faceStamp);
-        changedStorageCoords.insert(storageCoord);
-        ++written;
-    }
-
-    for (const SurfaceFaceStamp& faceStamp : changedFaces) {
-        const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
-
-        int uAxis = 0;
-        int vAxis = 1;
-        facePlaneAxes(face, uAxis, vAxis);
-
-        glm::ivec3 neighborOffsets[4]{};
-        neighborOffsets[0][uAxis] =  1;
-        neighborOffsets[1][uAxis] = -1;
-        neighborOffsets[2][vAxis] =  1;
-        neighborOffsets[3][vAxis] = -1;
-
-        bool isBoundary = false;
-        for (const glm::ivec3& offset : neighborOffsets) {
-            const glm::ivec3 neighborStorage =
-                encodeFaceCoord(faceStamp.lodCoord + offset, face);
-            if (changedStorageCoords.find(neighborStorage) == changedStorageCoords.end()) {
-                isBoundary = true;
+#ifndef NDEBUG
+    // Post-condition: every submesh must have all indices in-range.
+    for (size_t s = 0; s < best.size(); ++s) {
+        const auto& sub = best[s];
+        const uint32_t vc = static_cast<uint32_t>(sub.vertices.size());
+        for (uint16_t idx : sub.indices) {
+            if (static_cast<uint32_t>(idx) >= vc) {
+                std::cerr << "[TerrainEditMesher] CRITICAL: submesh " << s
+                          << " has out-of-range index " << static_cast<uint32_t>(idx)
+                          << " (vertex count " << vc << ")." << std::endl;
                 break;
             }
         }
-
-        if (!isBoundary) {
-            continue;
-        }
-
-        refreshTransitionEdgesAroundFaceLocked(map, lod, faceStamp.lodCoord, face);
-        for (const glm::ivec3& offset : neighborOffsets) {
-            refreshTransitionEdgesAroundFaceLocked(map, lod, faceStamp.lodCoord + offset, face);
-        }
     }
+#endif
 
-    if (written) m_generation.fetch_add(1, std::memory_order_release);
-    return written;
+    return best;
 }
 
-int TextureOverlayStore::clearSphere(const glm::ivec3& centerLod0,
-                                     int radiusVoxelsLod0,
-                                     int lod) {
-    if (!isLodValid(lod)) return 0;
-    if (radiusVoxelsLod0 <= 0) return 0;
-
-    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
-    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
-    if (rLod <= 0) return 0;
-    const int rSq = rLod * rLod;
-
-    int cleared = 0;
-    std::unique_lock lock(m_mutex);
-    requestFullGPUUploadLocked();
-    auto& map = m_lodMaps[lod];
-    for (int dz = -rLod; dz <= rLod; ++dz)
-    for (int dy = -rLod; dy <= rLod; ++dy)
-    for (int dx = -rLod; dx <= rLod; ++dx) {
-        if (dx*dx + dy*dy + dz*dz > rSq) continue;
-        glm::ivec3 v = centerLod + glm::ivec3(dx, dy, dz);
-        writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v),
-                        VoxelTextureData{});
-        for (const glm::ivec3& d : kNeighborDirs) {
-            refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
-        }
-        ++cleared;
-    }
-    if (cleared) m_generation.fetch_add(1, std::memory_order_release);
-    return cleared;
-}
-
-int TextureOverlayStore::clearBox(const glm::ivec3& minLod0,
-                                  const glm::ivec3& maxLod0,
-                                  int lod) {
-    if (!isLodValid(lod)) return 0;
-    glm::ivec3 a = lod0ToLOD(minLod0, lod);
-    glm::ivec3 b = lod0ToLOD(maxLod0, lod);
-    glm::ivec3 mn(std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z));
-    glm::ivec3 mx(std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z));
-
-    int cleared = 0;
-    std::unique_lock lock(m_mutex);
-    requestFullGPUUploadLocked();
-    auto& map = m_lodMaps[lod];
-    for (int z = mn.z; z <= mx.z; ++z)
-    for (int y = mn.y; y <= mx.y; ++y)
-    for (int x = mn.x; x <= mx.x; ++x) {
-        glm::ivec3 v(x, y, z);
-        writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v),
-                        VoxelTextureData{});
-        for (const glm::ivec3& d : kNeighborDirs) {
-            refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
-        }
-        ++cleared;
-    }
-    if (cleared) m_generation.fetch_add(1, std::memory_order_release);
-    return cleared;
-}
-
-int TextureOverlayStore::cascadeToCoarserLODs(const glm::ivec3& centerLod0,
-                                              int radiusVoxelsLod0,
-                                              int sourceLod,
-                                              TextureType type,
-                                              uint8_t variant) {
-    int total = 0;
-    for (int l = sourceLod + 1; l < LOD_COUNT; ++l) {
-        if (!m_lodConfigs[l].enabled) continue;
-        total += paintSphere(centerLod0, radiusVoxelsLod0, l, type, variant);
-    }
-    return total;
-}
-
-int TextureOverlayStore::cascadeFaceToCoarserLODs(const glm::ivec3& centerLod0,
-                                                  int radiusVoxelsLod0,
-                                                  int normalAxis,
-                                                  int sourceLod,
-                                                  SurfaceBrushShape shape,
-                                                  TextureType type,
-                                                  uint8_t variant,
-                                                  uint8_t face,
-                                                  int maxCellsPerLOD) {
-    int total = 0;
-    for (int l = sourceLod + 1; l < LOD_COUNT; ++l) {
-        if (!m_lodConfigs[l].enabled) continue;
-        if (shape == SurfaceBrushShape::Disc) {
-            total += paintFaceDisc(centerLod0, radiusVoxelsLod0, normalAxis,
-                                   l, type, variant, face, maxCellsPerLOD);
-        } else {
-            total += paintFaceRect(centerLod0, radiusVoxelsLod0, normalAxis,
-                                   l, type, variant, face, maxCellsPerLOD);
-        }
-    }
-    return total;
-}
-
-// ---------------------------------------------------------------------------
-// Stats / state
-// ---------------------------------------------------------------------------
-
-TextureOverlayStore::Stats TextureOverlayStore::getStats() const {
-    Stats s{};
-    std::shared_lock lock(m_mutex);
-    s.generation = m_generation.load(std::memory_order_acquire);
-    s.surfaceStampCount = m_surfacePaintStamps.size();
-    for (int lod = 0; lod < LOD_COUNT; ++lod) {
-        s.bricksByLOD[lod] = m_brickCountsByLOD[lod];
-        s.cellsByLOD[lod] = m_cellCountsByLOD[lod];
-        s.totalBricks += s.bricksByLOD[lod];
-        s.totalCells += s.cellsByLOD[lod];
-    }
-    return s;
-}
-
-size_t TextureOverlayStore::exportGPUCells(std::vector<GPUCell>& out, size_t maxCells) const {
-    (void)maxCells;
-
-    // Disabled by design.
-    //
-    // The old path exported every painted voxel face into a global GPU hash
-    // table. With millions of brush cells this becomes a terrain/light-pass
-    // tax even when the world itself can render fully textured at native speed.
-    //
-    // Painting now stays in the CPU sparse store and is made visible by rebaking
-    // affected chunks into the compact per-vertex material stream. Returning
-    // zero here keeps the shader overlay table empty, so unbaked/normal terrain
-    // remains on the procedural/native fast path.
-    out.clear();
-    return 0;
-}
-
-size_t TextureOverlayStore::exportGPUCellsForLOD(int lod,
-                                                 std::vector<GPUCell>& out,
-                                                 size_t maxCells) const {
-    (void)lod;
-    (void)maxCells;
-
-    // Same as exportGPUCells(): no per-cell material overlay is uploaded to the
-    // GPU. LOD-specific painted data is still stored for persistence/tools and
-    // for chunk material rebake, but it must not become a fragment shader hash
-    // table.
-    out.clear();
-    return 0;
-}
-
-size_t TextureOverlayStore::consumeDirtyGPUCells(std::vector<GPUCell>& out,
-                                                 size_t maxCells,
-                                                 bool& requiresFullUpload) {
-    out.clear();
-    requiresFullUpload = false;
-
-    std::unique_lock lock(m_mutex);
-    if (m_dirtyGPUFullUpload || m_dirtyGPUCells.size() > maxCells) {
-        requiresFullUpload = true;
-        m_dirtyGPUCells.clear();
-        m_dirtyGPUFullUpload = false;
-        return 0;
-    }
-
-    out.swap(m_dirtyGPUCells);
-    m_dirtyGPUCells.clear();
-    return out.size();
-}
-
-bool TextureOverlayStore::isEmpty() const {
-    std::shared_lock lock(m_mutex);
-    if (!m_surfacePaintStamps.empty()) {
-        return false;
-    }
-    for (size_t cells : m_cellCountsByLOD) {
-        if (cells != 0u) return false;
-    }
-    return true;
-}
-
-void TextureOverlayStore::clear() {
-    std::unique_lock lock(m_mutex);
-    for (auto& map : m_lodMaps) map.clear();
-    m_brickCountsByLOD.fill(0u);
-    m_cellCountsByLOD.fill(0u);
-    m_surfacePaintStamps.clear();
-    m_surfacePaintStampChunkIndex.clear();
-    m_nextSurfacePaintStampOrder = 1u;
-    requestFullGPUUploadLocked();
-    m_generation.fetch_add(1, std::memory_order_release);
-}
-
-void TextureOverlayStore::clearLOD(int lod) {
-    if (!isLodValid(lod)) return;
-    std::unique_lock lock(m_mutex);
-    m_lodMaps[lod].clear();
-    m_brickCountsByLOD[lod] = 0u;
-    m_cellCountsByLOD[lod] = 0u;
-    if (lod == 0) {
-        m_surfacePaintStamps.clear();
-        m_surfacePaintStampChunkIndex.clear();
-        m_nextSurfacePaintStampOrder = 1u;
-    }
-    requestFullGPUUploadLocked();
-    m_generation.fetch_add(1, std::memory_order_release);
-}
-
-// ---------------------------------------------------------------------------
-// Persistence
-// File layout:
-//   magic(4) version(4)
-//   For each LOD: pixelsPerVoxel(2) enabled(1) pad(1) brickCount(4)
-//     For each brick: key(12) activeCount(4) cells(512)
-// ---------------------------------------------------------------------------
-
-static constexpr uint32_t TEXTURE_OVERLAY_MAGIC = 0x54585050; // "TXPP"
-static constexpr uint32_t TEXTURE_OVERLAY_VERSION = 3;
-
-bool TextureOverlayStore::saveToFile(const char* path) const {
-    std::shared_lock lock(m_mutex);
-    std::ofstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-
-    uint32_t magic = TEXTURE_OVERLAY_MAGIC;
-    uint32_t ver = TEXTURE_OVERLAY_VERSION;
-    f.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-    f.write(reinterpret_cast<const char*>(&ver), sizeof(ver));
-
-    uint32_t lodCount = LOD_COUNT;
-    f.write(reinterpret_cast<const char*>(&lodCount), sizeof(lodCount));
-
-    for (int lod = 0; lod < LOD_COUNT; ++lod) {
-        const auto& cfg = m_lodConfigs[lod];
-        uint16_t res = cfg.pixelsPerVoxel;
-        uint8_t en = cfg.enabled ? 1 : 0;
-        uint8_t pad = 0;
-        f.write(reinterpret_cast<const char*>(&res), sizeof(res));
-        f.write(reinterpret_cast<const char*>(&en),  sizeof(en));
-        f.write(reinterpret_cast<const char*>(&pad), sizeof(pad));
-
-        const auto& map = m_lodMaps[lod];
-        uint32_t brickCount = static_cast<uint32_t>(map.size());
-        f.write(reinterpret_cast<const char*>(&brickCount), sizeof(brickCount));
-
-        for (const auto& [key, brick] : map) {
-            f.write(reinterpret_cast<const char*>(&key), sizeof(key));
-            f.write(reinterpret_cast<const char*>(&brick->activeCount),
-                    sizeof(brick->activeCount));
-            f.write(reinterpret_cast<const char*>(brick->cells.data()),
-                    sizeof(VoxelTextureData) * TextureBrick::CELLS);
-        }
-    }
-    return f.good();
-}
-
-bool TextureOverlayStore::loadFromFile(const char* path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-
-    uint32_t magic = 0, ver = 0;
-    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    f.read(reinterpret_cast<char*>(&ver), sizeof(ver));
-    if (magic != TEXTURE_OVERLAY_MAGIC || ver > TEXTURE_OVERLAY_VERSION) return false;
-
-    uint32_t lodCount = 0;
-    f.read(reinterpret_cast<char*>(&lodCount), sizeof(lodCount));
-    if (lodCount > LOD_COUNT) return false;
-
-    std::unique_lock lock(m_mutex);
-    for (auto& m : m_lodMaps) m.clear();
-    m_brickCountsByLOD.fill(0u);
-    m_cellCountsByLOD.fill(0u);
-
-    for (uint32_t lod = 0; lod < lodCount; ++lod) {
-        uint16_t res = 0; uint8_t en = 0; uint8_t pad = 0;
-        f.read(reinterpret_cast<char*>(&res), sizeof(res));
-        f.read(reinterpret_cast<char*>(&en),  sizeof(en));
-        f.read(reinterpret_cast<char*>(&pad), sizeof(pad));
-        m_lodConfigs[lod] = LODTextureConfig{ res, en != 0 };
-
-        uint32_t brickCount = 0;
-        f.read(reinterpret_cast<char*>(&brickCount), sizeof(brickCount));
-        for (uint32_t b = 0; b < brickCount; ++b) {
-            BrickKey key{};
-            uint32_t active = 0;
-            f.read(reinterpret_cast<char*>(&key), sizeof(key));
-            f.read(reinterpret_cast<char*>(&active), sizeof(active));
-            auto brick = std::make_unique<TextureBrick>();
-            brick->activeCount = active;
-            if (ver >= 3) {
-                f.read(reinterpret_cast<char*>(brick->cells.data()),
-                       sizeof(VoxelTextureData) * TextureBrick::CELLS);
-            } else {
-                for (auto& cell : brick->cells) {
-                    uint8_t packed = 0;
-                    f.read(reinterpret_cast<char*>(&packed), sizeof(packed));
-                    cell.packed = packed;
-                    cell.face = 3;
-                }
-            }
-            uint32_t actualActive = 0u;
-            for (const auto& cell : brick->cells) {
-                if (!cell.isEmpty()) {
-                    ++actualActive;
-                }
-            }
-            brick->activeCount = actualActive;
-            ++m_brickCountsByLOD[lod];
-            m_cellCountsByLOD[lod] += brick->activeCount;
-            m_lodMaps[lod].emplace(key, std::move(brick));
-        }
-    }
-    requestFullGPUUploadLocked();
-    m_generation.fetch_add(1, std::memory_order_release);
-    return f.good() || f.eof();
-}
-
-
-// ---------------------------------------------------------------------------
-// Deferred surface paint stamps — O(1) interactive brush authoring.
-// ---------------------------------------------------------------------------
-
-uint32_t TextureOverlayStore::appendSurfacePaintStamp(const glm::vec3& centerWorld,
-                                                     int radiusVoxelsLod0,
-                                                     SurfaceBrushShape shape,
-                                                     TextureType type,
-                                                     uint8_t variant,
-                                                     uint8_t sourceFace) {
-    if (radiusVoxelsLod0 <= 0) {
-        return 0u;
-    }
-
-    SurfacePaintStamp stamp{};
-    stamp.centerVoxelLod0 = centerWorld * static_cast<float>(WorldConfig::VOXELS_PER_METER);
-    stamp.radiusVoxelsLod0 = std::max(1, radiusVoxelsLod0);
-    stamp.shape = shape;
-    stamp.type = type;
-    stamp.variant = static_cast<uint8_t>(variant & 0x7u);
-    stamp.sourceFace = (sourceFace < 6u) ? sourceFace : 3u;
-
-    // Deferred material stamps are bounded 3D surface volumes.  They are still
-    // O(1) to author, but during chunk rebake every real exposed face whose
-    // centre lies inside this volume may sample the latest stamp.  This fixes
-    // large brushes over uneven terrain: top faces, side faces, and cut faces
-    // at different heights are all covered by the same brush volume instead of
-    // only the clicked face plane.
-    //
-    // The +2 voxel pad keeps chunk indexing conservative at exact integer face
-    // planes and LOD boundaries.  sampleSurfacePaintStampsLocked() performs the
-    // exact sphere/box test before returning material.
-    const float r = static_cast<float>(stamp.radiusVoxelsLod0) + 2.0f;
-    stamp.bboxMinLod0 = glm::ivec3(
-        static_cast<int>(std::floor(stamp.centerVoxelLod0.x - r)),
-        static_cast<int>(std::floor(stamp.centerVoxelLod0.y - r)),
-        static_cast<int>(std::floor(stamp.centerVoxelLod0.z - r)));
-    stamp.bboxMaxLod0 = glm::ivec3(
-        static_cast<int>(std::ceil(stamp.centerVoxelLod0.x + r)),
-        static_cast<int>(std::ceil(stamp.centerVoxelLod0.y + r)),
-        static_cast<int>(std::ceil(stamp.centerVoxelLod0.z + r)));
-
-    std::unique_lock lock(m_mutex);
-    if (!m_lodConfigs[0].enabled) {
-        return 0u;
-    }
-
-    if (m_nextSurfacePaintStampOrder == 0u) {
-        m_nextSurfacePaintStampOrder = 1u;
-    }
-    stamp.order = m_nextSurfacePaintStampOrder++;
-
-    const uint32_t stampIndex = static_cast<uint32_t>(m_surfacePaintStamps.size());
-    m_surfacePaintStamps.push_back(stamp);
-    indexSurfacePaintStampLocked(stampIndex);
-
-    // No GPU overlay upload: chunk material rebake consumes the stamp store.
-    m_generation.fetch_add(1, std::memory_order_release);
-    return stamp.order;
-}
-
-size_t TextureOverlayStore::getSurfacePaintStampCount() const {
-    std::shared_lock lock(m_mutex);
-    return m_surfacePaintStamps.size();
-}
-
-size_t TextureOverlayStore::exportLiveSurfacePaintStamps(
-    std::vector<SurfacePaintStamp>& out,
-    size_t maxStamps) const {
-    out.clear();
-    if (maxStamps == 0u) {
-        return 0u;
-    }
-
-    std::shared_lock lock(m_mutex);
-    const size_t total = m_surfacePaintStamps.size();
-    const size_t count = std::min(total, maxStamps);
-    const size_t first = total - count;
-
-    out.reserve(count);
-    for (size_t i = first; i < total; ++i) {
-        out.push_back(m_surfacePaintStamps[i]);
-    }
-    return out.size();
-}
-
-
-void TextureOverlayStore::indexSurfacePaintStampLocked(uint32_t stampIndex) {
-    if (stampIndex >= m_surfacePaintStamps.size()) {
-        return;
-    }
-
-    const SurfacePaintStamp& stamp = m_surfacePaintStamps[stampIndex];
-    const glm::ivec3 c0 = WorldConfig::microVoxelToChunk(stamp.bboxMinLod0);
-    const glm::ivec3 c1 = WorldConfig::microVoxelToChunk(stamp.bboxMaxLod0);
-
-    for (int z = std::min(c0.z, c1.z); z <= std::max(c0.z, c1.z); ++z) {
-        for (int y = std::min(c0.y, c1.y); y <= std::max(c0.y, c1.y); ++y) {
-            for (int x = std::min(c0.x, c1.x); x <= std::max(c0.x, c1.x); ++x) {
-                m_surfacePaintStampChunkIndex[glm::ivec3(x, y, z)].push_back(stampIndex);
-            }
-        }
-    }
-}
-
-bool TextureOverlayStore::surfaceStampTouchesBox(const TextureOverlayStore::SurfacePaintStamp& stamp,
-                                                 const glm::ivec3& minLod0,
-                                                 const glm::ivec3& maxLod0) {
-    return !(stamp.bboxMaxLod0.x < minLod0.x || stamp.bboxMinLod0.x > maxLod0.x ||
-             stamp.bboxMaxLod0.y < minLod0.y || stamp.bboxMinLod0.y > maxLod0.y ||
-             stamp.bboxMaxLod0.z < minLod0.z || stamp.bboxMinLod0.z > maxLod0.z);
-}
-
-VoxelTextureData TextureOverlayStore::sampleSurfacePaintStampsLocked(const glm::ivec3& lodCoord,
-                                                                     int lod,
-                                                                     uint8_t face) const {
-    if (m_surfacePaintStamps.empty()) {
-        return {};
-    }
-
-    const int step = (lod > 0) ? (1 << lod) : 1;
-    const int halfStep = step / 2;
-    const glm::ivec3 lod0Base = lodToLOD0(lodCoord, lod);
-    const glm::ivec3 lod0Sample = lod0Base + glm::ivec3(halfStep);
-    const glm::ivec3 chunk = WorldConfig::microVoxelToChunk(lod0Sample);
-
-    auto it = m_surfacePaintStampChunkIndex.find(chunk);
-    if (it == m_surfacePaintStampChunkIndex.end()) {
-        return {};
-    }
-
-    const uint8_t queryFace = static_cast<uint8_t>(face % 6u);
-    const int queryAxis = queryFace / 2;
-    const float querySign = (queryFace & 1u) ? 1.0f : -1.0f;
-
-    glm::vec3 faceCenter = glm::vec3(lod0Sample) + glm::vec3(0.5f);
-    faceCenter[queryAxis] += querySign * 0.5f;
-
-    const auto& candidates = it->second;
-    for (auto rit = candidates.rbegin(); rit != candidates.rend(); ++rit) {
-        const uint32_t stampIndex = *rit;
-        if (stampIndex >= m_surfacePaintStamps.size()) {
-            continue;
-        }
-
-        const SurfacePaintStamp& stamp = m_surfacePaintStamps[stampIndex];
-        if (!surfaceStampTouchesBox(stamp, lod0Sample, lod0Sample)) {
-            continue;
-        }
-
-        // Large paint brushes must behave like 3D surface-volume brushes, not
-        // face-plane decals.  The mesher only asks for real exposed faces, so
-        // testing the exposed face centre against the bounded stamp volume is
-        // enough to cover uneven terrain while avoiding the old through-slab
-        // vertical projection artifact.
-        const glm::vec3 d = faceCenter - stamp.centerVoxelLod0;
-        const float lodPad = std::max(1.0f, 0.51f * static_cast<float>(std::max(1, step)));
-        const float radius = static_cast<float>(stamp.radiusVoxelsLod0) + lodPad;
-
-        bool inside = false;
-        if (stamp.shape == SurfaceBrushShape::Disc) {
-            inside = glm::dot(d, d) <= radius * radius;
-        } else {
-            auto absf = [](float v) { return v < 0.0f ? -v : v; };
-            inside = absf(d.x) <= radius &&
-                     absf(d.y) <= radius &&
-                     absf(d.z) <= radius;
-        }
-
-        if (!inside) {
-            continue;
-        }
-
-        return VoxelTextureData(
-            stamp.type,
-            variedVariant(lod0Sample, queryFace, stamp.type, stamp.variant),
-            0u,
-            queryFace);
-    }
-
-    return {};
-}
-
-} // namespace TextureOverlay
+} // namespace TerrainEdit
 
 ````
 
-## include\world\edit\TextureOverlayStore.h
+## include\world\edit\TerrainEditMesher.h
 
-Description: No CC-DESC found. C++ struct 'VoxelTextureData'.
+Description: No CC-DESC found. C++ class 'TerrainEditMesher'.
 
 ````cpp
 #pragma once
 
-// GPT-DESC: Declares sparse texture material storage and deferred/live surface paint stamps.
-
-#include <array>
-#include <atomic>
-#include <cstdint>
-#include <memory>
-#include <shared_mutex>
-#include <unordered_map>
+#include "world/edit/TerrainEditTypes.h"
+#include "world/edit/TerrainFieldSource.h"
+#include "world/edit/HeightmapBaseSampler.h"
+#include "rendering/common/Mesh.h"
 #include <vector>
-
+#include <cstdint>
 #include <glm/glm.hpp>
 
-#include "world/WorldTypes.h"
-#include "world/config/WorldConfig.h"
+// Forward declaration — full header included in TerrainEditMesher.cpp
+namespace TerrainEdit { class VoxelBaseSampler; }
 
-namespace TextureOverlay {
+namespace TerrainEdit {
 
-// ---------------------------------------------------------------------------
-// Texture material types and per-voxel storage
-// ---------------------------------------------------------------------------
+/**
+ * Runtime greedy mesher for edited terrain chunks.
+ *
+ * Takes a TerrainFieldSource (base heightmap + sparse edit overlay) and produces
+ * greedy-meshed vertex/index data compatible with the engine's packed
+ * geometry + procedural material vertex format and SubChunk pipeline.
+ *
+ * Design priorities (in order):
+ *   1. Correctness — watertight meshes matching the packed vertex format
+ *   2. Speed — greedy merge identical faces, minimal allocations
+ *   3. Quality — per-vertex AO matching the offline tool's approach
+ */
+class TerrainEditMesher {
+public:
+    struct MeshStats {
+        float cacheBuildMs{0.0f};    // solid cache construction
+        float greedyMeshMs{0.0f};   // face detection + greedy merge + AO
+        float postProcessMs{0.0f};  // dedup/reorder/fast-compaction (usually 0 in fast mode)
+        float downsampleMs{0.0f};    // LOD downsample loop (LOD>0 + overlay only)
+        uint8_t downsampleCacheState{0}; // 0=miss, 1=full hit (no work), 2=partial (region recompute)
+        uint32_t cacheVoxels{0};     // total voxels in solid cache
+        uint32_t solidVoxels{0};     // solid voxels in cache
+        uint32_t facesEmitted{0};    // quads emitted before merge
+        int scanYRange{0};           // scanMaxY - scanMinY + 1
+        int cacheDimXZ{0};           // cache XZ dimension (with padding)
+        bool adaptiveEnabled{false}; // true when the chunk was actually split
+        uint32_t adaptiveLeafRegions{0};
+        uint32_t adaptiveSplitRegions{0};
+        uint32_t adaptiveMaxDepth{0};
+        uint32_t adaptivePeakRegionVoxels{0};
+        uint32_t adaptivePeakYRange{0};
+        uint64_t adaptiveWorkVoxels{0};   // sum of leaf region volumes
+        uint64_t monolithicWorkVoxels{0}; // equivalent single-region volume
 
-enum class TextureType : uint8_t {
-    Grass = 0,
-    Mud = 1,
-    Dirt = 2,
-    Sand = 3,
-    COUNT = 4
+        // Tier B Phase 1 scaffolding (no behavior change yet).
+        // bandLocalYMin/Max are the chunk-local Y range the caller asked us
+        // to remesh; -1/-1 = full chunk (current behavior). Future Phase 2
+        // will clip the greedy face loop to this band and splice with a
+        // cached out-of-band mesh.
+        int      bandLocalYMin{-1};
+        int      bandLocalYMax{-1};
+        bool     bandActive{false};       // true if Phase 2 actually clipped
+        uint32_t bandFacesEmitted{0};     // faces emitted inside the band
+    };
+
+    struct MeshResult {
+        std::vector<Vertex>   vertices;
+        std::vector<uint32_t> indices;
+        glm::vec3 aabbMin{1e10f};
+        glm::vec3 aabbMax{-1e10f};
+        MeshStats stats;
+        bool empty() const { return vertices.empty(); }
+    };
+
+    /**
+     * Split a mesh with uint32_t indices into multiple GPU-uploadable
+     * sub-meshes. The runtime path prefers spatial grid splits (2x2, 3x3,
+     * 4x4) before falling back to linear triangle-order splitting so heavily
+     * edited chunks keep a stable silhouette while staying under the 16-bit
+     * index limit.
+     */
+    struct SubMesh {
+        std::vector<Vertex>   vertices;
+        std::vector<uint16_t> indices;
+    };
+    static std::vector<SubMesh> splitToSubMeshes(const MeshResult& mesh);
+
+    /**
+     * Mesh one chunk from the merged terrain field at native (0.25 m) voxel resolution.
+     *
+     * @param field             Merged terrain field source (base + overlay)
+     * @param chunkCoord        Chunk coordinate in World chunk space (e.g. 0..159)
+     * @param chunkSizeVoxels   Number of voxels per chunk edge XZ (128)
+     * @param chunkHeightVoxels Number of voxels per chunk height Y (512)
+     * @param voxelSize         Size of one voxel in meters (0.25)
+     * @param hintMinY          Optional lower bound of solid voxels (from heightmap).
+     *                          –1 means "unknown — the mesher must scan".
+     * @param hintMaxY          Optional upper bound (same convention).
+     */
+    static MeshResult meshChunk(const TerrainFieldSource& field,
+                                const glm::ivec3& chunkCoord,
+                                int chunkSizeVoxels = 128,
+                                int chunkHeightVoxels = 512,
+                                float voxelSize = 0.25f,
+                                int hintMinY = -1,
+                                int hintMaxY = -1,
+                                const HeightmapBaseSampler* heightmap = nullptr,
+                                int lodLevel = 0,
+                                bool skipPostProcess = false,
+                                bool skipAmbientOcclusion = false,
+                                const RemeshCancellationToken* cancelToken = nullptr,
+                                const VoxelBaseSampler* voxelBase = nullptr,
+                                // Optional edit-dirty world-voxel AABB for the LOD>0 incremental
+                                // downsample fast path. {INT_MIN, INT_MAX} = sentinel "unknown,
+                                // do full downsample". Components are inclusive native voxel coords.
+                                const glm::ivec3* editDirtyVoxelMin = nullptr,
+                                const glm::ivec3* editDirtyVoxelMax = nullptr,
+                                // Tier B Phase 1 scaffolding: chunk-local Y band the caller
+                                // would prefer the greedy loop to focus on. -1/-1 = full chunk
+                                // (current behavior, splice not yet wired). Phase 2 will use
+                                // these to clip the face emission loop and splice the result
+                                // with a per-chunk face cache.
+                                int bandLocalYMin = -1,
+                                int bandLocalYMax = -1);
+
+private:
+    struct FaceAO {
+        uint8_t bl{0}, br{0}, tr{0}, tl{0};
+        bool operator==(const FaceAO& o) const {
+            return bl == o.bl && br == o.br && tr == o.tr && tl == o.tl;
+        }
+        bool operator!=(const FaceAO& o) const { return !(*this == o); }
+    };
+
+    /**
+     * Internal: query whether a voxel is solid at world voxel coordinate.
+     * Wraps TerrainFieldSource::sample, converting voxel coords to grid coords.
+     */
+    static bool isSolid(const TerrainFieldSource& field,
+                        int worldVoxelX, int worldVoxelY, int worldVoxelZ);
+
+    /// Calculate ambient occlusion for one face vertex quartet.
+    static FaceAO calcAO(const TerrainFieldSource& field,
+                         int wx, int wy, int wz,
+                         int axis, int direction);
+
+    // --- Cache-based fast paths (no locks, no hashing) ---
+
+    /**
+     * Pre-built solid cache covering [baseX, baseX+dimXZ) × [minY, minY+dimY) × [baseZ, baseZ+dimXZ).
+     * Stores 1 = solid, 0 = air.  Index: ((y-minY)*dimXZ + (z-baseZ))*dimXZ + (x-baseX).
+     */
+    struct SolidCache {
+        const uint8_t* data;
+        int baseX, baseZ, minY;
+        int dimXZ, dimY;
+
+        inline bool get(int wx, int wy, int wz) const {
+            const int cx = wx - baseX;
+            const int cy = wy - minY;
+            const int cz = wz - baseZ;
+            if (cx < 0 || cx >= dimXZ || cy < 0 || cy >= dimY || cz < 0 || cz >= dimXZ)
+                return false;
+            return data[static_cast<size_t>((cy * dimXZ + cz) * dimXZ + cx)] != 0;
+        }
+
+        /// Unchecked access — caller guarantees coords are within the padded cache.
+        /// Saves ~6 comparisons per call vs get().
+        inline bool getUnchecked(int wx, int wy, int wz) const {
+            return data[static_cast<size_t>(((wy - minY) * dimXZ + (wz - baseZ)) * dimXZ + (wx - baseX))] != 0;
+        }
+    };
+
+    /// Build the solid cache for a chunk and its 1-voxel border (heightmap path).
+    static std::vector<uint8_t> buildSolidCache(
+        const TerrainFieldSource& field,
+        const HeightmapBaseSampler& heightmap,
+        int baseVoxelX, int baseVoxelZ,
+        int cacheMinY, int cacheDimXZ, int cacheDimY,
+        const RemeshCancellationToken* cancelToken = nullptr);
+
+    /// Build solid cache when a 3D voxel base is used instead of a heightmap.
+    /// Starts all-air, bulk-applies voxelBase store, then bulk-applies edit overlay.
+    static std::vector<uint8_t> buildSolidCacheVoxelBase(
+        const TerrainFieldSource& field,
+        const VoxelBaseSampler& voxelBase,
+        int baseVoxelX, int baseVoxelZ,
+        int cacheMinY, int cacheDimXZ, int cacheDimY);
+
+    /// Cache-based AO calculation (no locks).
+    static FaceAO calcAOCached(const SolidCache& cache,
+                               int wx, int wy, int wz,
+                               int axis, int direction);
+
+    /// Mesh a single Y-band sub-region using a pre-built solid cache.
+    /// The band covers Y ∈ [bandMinY, bandMaxY] inclusive.
+    static void meshBandRegion(MeshResult& result,
+                               const SolidCache& cache,
+                               int chunkSizeVoxels,
+                               int chunkHeightVoxels,
+                               int baseX, int baseZ,
+                               int bandMinY, int bandMaxY);
+
+    /// Emit a greedy-merged quad into the result.
+    static void addQuad(MeshResult& out,
+                        int axis, int slicePos,
+                        int u, int v,
+                        int quadW, int quadH,
+                        int direction, uint8_t face,
+                        uint32_t material,
+                        const FaceAO& ao);
 };
 
-// Transition edge style used for material boundaries.
-// Stored in VoxelTextureData::edgeMask (2 bits).
-enum class TransitionEdgeStyle : uint8_t {
-    None = 0,
-    Leafy = 1,
-    Sloppy = 2,
-    Grainy = 3
+} // namespace TerrainEdit
+
+````
+
+## include\rendering\common\Mesh.h
+
+Description: No CC-DESC found. C++ struct 'Vertex'.
+
+````cpp
+#pragma once
+
+#include <glm/glm.hpp>
+#include <vector>
+#include <cstdint>
+
+// Compact terrain vertex format.
+// Bit packing: X(8 bits) + Y(10 bits) + Z(8 bits) + face(3 bits) + AO(3 bits) = 32 bits
+// - X: 8 bits = 0-128 (vertex positions for 128 voxels need 129 values)
+// - Y: 10 bits = 0-1023 (supports vertical chunk stacks without height-1 offset seams)
+// - Z: 8 bits = 0-128 (vertex positions for 128 voxels need 129 values)
+// - Face: 3 bits = 6 directions
+// - AO: 3 bits = ambient occlusion level
+//
+// Material is intentionally tiny metadata, not per-voxel bitmap data. Generated
+// terrain can carry a fallback 32-bit procedural-material word per vertex, while
+// texture-paint edits normally arrive through the sparse material overlay SSBO.
+struct Vertex {
+    uint32_t packed{0};
+    uint32_t material{0};
 };
 
-enum class SurfaceBrushShape : uint8_t {
-    Disc = 0,
-    Rect = 1
-};
+namespace VertexPacking {
+    inline uint32_t textureResolutionLog2(uint16_t pixelsPerVoxel) {
+        uint32_t p = pixelsPerVoxel;
+        if (p < 2u) p = 2u;
+        if (p > 1024u) p = 1024u;
+        uint32_t log2 = 1u;
+        while ((1u << log2) < p && log2 < 10u) {
+            ++log2;
+        }
+        return log2;
+    }
 
-inline const char* textureTypeName(TextureType t) {
-    switch (t) {
-        case TextureType::Grass: return "grass";
-        case TextureType::Mud:   return "mud";
-        case TextureType::Dirt:  return "dirt";
-        case TextureType::Sand:  return "sand";
-        default: return "?";
+    inline uint32_t packMaterial(uint8_t type,
+                                 uint8_t variant,
+                                 uint8_t edgeMask,
+                                 uint16_t pixelsPerVoxel) {
+        return 0x80000000u |
+               ((static_cast<uint32_t>(type) & 0x3u) << 0) |
+               ((static_cast<uint32_t>(variant) & 0x7u) << 2) |
+               ((static_cast<uint32_t>(edgeMask) & 0x3u) << 5) |
+               ((textureResolutionLog2(pixelsPerVoxel) & 0xFu) << 7);
+    }
+
+    // Pack chunk-relative position into uint32.
+    // Bit layout: X(8) | Y(10) | Z(8) | face(3) | AO(3) = 32 bits total
+    inline Vertex packChunkRelativeVertex(float chunkRelX,
+                                          float chunkRelY,
+                                          float chunkRelZ,
+                                          uint8_t faceDir,
+                                          uint8_t extras = 0) {
+        // X: 0-8m -> 0-128 (8 bits) - 128 voxels need 129 vertex positions
+        uint32_t x = static_cast<uint32_t>(glm::clamp(chunkRelX * (128.0f / 8.0f), 0.0f, 128.0f));
+        // Y: Store direct voxel coordinate (0-1023) to avoid height-1 seams on stacked Y chunks
+        uint32_t y = static_cast<uint32_t>(glm::clamp(chunkRelY * 4.0f, 0.0f, 1023.0f));
+        // Z: 0-8m -> 0-128 (8 bits) - 128 voxels need 129 vertex positions
+        uint32_t z = static_cast<uint32_t>(glm::clamp(chunkRelZ * (128.0f / 8.0f), 0.0f, 128.0f));
+        // Face: 0-7 (3 bits)
+        uint32_t face = static_cast<uint32_t>(faceDir) & 0x7;
+        // Extras: 3-bit payload for AO (bits 29-31)
+        uint32_t extraBits = static_cast<uint32_t>(extras) & 0x7;
+        
+        // Pack into 32 bits: X(bits 0-7) | Y(bits 8-17) | Z(bits 18-25) | face(bits 26-28) | AO(bits 29-31)
+        uint32_t packed = (x << 0) | (y << 8) | (z << 18) | (face << 26) | (extraBits << 29);
+        
+        return {packed, 0u};
+    }
+    
+    // Face normal indices
+    enum FaceDirection : uint8_t {
+        FACE_NEG_X = 0,
+        FACE_POS_X = 1,
+        FACE_NEG_Y = 2,
+        FACE_POS_Y = 3,
+        FACE_NEG_Z = 4,
+        FACE_POS_Z = 5
+    };
+    
+    // Pack color and face direction into 16-bit integer
+    // [0-9]   Color index (10 bits, 0-1023) - 10-bit palette for better color fidelity
+    // [10-12] Face normal (3 bits, 0-5)
+    // [13-15] Spare (3 bits)
+    inline uint16_t packData(uint16_t colorIndex, uint8_t faceDir) {
+        uint16_t color = colorIndex & 0x3FF;  // 10 bits
+        uint16_t face = static_cast<uint16_t>(faceDir) & 0x7;  // 3 bits
+        
+        return (color << 0) | (face << 10);
+    }
+    
+    // Color palette: map RGB colors to 10-bit indices (1024 colors)
+    // Returns index into a 1024-color palette (better than 8-bit)
+    inline uint16_t rgbToColorIndex(const glm::vec3& rgb) {
+        // 10-bit palette: 4-3-3 bit RGB encoding
+        // R: 4 bits (16 levels), G: 3 bits (8 levels), B: 3 bits (8 levels)
+        uint16_t r = static_cast<uint16_t>(rgb.r * 15.0f) & 0xF;
+        uint16_t g = static_cast<uint16_t>(rgb.g * 7.0f) & 0x7;
+        uint16_t b = static_cast<uint16_t>(rgb.b * 7.0f) & 0x7;
+        
+        return (r << 6) | (g << 3) | b;
+    }
+    
+    // Determine face direction from axis and direction
+    inline uint8_t getFaceDirection(int axis, int dir) {
+        // axis: 0=X, 1=Y, 2=Z
+        // dir: -1=negative, +1=positive
+        return static_cast<uint8_t>(axis * 2 + (dir > 0 ? 1 : 0));
     }
 }
 
-// Per-voxel texture assignment.  Packed into 1 byte:
-//   bit 0..1  textureType (4 types)
-//   bit 2..4  variant (8 variants — we only need 5 in practice)
-//   bit 5..6  edgeMask (2 bits, reserved for transition flags)
-//   bit 7     valid flag (1 = painted, 0 = empty)
-//
-// The valid flag is essential: without it, "Grass + variant 0" would collide
-// with "empty" (both packed=0).  It's the only way to clear a cell back to
-// its un-painted state via the same packed byte.
-struct VoxelTextureData {
-    uint8_t packed{0};
-    uint8_t face{3}; // 0..5, same face IDs as the terrain vertex format.
-
-    constexpr VoxelTextureData() = default;
-    VoxelTextureData(TextureType type,
-                     uint8_t variant,
-                     uint8_t edgeMask = 0,
-                     uint8_t faceId = 3) {
-        packed = static_cast<uint8_t>(
-            0x80u |  // valid flag
-            (static_cast<uint32_t>(type) & 0x3u) |
-            ((variant & 0x7u) << 2) |
-            ((edgeMask & 0x3u) << 5));
-        face = static_cast<uint8_t>(faceId % 6u);
-    }
-
-    TextureType getType() const {
-        return static_cast<TextureType>(packed & 0x3u);
-    }
-    uint8_t getVariant() const {
-        return static_cast<uint8_t>((packed >> 2) & 0x7u);
-    }
-    uint8_t getEdgeMask() const {
-        return static_cast<uint8_t>((packed >> 5) & 0x3u);
-    }
-    uint8_t getFace() const { return face; }
-    bool isEmpty() const { return (packed & 0x80u) == 0; }
-
-    VoxelTextureData withEdgeMask(uint8_t edgeMask) const {
-        if (isEmpty()) return *this;
-        VoxelTextureData out = *this;
-        out.packed = static_cast<uint8_t>(
-            (out.packed & ~0x60u) | ((edgeMask & 0x3u) << 5));
-        return out;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Per-LOD resolution config
-//
-// Each LOD level has its own pixels-per-voxel-face value. Selectable from
-// 2,4,8,...,1024. The terrain shader uses this to quantize procedural pixel
-// detail on a face emitted for that LOD.
-// ---------------------------------------------------------------------------
-
-struct LODTextureConfig {
-    // Texels per voxel face edge.  Must be a power of two >= 2 and <= 1024.
-    // Default cascade: LOD 0 = 16 px, LOD 1 = 8 px, LOD 2 = 4 px, LOD 3 = 2 px
-    uint16_t pixelsPerVoxel{4};
-    // If false, no painting is authored at this LOD.
-    bool enabled{true};
-};
-
-// ---------------------------------------------------------------------------
-// Sparse storage primitives
-// ---------------------------------------------------------------------------
-
-// 8x8x8 brick of texture cells (matches the edit-overlay brick size).
-struct TextureBrick {
-    static constexpr int SIZE = 8;
-    static constexpr int CELLS = SIZE * SIZE * SIZE;
-
-    std::array<VoxelTextureData, CELLS> cells{};
-    uint32_t activeCount{0};
-
-    static int toIndex(int lx, int ly, int lz) {
-        return lx + ly * SIZE + lz * SIZE * SIZE;
-    }
-};
-
-// ---------------------------------------------------------------------------
-// Sparse, per-LOD voxel-face material store
-//
-// LOD storage:
-//   - One independent BrickMap per LOD level (4 levels).
-//   - Coordinates within each LOD's BrickMap are voxel coords *at that LOD*.
-//     i.e. an LOD-1 voxel coordinate = lod0Coord >> 1, LOD-2 = lod0Coord >> 2.
-//
-// Paint operations take the LOD level explicitly so the brush can target the
-// LOD that the hit chunk is currently rendered at, and the radius scales
-// naturally (the stored cell footprint at LOD-N is 1/(2^N) of the LOD-0
-// footprint for the same world distance).
-// ---------------------------------------------------------------------------
-
-class TextureOverlayStore {
+class Mesh {
 public:
-    struct SurfaceFaceStamp {
-        glm::ivec3 lodCoord{0};
-        uint8_t face{3};
-    };
+    std::vector<Vertex> vertices;
+    std::vector<uint16_t> indices;
 
-    // Deferred surface brush command. This is the interactive O(1) authoring path:
-    // one huge brush stroke stores one stamp and affected chunks are rebaked later.
-    // The mesher resolves stamps through getSurfaceTexture() while emitting real
-    // terrain faces, so the click path never expands radius^2 faces.
-    struct SurfacePaintStamp {
-        glm::vec3 centerVoxelLod0{0.0f};
-        glm::ivec3 bboxMinLod0{0};
-        glm::ivec3 bboxMaxLod0{0};
-        int radiusVoxelsLod0{1};
-        SurfaceBrushShape shape{SurfaceBrushShape::Disc};
-        TextureType type{TextureType::Grass};
-        uint8_t variant{0};
-        uint8_t sourceFace{255};
-        uint32_t order{0};
-    };
+    Mesh() = default;
+    Mesh(const std::vector<Vertex>& verts, const std::vector<uint16_t>& inds)
+        : vertices(verts), indices(inds) {}
 
-    struct GPUCell {
-        int32_t x{0};
-        int32_t y{0};
-        int32_t z{0};
-        uint32_t lod{0};
-        uint32_t packed{0};
-        uint32_t face{3};
-    };
-
-    static constexpr int LOD_COUNT = MAX_LOD_LEVELS;
-    static constexpr int RES_OPTION_COUNT = 10;
-    static const uint16_t RES_OPTIONS[RES_OPTION_COUNT];   // {2,4,8,...,1024}
-    static const char*   RES_OPTION_LABELS[RES_OPTION_COUNT];
-
-    TextureOverlayStore();
-
-    // -------- Per-LOD configuration --------
-    void setLODConfig(int lod, const LODTextureConfig& cfg);
-    LODTextureConfig getLODConfig(int lod) const;
-
-    // -------- Single-cell access (LOD-aware) --------
-    // 'lodCoord' is in voxel coords at the requested LOD level.
-    void setTexture(const glm::ivec3& lodCoord, int lod, VoxelTextureData data);
-    VoxelTextureData getTexture(const glm::ivec3& lodCoord, int lod) const;
-    VoxelTextureData getSurfaceTexture(const glm::ivec3& lodCoord,
-                                       int lod,
-                                       uint8_t face) const;
-    bool hasSurfaceTexturesInBox(const glm::ivec3& minLodCoord,
-                                 const glm::ivec3& maxExclusiveLodCoord,
-                                 int lod) const;
-    void clearTexture(const glm::ivec3& lodCoord, int lod);
-
-    // -------- Brush paint operations --------
-    // 'centerLod0' is the world-voxel center *at LOD-0*; the paint operation
-    // automatically converts to the target LOD's resolution.
-    // 'radiusVoxelsLod0' is the brush radius in LOD-0 voxels.
-    // Returns the number of LOD cells written.
-    int paintSphere(const glm::ivec3& centerLod0,
-                    int radiusVoxelsLod0,
-                    int lod,
-                    TextureType type,
-                    uint8_t variant);
-    int paintBox(const glm::ivec3& minLod0,
-                 const glm::ivec3& maxLod0,
-                 int lod,
-                 TextureType type,
-                 uint8_t variant);
-
-    // Fast surface stamps for texture painting. They write only the face plane
-    // under the cursor instead of filling a 3D volume.
-    int paintFaceDisc(const glm::ivec3& centerLod0,
-                      int radiusVoxelsLod0,
-                      int normalAxis,
-                      int lod,
-                      TextureType type,
-                      uint8_t variant,
-                      uint8_t face,
-                      int maxCells = 300000);
-    int paintFaceRect(const glm::ivec3& centerLod0,
-                      int radiusVoxelsLod0,
-                      int normalAxis,
-                      int lod,
-                      TextureType type,
-                      uint8_t variant,
-                      uint8_t face,
-                      int maxCells = 300000);
-    int paintSurfaceFaces(const std::vector<SurfaceFaceStamp>& faces,
-                          int lod,
-                          TextureType type,
-                          uint8_t variant);
-
-    // Theoretical-minimum interactive brush path. Stores one deferred stamp
-    // instead of expanding the brush into per-face cells. Returned value is
-    // the monotonically increasing stamp order, or 0 if the stamp was rejected.
-    uint32_t appendSurfacePaintStamp(const glm::vec3& centerWorld,
-                                     int radiusVoxelsLod0,
-                                     SurfaceBrushShape shape,
-                                     TextureType type,
-                                     uint8_t variant,
-                                     uint8_t sourceFace = 255);
-    size_t getSurfacePaintStampCount() const;
-
-    // Copy newest deferred paint stamps for the bounded live GPU overlay.
-    // Returned stamps stay chronological; the shader scans newest-first.
-    size_t exportLiveSurfacePaintStamps(std::vector<SurfacePaintStamp>& out,
-                                        size_t maxStamps) const;
-
-    int clearSphere(const glm::ivec3& centerLod0,
-                    int radiusVoxelsLod0,
-                    int lod);
-    int clearBox(const glm::ivec3& minLod0,
-                 const glm::ivec3& maxLod0,
-                 int lod);
-
-    // Cascade a paint from sourceLod to all coarser LODs (sourceLod+1..MAX).
-    // Useful when the user paints at LOD 0 and wants the texture to show up
-    // when the chunk later transitions to a coarser LOD.  Returns total cells
-    // written across all cascaded LODs.
-    int cascadeToCoarserLODs(const glm::ivec3& centerLod0,
-                             int radiusVoxelsLod0,
-                             int sourceLod,
-                             TextureType type,
-                             uint8_t variant);
-    int cascadeFaceToCoarserLODs(const glm::ivec3& centerLod0,
-                                 int radiusVoxelsLod0,
-                                 int normalAxis,
-                                 int sourceLod,
-                                 SurfaceBrushShape shape,
-                                 TextureType type,
-                                 uint8_t variant,
-                                 uint8_t face,
-                                 int maxCellsPerLOD = 300000);
-
-    // -------- Stats / state --------
-    struct Stats {
-        size_t bricksByLOD[LOD_COUNT]{};
-        size_t cellsByLOD[LOD_COUNT]{};
-        size_t totalBricks{0};
-        size_t totalCells{0};
-        size_t surfaceStampCount{0};
-        size_t generation{0};
-    };
-    Stats getStats() const;
-    size_t exportGPUCells(std::vector<GPUCell>& out, size_t maxCells) const;
-    size_t exportGPUCellsForLOD(int lod, std::vector<GPUCell>& out, size_t maxCells) const;
-    size_t consumeDirtyGPUCells(std::vector<GPUCell>& out,
-                                size_t maxCells,
-                                bool& requiresFullUpload);
-    bool isEmpty() const;
-    void clear();
-    void clearLOD(int lod);
-
-    // Monotonically incremented every write — used by mesher caches.
-    size_t getGeneration() const {
-        return m_generation.load(std::memory_order_acquire);
-    }
-
-    // -------- Persistence (binary) --------
-    bool saveToFile(const char* path) const;
-    bool loadFromFile(const char* path);
-
-    // -------- LOD/coordinate helpers --------
-    static glm::ivec3 lod0ToLOD(const glm::ivec3& lod0Coord, int lod) {
-        const int shift = lod;
-        // Arithmetic shift handles negative coords correctly for power-of-two
-        // downsampling — equivalent to floor(coord / 2^lod) for negatives too.
-        return glm::ivec3(lod0Coord.x >> shift,
-                          lod0Coord.y >> shift,
-                          lod0Coord.z >> shift);
-    }
-    static glm::ivec3 lodToLOD0(const glm::ivec3& lodCoord, int lod) {
-        return glm::ivec3(lodCoord.x << lod,
-                          lodCoord.y << lod,
-                          lodCoord.z << lod);
-    }
-
-private:
-    struct BrickKey {
-        int32_t bx, by, bz;
-        bool operator==(const BrickKey& o) const noexcept {
-            return bx == o.bx && by == o.by && bz == o.bz;
-        }
-    };
-    struct BrickKeyHash {
-        size_t operator()(const BrickKey& k) const noexcept {
-            // splitmix-style mix; cheap and good distribution
-            uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(k.bx)) * 73856093ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(k.by)) * 19349663ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(k.bz)) * 83492791ull;
-            h ^= h >> 33;
-            return static_cast<size_t>(h);
-        }
-    };
-    using BrickMap = std::unordered_map<BrickKey,
-                                        std::unique_ptr<TextureBrick>,
-                                        BrickKeyHash>;
-
-    static BrickKey voxelToBrick(const glm::ivec3& v);
-    static glm::ivec3 voxelLocalInBrick(const glm::ivec3& v);
-    static glm::ivec3 encodeFaceCoord(const glm::ivec3& voxelCoord, uint8_t face);
-    static glm::ivec3 decodeFaceCoord(const glm::ivec3& storageCoord, uint8_t& face);
-
-    TextureBrick* getOrCreateBrickLocked(BrickMap& map, int lod, BrickKey key);
-    TextureBrick* getBrickLocked(BrickMap& map, BrickKey key);
-    const TextureBrick* getBrickLocked(const BrickMap& map, BrickKey key) const;
-
-    void writeCellLocked(BrickMap& map, int lod, BrickKey key,
-                         const glm::ivec3& local,
-                         VoxelTextureData data);
-
-    static uint8_t classifyTransitionEdge(TextureType a,
-                                          TextureType b,
-                                          const glm::ivec3& lodCoord);
-    static uint8_t mergeEdgeStyle(uint8_t lhs, uint8_t rhs);
-    void recordDirtyGPUCellLocked(int lod,
-                                  const glm::ivec3& lodCoord,
-                                  VoxelTextureData data);
-    void requestFullGPUUploadLocked();
-    void refreshTransitionEdgesAroundCellLocked(BrickMap& map,
-                                                int lod,
-                                                const glm::ivec3& lodCoord);
-    void refreshTransitionEdgesAroundFaceLocked(BrickMap& map,
-                                                int lod,
-                                                const glm::ivec3& lodCoord,
-                                                uint8_t face);
-
-    struct SurfacePaintChunkHash {
-        size_t operator()(const glm::ivec3& v) const noexcept {
-            uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(v.x)) * 73856093ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.y)) * 19349663ull;
-            h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.z)) * 83492791ull;
-            h ^= h >> 33;
-            return static_cast<size_t>(h);
-        }
-    };
-    void indexSurfacePaintStampLocked(uint32_t stampIndex);
-    VoxelTextureData sampleSurfacePaintStampsLocked(const glm::ivec3& lodCoord,
-                                                    int lod,
-                                                    uint8_t face) const;
-    static bool surfaceStampTouchesBox(const SurfacePaintStamp& stamp,
-                                       const glm::ivec3& minLod0,
-                                       const glm::ivec3& maxLod0);
-
-    bool isLodValid(int lod) const { return lod >= 0 && lod < LOD_COUNT; }
-
-    // One BrickMap per LOD.  Indices 0..MAX_LOD_LEVEL.
-    std::array<BrickMap, LOD_COUNT> m_lodMaps;
-    std::array<size_t, LOD_COUNT> m_brickCountsByLOD{};
-    std::array<size_t, LOD_COUNT> m_cellCountsByLOD{};
-
-    std::array<LODTextureConfig, LOD_COUNT> m_lodConfigs;
-
-    mutable std::shared_mutex m_mutex;
-    std::atomic<size_t> m_generation{0};
-
-    // Deferred brush stamps indexed by affected native chunk. The stamp vector
-    // is append-only between clears, so chunk index entries can store stable
-    // integer indices. Newest stamp wins during mesher material sampling.
-    std::vector<SurfacePaintStamp> m_surfacePaintStamps;
-    std::unordered_map<glm::ivec3, std::vector<uint32_t>, SurfacePaintChunkHash>
-        m_surfacePaintStampChunkIndex;
-    uint32_t m_nextSurfacePaintStampOrder{1};
-
-    // Dirty LOD0 face cells consumed by the terrain material overlay SSBO.
-    // Full-upload mode is used for clears/config changes and delta overflow.
-    std::vector<GPUCell> m_dirtyGPUCells;
-    bool m_dirtyGPUFullUpload{false};
+    // Factory methods for common shapes
+    static Mesh createCube();
 };
 
-} // namespace TextureOverlay
+````
+
+## src\world\chunks\core\ChunkJobs.cpp
+
+Description: No CC-DESC found.
+
+````cpp
+#include "world/chunks/core/ChunkJobs.h"
+#include "world/World.h"
+#include "world/config/WorldConfig.h"
+#include "world/TerrainFileLoader.h"
+#include "world/chunks/core/ChunkManager.h"
+#include "world/edit/TerrainEditMesher.h"
+#include "world/edit/TerrainEditDCCMMesher.h"
+#include "world/edit/TerrainFieldSource.h"
+#include "world/edit/HeightmapBaseSampler.h"
+#include "rendering/common/Mesh.h"
+#include <algorithm>
+#include <iostream>
+#include <map>
+
+// C-nits 8: Global state removed, now owned by World class
+
+// EntityHash implementation
+std::size_t EntityHash::operator()(entt::entity value) const noexcept {
+    return static_cast<std::size_t>(entt::to_integral(value));
+}
+
+// Chunk version state management
+std::shared_ptr<ChunkVersionState> ensureChunkVersionState(World* world, entt::entity entity) {
+    if (!world || entity == entt::null) {
+        return nullptr;
+    }
+    std::scoped_lock lock(world->chunkVersionMutex());
+    auto& states = world->getChunkVersionStates();
+    auto it = states.find(entity);
+    if (it != states.end()) {
+        return it->second;
+    }
+    auto state = std::make_shared<ChunkVersionState>();
+    states.emplace(entity, state);
+    return state;
+}
+
+void removeChunkVersionState(World* world, entt::entity entity) {
+    if (!world || entity == entt::null) {
+        return;
+    }
+    std::scoped_lock lock(world->chunkVersionMutex());
+    world->getChunkVersionStates().erase(entity);
+}
+
+bool payloadStillCurrent(const ChunkPipelinePayload* payload) {
+    if (!payload || !payload->world || !payload->versionState) {
+        return false;
+    }
+    // NOTE: We intentionally do NOT call registry.valid() here.
+    // This function is called from worker threads without holding
+    // m_registryMutex, so registry.valid() would race with
+    // entity destruction on the lifecycle thread.
+    // The atomic version check alone is sufficient: the version is
+    // bumped before entity destruction, so a mismatch guarantees
+    // the entity is stale / being destroyed.
+    const uint32_t activeVersion = payload->versionState->version.load(std::memory_order_acquire);
+    return activeVersion == payload->version;
+}
+
+// Legacy terrain files store packed verts as:
+//   X(8) | Y(9, height-1) | Z(8) | face(3) | AO(3)
+// Runtime now uses:
+//   X(8) | Y(10) | Z(8) | face(3) | AO(3)
+//         bits 0..7  8..17   18..25   26..28   29..31
+static uint32_t repackLegacyPackedVertex(uint32_t packedLegacy) {
+    const uint32_t x = (packedLegacy >> 0) & 0xFFu;
+    const uint32_t yLegacy = (packedLegacy >> 8) & 0x1FFu;
+    const uint32_t z = (packedLegacy >> 17) & 0xFFu;
+    const uint32_t face = (packedLegacy >> 25) & 0x7u;
+    const uint32_t ao = (packedLegacy >> 28) & 0x7u;
+    const uint32_t y = std::min<uint32_t>(yLegacy + 1u, 0x3FFu);
+    return (x << 0) | (y << 8) | (z << 18) | (face << 26) | (ao << 29);
+}
+
+static bool isLikelyLegacyPackedLayout(const std::vector<uint32_t>& vertices) {
+    if (vertices.empty()) {
+        return false;
+    }
+
+    const size_t sampleCount = std::min<size_t>(vertices.size(), 256);
+    size_t invalidNewDecode = 0;
+    for (size_t i = 0; i < sampleCount; ++i) {
+        const uint32_t p = vertices[i];
+        const uint32_t y = (p >> 8) & 0x3FFu;
+        const uint32_t z = (p >> 18) & 0xFFu;
+        const uint32_t face = (p >> 26) & 0x7u;
+        if (y > static_cast<uint32_t>(WorldConfig::CHUNK_HEIGHT) ||
+            z > static_cast<uint32_t>(WorldConfig::CHUNK_SIZE) ||
+            face > 6u) {
+            ++invalidNewDecode;
+        }
+    }
+
+    // Legacy vertices decoded as new format produce many invalid Y/Z values.
+    return (invalidNewDecode * 3) > sampleCount;
+}
+
+static void normalizePackedVertexLayout(std::vector<uint32_t>& vertices, bool forceLegacyLayout) {
+    if (!forceLegacyLayout && !isLikelyLegacyPackedLayout(vertices)) {
+        return;
+    }
+    for (uint32_t& packed : vertices) {
+        packed = repackLegacyPackedVertex(packed);
+    }
+}
+
+static constexpr uint16_t kEditPagesPerAxis =
+    static_cast<uint16_t>(WorldConfig::CHUNK_SIZE / ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS);
+static constexpr uint16_t kEditPageCount = kEditPagesPerAxis * kEditPagesPerAxis;
+
+static void ensureChunkEditRuntimeScaffold(ChunkEditRuntime& editRuntime) {
+    editRuntime.targetMode = ChunkMeshMode::PagedEditable;
+    if (!editRuntime.pages.empty()) {
+        return;
+    }
+
+    editRuntime.pages.reserve(kEditPageCount);
+    for (uint16_t pageZ = 0; pageZ < kEditPagesPerAxis; ++pageZ) {
+        for (uint16_t pageX = 0; pageX < kEditPagesPerAxis; ++pageX) {
+            ChunkEditPageRuntime page{};
+            page.pageId = static_cast<uint16_t>(pageZ * kEditPagesPerAxis + pageX);
+            page.bounds.minX = static_cast<uint16_t>(pageX * ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS);
+            page.bounds.maxX = static_cast<uint16_t>(page.bounds.minX + ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS - 1);
+            page.bounds.minY = 0;
+            page.bounds.maxY = 0;
+            page.bounds.minZ = static_cast<uint16_t>(pageZ * ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS);
+            page.bounds.maxZ = static_cast<uint16_t>(page.bounds.minZ + ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS - 1);
+            editRuntime.pages.push_back(page);
+        }
+    }
+}
+
+static uint16_t countResidentEditPages(const ChunkEditRuntime& editRuntime) {
+    uint16_t resident = 0;
+    for (const auto& page : editRuntime.pages) {
+        if (page.resident) {
+            ++resident;
+        }
+    }
+    return resident;
+}
+
+static bool shouldExposePagedEditableMode(TerrainType terrainType,
+                                          int effectiveLOD,
+                                          const ChunkEditRuntime* editRuntime = nullptr) {
+    if (terrainType != TerrainType::Voxel || effectiveLOD != 0) {
+        return false;
+    }
+
+    return !editRuntime || editRuntime->targetMode == ChunkMeshMode::PagedEditable;
+}
+
+static void fillPagedDebugInfo(const ChunkEditRuntime& editRuntime, ChunkDebugAttribution& debugInfo) {
+    debugInfo.workModel = ChunkWorkModel::PagedLocal;
+    debugInfo.meshMode = static_cast<uint8_t>(ChunkMeshMode::PagedEditable);
+    debugInfo.dirtyPages = static_cast<uint16_t>(
+        std::min<size_t>(editRuntime.dirtyPageIds.size(), UINT16_MAX));
+    debugInfo.residentPages = countResidentEditPages(editRuntime);
+}
+
+// Procedural generation functions removed - using precomputed meshes only
+
+//──────────────────────────────────────────────────────────────────────────────
+// Runtime DCCM casing generation
+//──────────────────────────────────────────────────────────────────────────────
+// Generates vertical side-faces (casing) at chunk boundaries from the loaded
+// surface mesh's boundary vertices.  Replaces precomputed casing which had
+// tiny gaps at the surface/casing junction.
+//
+// Edge definitions (must match converter & fix_dccm_gaps):
+//   EDGE 0 = NEG_X (x=0),   face=0, reverseWinding=false
+//   EDGE 1 = POS_X (x=128), face=1, reverseWinding=true
+//   EDGE 2 = NEG_Z (z=0),   face=4, reverseWinding=true
+//   EDGE 3 = POS_Z (z=128), face=5, reverseWinding=false
+
+static void generateDCCMCasingForEdge(
+    int edge,
+    const std::vector<SubChunkMesh>& mainSubChunks,
+    MeshData& outCasing)
+{
+    constexpr uint8_t FACE_DCCM_SURFACE = 6;
+    struct EdgeDef {
+        uint8_t coord;          // boundary coordinate (0 or 128)
+        bool    isXBound;       // true = match by X, false = match by Z
+        bool    reverseWinding;
+    };
+    static constexpr EdgeDef edgeDefs[CHUNK_EDGE_COUNT] = {
+        {   0, true,  false }, // NEG_X
+        { 128, true,  true  }, // POS_X
+        {   0, false, true  }, // NEG_Z
+        { 128, false, false }, // POS_Z
+    };
+
+    const auto& def = edgeDefs[edge];
+
+    // Collect boundary vertices: position_along_edge → highest surface height
+    std::map<uint8_t, uint16_t> boundaryVerts;
+
+    for (const auto& subChunk : mainSubChunks) {
+        for (uint32_t packedVert : subChunk.vertices) {
+            uint8_t  vx = packedVert & 0xFF;
+            uint16_t vy = (packedVert >> 8) & 0x3FF;
+            uint8_t  vz = (packedVert >> 18) & 0xFF;
+
+            if (def.isXBound) {
+                if (vx == def.coord) {
+                    auto it = boundaryVerts.find(vz);
+                    if (it == boundaryVerts.end() || vy > it->second)
+                        boundaryVerts[vz] = vy;
+                }
+            } else {
+                if (vz == def.coord) {
+                    auto it = boundaryVerts.find(vx);
+                    if (it == boundaryVerts.end() || vy > it->second)
+                        boundaryVerts[vx] = vy;
+                }
+            }
+        }
+    }
+
+    if (boundaryVerts.size() < 2) return;
+
+    // Pack a casing vertex (same layout as engine PackedVertex / fix_dccm_gaps)
+    auto packVert = [](uint8_t x, uint16_t y, uint8_t z,
+                       uint8_t face, uint8_t ao = 0) -> uint32_t {
+        return uint32_t(x)
+             | (uint32_t(y)        << 8)
+             | (uint32_t(z)        << 18)
+             | (uint32_t(face & 7) << 26)
+             | (uint32_t(ao & 7)   << 29);
+    };
+
+    constexpr uint16_t Y_BASE = 0; // minimum packed Y
+
+    auto it = boundaryVerts.begin();
+    auto prev = it;
+    ++it;
+    for (; it != boundaryVerts.end(); prev = it, ++it) {
+        uint8_t  pos0 = prev->first;
+        uint16_t h0   = prev->second;
+        uint8_t  pos1 = it->first;
+        uint16_t h1   = it->second;
+
+        if (h0 <= 1 && h1 <= 1) continue;
+
+        uint8_t x0, z0, x1, z1;
+        if (def.isXBound) {
+            x0 = def.coord; z0 = pos0;
+            x1 = def.coord; z1 = pos1;
+        } else {
+            x0 = pos0; z0 = def.coord;
+            x1 = pos1; z1 = def.coord;
+        }
+
+        uint32_t baseIdx = static_cast<uint32_t>(outCasing.vertices.size());
+
+        // 4 vertices: bottom-left, bottom-right, top-right, top-left
+        Vertex v;
+        v.packed = packVert(x0, Y_BASE, z0, FACE_DCCM_SURFACE);
+        outCasing.vertices.push_back(v);
+        v.packed = packVert(x1, Y_BASE, z1, FACE_DCCM_SURFACE);
+        outCasing.vertices.push_back(v);
+        v.packed = packVert(x1, h1, z1, FACE_DCCM_SURFACE);
+        outCasing.vertices.push_back(v);
+        v.packed = packVert(x0, h0, z0, FACE_DCCM_SURFACE);
+        outCasing.vertices.push_back(v);
+
+        if (def.reverseWinding) {
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 1));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 3));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+        } else {
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 1));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 3));
+        }
+    }
+}
+
+static void generateDCCMCasingForEdge(
+    int edge,
+    const std::vector<MeshData>& mainSubChunks,
+    uint8_t mainSubChunkCount,
+    MeshData& outCasing)
+{
+    constexpr uint8_t FACE_DCCM_SURFACE = 6;
+    struct EdgeDef {
+        uint8_t coord;
+        bool    isXBound;
+        bool    reverseWinding;
+    };
+    static constexpr EdgeDef edgeDefs[CHUNK_EDGE_COUNT] = {
+        {   0, true,  false },
+        { 128, true,  true  },
+        {   0, false, true  },
+        { 128, false, false },
+    };
+
+    const auto& def = edgeDefs[edge];
+    std::map<uint8_t, uint16_t> boundaryVerts;
+
+    for (uint8_t subIndex = 0; subIndex < mainSubChunkCount && subIndex < mainSubChunks.size(); ++subIndex) {
+        const auto& subChunk = mainSubChunks[subIndex];
+        for (const Vertex& vertex : subChunk.vertices) {
+            const uint32_t packedVert = vertex.packed;
+            const uint8_t vx = packedVert & 0xFF;
+            const uint16_t vy = (packedVert >> 8) & 0x3FF;
+            const uint8_t vz = (packedVert >> 18) & 0xFF;
+
+            if (def.isXBound) {
+                if (vx == def.coord) {
+                    auto it = boundaryVerts.find(vz);
+                    if (it == boundaryVerts.end() || vy > it->second) {
+                        boundaryVerts[vz] = vy;
+                    }
+                }
+            } else {
+                if (vz == def.coord) {
+                    auto it = boundaryVerts.find(vx);
+                    if (it == boundaryVerts.end() || vy > it->second) {
+                        boundaryVerts[vx] = vy;
+                    }
+                }
+            }
+        }
+    }
+
+    if (boundaryVerts.size() < 2) return;
+
+    auto packVert = [](uint8_t x, uint16_t y, uint8_t z,
+                       uint8_t face, uint8_t ao = 0) -> uint32_t {
+        return uint32_t(x)
+             | (uint32_t(y)        << 8)
+             | (uint32_t(z)        << 18)
+             | (uint32_t(face & 7) << 26)
+             | (uint32_t(ao & 7)   << 29);
+    };
+
+    constexpr uint16_t Y_BASE = 0;
+    auto it = boundaryVerts.begin();
+    auto prev = it;
+    ++it;
+    for (; it != boundaryVerts.end(); prev = it, ++it) {
+        const uint8_t pos0 = prev->first;
+        const uint16_t h0 = prev->second;
+        const uint8_t pos1 = it->first;
+        const uint16_t h1 = it->second;
+
+        if (h0 <= 1 && h1 <= 1) continue;
+
+        uint8_t x0, z0, x1, z1;
+        if (def.isXBound) {
+            x0 = def.coord; z0 = pos0;
+            x1 = def.coord; z1 = pos1;
+        } else {
+            x0 = pos0; z0 = def.coord;
+            x1 = pos1; z1 = def.coord;
+        }
+
+        const uint32_t baseIdx = static_cast<uint32_t>(outCasing.vertices.size());
+        Vertex v;
+        v.packed = packVert(x0, Y_BASE, z0, FACE_DCCM_SURFACE);
+        outCasing.vertices.push_back(v);
+        v.packed = packVert(x1, Y_BASE, z1, FACE_DCCM_SURFACE);
+        outCasing.vertices.push_back(v);
+        v.packed = packVert(x1, h1, z1, FACE_DCCM_SURFACE);
+        outCasing.vertices.push_back(v);
+        v.packed = packVert(x0, h0, z0, FACE_DCCM_SURFACE);
+        outCasing.vertices.push_back(v);
+
+        if (def.reverseWinding) {
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 1));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 3));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+        } else {
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 1));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
+            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 3));
+        }
+    }
+}
+
+static uint8_t computeDCCMCasingMask(
+    World* world,
+    const glm::ivec3& chunkCoord,
+    const glm::ivec3& centerAtEnqueue)
+{
+    if (!world) {
+        return 0;
+    }
+
+    ChunkManager* chunkMgr = world->getChunkManager();
+    if (!chunkMgr) {
+        return 0;
+    }
+
+    static const glm::ivec3 neighborOffsets[4] = {
+        {-1,0,0}, {1,0,0}, {0,0,-1}, {0,0,1}
+    };
+
+    uint8_t casingMask = 0;
+    for (int edge = 0; edge < 4; ++edge) {
+        const glm::ivec3 neighbor = chunkCoord + neighborOffsets[edge];
+        const int neighborRing = chunkMgr->calculateRingNumber(neighbor, centerAtEnqueue);
+        const int neighborLOD = chunkMgr->calculateLODFromRing(neighborRing);
+        if (world->getTerrainTypeForChunk(neighbor, neighborLOD) != TerrainType::DCCM) {
+            casingMask |= (1 << edge);
+        }
+    }
+
+    return casingMask;
+}
+
+static bool computeTightAABBFromSubChunks(const std::vector<MeshData>& subChunks,
+                                          glm::vec3& outMin,
+                                          glm::vec3& outMax)
+{
+    constexpr float voxelSize = 0.25f;
+    glm::vec3 localMin(1e10f);
+    glm::vec3 localMax(-1e10f);
+    bool hasVerts = false;
+
+    for (const auto& sub : subChunks) {
+        for (const auto& v : sub.vertices) {
+            const uint32_t packed = v.packed;
+            const uint32_t xBits = (packed >> 0) & 0xFF;
+            const uint32_t yBits = (packed >> 8) & 0x3FF;
+            const uint32_t zBits = (packed >> 18) & 0xFF;
+            const float x = static_cast<float>(xBits) * voxelSize;
+            const float y = static_cast<float>(yBits) * voxelSize;
+            const float z = static_cast<float>(zBits) * voxelSize;
+            localMin = glm::min(localMin, glm::vec3(x, y, z));
+            localMax = glm::max(localMax, glm::vec3(x, y, z));
+            hasVerts = true;
+        }
+    }
+
+    if (!hasVerts) {
+        return false;
+    }
+
+    const float padding = voxelSize * 0.5f;
+    outMin = localMin - padding;
+    outMax = localMax + padding;
+    return true;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// Job Pipeline Functions
+//──────────────────────────────────────────────────────────────────────────────
+// Each job function operates on ChunkPipelinePayload.
+// Pipeline stages: Load → Upload → Finalize
+//
+// Thread Safety:
+// - Registry: protected by World's m_registryMutex
+// - Upload queue: lock-free (worker threads enqueue)
+//──────────────────────────────────────────────────────────────────────────────
+
+void LoadPrecomputedMeshJob(JobCtx& ctx, void* user) {
+    auto* payload = static_cast<ChunkPipelinePayload*>(user);
+    if (!payload) {
+        std::cout << "[LoadPrecomputedMeshJob] ERROR: null payload" << std::endl;
+        return;
+    }
+
+    if (payload->cancelled.load(std::memory_order_acquire)) {
+        std::cout << "[LoadPrecomputedMeshJob] Cancelled" << std::endl;
+        return;
+    }
+
+    if (!payloadStillCurrent(payload)) {
+        payload->cancelled.store(true, std::memory_order_release);
+        // Do NOT clear inFlight/pending here — a newer pipeline for this
+        // entity owns those flags.  Clearing them would race with the new
+        // pipeline and can cause double-scheduling → double-free → crash.
+        static std::atomic<int> staleCount{0};
+        if (staleCount.fetch_add(1, std::memory_order_relaxed) % 200 == 0) {
+            std::cout << "[LoadPrecomputedMeshJob] Stale version (total: " << staleCount.load() << ")" << std::endl;
+        }
+        return;
+    }
+
+    if (!payload->world) {
+        std::cout << "[LoadPrecomputedMeshJob] ERROR: null world" << std::endl;
+        return;
+    }
+
+    // Safety net: if this chunk has runtime voxel edits, the dispatcher should
+    // have selected LoadEditMeshJob.  Redirect here to guarantee correct mesh
+    // data regardless of which code path enqueued the job.
+    if (payload->world->chunkNeedsRuntimeVoxel(payload->coord.toVec3())) {
+        LoadEditMeshJob(ctx, user);
+        return;
+    }
+
+    // Load precomputed mesh data from terrain file
+    // Use per-LOD terrain loader (voxel or DCCM) and effective LOD level
+    // DCCM always uses LOD 0 regardless of actual LOD level
+    TerrainFileLoader* terrainLoader = payload->world->getTerrainLoaderForLOD(payload->lodLevel);
+    if (!terrainLoader || !terrainLoader->isLoaded()) {
+        std::cout << "[LoadPrecomputedMeshJob] ERROR: no terrain file loader available" << std::endl;
+        return;
+    }
+
+    int effectiveLOD = payload->world->getEffectiveLODForChunk(payload->coord.toVec3(), payload->lodLevel);
+    uint8_t computedVoxelSeamMask = 0;
+    payload->debugInfo = {};
+    payload->debugInfo.artifactSource = ChunkArtifactSource::PrecomputedTerrain;
+    payload->debugInfo.workModel = ChunkWorkModel::MonolithicChunk;
+    payload->debugInfo.meshMode = static_cast<uint8_t>(ChunkMeshMode::MonolithicPristine);
+    payload->debugInfo.fromLodBatch = payload->isRemesh;
+    payload->debugInfo.fromTerrainEdit = payload->fromTerrainEdit;
+    payload->debugInfo.affectsShadowGeometry = payload->affectsShadowGeometry;
+    payload->debugInfo.collisionSource = (payload->lodLevel == 0)
+        ? ChunkCollisionSource::BaseCollisionCache
+        : ChunkCollisionSource::None;
+
+    // Use v4 SubChunk API - SubChunks are NEVER merged, each stays under 65535 vertices
+    auto meshWithSubChunks = terrainLoader->getMeshDataWithSubChunks(
+        payload->coord.x,
+        payload->coord.z,
+        effectiveLOD
+    );
+
+    const bool forceLegacyLayout = terrainLoader->usesLegacyPackedVertexLayout();
+
+    // Normalize legacy packed vertex layout on load so shaders/physics/edit
+    // all consume one consistent format.
+    for (auto& subChunk : meshWithSubChunks.mainSubChunks) {
+        normalizePackedVertexLayout(subChunk.vertices, forceLegacyLayout);
+    }
+    for (auto& seamEdge : meshWithSubChunks.seamSubChunks) {
+        for (auto& subChunk : seamEdge) {
+            normalizePackedVertexLayout(subChunk.vertices, forceLegacyLayout);
+        }
+    }
+
+    if (!meshWithSubChunks.isEmpty()) {
+        payload->isEmpty = false;
+        
+        // Get the seam edge mask to determine which edges need seams
+        // Uses centerAtEnqueue (captured when the job was queued) for
+        // a stable seam mask even if the player moves between enqueue
+        // and worker-thread execution.
+        uint8_t seamMask = 0;     // LOD boundary seams (voxel only)
+        uint8_t casingMask = 0;   // DCCM casing at terrain type boundaries
+        ChunkManager* chunkMgr = payload->world->getChunkManager();
+        TerrainType thisType = payload->world->getTerrainTypeForChunk(payload->coord.toVec3(), payload->lodLevel);
+        if (chunkMgr) {
+            glm::ivec3 chunkCoord(payload->coord.x, payload->coord.y, payload->coord.z);
+
+            // LOD boundary seams (voxel chunks only - prevents cracks between LOD levels)
+            if (payload->lodLevel > 0) {
+                seamMask = chunkMgr->getSeamEdgeMask(chunkCoord, payload->centerAtEnqueue);
+            }
+            computedVoxelSeamMask = seamMask;
+
+            // DCCM casing: side faces at edges where DCCM meets voxel terrain
+            if (thisType == TerrainType::DCCM) {
+                casingMask = computeDCCMCasingMask(payload->world, chunkCoord, payload->centerAtEnqueue);
+            }
+        }
+        
+        // Convert main mesh SubChunks to MeshData format
+        // Each SubChunk becomes a separate MeshData, NEVER merged
+        for (const auto& subChunk : meshWithSubChunks.mainSubChunks) {
+            if (subChunk.isEmpty()) continue;
+            
+            MeshData meshData;
+            meshData.entity = payload->entity;
+            meshData.vertices.resize(subChunk.vertices.size());
+            for (size_t i = 0; i < subChunk.vertices.size(); ++i) {
+                uint32_t v = subChunk.vertices[i];
+                if (thisType == TerrainType::DCCM) {
+                    // Stamp face=6 so DCCM surface vertices route through
+                    // dccm_terrain.frag (which keeps face==6) instead of
+                    // cube.frag (which discards face==6).
+                    v = (v & ~(0x7u << 26)) | (6u << 26);
+                }
+                meshData.vertices[i].packed = v;
+            }
+            meshData.indices = subChunk.indices;
+            payload->subChunks.push_back(std::move(meshData));
+        }
+        
+        // Track how many are main mesh SubChunks
+        payload->mainSubChunkCount = static_cast<uint8_t>(payload->subChunks.size());
+
+        // Add seam/casing SubChunks based on terrain type
+        if (thisType == TerrainType::DCCM) {
+            // DCCM: generate casing at runtime from boundary vertices
+            // This replaces precomputed seam data, fixing gaps between
+            // the casing top edge and the DCCM surface.
+            for (int e = 0; e < CHUNK_EDGE_COUNT; ++e) {
+                if ((casingMask & (1 << e)) == 0) continue;
+
+                MeshData casingData;
+                casingData.entity = payload->entity;
+                generateDCCMCasingForEdge(e, meshWithSubChunks.mainSubChunks, casingData);
+                if (!casingData.isEmpty()) {
+                    payload->subChunks.push_back(std::move(casingData));
+                }
+            }
+        } else {
+            // Voxel: use precomputed seam SubChunks from terrain file
+            for (int e = 0; e < CHUNK_EDGE_COUNT; ++e) {
+                if ((seamMask & (1 << e)) == 0) continue;
+
+                for (const auto& seamSubChunk : meshWithSubChunks.seamSubChunks[e]) {
+                    if (seamSubChunk.isEmpty()) continue;
+
+                    MeshData meshData;
+                    meshData.entity = payload->entity;
+                    meshData.vertices.resize(seamSubChunk.vertices.size());
+                    for (size_t i = 0; i < seamSubChunk.vertices.size(); ++i) {
+                        meshData.vertices[i].packed = seamSubChunk.vertices[i];
+                    }
+                    meshData.indices = seamSubChunk.indices;
+                    payload->subChunks.push_back(std::move(meshData));
+                }
+            }
+        }
+    } else {
+        // Empty chunk
+        payload->isEmpty = true;
+    }
+
+    // Precompute tight AABB on worker thread (avoids vertex scan on main thread)
+    if (!payload->isEmpty && !payload->subChunks.empty()) {
+        constexpr float VOXEL_SIZE = 0.25f;
+        glm::vec3 localMin(1e10f);
+        glm::vec3 localMax(-1e10f);
+        bool hasVerts = false;
+        
+        for (const auto& sub : payload->subChunks) {
+            for (const auto& v : sub.vertices) {
+                uint32_t packed = v.packed;
+                uint32_t xBits = (packed >> 0) & 0xFF;
+                uint32_t yBits = (packed >> 8) & 0x3FF;
+                uint32_t zBits = (packed >> 18) & 0xFF;
+                float x = static_cast<float>(xBits) * VOXEL_SIZE;
+                float y = static_cast<float>(yBits) * VOXEL_SIZE;
+                float z = static_cast<float>(zBits) * VOXEL_SIZE;
+                localMin = glm::min(localMin, glm::vec3(x, y, z));
+                localMax = glm::max(localMax, glm::vec3(x, y, z));
+                hasVerts = true;
+            }
+        }
+        
+        if (hasVerts) {
+            const float padding = VOXEL_SIZE * 0.5f;
+            payload->tightAABBMin = localMin - padding;
+            payload->tightAABBMax = localMax + padding;
+            payload->hasTightAABB = true;
+        }
+    }
+    payload->debugInfo.subChunkCount = static_cast<uint16_t>(payload->subChunks.size());
+
+    // Mark chunk as not empty and meshed (under lock — main thread also accesses Chunk)
+    {
+        std::unique_lock regLock(payload->world->registryMutex());
+        auto& registry = payload->world->getRegistry();
+        if (registry.valid(payload->entity) && registry.all_of<Chunk>(payload->entity)) {
+            auto& chunk = registry.get<Chunk>(payload->entity);
+            chunk.isEmpty = payload->isEmpty;
+            chunk.meshMode = ChunkMeshMode::MonolithicPristine;
+            // For remesh batches, topology metadata is applied in processLODSwaps()
+            // when the new mesh is actually swapped in.
+            if (!payload->isRemesh) {
+                chunk.effectiveDataLod = static_cast<uint8_t>(std::clamp(effectiveLOD, 0, 255));
+                // Store DCCM casing mask / voxel seam mask for same-LOD topology detection.
+                TerrainType chunkType = payload->world->getTerrainTypeForChunk(payload->coord.toVec3(), payload->lodLevel);
+                if (chunkType == TerrainType::DCCM) {
+                    chunk.voxelSeamMask = 0;
+                    uint8_t storedCasingMask = 0;
+                    ChunkManager* mgr = payload->world->getChunkManager();
+                    if (mgr) {
+                        storedCasingMask = computeDCCMCasingMask(
+                            payload->world,
+                            glm::ivec3(payload->coord.x, payload->coord.y, payload->coord.z),
+                            payload->centerAtEnqueue);
+                    }
+                    chunk.casingSeamMask = storedCasingMask;
+                } else {
+                    chunk.voxelSeamMask = computedVoxelSeamMask;
+                    chunk.casingSeamMask = 0;
+                }
+            }
+            // IMPORTANT: Only set lodLevel for initial loads, NOT for remeshes.
+            // For remeshes, processLODSwaps() sets lodLevel atomically when
+            // the entire batch swaps PendingMeshHandle → MeshHandle.
+            // Writing it early here would cause the LOD mismatch scan to
+            // think the chunk is already at the target LOD, skip it, and
+            // if the batch gets cancelled, the chunk is stuck with the
+            // wrong lodLevel vs. the mesh it's actually rendering.
+            if (!payload->isRemesh) {
+                chunk.lodLevel = payload->lodLevel;
+            }
+        }
+    }
+
+    // Transition chunk to Ready for initial loads.
+    // This makes the chunk visible to LOD scans and rendering.
+    // processFinalizeQueue will also set Ready after upload completes (idempotent).
+    // The previous freeze bug was NOT caused by this early Ready — it was caused by
+    // FinalizeChunkJob not clearing inFlight on version mismatch (now fixed).
+    if (!payload->isRemesh) {
+        payload->world->transitionChunkState(payload->entity, ChunkState::State::Ready);
+    }
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+// LoadEditMeshJob — runs edit mesher (Voxel or DCCM) for chunks with overlays
+//──────────────────────────────────────────────────────────────────────────────
+
+void LoadEditMeshJob(JobCtx& /*ctx*/, void* user) {
+    auto* payload = static_cast<ChunkPipelinePayload*>(user);
+    if (!payload || !payload->world) return;
+    if (!payloadStillCurrent(payload)) {
+        payload->cancelled.store(true, std::memory_order_release);
+        return;
+    }
+
+    World* world = payload->world;
+    const auto& fieldSource = world->getTerrainFieldSource();
+    const auto& heightmap   = world->getHeightmapSampler();
+
+    TerrainType terrainType = world->getTerrainTypeForChunk(payload->coord.toVec3(), payload->lodLevel);
+    bool useDCCM = (terrainType == TerrainType::DCCM) && heightmap.isLoaded();
+    int effectiveLOD = world->getEffectiveLODForChunk(payload->coord.toVec3(), payload->lodLevel);
+    TerrainType artifactTerrainType = useDCCM ? TerrainType::DCCM : TerrainType::Voxel;
+    const glm::ivec3 chunkCoord(payload->coord.x, payload->coord.y, payload->coord.z);
+    const auto* overlay = fieldSource.getOverlay();
+    const bool hasGeometryEdits = overlay && overlay->hasEditsInChunk(chunkCoord);
+    const uint8_t dccmCasingMask = useDCCM
+        ? computeDCCMCasingMask(world, chunkCoord, payload->centerAtEnqueue)
+        : 0;
+    payload->debugInfo = {};
+    payload->debugInfo.workModel = ChunkWorkModel::MonolithicChunk;
+    payload->debugInfo.meshMode = static_cast<uint8_t>(ChunkMeshMode::MonolithicEdited);
+    payload->debugInfo.fromLodBatch = payload->isRemesh;
+    payload->debugInfo.fromTerrainEdit = true;
+    payload->debugInfo.affectsShadowGeometry = payload->affectsShadowGeometry;
+    payload->debugInfo.collisionSource = (effectiveLOD == 0 && hasGeometryEdits)
+        ? ChunkCollisionSource::ArtifactRefresh
+        : ChunkCollisionSource::None;
+    {
+        std::unique_lock regLock(payload->world->registryMutex());
+        auto& registry = payload->world->getRegistry();
+        if (registry.valid(payload->entity) && registry.all_of<Chunk>(payload->entity)) {
+            const bool hasEditOwnership =
+                registry.any_of<ChunkEditRuntime>(payload->entity) ||
+                (overlay && overlay->hasEditsInChunk(chunkCoord));
+            if (hasEditOwnership &&
+                shouldExposePagedEditableMode(artifactTerrainType, effectiveLOD)) {
+                auto& editRuntime = registry.get_or_emplace<ChunkEditRuntime>(payload->entity);
+                ensureChunkEditRuntimeScaffold(editRuntime);
+                fillPagedDebugInfo(editRuntime, payload->debugInfo);
+                registry.get<Chunk>(payload->entity).meshMode = ChunkMeshMode::PagedEditable;
+            }
+        }
+    }
+    const TerrainEdit::RemeshCancellationToken cancelToken{
+        &payload->versionState->version,
+        payload->version
+    };
+
+    World::EditArtifact cachedArtifact;
+    if (world->tryGetEditArtifact(payload->coord.toVec3(),
+                                  artifactTerrainType,
+                                  effectiveLOD,
+                                  cachedArtifact)) {
+        payload->debugInfo.artifactSource = cachedArtifact.deferredBuild
+            ? ChunkArtifactSource::DeferredArtifactCache
+            : ChunkArtifactSource::EditArtifactCache;
+        payload->debugInfo.artifactCacheHit = true;
+        payload->debugInfo.artifactCacheResident = true;
+        payload->debugInfo.artifactGeneration = cachedArtifact.generation;
+        if (cachedArtifact.isEmpty) {
+            payload->isEmpty = true;
+        } else {
+            // Split cached artifact into sub-meshes (handles >65535 vertex overflow)
+            TerrainEdit::TerrainEditMesher::MeshResult tmpResult;
+            tmpResult.vertices = std::move(cachedArtifact.vertices);
+            tmpResult.indices  = std::move(cachedArtifact.indices);
+            auto subs = TerrainEdit::TerrainEditMesher::splitToSubMeshes(tmpResult);
+            for (auto& sub : subs) {
+                MeshData md(payload->entity);
+                md.vertices = std::move(sub.vertices);
+                md.indices  = std::move(sub.indices);
+                payload->subChunks.push_back(std::move(md));
+            }
+            payload->mainSubChunkCount = static_cast<uint8_t>(payload->subChunks.size());
+            if (useDCCM) {
+                for (int edge = 0; edge < CHUNK_EDGE_COUNT; ++edge) {
+                    if ((dccmCasingMask & (1 << edge)) == 0) continue;
+                    MeshData casingData(payload->entity);
+                    generateDCCMCasingForEdge(edge, payload->subChunks, payload->mainSubChunkCount, casingData);
+                    if (!casingData.isEmpty()) {
+                        payload->subChunks.push_back(std::move(casingData));
+                    }
+                }
+            }
+            payload->isEmpty = false;
+            payload->hasTightAABB = computeTightAABBFromSubChunks(
+                payload->subChunks,
+                payload->tightAABBMin,
+                payload->tightAABBMax);
+        }
+        payload->debugInfo.subChunkCount = static_cast<uint16_t>(payload->subChunks.size());
+
+        if (!payloadStillCurrent(payload)) {
+            payload->cancelled.store(true, std::memory_order_release);
+            return;
+        }
+
+        {
+            std::unique_lock regLock(payload->world->registryMutex());
+            auto& registry = payload->world->getRegistry();
+            if (registry.valid(payload->entity) && registry.all_of<Chunk>(payload->entity)) {
+                auto& chunk = registry.get<Chunk>(payload->entity);
+                chunk.isEmpty = payload->isEmpty;
+                if (registry.any_of<ChunkEditRuntime>(payload->entity)) {
+                    auto& editRuntime = registry.get<ChunkEditRuntime>(payload->entity);
+                    if (shouldExposePagedEditableMode(
+                            artifactTerrainType,
+                            effectiveLOD,
+                            &editRuntime)) {
+                        ensureChunkEditRuntimeScaffold(editRuntime);
+                        fillPagedDebugInfo(editRuntime, payload->debugInfo);
+                        chunk.meshMode = ChunkMeshMode::PagedEditable;
+                    } else {
+                        chunk.meshMode = ChunkMeshMode::MonolithicEdited;
+                    }
+                } else {
+                    chunk.meshMode = ChunkMeshMode::MonolithicEdited;
+                }
+                if (useDCCM) {
+                    chunk.voxelSeamMask = 0;
+                    chunk.casingSeamMask = dccmCasingMask;
+                } else {
+                    // Match what WorldUpdateLODScan compares against, so the
+                    // reconciliation pass doesn't immediately re-batch this
+                    // chunk after a non-batch finalize requeue.
+                    uint8_t computedSeam = 0;
+                    if (payload->lodLevel > 0) {
+                        if (auto* mgr = payload->world->getChunkManager()) {
+                            computedSeam = mgr->getSeamEdgeMask(
+                                chunkCoord, payload->centerAtEnqueue);
+                        }
+                    }
+                    chunk.voxelSeamMask = computedSeam;
+                    chunk.casingSeamMask = 0;
+                }
+                if (!payload->isRemesh) {
+                    chunk.effectiveDataLod = static_cast<uint8_t>(
+                        std::clamp(effectiveLOD, 0, 255));
+                    chunk.lodLevel = payload->lodLevel;
+                }
+            }
+        }
+
+        if (!payload->isRemesh) {
+            payload->world->transitionChunkState(payload->entity, ChunkState::State::Ready);
+        }
+        return;
+    }
+
+    TerrainEdit::TerrainEditMesher::MeshResult result;
+
+    if (useDCCM) {
+        auto dccm = TerrainEdit::TerrainEditDCCMMesher::meshChunk(
+            heightmap, nullptr,
+            payload->coord.x, payload->coord.z,
+            WorldConfig::CHUNK_SIZE,
+            WorldConfig::CHUNK_HEIGHT,
+            effectiveLOD);
+        result.vertices = std::move(dccm.vertices);
+        result.indices.assign(dccm.indices.begin(), dccm.indices.end());
+        result.aabbMin  = dccm.aabbMin;
+        result.aabbMax  = dccm.aabbMax;
+    } else {
+        int hintMinY = -1, hintMaxY = -1;
+        if (heightmap.isLoaded()) {
+            const int chunkBaseY = payload->coord.y * WorldConfig::CHUNK_HEIGHT;
+            if (payload->coord.y < 0) {
+                hintMinY = chunkBaseY;
+                hintMaxY = chunkBaseY + WorldConfig::CHUNK_HEIGHT - 1;
+            } else if (payload->coord.y == 0) {
+                auto [hMin, hMax] = heightmap.getHeightRangeForChunk(
+                    payload->coord.x, payload->coord.z, WorldConfig::CHUNK_SIZE);
+                hintMinY = hMin;
+                hintMaxY = hMax;
+            }
+
+            const auto* overlay = fieldSource.getOverlay();
+            if (overlay && overlay->hasAnyEdits()) {
+                auto [editMinY, editMaxY] = overlay->getEditVoxelYRange(
+                    payload->coord.x * WorldConfig::CHUNK_SIZE,
+                    payload->coord.z * WorldConfig::CHUNK_SIZE,
+                    WorldConfig::CHUNK_SIZE);
+                if (editMinY <= editMaxY) {
+                    if (hintMinY < 0) { hintMinY = editMinY; hintMaxY = editMaxY; }
+                    else {
+                        if (editMinY < hintMinY) hintMinY = editMinY;
+                        if (editMaxY > hintMaxY) hintMaxY = editMaxY;
+                    }
+                }
+            }
+        }
+
+        glm::ivec3 editCoord(payload->coord.x, payload->coord.y, payload->coord.z);
+        result = TerrainEdit::TerrainEditMesher::meshChunk(
+            fieldSource, editCoord,
+            WorldConfig::CHUNK_SIZE,
+            WorldConfig::CHUNK_HEIGHT,
+            WorldConfig::VOXEL_SIZE_M,
+            hintMinY, hintMaxY,
+            heightmap.isLoaded() ? &heightmap : nullptr,
+            effectiveLOD,
+            /*skipPostProcess=*/false,
+            /*skipAmbientOcclusion=*/false,
+            &cancelToken);
+    }
+
+    if (!payloadStillCurrent(payload)) {
+        payload->cancelled.store(true, std::memory_order_release);
+        return;
+    }
+
+    if (result.empty()) {
+        payload->isEmpty = true;
+        // Cache the empty result so future loads at this LOD/type are instant.
+        world->storeEditArtifact(
+            payload->coord.toVec3(),
+            artifactTerrainType,
+            effectiveLOD,
+            {}, {},
+            glm::vec3(1e10f), glm::vec3(-1e10f),
+            /*isEmpty=*/true);
+    } else {
+        // Cache the meshed result before moving data into the payload.
+        world->storeEditArtifact(
+            payload->coord.toVec3(),
+            artifactTerrainType,
+            effectiveLOD,
+            std::vector<Vertex>(result.vertices),
+            std::vector<uint32_t>(result.indices),
+            result.aabbMin,
+            result.aabbMax,
+            /*isEmpty=*/false);
+
+        // Split into sub-meshes for GPU upload (handles >65535 vertex overflow)
+        auto subs = TerrainEdit::TerrainEditMesher::splitToSubMeshes(result);
+        for (auto& sub : subs) {
+            MeshData md(payload->entity);
+            md.vertices = std::move(sub.vertices);
+            md.indices  = std::move(sub.indices);
+            payload->subChunks.push_back(std::move(md));
+        }
+        payload->mainSubChunkCount = static_cast<uint8_t>(payload->subChunks.size());
+        if (useDCCM) {
+            for (int edge = 0; edge < CHUNK_EDGE_COUNT; ++edge) {
+                if ((dccmCasingMask & (1 << edge)) == 0) continue;
+                MeshData casingData(payload->entity);
+                generateDCCMCasingForEdge(edge, payload->subChunks, payload->mainSubChunkCount, casingData);
+                if (!casingData.isEmpty()) {
+                    payload->subChunks.push_back(std::move(casingData));
+                }
+            }
+        }
+        payload->isEmpty = false;
+        payload->hasTightAABB = computeTightAABBFromSubChunks(
+            payload->subChunks,
+            payload->tightAABBMin,
+            payload->tightAABBMax);
+    }
+    payload->debugInfo.artifactSource = ChunkArtifactSource::RuntimeEditBuild;
+    payload->debugInfo.artifactCacheResident = true;
+    payload->debugInfo.artifactGeneration = world->getEditArtifactGeneration(
+        payload->coord.toVec3(),
+        artifactTerrainType,
+        effectiveLOD);
+    payload->debugInfo.subChunkCount = static_cast<uint16_t>(payload->subChunks.size());
+
+    // Update chunk component
+    {
+        std::unique_lock regLock(payload->world->registryMutex());
+        auto& registry = payload->world->getRegistry();
+        if (registry.valid(payload->entity) && registry.all_of<Chunk>(payload->entity)) {
+            auto& chunk = registry.get<Chunk>(payload->entity);
+            chunk.isEmpty = payload->isEmpty;
+            if (registry.any_of<ChunkEditRuntime>(payload->entity)) {
+                auto& editRuntime = registry.get<ChunkEditRuntime>(payload->entity);
+                if (shouldExposePagedEditableMode(
+                        artifactTerrainType,
+                        effectiveLOD,
+                        &editRuntime)) {
+                    ensureChunkEditRuntimeScaffold(editRuntime);
+                    fillPagedDebugInfo(editRuntime, payload->debugInfo);
+                    chunk.meshMode = ChunkMeshMode::PagedEditable;
+                } else {
+                    chunk.meshMode = ChunkMeshMode::MonolithicEdited;
+                }
+            } else {
+                chunk.meshMode = ChunkMeshMode::MonolithicEdited;
+            }
+            if (!payload->isRemesh) {
+                chunk.effectiveDataLod = static_cast<uint8_t>(std::clamp(effectiveLOD, 0, 255));
+                chunk.lodLevel = payload->lodLevel;
+            }
+            if (useDCCM) {
+                chunk.voxelSeamMask = 0;
+                chunk.casingSeamMask = dccmCasingMask;
+            } else {
+                // Match what WorldUpdateLODScan compares against, so the
+                // reconciliation pass doesn't immediately re-batch this
+                // chunk after a non-batch finalize requeue.
+                uint8_t computedSeam = 0;
+                if (payload->lodLevel > 0) {
+                    if (auto* mgr = payload->world->getChunkManager()) {
+                        computedSeam = mgr->getSeamEdgeMask(
+                            chunkCoord, payload->centerAtEnqueue);
+                    }
+                }
+                chunk.voxelSeamMask = computedSeam;
+                chunk.casingSeamMask = 0;
+            }
+        }
+    }
+
+    if (!payload->isRemesh) {
+        payload->world->transitionChunkState(payload->entity, ChunkState::State::Ready);
+    }
+}
+
+void UploadChunkJob(JobCtx&, void* user) {
+    auto* payload = static_cast<ChunkPipelinePayload*>(user);
+    if (!payload) {
+        std::cout << "[UploadJob] ERROR: null payload" << std::endl;
+        return;
+    }
+    
+    // Empty chunks have nothing to upload — skip.
+    // LoadPrecomputedMeshJob already transitioned them to Ready.
+    if (payload->isEmpty || payload->subChunks.empty()) {
+        // For LOD remesh batches, empty chunks must still flow through the
+        // upload system so the batch gets signaled (via onBatchChunkReady).
+        // Without this, one empty chunk permanently blocks the entire batch's
+        // PendingMeshHandle swap, freezing all chunks in that batch at old LOD.
+        if (payload->isRemesh && payload->batchId != 0 && payload->world) {
+            payload->world->enqueueMeshForUpload(
+                payload->entity,
+                std::move(payload->subChunks),
+                payload->mainSubChunkCount,
+                payload->fromTerrainEdit,
+                payload->versionState,
+                payload->version,
+                payload->tightAABBMin,
+                payload->tightAABBMax,
+                payload->hasTightAABB,
+                payload->isRemesh,
+                payload->batchId,
+                payload->debugInfo);
+        }
+        return;
+    }
+
+    if (payload->cancelled.load(std::memory_order_acquire)) {
+        // Do NOT clear inFlight — a newer pipeline may own it.
+        return;
+    }
+
+    if (!payloadStillCurrent(payload)) {
+        payload->cancelled.store(true, std::memory_order_release);
+        // Do NOT clear inFlight/pending — a newer pipeline owns those flags.
+        static std::atomic<int> staleCount{0};
+        if (staleCount.fetch_add(1, std::memory_order_relaxed) % 200 == 0) {
+            std::cout << "[UploadJob] Stale version (total: " << staleCount.load() << ")" << std::endl;
+        }
+        return;
+    }
+
+    if (!payload->world) {
+        if (payload->versionState) {
+            payload->versionState->inFlight.store(false, std::memory_order_release);
+        }
+        std::cout << "[UploadJob] ERROR: null world" << std::endl;
+        return;
+    }
+
+    // Upload all SubChunks together - they share a single MeshHandle with multiple draw ranges
+    payload->world->enqueueMeshForUpload(payload->entity,
+                                         std::move(payload->subChunks),
+                                         payload->mainSubChunkCount,
+                                         payload->fromTerrainEdit,
+                                         payload->versionState,
+                                         payload->version,
+                                         payload->tightAABBMin,
+                                         payload->tightAABBMax,
+                                         payload->hasTightAABB,
+                                         payload->isRemesh,
+                                         payload->batchId,
+                                         payload->debugInfo);
+}
+
+void FinalizeChunkJob(JobCtx&, void* user) {
+    // Return payload to pool instead of deleting (avoids heap free)
+    ChunkPipelinePayload* payload = static_cast<ChunkPipelinePayload*>(user);
+    if (!payload) {
+        std::cout << "[FinalizeJob] ERROR: null payload" << std::endl;
+        return;
+    }
+
+    // Successful uploads are only truly complete once the main-thread upload
+    // + finalize stages drain their queues. Clearing inFlight here makes the
+    // chunk look idle while an older mesh is still pending upload/finalize,
+    // which allows duplicate remesh dispatches and eventually produces
+    // VersionMismatchDrop / FinalizeDataLodMismatchRequeued cascades.
+    //
+    // Keep inFlight owned until processFinalizeQueue() for any pipeline that
+    // reached the upload path. Only release it here for terminal paths that do
+    // NOT enqueue a finalize request:
+    //  - cancelled / stale pipelines
+    //  - initial empty loads (non-remesh) that skip upload entirely
+    //  - malformed payloads with no world pointer
+    const bool terminalWithoutMainThreadFinalize =
+        !payload->world ||
+        payload->cancelled.load(std::memory_order_acquire) ||
+        (!payloadStillCurrent(payload)) ||
+        ((payload->isEmpty || payload->subChunks.empty()) && !payload->isRemesh);
+
+    if (terminalWithoutMainThreadFinalize && payload->versionState) {
+        payload->versionState->inFlight.store(false, std::memory_order_release);
+        payload->versionState->pending.store(false, std::memory_order_release);
+    }
+    
+    // Return to pool for reuse (world pointer gives us access to the pool)
+    if (payload->world) {
+        payload->world->getPayloadPool().release(payload);
+    } else {
+        delete payload;
+    }
+}
+
+````
+
+## src\world\chunks\streaming\ChunkUploadSystem.cpp
+
+Description: No CC-DESC found.
+
+````cpp
+#include "world/chunks/streaming/ChunkUploadSystem.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/config/WorldConfig.h"
+#include "vulkan/BufferSuballocator.h"
+#include "vulkan/UploadArena.h"
+#include "rendering/common/VulkanHelpers.h"
+#include "rendering/culling/GPUCullingSystem.h"
+#include <iostream>
+#include <algorithm>
+#include <unordered_set>
+
+ChunkUploadSystem::~ChunkUploadSystem() {
+    // Clean up any remaining nodes in the lock-free queue
+    UploadNode* head = m_queueHead.load(std::memory_order_acquire);
+    while (head) {
+        UploadNode* next = head->next.load(std::memory_order_relaxed);
+        delete head;
+        head = next;
+    }
+    // Clean up pool
+    head = m_poolHead.load(std::memory_order_acquire);
+    while (head) {
+        UploadNode* next = head->next.load(std::memory_order_relaxed);
+        delete head;
+        head = next;
+    }
+}
+
+ChunkUploadSystem::UploadNode* ChunkUploadSystem::allocNode(PendingUpload&& data) {
+    // Try to pop from the lock-free pool
+    UploadNode* node = m_poolHead.load(std::memory_order_acquire);
+    while (node) {
+        UploadNode* next = node->next.load(std::memory_order_relaxed);
+        if (m_poolHead.compare_exchange_weak(node, next,
+                                              std::memory_order_release,
+                                              std::memory_order_acquire)) {
+            node->data = std::move(data);
+            node->next.store(nullptr, std::memory_order_relaxed);
+            return node;
+        }
+    }
+    return new UploadNode(std::move(data));
+}
+
+void ChunkUploadSystem::freeNode(UploadNode* node) {
+    // Clear heavy data to free memory, then push to pool
+    node->data.subChunks.clear();
+    node->data.subChunks.shrink_to_fit();
+    node->data.versionState.reset();
+    UploadNode* oldHead = m_poolHead.load(std::memory_order_relaxed);
+    do {
+        node->next.store(oldHead, std::memory_order_relaxed);
+    } while (!m_poolHead.compare_exchange_weak(oldHead, node,
+                                                std::memory_order_release,
+                                                std::memory_order_relaxed));
+}
+
+void ChunkUploadSystem::enqueueMeshForUpload(
+    entt::entity entity,
+    MeshData&& mesh,
+    bool fromTerrainEdit,
+    std::shared_ptr<ChunkVersionState> versionState,
+    uint32_t version,
+    std::chrono::steady_clock::time_point enqueueTime,
+    ChunkDebugAttribution debugInfo)
+{
+    // Legacy single-mesh path: wrap in SubChunks vector
+    std::vector<MeshData> subChunks;
+    subChunks.push_back(std::move(mesh));
+    enqueueMeshForUpload(entity, std::move(subChunks), 1, fromTerrainEdit, versionState, version,
+                         glm::vec3(1e10f), glm::vec3(-1e10f), false, false, 0, enqueueTime,
+                         debugInfo);
+}
+
+void ChunkUploadSystem::enqueueMeshForUpload(
+    entt::entity entity,
+    std::vector<MeshData>&& subChunks,
+    uint8_t mainSubChunkCount,
+    bool fromTerrainEdit,
+    std::shared_ptr<ChunkVersionState> versionState,
+    uint32_t version,
+    glm::vec3 tightMin,
+    glm::vec3 tightMax,
+    bool hasTight,
+    bool isRemesh,
+    uint32_t batchId,
+    std::chrono::steady_clock::time_point enqueueTime,
+    ChunkDebugAttribution debugInfo)
+{
+    // Lock-free enqueue: create node and push to head
+    PendingUpload pu;
+    pu.entity = entity;
+    pu.subChunks = std::move(subChunks);
+    pu.mainSubChunkCount = mainSubChunkCount;
+    pu.fromTerrainEdit = fromTerrainEdit;
+    pu.versionState = versionState;
+    pu.version = version;
+    pu.tightAABBMin = tightMin;
+    pu.tightAABBMax = tightMax;
+    pu.hasTightAABB = hasTight;
+    pu.isRemesh = isRemesh;
+    pu.batchId = batchId;
+    pu.enqueueTime = (enqueueTime == std::chrono::steady_clock::time_point{})
+        ? std::chrono::steady_clock::now()
+        : enqueueTime;
+    pu.debugInfo = debugInfo;
+    
+    auto* node = allocNode(std::move(pu));
+    
+    // Push to head atomically (LIFO stack pattern for simplicity)
+    UploadNode* oldHead = m_queueHead.load(std::memory_order_relaxed);
+    do {
+        node->next.store(oldHead, std::memory_order_relaxed);
+    } while (!m_queueHead.compare_exchange_weak(oldHead, node, 
+                                                 std::memory_order_release,
+                                                 std::memory_order_relaxed));
+    
+    // Update size for metrics
+    m_queueSize.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ChunkUploadSystem::clearQueue() {
+    // Drain and return all nodes to pool from the lock-free stack
+    UploadNode* head = m_queueHead.exchange(nullptr, std::memory_order_acquire);
+    while (head) {
+        UploadNode* next = head->next.load(std::memory_order_relaxed);
+        freeNode(head);
+        head = next;
+    }
+    m_queueSize.store(0, std::memory_order_relaxed);
+    
+    // Clear finalize queue
+    while (!m_finalizeQueue.empty()) {
+        m_finalizeQueue.pop();
+    }
+}
+
+size_t ChunkUploadSystem::processUploads(
+    entt::registry& registry,
+    std::shared_mutex& registryMutex,
+    BufferSuballocator* vbAllocator,
+    BufferSuballocator* ibAllocator,
+    UploadArena* uploadArena,
+    ResourceUploader* uploader,
+    uint64_t uploadReadyValue,
+    IUploadCallback* callback,
+    size_t maxUploadsOverride,
+    bool terrainEditOnly)
+{
+    // Quick check: is there any work at all? If not, skip everything.
+    UploadNode* head = m_queueHead.load(std::memory_order_acquire);
+    if (!head && m_finalizeQueue.empty()) {
+        m_currentUploadBudget = 0;
+        return 0;
+    }
+
+    if (!head) {
+        m_currentUploadBudget = 0;
+        return 0;
+    }
+
+    const size_t queuedAtStart = m_queueSize.load(std::memory_order_relaxed);
+    size_t maxBudget = queuedAtStart;
+    if (maxUploadsOverride > 0) {
+        maxBudget = std::min(maxBudget, maxUploadsOverride);
+    }
+
+    auto popQueuedNode = [this]() -> UploadNode* {
+        UploadNode* node = m_queueHead.load(std::memory_order_acquire);
+        while (node) {
+            UploadNode* next = node->next.load(std::memory_order_relaxed);
+            if (m_queueHead.compare_exchange_weak(
+                    node,
+                    next,
+                    std::memory_order_acquire,
+                    std::memory_order_acquire)) {
+                node->next.store(nullptr, std::memory_order_relaxed);
+                return node;
+            }
+        }
+        return nullptr;
+    };
+
+    // Do not drain/sort/deduplicate the entire streaming backlog every frame
+    // when the caller explicitly supplied a small budget. The old path touched
+    // queuedAtStart nodes even if only 96 uploads could be processed, so a large
+    // finished-mesh backlog showed up as persistent CPU time outside finalize.
+    //
+    // Keep terrainEditOnly full-scan: late edit catch-up must be allowed to fish
+    // edit uploads out of a mixed queue immediately. Normal streaming gets a
+    // bounded overscan window so distance sorting still has useful candidates
+    // without scanning thousands of queued uploads per frame.
+    size_t scanLimit = queuedAtStart;
+    if (!terrainEditOnly && maxUploadsOverride > 0) {
+        constexpr size_t kStreamingOverscanMultiplier = 4;
+        constexpr size_t kStreamingMinimumScanWindow = 128;
+        const size_t budgetWindow = std::max(maxBudget, kStreamingMinimumScanWindow);
+        const size_t boundedScanLimit = budgetWindow * kStreamingOverscanMultiplier;
+        scanLimit = std::min(queuedAtStart, boundedScanLimit);
+    }
+
+    // Reuse pre-allocated drain buffer (avoid per-frame heap allocation)
+    m_drainBuffer.clear();
+    for (size_t i = 0; i < scanLimit; ++i) {
+        UploadNode* node = popQueuedNode();
+        if (!node) break;
+        m_drainBuffer.push_back(node);
+    }
+    if (m_drainBuffer.empty()) {
+        m_currentUploadBudget = 0;
+        return 0;
+    }
+
+    auto requeueNode = [this](UploadNode* node) {
+        UploadNode* expected = m_queueHead.load(std::memory_order_relaxed);
+        do {
+            node->next.store(expected, std::memory_order_relaxed);
+        } while (!m_queueHead.compare_exchange_weak(expected, node,
+            std::memory_order_release, std::memory_order_relaxed));
+    };
+
+    // Deduplicate: if multiple uploads exist for the same entity, keep only the latest.
+    // The drain buffer is in LIFO order: index 0 = newest push, index N-1 = oldest push.
+    // Iterate newest-first so the first occurrence (newest) is kept and older duplicates
+    // are freed.  The old reverse iteration kept the OLDEST upload, which then failed
+    // the version check because a newer edit had already bumped the version.
+    {
+        m_deduplicateSet.clear();
+        for (size_t i = 0; i < m_drainBuffer.size(); ++i) {
+            uint32_t key = static_cast<uint32_t>(entt::to_integral(m_drainBuffer[i]->data.entity));
+            if (!m_deduplicateSet.insert(key).second) {
+                freeNode(m_drainBuffer[i]);
+                m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                m_drainBuffer[i] = nullptr;
+            }
+        }
+        m_drainBuffer.erase(std::remove(m_drainBuffer.begin(), m_drainBuffer.end(), nullptr), m_drainBuffer.end());
+    }
+
+    if (terrainEditOnly) {
+        for (size_t i = 0; i < m_drainBuffer.size(); ++i) {
+            UploadNode* node = m_drainBuffer[i];
+            if (!node->data.fromTerrainEdit) {
+                requeueNode(node);
+                m_drainBuffer[i] = nullptr;
+            }
+        }
+        m_drainBuffer.erase(std::remove(m_drainBuffer.begin(), m_drainBuffer.end(), nullptr), m_drainBuffer.end());
+        if (m_drainBuffer.empty()) {
+            m_currentUploadBudget = 0;
+            return 0;
+        }
+    }
+
+    // Sort by Chebyshev distance from center (ascending) and mark invalid entities
+    glm::ivec3 center = m_centerChunk;
+    {
+        std::shared_lock regLock(registryMutex);
+        for (size_t i = 0; i < m_drainBuffer.size(); ) {
+            auto* node = m_drainBuffer[i];
+            if (!registry.valid(node->data.entity)) {
+                // Entity destroyed before upload — prune now under this single lock
+                freeNode(node);
+                m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                m_drainBuffer[i] = m_drainBuffer.back();
+                m_drainBuffer.pop_back();
+                continue;
+            }
+            if (registry.all_of<ChunkCoord>(node->data.entity)) {
+                const auto& cc = registry.get<ChunkCoord>(node->data.entity);
+                node->data.distanceSortKey =
+                    std::max(std::abs(cc.x - center.x), std::abs(cc.z - center.z));
+            } else {
+                node->data.distanceSortKey = 999999;
+            }
+            ++i;
+        }
+    }
+    std::sort(m_drainBuffer.begin(), m_drainBuffer.end(), [&](UploadNode* a, UploadNode* b) {
+        if (a->data.fromTerrainEdit != b->data.fromTerrainEdit) {
+            return a->data.fromTerrainEdit && !b->data.fromTerrainEdit;
+        }
+        const int distA = a->data.distanceSortKey;
+        const int distB = b->data.distanceSortKey;
+        if (distA != distB) {
+            return distA < distB;
+        }
+        return a->data.enqueueTime < b->data.enqueueTime;
+    });
+
+    const size_t initialQueueSize = m_drainBuffer.size();
+    const size_t uploadBudget = std::min(initialQueueSize, maxBudget);
+    m_currentUploadBudget = static_cast<uint32_t>(uploadBudget);
+
+    auto emitUploadEvent = [&](entt::entity entity,
+                               const glm::ivec3* chunkCoord,
+                               int lodLevel,
+                               const char* stage,
+                               const char* reason,
+                               uint32_t batchId,
+                               uint32_t expectedVersion,
+                               uint32_t actualVersion,
+                               const ChunkDebugAttribution* debugInfo) {
+        if (!callback) return;
+        callback->onUploadPipelineEvent(
+            entity,
+            chunkCoord,
+            lodLevel,
+            stage,
+            reason,
+            batchId,
+            expectedVersion,
+            actualVersion,
+            debugInfo);
+    };
+
+    auto lookupEntityContext = [&](entt::entity entity, glm::ivec3& outCoord, int& outLodLevel) -> const glm::ivec3* {
+        outLodLevel = -1;
+        std::shared_lock regLock(registryMutex);
+        if (!registry.valid(entity)) {
+            return nullptr;
+        }
+        if (registry.all_of<ChunkCoord>(entity)) {
+            outCoord = registry.get<ChunkCoord>(entity).toVec3();
+        } else {
+            return nullptr;
+        }
+        if (registry.all_of<Chunk>(entity)) {
+            outLodLevel = registry.get<Chunk>(entity).lodLevel;
+        }
+        return &outCoord;
+    };
+
+    // ── PHASE 1: Prepare upload data OUTSIDE the unique lock ──
+    // Validate entities, allocate GPU memory, and record staging copies.
+    // This moves the expensive work (allocator locks, staging copies) out
+    // of the registry unique_lock, dramatically reducing lock hold time.
+    struct PreparedUpload {
+        UploadNode* node;
+        BufferSlice vb;
+        BufferSlice ib;
+        MeshHandle handle;
+        bool allEmpty;
+        bool valid;
+        bool skipVersion;
+        const MeshData* firstSubChunk;
+    };
+
+    // Use a local small buffer for typical case, heap only if many uploads
+    std::vector<PreparedUpload> prepared;
+    prepared.reserve(uploadBudget);
+    std::vector<UploadNode*> deferredUploads;
+    deferredUploads.reserve(m_drainBuffer.size());
+
+    size_t processed = 0;
+    bool allocationFailed = false;
+    for (size_t nodeIdx = 0; nodeIdx < m_drainBuffer.size(); ++nodeIdx) {
+        UploadNode* node = m_drainBuffer[nodeIdx];
+
+        // Re-enqueue over-budget nodes or nodes after allocation failure
+        if (processed >= uploadBudget || allocationFailed) {
+            deferredUploads.push_back(node);
+            continue;
+        }
+
+        PendingUpload& req = node->data;
+
+        // Entity validity already checked during distance-sort shared_lock above.
+        // Re-check is deferred to Phase 2 under the unique_lock.
+
+        // Version check (no lock needed — atomic)
+        if (req.versionState) {
+            uint32_t currentVersion = req.versionState->version.load(std::memory_order_acquire);
+            if (currentVersion != req.version) {
+                glm::ivec3 chunkCoord{};
+                int lodLevel = -1;
+                emitUploadEvent(
+                    req.entity,
+                    lookupEntityContext(req.entity, chunkCoord, lodLevel),
+                    lodLevel,
+                    "UploadPrepare",
+                    "VersionMismatchDrop",
+                    req.batchId,
+                    req.version,
+                    currentVersion,
+                    &req.debugInfo);
+                // Signal batch so LOD transitions don't get permanently stuck
+                // waiting for a chunk whose upload was superseded by a newer
+                // pipeline run.  The entity that bumped the version owns
+                // inFlight and will clear it via its own finalize path —
+                // do NOT clear inFlight here or the drain may create
+                // duplicate batches while the newer pipeline is in-flight.
+                if (req.isRemesh && req.batchId != 0 && m_batchCallback) {
+                    m_batchCallback->onBatchChunkReady(req.batchId);
+                }
+                freeNode(node);
+                m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                continue;
+            }
+        }
+
+        // Check for empty SubChunks
+        bool allEmpty = req.subChunks.empty();
+        if (!allEmpty) {
+            allEmpty = true;
+            for (const auto& sub : req.subChunks) {
+                if (!sub.isEmpty()) {
+                    allEmpty = false;
+                    break;
+                }
+            }
+        }
+
+        PreparedUpload prep;
+        prep.node = node;
+        prep.allEmpty = allEmpty;
+        prep.valid = true;
+        prep.skipVersion = false;
+        prep.firstSubChunk = nullptr;
+        req.debugInfo.fromLodBatch = req.isRemesh;
+        req.debugInfo.fromTerrainEdit = req.fromTerrainEdit;
+
+        if (allEmpty) {
+            // Empty mesh — no GPU allocation needed
+            req.debugInfo.uploadBytes = 0;
+            req.debugInfo.subChunkCount = 0;
+            prep.handle = MeshHandle{};
+            prep.handle.subChunkCount = 0;
+            prep.handle.gpuReadyValue = uploadReadyValue;
+            prepared.push_back(prep);
+            ++processed;
+            continue;
+        }
+
+        // Calculate total sizes
+        VkDeviceSize totalVbSize = 0;
+        VkDeviceSize totalIbSize = 0;
+        size_t validSubChunks = 0;
+
+        for (const auto& sub : req.subChunks) {
+            if (sub.isEmpty()) continue;
+            totalVbSize += sub.vertices.size() * sizeof(Vertex);
+            totalIbSize += sub.indices.size() * sizeof(uint16_t);
+            validSubChunks++;
+        }
+
+        if (validSubChunks > MAX_SUBCHUNKS) {
+            // Loud + persistent: silent truncation here was a known cause of stale
+            // GPU vb/ib slices being reused by other chunks, producing stretched
+            // "far away" triangles. If this fires, the splitter (or its caller)
+            // produced more sub-meshes than MAX_SUBCHUNKS can hold; bump
+            // MAX_SUBCHUNKS in include/world/chunks/core/Chunk.h (and the matching
+            // GPU_MAX_SUBCHUNKS / shader #define / MAX_RUNTIME_SUBMESHES).
+            std::cerr << "[ChunkUploadSystem] CRITICAL: Chunk has " << validSubChunks
+                      << " SubChunks, max is " << MAX_SUBCHUNKS
+                      << ". TRUNCATING (geometry will be lost — expect visual corruption)."
+                      << std::endl;
+            validSubChunks = MAX_SUBCHUNKS;
+        }
+
+        const VkDeviceSize totalUploadBytes = totalVbSize + totalIbSize;
+        req.debugInfo.uploadBytes = static_cast<uint64_t>(totalUploadBytes);
+        req.debugInfo.subChunkCount = static_cast<uint16_t>(validSubChunks);
+        // Allocate GPU buffers (outside registry lock — allocator has its own lock)
+        BufferSlice vb = vbAllocator->allocate(totalVbSize, 16);
+        BufferSlice ib = ibAllocator->allocate(totalIbSize, 16);
+
+        if (!vb.isValid() || !ib.isValid()) {
+            // Throttle log: only print every 60 failures to avoid spam
+            uint32_t failCount = m_allocationFailures.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (failCount == 1 || failCount % 60 == 0) {
+                VkDeviceSize vbTotal = vbAllocator->getTotalCapacity();
+                VkDeviceSize vbUsed = vbAllocator->getAllocatedBytes();
+                VkDeviceSize ibTotal = ibAllocator->getTotalCapacity();
+                VkDeviceSize ibUsed = ibAllocator->getAllocatedBytes();
+                std::cout << "[ChunkUploadSystem] BUFFER ALLOCATION FAILED (x" << failCount << ") - VB: " << (vbUsed / 1024 / 1024) << "/" << (vbTotal / 1024 / 1024)
+                          << "MB, IB: " << (ibUsed / 1024 / 1024) << "/" << (ibTotal / 1024 / 1024) << "MB" << std::endl;
+            }
+            if (vb.isValid()) vbAllocator->free(vb);
+            if (ib.isValid()) ibAllocator->free(ib);
+
+            glm::ivec3 chunkCoord{};
+            int lodLevel = -1;
+            emitUploadEvent(
+                req.entity,
+                lookupEntityContext(req.entity, chunkCoord, lodLevel),
+                lodLevel,
+                "UploadPrepare",
+                "GpuBufferAllocFailedRequeue",
+                req.batchId,
+                req.version,
+                req.version,
+                &req.debugInfo);
+
+            // Preserve the same node. Rebuilding the request via enqueue would
+            // transiently double-count m_queueSize and allocate another node.
+            deferredUploads.push_back(node);
+            allocationFailed = true;
+            continue;
+        }
+
+        // Allocation succeeded — reset failure counter
+        m_allocationFailures.store(0, std::memory_order_relaxed);
+
+        // Build MeshHandle and record staging copies (outside registry lock)
+        MeshHandle handle;
+        handle.vb = vb;
+        handle.ib = ib;
+        handle.sourceBuffer = vb.buffer;
+        handle.gpuReadyValue = uploadReadyValue;
+        handle.subChunkCount = 0;
+        handle.mainSubChunkCount = req.mainSubChunkCount;
+
+        VkDeviceSize vbOffset = 0;
+        VkDeviceSize ibOffset = 0;
+        const MeshData* firstSubChunk = nullptr;
+
+        for (const auto& sub : req.subChunks) {
+            if (sub.isEmpty()) continue;
+            if (handle.subChunkCount >= MAX_SUBCHUNKS) {
+                std::cerr << "[ChunkUploadSystem] CRITICAL: dropping submesh #"
+                          << static_cast<int>(handle.subChunkCount)
+                          << " — MAX_SUBCHUNKS=" << MAX_SUBCHUNKS
+                          << " reached. This will corrupt rendering." << std::endl;
+                break;
+            }
+
+            // Validate that every 16-bit index fits within this submesh's
+            // vertex range. If not, the splitter has a bug and we'd render
+            // garbage from a neighbouring chunk's slice.
+            const uint32_t subVertCount = static_cast<uint32_t>(sub.vertices.size());
+            if (subVertCount > 65536u) {
+                std::cerr << "[ChunkUploadSystem] CRITICAL: submesh has "
+                          << subVertCount << " verts > 65536 — 16-bit indices will overflow."
+                          << std::endl;
+            }
+#ifndef NDEBUG
+            for (uint16_t idx : sub.indices) {
+                if (static_cast<uint32_t>(idx) >= subVertCount) {
+                    std::cerr << "[ChunkUploadSystem] CRITICAL: submesh index "
+                              << static_cast<uint32_t>(idx)
+                              << " >= submesh vertex count " << subVertCount
+                              << " — splitter produced out-of-range indices." << std::endl;
+                    break;
+                }
+            }
+#endif
+
+            VkDeviceSize subVbSize = sub.vertices.size() * sizeof(Vertex);
+            VkDeviceSize subIbSize = sub.indices.size() * sizeof(uint16_t);
+
+            BufferSlice subVb = vb;
+            subVb.offset += vbOffset;
+            subVb.size = subVbSize;
+
+            BufferSlice subIb = ib;
+            subIb.offset += ibOffset;
+            subIb.size = subIbSize;
+
+            // Record staging copies (uses uploadArena which has its own lock)
+            UploadRequest vbReq{sub.vertices.data(), subVbSize, subVb};
+            UploadRequest ibReq{sub.indices.data(), subIbSize, subIb};
+            uploader->recordCopy(vbReq, *uploadArena);
+            uploader->recordCopy(ibReq, *uploadArena);
+
+            uint32_t firstIndex = static_cast<uint32_t>((ib.offset + ibOffset) / sizeof(uint16_t));
+            int32_t vertexOffset = static_cast<int32_t>((vb.offset + vbOffset) / sizeof(Vertex));
+
+            handle.subChunks[handle.subChunkCount].firstIndex = firstIndex;
+            handle.subChunks[handle.subChunkCount].indexCount = static_cast<uint32_t>(sub.indices.size());
+            handle.subChunks[handle.subChunkCount].vertexOffset = vertexOffset;
+            handle.subChunkCount++;
+
+            if (!firstSubChunk) {
+                firstSubChunk = &sub;
+            }
+
+            vbOffset += subVbSize;
+            ibOffset += subIbSize;
+        }
+
+        prep.vb = vb;
+        prep.ib = ib;
+        prep.handle = handle;
+        prep.firstSubChunk = firstSubChunk;
+        prepared.push_back(prep);
+        ++processed;
+    }
+
+    // m_drainBuffer is sorted nearest-first. Push deferred nodes back in reverse
+    // order so the nearest remaining upload is at the stack head next frame.
+    for (auto it = deferredUploads.rbegin(); it != deferredUploads.rend(); ++it) {
+        requeueNode(*it);
+    }
+
+    // ── PHASE 2: Apply to registry under unique lock (fast — no allocations) ──
+    // Only emplace_or_replace / get<> calls — bounded by budget count.
+    {
+        std::unique_lock regLock(registryMutex);
+
+        for (auto& prep : prepared) {
+            PendingUpload& req = prep.node->data;
+
+            if (!registry.valid(req.entity)) {
+                // Entity destroyed between phase 1 and 2 — free allocated buffers
+                if (!prep.allEmpty && prep.vb.isValid()) vbAllocator->free(prep.vb);
+                if (!prep.allEmpty && prep.ib.isValid()) ibAllocator->free(prep.ib);
+                // Signal batch so it doesn't get permanently stuck
+                if (req.isRemesh && req.batchId != 0 && m_batchCallback) {
+                    m_batchCallback->onBatchChunkReady(req.batchId);
+                }
+                emitUploadEvent(
+                    req.entity,
+                    nullptr,
+                    -1,
+                    "UploadApply",
+                    "EntityDestroyedBeforeApply",
+                    req.batchId,
+                    req.version,
+                    req.version,
+                    &req.debugInfo);
+                freeNode(prep.node);
+                m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            if (prep.allEmpty) {
+                if (req.isRemesh && req.batchId != 0) {
+                    // Empty chunk in a LOD remesh batch — store an empty
+                    // PendingMeshHandle so processLODSwaps can swap it in
+                    // (replacing the old mesh) and push a finalize request
+                    // so inFlight is cleared.  Without this, empty batch
+                    // entities are permanently stuck with inFlight=true and
+                    // processLODSwaps reports missingPending.
+                    PendingMeshHandle pending;
+                    pending.handle = prep.handle;
+                    pending.batchId = req.batchId;
+                    pending.uploadEnqueueTime = req.enqueueTime;
+                    pending.debugInfo = req.debugInfo;
+                    pending.debugInfo.residency = deriveChunkResidencyKind(
+                        /*gpuResident=*/false,
+                        pending.debugInfo.artifactCacheResident,
+                        /*pendingBatch=*/true);
+
+                    // Free any prior PendingMeshHandle's GPU resources
+                    if (registry.all_of<PendingMeshHandle>(req.entity)) {
+                        auto& old = registry.get<PendingMeshHandle>(req.entity);
+                        if (old.handle.vb.isValid() && vbAllocator) vbAllocator->free(old.handle.vb);
+                        if (old.handle.ib.isValid() && ibAllocator) ibAllocator->free(old.handle.ib);
+                        if (m_gpuCulling && old.handle.gpuCullingSlot != UINT32_MAX) {
+                            m_gpuCulling->freeSlot(old.handle.gpuCullingSlot);
+                        }
+                    }
+
+                    registry.emplace_or_replace<PendingMeshHandle>(req.entity, pending);
+
+                    if (m_batchCallback) {
+                        m_batchCallback->onBatchChunkReady(req.batchId);
+                    }
+
+                    ChunkFinalizeRequest finalizeReq;
+                    finalizeReq.entity = req.entity;
+                    finalizeReq.uploadValue = uploadReadyValue;
+                    finalizeReq.enqueueTime = req.enqueueTime;
+                    finalizeReq.versionState = req.versionState;
+                    finalizeReq.debugInfo = pending.debugInfo;
+                    m_finalizeQueue.push(finalizeReq);
+
+                    freeNode(prep.node);
+                    m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                    continue;
+                }
+
+                if (callback && registry.all_of<MeshHandle>(req.entity)) {
+                    callback->onMeshHandleRemoved(registry.get<MeshHandle>(req.entity));
+                }
+                // GHOST-GEOMETRY FIX: when a solo edit fully empties a chunk
+                // (allEmpty + non-batch), we replace the existing MeshHandle
+                // with an empty one. The old handle's vb/ib slices and GPU
+                // culling slot must be freed explicitly — emplace_or_replace
+                // simply overwrites the component without touching its GPU
+                // resources. Leaking the slot leaves stale ChunkDrawData
+                // active in the GPU compute culling shader, which keeps
+                // drawing the pre-edit mesh from the leaked vb/ib (visible
+                // only with G mode ON, since the CPU gather path filters on
+                // mesh.getTotalIndexCount() == 0). The chunk also has no
+                // collider because enqueueEditCollision tore the body down,
+                // matching the "ghost faces with no collision" symptom.
+                if (registry.all_of<MeshHandle>(req.entity)) {
+                    auto& oldMesh = registry.get<MeshHandle>(req.entity);
+                    if (oldMesh.vb.isValid() && vbAllocator) vbAllocator->free(oldMesh.vb);
+                    if (oldMesh.ib.isValid() && ibAllocator) ibAllocator->free(oldMesh.ib);
+                    if (m_gpuCulling && oldMesh.gpuCullingSlot != UINT32_MAX) {
+                        m_gpuCulling->freeSlot(oldMesh.gpuCullingSlot);
+                    }
+                }
+                // Free stale PendingMeshHandle from a prior LOD batch; otherwise
+                // processLODSwaps would overwrite this newer empty mesh.
+                if (registry.all_of<PendingMeshHandle>(req.entity)) {
+                    auto& stale = registry.get<PendingMeshHandle>(req.entity);
+                    if (stale.handle.vb.isValid() && vbAllocator) vbAllocator->free(stale.handle.vb);
+                    if (stale.handle.ib.isValid() && ibAllocator) ibAllocator->free(stale.handle.ib);
+                    if (m_gpuCulling && stale.handle.gpuCullingSlot != UINT32_MAX) {
+                        m_gpuCulling->freeSlot(stale.handle.gpuCullingSlot);
+                    }
+                    registry.remove<PendingMeshHandle>(req.entity);
+                }
+                registry.emplace_or_replace<MeshHandle>(req.entity, prep.handle);
+
+                ChunkFinalizeRequest finalizeReq;
+                finalizeReq.entity = req.entity;
+                finalizeReq.uploadValue = uploadReadyValue;
+                finalizeReq.enqueueTime = req.enqueueTime;
+                finalizeReq.versionState = req.versionState;
+                finalizeReq.debugInfo = req.debugInfo;
+                finalizeReq.debugInfo.residency = deriveChunkResidencyKind(
+                    /*gpuResident=*/true,
+                    finalizeReq.debugInfo.artifactCacheResident,
+                    /*pendingBatch=*/false);
+                m_finalizeQueue.push(finalizeReq);
+
+                freeNode(prep.node);
+                m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            MeshHandle& handle = prep.handle;
+
+            if (req.isRemesh && req.batchId != 0) {
+                // --- LOD REMESH PATH ---
+                // Batch was cancelled while this upload was in-flight: drop it.
+                if (!m_batchCallback || !m_batchCallback->isBatchActive(req.batchId)) {
+                    glm::ivec3 chunkCoord{};
+                    const glm::ivec3* chunkCoordPtr = nullptr;
+                    int lodLevel = -1;
+                    if (registry.all_of<ChunkCoord>(req.entity)) {
+                        chunkCoord = registry.get<ChunkCoord>(req.entity).toVec3();
+                        chunkCoordPtr = &chunkCoord;
+                    }
+                    if (registry.all_of<Chunk>(req.entity)) {
+                        lodLevel = registry.get<Chunk>(req.entity).lodLevel;
+                    }
+                    if (prep.vb.isValid()) vbAllocator->free(prep.vb);
+                    if (prep.ib.isValid()) ibAllocator->free(prep.ib);
+                    emitUploadEvent(
+                        req.entity,
+                        chunkCoordPtr,
+                        lodLevel,
+                        "UploadApply",
+                        "RemeshBatchCancelledDrop",
+                        req.batchId,
+                        req.version,
+                        req.version,
+                        &req.debugInfo);
+                    freeNode(prep.node);
+                    m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                    continue;
+                }
+
+                if (m_gpuCulling && m_gpuCulling->isReady() && registry.all_of<AABB, ChunkCoord>(req.entity)) {
+                    // LOD remeshes live in PendingMeshHandle until the whole
+                    // batch swaps. Keep their culling slots inactive so the
+                    // GPU cannot draw pending LOD meshes beside the old mesh.
+                    uint32_t slot = m_gpuCulling->allocateSlot(/*active=*/false);
+                    if (slot != UINT32_MAX) {
+                        handle.gpuCullingSlot = slot;
+
+                        const auto& chunkAabb = registry.get<AABB>(req.entity);
+                        const auto& coord = registry.get<ChunkCoord>(req.entity);
+
+                        ChunkDrawData drawData{};
+                        drawData.subChunkCount = handle.subChunkCount;
+
+                        for (uint8_t i = 0; i < handle.subChunkCount && i < GPU_MAX_SUBCHUNKS; ++i) {
+                            const auto& sc = handle.subChunks[i];
+                            drawData.draws[i].indexCount = sc.indexCount;
+                            drawData.draws[i].instanceCount = 1;
+                            drawData.draws[i].firstIndex = sc.firstIndex;
+                            drawData.draws[i].vertexOffset = sc.vertexOffset;
+                            drawData.draws[i].firstInstance = 0;
+                        }
+
+                        if (req.hasTightAABB) {
+                            glm::vec3 chunkOrigin = chunkAabb.min;
+                            drawData.aabbMin = glm::vec4(chunkOrigin + req.tightAABBMin, 0.0f);
+                            drawData.aabbMax = glm::vec4(chunkOrigin + req.tightAABBMax, 0.0f);
+                            drawData.aabbMin = glm::max(drawData.aabbMin, glm::vec4(chunkAabb.min, 0.0f));
+                            drawData.aabbMax = glm::min(drawData.aabbMax, glm::vec4(chunkAabb.max, 0.0f));
+                        } else {
+                            drawData.aabbMin = glm::vec4(chunkAabb.min, 0.0f);
+                            drawData.aabbMax = glm::vec4(chunkAabb.max, 0.0f);
+                        }
+
+                        drawData.origin = glm::vec4(float(coord.x), float(coord.y), float(coord.z), 0.0f);
+                        uint32_t readyValueBits = static_cast<uint32_t>(handle.gpuReadyValue);
+                        drawData.origin.w = *reinterpret_cast<float*>(&readyValueBits);
+                        // LOD swaps replace one representation of the same
+                        // terrain with another. They must remain occludable
+                        // immediately; only topology-changing edits need Hi-Z
+                        // grace to avoid stale-pyramid death spirals.
+                        drawData.hiZGraceTimeline = readyValueBits;
+
+                        VkDeviceSize dataSize = sizeof(ChunkDrawData);
+                        VkDeviceSize slotOffset = slot * sizeof(ChunkDrawData);
+
+                        UploadRequest cullReq{};
+                        cullReq.src = &drawData;
+                        cullReq.size = dataSize;
+                        cullReq.dst = BufferSlice{m_gpuCulling->getAllDrawsBuffer(), slotOffset, dataSize};
+                        uploader->recordCopy(cullReq, *uploadArena);
+                        m_gpuCulling->noteChunkDrawDataUpload(
+                            slot,
+                            drawData,
+                            req.fromTerrainEdit,
+                            /*replacesExistingMesh=*/true);
+                    }
+                }
+
+                if (registry.all_of<PendingMeshHandle>(req.entity)) {
+                    auto& oldPending = registry.get<PendingMeshHandle>(req.entity);
+                    if (oldPending.handle.vb.isValid() && vbAllocator) vbAllocator->free(oldPending.handle.vb);
+                    if (oldPending.handle.ib.isValid() && ibAllocator) ibAllocator->free(oldPending.handle.ib);
+                    if (m_gpuCulling && oldPending.handle.gpuCullingSlot != UINT32_MAX) {
+                        m_gpuCulling->freeSlot(oldPending.handle.gpuCullingSlot);
+                    }
+                }
+
+                PendingMeshHandle pending;
+                pending.handle = handle;
+                pending.batchId = req.batchId;
+                pending.uploadEnqueueTime = req.enqueueTime;
+                pending.debugInfo = req.debugInfo;
+                pending.debugInfo.residency = deriveChunkResidencyKind(
+                    /*gpuResident=*/false,
+                    pending.debugInfo.artifactCacheResident,
+                    /*pendingBatch=*/true);
+                registry.emplace_or_replace<PendingMeshHandle>(req.entity, pending);
+
+                if (m_batchCallback) {
+                    m_batchCallback->onBatchChunkReady(req.batchId);
+                }
+
+                ChunkFinalizeRequest finalizeReq;
+                finalizeReq.entity = req.entity;
+                finalizeReq.uploadValue = uploadReadyValue;
+                finalizeReq.enqueueTime = req.enqueueTime;
+                finalizeReq.versionState = req.versionState;
+                finalizeReq.debugInfo = pending.debugInfo;
+                m_finalizeQueue.push(finalizeReq);
+
+                m_meshesUploaded.fetch_add(1, std::memory_order_relaxed);
+                freeNode(prep.node);
+                m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+                continue;
+            }
+
+            // --- NORMAL PATH ---
+            const bool hasExistingMesh = registry.all_of<MeshHandle>(req.entity);
+            const uint32_t existingCullingSlot =
+                hasExistingMesh ? registry.get<MeshHandle>(req.entity).gpuCullingSlot : UINT32_MAX;
+            // If a LOD batch stored a PendingMeshHandle before this entity was
+            // updated through a non-batch path (e.g. edit remesh), the stale
+            // pending mesh must be freed.  Otherwise processLODSwaps would
+            // overwrite the newer non-batch mesh with the older batch mesh,
+            // producing [Load] entries after every [Edit]. Also drops any prior
+            // solo-edit PendingMeshHandle superseded by this newer upload.
+            if (registry.all_of<PendingMeshHandle>(req.entity)) {
+                auto& stale = registry.get<PendingMeshHandle>(req.entity);
+                if (stale.handle.vb.isValid()) vbAllocator->free(stale.handle.vb);
+                if (stale.handle.ib.isValid()) ibAllocator->free(stale.handle.ib);
+                // Solo-edit uploads reuse the current MeshHandle's culling slot.
+                // If the stale pending handle references that same slot, freeing
+                // it here would deactivate the live chunk and make it vanish
+                // under GPU culling (NotDrawn.SlotInactive).
+                if (m_gpuCulling &&
+                    stale.handle.gpuCullingSlot != UINT32_MAX &&
+                    stale.handle.gpuCullingSlot != existingCullingSlot) {
+                    m_gpuCulling->freeSlot(stale.handle.gpuCullingSlot);
+                }
+                registry.remove<PendingMeshHandle>(req.entity);
+            }
+
+            // GPU Culling slot allocation + upload
+            if (m_gpuCulling && m_gpuCulling->isReady() && registry.all_of<AABB, ChunkCoord>(req.entity)) {
+                // Solo-edit path: REUSE the existing chunk's gpuCullingSlot so we
+                // don't briefly have two active slots for the same chunk (which
+                // causes the GPU to draw the chunk twice → z-fighting / flicker).
+                // The slot's draw data is overwritten with the new vb/ib pointers
+                // and gpuReadyValue=batchValue; this frame's culling dispatch
+                // waits for the upload semaphore so it reads the NEW data, while
+                // in-flight previous frames already captured indirect draws using
+                // the OLD vb/ib (still alive until processSoloPendingSwaps).
+                uint32_t reuseSlot = UINT32_MAX;
+                if (hasExistingMesh) {
+                    reuseSlot = existingCullingSlot;
+                }
+                uint32_t slot = (reuseSlot != UINT32_MAX) ? reuseSlot : m_gpuCulling->allocateSlot();
+                if (slot != UINT32_MAX) {
+                    handle.gpuCullingSlot = slot;
+
+                    const auto& chunkAabb = registry.get<AABB>(req.entity);
+                    const auto& coord = registry.get<ChunkCoord>(req.entity);
+
+                    ChunkDrawData drawData{};
+                    drawData.subChunkCount = handle.subChunkCount;
+
+                    for (uint8_t i = 0; i < handle.subChunkCount && i < GPU_MAX_SUBCHUNKS; ++i) {
+                        const auto& sc = handle.subChunks[i];
+                        drawData.draws[i].indexCount = sc.indexCount;
+                        drawData.draws[i].instanceCount = 1;
+                        drawData.draws[i].firstIndex = sc.firstIndex;
+                        drawData.draws[i].vertexOffset = sc.vertexOffset;
+                        drawData.draws[i].firstInstance = 0;
+                    }
+
+                    if (req.hasTightAABB) {
+                        glm::vec3 chunkOrigin = chunkAabb.min;
+                        drawData.aabbMin = glm::vec4(chunkOrigin + req.tightAABBMin, 0.0f);
+                        drawData.aabbMax = glm::vec4(chunkOrigin + req.tightAABBMax, 0.0f);
+                        drawData.aabbMin = glm::max(drawData.aabbMin, glm::vec4(chunkAabb.min, 0.0f));
+                        drawData.aabbMax = glm::min(drawData.aabbMax, glm::vec4(chunkAabb.max, 0.0f));
+                    } else {
+                        drawData.aabbMin = glm::vec4(chunkAabb.min, 0.0f);
+                        drawData.aabbMax = glm::vec4(chunkAabb.max, 0.0f);
+                    }
+
+                    glm::ivec3 chunkCoordVec(coord.x, coord.y, coord.z);
+                    drawData.origin = glm::vec4(float(coord.x), float(coord.y), float(coord.z), 0.0f);
+                    uint32_t readyValueBits = static_cast<uint32_t>(handle.gpuReadyValue);
+                    drawData.origin.w = *reinterpret_cast<float*>(&readyValueBits);
+                    // Hi-Z grace is only needed when replacing already-visible
+                    // topology (terrain edits / solo remeshes). Initial loads
+                    // and LOD batch swaps should be occludable immediately.
+                    constexpr uint32_t HI_Z_GRACE_OFFSET = 4u;
+                    const uint32_t hiZGraceOffset = hasExistingMesh ? HI_Z_GRACE_OFFSET : 0u;
+                    drawData.hiZGraceTimeline = readyValueBits + hiZGraceOffset;
+
+                    VkDeviceSize dataSize = sizeof(ChunkDrawData);
+                    VkDeviceSize slotOffset = slot * sizeof(ChunkDrawData);
+
+                    UploadRequest cullReq{};
+                    cullReq.src = &drawData;
+                    cullReq.size = dataSize;
+                    cullReq.dst = BufferSlice{m_gpuCulling->getAllDrawsBuffer(), slotOffset, dataSize};
+                    uploader->recordCopy(cullReq, *uploadArena);
+                    m_gpuCulling->noteChunkDrawDataUpload(
+                        slot,
+                        drawData,
+                        req.fromTerrainEdit,
+                        hasExistingMesh);
+                }
+            }
+
+            // Edit path: an existing MeshHandle is already visible. Stage the
+            // new handle as PendingMeshHandle (batchId=0 = solo swap sentinel)
+            // so the old mesh keeps rendering until the upload fence signals.
+            // World::processSoloPendingSwaps performs the atomic swap once
+            // deviceTimeline >= pending.handle.gpuReadyValue.
+            // Initial-load path: no prior mesh, install directly (renderer
+            // gates visibility on the timeline via mesh.gpuReadyValue anyway).
+            if (hasExistingMesh) {
+                PendingMeshHandle pending;
+                pending.handle = handle;
+                pending.batchId = 0;
+                pending.uploadEnqueueTime = req.enqueueTime;
+                pending.debugInfo = req.debugInfo;
+                pending.debugInfo.residency = deriveChunkResidencyKind(
+                    /*gpuResident=*/false,
+                    pending.debugInfo.artifactCacheResident,
+                    /*pendingBatch=*/true);
+                registry.emplace_or_replace<PendingMeshHandle>(req.entity, pending);
+            } else {
+                if (callback) callback->onMeshHandleAdded(handle);
+                registry.emplace_or_replace<MeshHandle>(req.entity, handle);
+            }
+
+            // Callback for collision (LOD 0 only)
+            if (callback &&
+                req.debugInfo.collisionSource != ChunkCollisionSource::None &&
+                prep.firstSubChunk &&
+                registry.all_of<Chunk, ChunkCoord>(req.entity)) {
+                const auto& chunk = registry.get<Chunk>(req.entity);
+                if (chunk.lodLevel == 0) {
+                    const auto& chunkCoord = registry.get<ChunkCoord>(req.entity);
+                    callback->onMeshUploaded(
+                        req.entity,
+                        chunkCoord.toVec3(),
+                        prep.firstSubChunk->vertices,
+                        prep.firstSubChunk->indices,
+                        chunk.lodLevel);
+                }
+            }
+
+            m_meshesUploaded.fetch_add(1, std::memory_order_relaxed);
+            // Any upload that REPLACES an existing mesh (terrain edit, late
+            // remesh, regen) can expose previously-occluded neighbor chunks.
+            // Initial chunk loads (no prior MeshHandle) cannot — the area was
+            // empty, so the pyramid has nothing stale for that screen region.
+            // NOTE: req.isRemesh in this codebase only means "LOD-batch remesh"
+            // — terrain edits set it to false. Use hasExistingMesh instead.
+            if (hasExistingMesh && req.debugInfo.affectsShadowGeometry) {
+                m_remeshUploadsThisCall.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            ChunkFinalizeRequest finalizeReq;
+            finalizeReq.entity = req.entity;
+            finalizeReq.uploadValue = uploadReadyValue;
+            finalizeReq.enqueueTime = req.enqueueTime;
+            finalizeReq.versionState = req.versionState;
+            finalizeReq.debugInfo = req.debugInfo;
+            finalizeReq.debugInfo.residency = deriveChunkResidencyKind(
+                /*gpuResident=*/!hasExistingMesh,
+                finalizeReq.debugInfo.artifactCacheResident,
+                /*pendingBatch=*/hasExistingMesh);
+            if (!hasExistingMesh) {
+                // Initial visibility introduces geometry to shadow gather even
+                // if the upload was queued by a material refresh path.
+                finalizeReq.debugInfo.affectsShadowGeometry = true;
+            }
+            m_finalizeQueue.push(finalizeReq);
+
+            freeNode(prep.node);
+            m_queueSize.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    return processed;
+}
+
+````
+
+## src\world\World.cpp
+
+Description: No CC-DESC found.
+
+````cpp
+#include "world/World.h"
+#include "ui/InGameDebug.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/config/WorldConfig.h"
+#include "world/config/MapConfig.h"
+#include "world/chunks/core/ChunkJobs.h"
+#include "physics/PhysicsWorld.h"
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Body/BodyID.h>
+#include "vulkan/BufferSuballocator.h"
+#include "vulkan/UploadArena.h"
+#include "rendering/common/VulkanHelpers.h"
+#include "rendering/culling/GPUCullingSystem.h"
+#include <iostream>
+#include <algorithm>
+#include <cmath>
+#include <chrono>
+#include <thread>
+#include <condition_variable>
+#include <limits>
+#include <iomanip>
+#include <sstream>
+#include <filesystem>
+#include <ctime>
+#include <glm/gtc/matrix_transform.hpp>
+
+void World::meshStatsAdd(const MeshHandle& h) {
+    if (h.subChunkCount > 0) {
+        m_statsChunksWithMesh.fetch_add(1, std::memory_order_relaxed);
+        m_statsTotalSubChunks.fetch_add(h.subChunkCount, std::memory_order_relaxed);
+        if (h.mainSubChunkCount > 1)
+            m_statsSplitChunks.fetch_add(1, std::memory_order_relaxed);
+        if (h.subChunkCount > h.mainSubChunkCount)
+            m_statsSeamSubChunks.fetch_add(h.subChunkCount - h.mainSubChunkCount, std::memory_order_relaxed);
+    }
+}
+
+void World::meshStatsSub(const MeshHandle& h) {
+    if (h.subChunkCount > 0) {
+        m_statsChunksWithMesh.fetch_sub(1, std::memory_order_relaxed);
+        m_statsTotalSubChunks.fetch_sub(h.subChunkCount, std::memory_order_relaxed);
+        if (h.mainSubChunkCount > 1)
+            m_statsSplitChunks.fetch_sub(1, std::memory_order_relaxed);
+        if (h.subChunkCount > h.mainSubChunkCount)
+            m_statsSeamSubChunks.fetch_sub(h.subChunkCount - h.mainSubChunkCount, std::memory_order_relaxed);
+    }
+}
+
+World::World()
+    : m_chunkManager(std::make_unique<ChunkManager>())
+{
+    std::cout << "[World] Initialized with full terrain system" << std::endl;
+    
+    // Initialize subsystems with chunk manager reference
+    m_lodSystem.setChunkManager(m_chunkManager.get());
+    
+    // Set up debug overlay with World pointer
+    m_inGameDebug = std::make_unique<InGameDebug>();
+    m_inGameDebug->setWorld(this);
+
+    // Wire the new editable terrain foundation.
+    // Load the heightmap CSV as the base terrain field, then layer the sparse
+    // overlay on top for runtime edits.
+    m_terrainFieldSource.setOverlay(&m_terrainEditOverlay);
+    m_terrainFieldSource.setTextureMaterialStore(&m_textureMaterialStore);
+
+    {
+        std::string heightmapPath = MapConfig::getHeightmapPath();
+        if (m_heightmapSampler.load(heightmapPath)) {
+            m_terrainFieldSource.setBaseSampler(m_heightmapSampler.makeSamplerFunc());
+            std::cout << "[World] Heightmap base sampler wired ("
+                      << m_heightmapSampler.getMapWidth() << "x"
+                      << m_heightmapSampler.getMapHeight() << ")\n";
+        } else {
+            // No 2D heightmap — try 3D voxel base (worlds with overhangs / floating islands).
+            const std::string voxelBasePath = MapConfig::getBaseVoxelsBinPath();
+            if (m_voxelBaseSampler.load(voxelBasePath)) {
+                m_terrainFieldSource.setBaseSampler(m_voxelBaseSampler.makeSamplerFunc());
+                std::cout << "[World] 3D voxel base sampler wired (base_voxels.bin)\n";
+            } else {
+                std::cout << "[World] WARNING: No base terrain loaded"
+                             " — terrain edits will have no base data\n";
+            }
+        }
+    }
+    
+    // Initialize terrain file loader using MapConfig (flat maps/ directory)
+    std::string terrainFilePath = MapConfig::getTerrainBinPath();
+    std::string dccmTerrainFilePath = MapConfig::getDCCMTerrainBinPath();
+    std::string collisionFilePath = MapConfig::getCollisionPath();
+    m_baseTerrainPath = terrainFilePath;
+    m_baseCollisionPath = collisionFilePath;
+    m_snapshotRootDir = MapConfig::getMapsBasePath().string();
+    
+    std::cout << "[World] Loading terrain from maps/" << std::endl;
+    std::cout << "[World] Terrain (voxel): " << terrainFilePath << std::endl;
+    std::cout << "[World] Terrain (DCCM):  " << dccmTerrainFilePath << std::endl;
+    std::cout << "[World] Collision: " << collisionFilePath << std::endl;
+    
+    m_terrainLoader = std::make_unique<TerrainFileLoader>(terrainFilePath);
+    
+    // Load DCCM terrain file if it exists
+    if (MapConfig::dccmMapExists()) {
+        m_dccmTerrainLoader = std::make_unique<TerrainFileLoader>(dccmTerrainFilePath);
+        if (m_dccmTerrainLoader->isLoaded()) {
+            std::cout << "[World] DCCM terrain loaded successfully" << std::endl;
+        } else {
+            std::cout << "[World] DCCM terrain file exists but failed to load" << std::endl;
+            m_dccmTerrainLoader.reset();
+        }
+    } else {
+        std::cout << "[World] No DCCM terrain file found (terrain_dccm.bin)" << std::endl;
+    }
+    
+    // Set terrain center on ChunkManager based on actual terrain dimensions
+    auto dims = m_terrainLoader->getDimensions();
+    if (dims.chunksX > 0 && dims.chunksZ > 0) {
+        m_chunkManager->setTerrainCenter(dims.chunksX, dims.chunksZ);
+    }
+    
+    m_collisionCache = std::make_unique<Collision::CollisionCache>();
+    if (m_collisionCache->load(collisionFilePath)) {
+        std::cout << "[World] Loaded precomputed collision cache\n";
+    } else {
+        std::cout << "[World] No collision cache found, will compute at runtime\n";
+        m_collisionCache.reset();
+    }
+    
+    // Set world name
+    m_worldName = "terrain";
+    
+    // Get file modification time as generation date
+    try {
+        auto ftime = std::filesystem::last_write_time(terrainFilePath);
+        auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+            ftime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now()
+        );
+        std::time_t cftime = std::chrono::system_clock::to_time_t(sctp);
+        std::tm tm_buf;
+        localtime_s(&tm_buf, &cftime);
+        char buffer[64];
+        std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M", &tm_buf);
+        m_worldGenerationDate = buffer;
+    } catch (...) {
+        m_worldGenerationDate = "Unknown";
+    }
+    
+    std::cout << "[World] Loaded: " << m_worldName << " (Generated: " << m_worldGenerationDate << ")\n";
+
+    refreshSnapshots();
+    updateWorldIdentityFromActiveSnapshot();
+    
+    // Start lifecycle manager background thread
+    m_lifecycleManager.setCallback(this);
+    m_lifecycleManager.start();
+    std::cout << "[World] Background lifecycle thread started\n";
+    
+    // Set up batch signal callback for LOD transitions
+    m_uploadSystem.setBatchSignalCallback(this);
+}
+
+World::~World() {
+    // Stop lifecycle manager
+    m_lifecycleManager.stop();
+    std::cout << "[World] Background lifecycle thread stopped\n";
+    
+    // ChunkUploadSystem cleans up its own queue in destructor
+    // unique_ptr<InGameDebug> destructor runs here (InGameDebug is complete in this TU)
+}
+
+std::vector<FramePassKind> World::enumerateFramePasses() const {
+    // Current runtime only submits the voxel opaque pass; UI/debug remain inactive.
+    return {FramePassKind::VoxelOpaque};
+}
+
+// --- IChunkLifecycleCallback implementation ---
+
+std::vector<entt::entity> World::createChunkEntities(const std::vector<glm::ivec3>& coords) {
+    return createChunksBatch(coords);
+}
+
+void World::scheduleChunkJobs(entt::entity entity, const glm::ivec3& coord, const glm::ivec3& playerChunk) {
+    if (entity == entt::null) return;
+    
+    markChunkPending(coord);
+
+    int desiredLod = getDesiredLODForChunk(coord);
+    {
+        std::unique_lock regLock(m_registryMutex);
+        if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
+            auto& chunk = m_registry.get<Chunk>(entity);
+            chunk.lodLevel = desiredLod;
+        }
+    }
+    
+    auto versionState = ensureChunkVersionState(this, entity);
+    if (!versionState) {
+        return;
+    }
+    
+    // Start pipeline
+    versionState->inFlight.store(true, std::memory_order_release);
+    versionState->pending.store(false, std::memory_order_release);
+    
+    setChunkState(entity, ChunkState::State::Loading);
+    
+    ChunkCoord chunkCoord;
+    AABB aabb;
+    {
+        std::shared_lock regLock(m_registryMutex);
+        if (!m_registry.valid(entity)) return;
+        chunkCoord = m_registry.get<ChunkCoord>(entity);
+        aabb = m_registry.get<AABB>(entity);
+    }
+    
+    // Ring-based priority
+    int dx = std::abs(coord.x - playerChunk.x);
+    int dz = std::abs(coord.z - playerChunk.z);
+    int ringNumber = std::max(dx, dz);
+    int distSq = dx * dx + dz * dz;
+    int priority = ringNumber * 1000000 + distSq;
+    
+    auto* payload = m_payloadPool.acquire();
+    payload->world = this;
+    payload->entity = entity;
+    payload->coord = chunkCoord;
+    payload->bounds = aabb;
+    payload->versionState = versionState;
+    payload->version = versionState->version.load(std::memory_order_acquire);
+    payload->distanceFromPlayer = priority;
+    payload->lodLevel = desiredLod;
+    payload->centerAtEnqueue = playerChunk;
+    
+    int chunkPriority = 1000000 - priority;
+    
+    // Choose mesh pipeline based on whether chunk has runtime voxel edits
+    const bool useRuntimeVoxel = chunkNeedsRuntimeVoxel(coord);
+    const TerrainType lodTerrainType = getTerrainTypeForChunk(coord, desiredLod);
+    const bool isDCCM = (lodTerrainType == TerrainType::DCCM) && m_heightmapSampler.isLoaded();
+    const bool useEditMesher = useRuntimeVoxel && !isDCCM;
+    payload->fromTerrainEdit = useEditMesher;
+    auto loadJobFn = useEditMesher ? LoadEditMeshJob : LoadPrecomputedMeshJob;
+    
+    JobHandle load = m_jobSystem.makeWithPriority(loadJobFn, payload, 0, chunkPriority);
+    JobHandle upload = m_jobSystem.makeWithPriority(UploadChunkJob, payload, 0, chunkPriority);
+    JobHandle finalize = m_jobSystem.makeWithPriority(FinalizeChunkJob, payload, 0, chunkPriority);
+    
+    m_jobSystem.addDependency(upload, load);
+    m_jobSystem.addDependency(finalize, upload);
+    
+    payload->jobHandles = {load, upload, finalize};
+    
+    m_jobSystem.schedule(load);
+    m_jobSystem.schedule(upload);
+    m_jobSystem.schedule(finalize);
+}
+
+int World::destroyChunks(const std::vector<glm::ivec3>& coords) {
+    return tryDestroyChunksBatch(coords);
+}
+
+void World::cleanupStaleVersionStates() {
+    std::shared_lock regLock(m_registryMutex);   // protect registry.valid()
+    std::scoped_lock versionLock(m_chunkVersionMutex);
+    auto& states = m_chunkVersionStates;
+    for (auto it = states.begin(); it != states.end(); ) {
+        if (!m_registry.valid(it->first)) {
+            it = states.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void World::transitionChunkState(entt::entity entity, ChunkState::State state) {
+    setChunkState(entity, state);
+}
+
+void World::setChunkState(entt::entity entity, ChunkState::State state) {
+    glm::ivec3 coord;
+    {
+        std::unique_lock lock(m_registryMutex);
+        if (!m_registry.valid(entity) ||
+            !m_registry.all_of<ChunkState, ChunkCoord>(entity)) {
+            return;
+        }
+        auto& chunkState = m_registry.get<ChunkState>(entity);
+        chunkState.state = state;
+        const auto& chunkCoord = m_registry.get<ChunkCoord>(entity);
+        coord = chunkCoord.toVec3();
+    }
+    setChunkState(coord, state);
+}
+
+void World::setChunkState(const glm::ivec3& coord, ChunkState::State state) {
+    ChunkState::State oldState = ChunkState::State::Unloaded;
+    {
+        std::unique_lock lock(m_chunkStateMutex);
+        auto it = m_chunkStateMap.find(coord);
+        if (it != m_chunkStateMap.end()) {
+            oldState = it->second;
+        }
+        m_chunkStateMap[coord] = state;
+    }
+    
+    // Update atomic counters (decrement old, increment new)
+    if (oldState == ChunkState::State::Loading) m_loadingCount.fetch_sub(1, std::memory_order_relaxed);
+    else if (oldState == ChunkState::State::Meshing) m_meshingCount.fetch_sub(1, std::memory_order_relaxed);
+    else if (oldState == ChunkState::State::Ready) m_readyCount.fetch_sub(1, std::memory_order_relaxed);
+    
+    if (state == ChunkState::State::Loading) m_loadingCount.fetch_add(1, std::memory_order_relaxed);
+    else if (state == ChunkState::State::Meshing) m_meshingCount.fetch_add(1, std::memory_order_relaxed);
+    else if (state == ChunkState::State::Ready) m_readyCount.fetch_add(1, std::memory_order_relaxed);
+
+    {
+        std::unique_lock setLock(m_chunkSetMutex);
+        if (state == ChunkState::State::Ready) {
+            m_readyChunkSet.insert(coord);
+            if (m_chunkManager && coord.y == 0) {
+                m_chunkManager->notifyChunkCreated(coord);
+            }
+        } else {
+            m_readyChunkSet.erase(coord);
+        }
+    }
+}
+
+void World::removeChunkState(const glm::ivec3& coord) {
+    std::unique_lock lock(m_chunkStateMutex);
+    auto it = m_chunkStateMap.find(coord);
+    if (it != m_chunkStateMap.end()) {
+        ChunkState::State oldState = it->second;
+        if (oldState == ChunkState::State::Loading) m_loadingCount.fetch_sub(1, std::memory_order_relaxed);
+        else if (oldState == ChunkState::State::Meshing) m_meshingCount.fetch_sub(1, std::memory_order_relaxed);
+        else if (oldState == ChunkState::State::Ready) m_readyCount.fetch_sub(1, std::memory_order_relaxed);
+        m_chunkStateMap.erase(it);
+    }
+    m_chunkEntityMap.erase(coord);
+    lock.unlock();
+    if (m_chunkManager && coord.y == 0) {
+        m_chunkManager->notifyChunkDestroyed(coord);
+    }
+    {
+        std::unique_lock setLock(m_chunkSetMutex);
+        m_readyChunkSet.erase(coord);
+        m_existingChunkSet.erase(coord);
+    }
+}
+
+ChunkState::State World::getChunkStateSnapshot(const glm::ivec3& coord) const {
+    std::shared_lock lock(m_chunkStateMutex);
+    auto it = m_chunkStateMap.find(coord);
+    if (it != m_chunkStateMap.end()) {
+        return it->second;
+    }
+    return ChunkState::State::Unloaded;
+}
+
+void World::markChunkPending(const glm::ivec3& coord) {
+    std::lock_guard lock(m_pendingChunksMutex);
+    m_pendingChunks.insert(coord);
+}
+
+void World::clearChunkPending(const glm::ivec3& coord) {
+    std::lock_guard lock(m_pendingChunksMutex);
+    m_pendingChunks.erase(coord);
+}
+
+bool World::isChunkPending(const glm::ivec3& coord) const {
+    std::lock_guard lock(m_pendingChunksMutex);
+    return m_pendingChunks.find(coord) != m_pendingChunks.end();
+}
+
+// update(), updateChunkLoader(), updateMarkDirtyOnGeneration(),
+// updateMeshingSystem(), updateUploadQueueSystem(), onMeshUploaded(),
+// processFinalizeQueue() moved to WorldUpdate.cpp
+
+// createChunk() moved to WorldChunkCRUD.cpp
+
+// createChunksBatch(), tryDestroyChunk(), tryDestroyChunksBatch(),
+// resetChunkGeneration(), switchTerrainFile() moved to WorldChunkCRUD.cpp
+
+// setTerrainTypeForLOD(), applyLODChangesIncrementally(),
+// releaseMeshesForLOD(), reloadMeshesForLOD() moved to WorldLODTransitions.cpp
+
+int World::getDesiredLODForChunk(const glm::ivec3& coord) const {
+    return m_lodSystem.getDesiredLOD(coord);
+}
+
+entt::entity World::findChunk(const glm::ivec3& chunkCoord) const {
+    std::shared_lock lock(m_chunkStateMutex);
+    auto it = m_chunkEntityMap.find(chunkCoord);
+    if (it != m_chunkEntityMap.end()) {
+        return it->second;
+    }
+    return entt::null;
+}
+
+World::LoadManagementDiag World::getLoadManagementDiag() const {
+    LoadManagementDiag diag{};
+    if (m_chunkManager) {
+        const auto info = m_chunkManager->getDebugInfo();
+        diag.baseRenderDist = info.baseRenderDist;
+        diag.effectiveRenderDist = info.effectiveRenderDist;
+        diag.extensionRings = info.extensionRings;
+        diag.measuredThroughput = info.measuredThroughput;
+        diag.pendingCreates = static_cast<uint32_t>(std::max(info.pendingCreates, 0));
+        diag.pendingDestroys = static_cast<uint32_t>(std::max(info.pendingDestroys, 0));
+        diag.bufferPressure = m_chunkManager->hasBufferPressure();
+    }
+
+    diag.lodRemeshQueue =
+        static_cast<uint32_t>(std::min<size_t>(m_lodSystem.getRemeshQueueSize(), UINT32_MAX));
+    diag.pendingLodRemeshes =
+        static_cast<uint32_t>(std::min<size_t>(m_pendingLODRemeshes.size(), UINT32_MAX));
+    diag.editRemeshPending =
+        static_cast<uint32_t>(std::min<size_t>(m_editRemeshScheduler.pendingCount(), UINT32_MAX));
+    diag.uploadQueue = m_uploadSystem.getQueueSize();
+    diag.finalizeQueue =
+        static_cast<uint32_t>(std::min<size_t>(m_uploadSystem.getFinalizeQueueSize(), UINT32_MAX));
+    return diag;
+}
+
+size_t World::getChunkCount() const {
+    std::shared_lock lock(m_registryMutex);
+    return m_registry.view<ChunkCoord>().size();
+}
+
+World::TerrainEditPlacementContext World::getTerrainEditPlacementContext(const glm::vec3& worldPos) const {
+    TerrainEditPlacementContext context;
+
+    const auto micro = WorldConfig::worldToMicroVoxel(worldPos);
+    const auto chunk = WorldConfig::microVoxelToChunk(micro);
+    context.chunkCoord = glm::ivec3(chunk.x, chunk.y, chunk.z);
+
+    int bandLodLevel = 0;
+    bool foundLoadedChunk = false;
+
+    entt::entity entity = findChunk(context.chunkCoord);
+    if (entity != entt::null) {
+        std::shared_lock regLock(m_registryMutex);
+        if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
+            bandLodLevel = m_registry.get<Chunk>(entity).lodLevel;
+            foundLoadedChunk = true;
+        }
+    }
+
+    if (!foundLoadedChunk) {
+        bandLodLevel = getDesiredLODForChunk(context.chunkCoord);
+        if (bandLodLevel < 0 && m_chunkManager) {
+            const glm::ivec3 center = m_chunkManager->getCenterChunk();
+            const int ring = m_chunkManager->calculateRingNumber(context.chunkCoord, center);
+            bandLodLevel = m_chunkManager->calculateLODFromRing(ring);
+        }
+    }
+
+    bandLodLevel = std::clamp(bandLodLevel, 0, MAX_LOD_LEVELS - 1);
+    context.valid = true;
+    context.bandLodLevel = bandLodLevel;
+    context.terrainType = getTerrainTypeForChunk(context.chunkCoord, bandLodLevel);
+    context.previewLodLevel = (context.terrainType == TerrainType::Voxel)
+        ? getEffectiveLODForChunk(context.chunkCoord, bandLodLevel)
+        : bandLodLevel;
+    context.previewLodLevel = std::clamp(context.previewLodLevel, 0, MAX_LOD_LEVELS - 1);
+    context.voxelSizeM = WorldConfig::getLODVoxelSizeM(context.previewLodLevel);
+
+    return context;
+}
+
+void World::clearEditArtifactCache() {
+    std::unique_lock lock(m_editArtifactCacheMutex);
+    m_editArtifactCache.clear();
+}
+
+void World::markRuntimeVoxelChunks(
+    const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords)
+{
+    if (chunkCoords.empty()) {
+        return;
+    }
+
+    std::unique_lock lock(m_runtimeVoxelChunkMutex);
+    m_runtimeVoxelChunks.insert(chunkCoords.begin(), chunkCoords.end());
+}
+
+void World::clearRuntimeVoxelChunks() {
+    std::unique_lock lock(m_runtimeVoxelChunkMutex);
+    m_runtimeVoxelChunks.clear();
+}
+
+TerrainEdit::TerrainEditOverlayStore::ChunkSet World::getRuntimeVoxelChunkCoords() const {
+    std::shared_lock lock(m_runtimeVoxelChunkMutex);
+    return m_runtimeVoxelChunks;
+}
+
+bool World::chunkNeedsRuntimeVoxel(const glm::ivec3& chunkCoord) const {
+    if (chunkCoord.y != 0 || m_terrainEditOverlay.hasEditsInChunk(chunkCoord)) {
+        return true;
+    }
+
+    std::shared_lock lock(m_runtimeVoxelChunkMutex);
+    return m_runtimeVoxelChunks.find(chunkCoord) != m_runtimeVoxelChunks.end();
+}
+
+void World::markEditsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks) {
+    if (touchedChunks.empty()) return;
+    markRuntimeVoxelChunks(touchedChunks);
+    m_editRemeshScheduler.markChunksDirty(touchedChunks);
+}
+
+void World::markTextureMaterialsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks) {
+    if (touchedChunks.empty()) return;
+
+    // Texture paint changes material only, not occupancy/collision.
+    // Invalidate all cached runtime voxel artifacts for these chunks before
+    // scheduling the material-only rebake. Otherwise LOD swaps can reuse a
+    // pre-paint cached lower-LOD artifact, which makes LOD0 look correct while
+    // coarser LODs still show procedural/default material.
+    markRuntimeVoxelChunks(touchedChunks);
+    invalidateEditArtifacts(touchedChunks);
+    m_editRemeshScheduler.markMaterialChunksDirty(touchedChunks);
+}
+
+void World::invalidateEditArtifact(const glm::ivec3& chunkCoord) {
+    std::unique_lock lock(m_editArtifactCacheMutex);
+    for (auto it = m_editArtifactCache.begin(); it != m_editArtifactCache.end(); ) {
+        if (it->first.chunkCoord == chunkCoord) {
+            it = m_editArtifactCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void World::invalidateEditArtifacts(
+    const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords)
+{
+    if (chunkCoords.empty()) {
+        return;
+    }
+
+    std::unique_lock lock(m_editArtifactCacheMutex);
+    for (auto it = m_editArtifactCache.begin(); it != m_editArtifactCache.end(); ) {
+        if (chunkCoords.find(it->first.chunkCoord) != chunkCoords.end()) {
+            it = m_editArtifactCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void World::storeEditArtifact(const glm::ivec3& chunkCoord,
+                              TerrainType terrainType,
+                              int lodLevel,
+                              std::vector<Vertex>&& vertices,
+                              std::vector<uint32_t>&& indices,
+                              glm::vec3 aabbMin,
+                              glm::vec3 aabbMax,
+                              bool isEmpty,
+                              bool deferredBuild) {
+    EditArtifactKey key;
+    key.chunkCoord = chunkCoord;
+    key.terrainType = terrainType;
+    key.lodLevel = lodLevel;
+
+    EditArtifact artifact;
+    artifact.terrainType = terrainType;
+    artifact.lodLevel = lodLevel;
+    artifact.isEmpty = isEmpty;
+    artifact.deferredBuild = deferredBuild;
+    artifact.vertices = std::move(vertices);
+    artifact.indices = std::move(indices);
+    artifact.aabbMin = aabbMin;
+    artifact.aabbMax = aabbMax;
+
+    artifact.generation = ++m_editArtifactGenCounter;
+
+    std::unique_lock lock(m_editArtifactCacheMutex);
+    m_editArtifactCache[key] = std::move(artifact);
+}
+
+bool World::tryGetEditArtifact(const glm::ivec3& chunkCoord,
+                               TerrainType terrainType,
+                               int lodLevel,
+                               EditArtifact& outArtifact) const {
+    EditArtifactKey key;
+    key.chunkCoord = chunkCoord;
+    key.terrainType = terrainType;
+    key.lodLevel = lodLevel;
+
+    std::shared_lock lock(m_editArtifactCacheMutex);
+    auto it = m_editArtifactCache.find(key);
+    if (it == m_editArtifactCache.end()) {
+        return false;
+    }
+
+    outArtifact = it->second;
+    return true;
+}
+
+uint64_t World::getEditArtifactGeneration(const glm::ivec3& chunkCoord,
+                                          TerrainType terrainType,
+                                          int lodLevel) const {
+    EditArtifactKey key;
+    key.chunkCoord = chunkCoord;
+    key.terrainType = terrainType;
+    key.lodLevel = lodLevel;
+
+    std::shared_lock lock(m_editArtifactCacheMutex);
+    auto it = m_editArtifactCache.find(key);
+    return (it != m_editArtifactCache.end()) ? it->second.generation : 0;
+}
+
+void World::preDeserializeCollisionShapes() {
+    if (m_collisionCache && m_collisionCache->isLoaded()) {
+        m_collisionCache->preDeserializeAll();
+    }
+}
+
+// cleanupStalePendingMeshHandles(), onBatchChunkReady(),
+// processLODSwaps() moved to WorldLODTransitions.cpp
+
+// generateFinalizeDiagReport() moved to WorldDebugMetrics.cpp
+
+// gatherDrawCommands(), gatherDrawCommandsInSphere(),
+// enqueueMeshForUpload() moved to WorldRendering.cpp
+
 
 ````
 
@@ -4330,4458 +6505,4018 @@ std::string World::formatLODSwitchDiagReport() const {
 
 ````
 
-## src\world\edit\TerrainEditRemeshScheduler.cpp
+## include\world\World.h
 
-Description: No CC-DESC found. C++ struct 'EdgeDef'.
+Description: No CC-DESC found. C++ class 'BufferSuballocator'.
 
 ````cpp
-#include "world/edit/TerrainEditRemeshScheduler.h"
-#include "world/edit/TerrainEditMesher.h"
-#include "world/edit/TerrainEditDCCMMesher.h"
+#pragma once
+
+#include <entt/entt.hpp>
+#include <glm/glm.hpp>
+#include "vulkan/FramePassTypes.h"
+#include "world/WorldTypes.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/chunks/core/ChunkManager.h"
+#include "world/config/WorldConfig.h"
+#include "world/chunks/core/ChunkJobs.h"
+#include "world/TerrainFileLoader.h"
+#include "world/edit/TerrainEditOverlayStore.h"
 #include "world/edit/TerrainFieldSource.h"
+#include "world/edit/TextureOverlayStore.h"
 #include "world/edit/HeightmapBaseSampler.h"
 #include "world/edit/VoxelBaseSampler.h"
+#include "world/edit/TerrainEditRemeshScheduler.h"
 #include "world/ChunkHoleTracker.h"
-#include "world/World.h"
-#include "world/config/WorldConfig.h"
-#include "world/chunks/core/Chunk.h"
-#include "world/chunks/core/ChunkJobs.h"
-#include "core/Jobs.h"
-#include <algorithm>
-#include <iostream>
+#include "world/chunks/physics/CollisionCache.h"
+#include "world/chunks/streaming/ChunkRenderSystem.h"
+#include "world/chunks/streaming/ChunkUploadSystem.h"
+#include "world/chunks/physics/ChunkCollisionSystem.h"
+#include "world/chunks/core/ChunkLODSystem.h"
+#include "world/chunks/core/ChunkLifecycleManager.h"
+#include "world/WorldDiagnostics.h"
+#include "rendering/common/Mesh.h"
+#include "ui/InGameDebug.h"
+#include <array>
+#include <memory>
+#include <vector>
+#include <deque>
+#include <queue>
+#include <unordered_set>
+#include <unordered_map>
+#include <mutex>
+#include <shared_mutex>
+#include <atomic>
+#include <string>
+#include <thread>
+#include <condition_variable>
+#include <set>
 #include <chrono>
-#include <map>
+#include <vulkan/vulkan.h>
 
-namespace TerrainEdit {
+// Forward declarations
+class BufferSuballocator;
+class UploadArena;
+class ResourceUploader;
+class GPUCullingSystem;
 
-namespace {
+namespace Physics { class PhysicsWorld; }
 
-uint8_t computeDCCMCasingMask(World* world, const glm::ivec3& chunkCoord,
-                              const glm::ivec3& center)
-{
-    if (!world || !world->getChunkManager()) {
-        return 0;
-    }
+/**
+ * World - Manages chunk entity lifecycle, terrain generation, and rendering
+ * 
+ * Full terrain system with:
+ * - Chunk loading/unloading in circular area around camera
+ * - Job-based terrain generation and meshing pipeline
+ * - Upload queue system for GPU mesh data
+ * - Multi-draw indirect (MDI) rendering with frustum culling
+ */
+class World : public IUploadCallback, public IChunkLifecycleCallback, public IBatchSignalCallback {
+public:
+    using Registry = entt::registry;
 
-    static const glm::ivec3 neighborOffsets[4] = {
-        {-1,0,0}, {1,0,0}, {0,0,-1}, {0,0,1}
+    // ---- Diagnostic / stats / history types live in WorldDiagnostics.h ----
+    // These using-aliases preserve the historical `World::*` qualified names
+    // used throughout the codebase.
+    using CullingStats              = WorldDiag::CullingStats;
+    using TerrainEditDiag           = WorldDiag::TerrainEditDiag;
+    using TerrainEditStats          = WorldDiag::TerrainEditStats;
+    using TerrainEditHistoryEntry   = WorldDiag::TerrainEditHistoryEntry;
+    using TerrainEditHistory        = WorldDiag::TerrainEditHistory;
+    using LoadManagementDiag        = WorldDiag::LoadManagementDiag;
+    using ChunkVisualHistoryEntry   = WorldDiag::ChunkVisualHistoryEntry;
+    using ChunkVisualHistory        = WorldDiag::ChunkVisualHistory;
+    using ChunkVisualErrorEntry     = WorldDiag::ChunkVisualErrorEntry;
+    using ChunkVisualErrorHistory   = WorldDiag::ChunkVisualErrorHistory;
+    using FinalizeDiagFrame         = WorldDiag::FinalizeDiagFrame;
+    using LODSwitchDiag             = WorldDiag::LODSwitchDiag;
+    using LastUpdateBreakdown       = WorldDiag::LastUpdateBreakdown;
+
+    // Per-snapshot edit collision data (world-space positions + indices per chunk)
+    struct EditCollisionEntry {
+        std::vector<uint32_t> packedVerts;   // Vertex::packed values
+        std::vector<uint32_t> indices;
+        glm::ivec3 chunkCoord{0};            // For reconstructing world positions
+        uint64_t collisionArtifactGen{0};    // last artifact generation synced to collision
     };
 
-    uint8_t casingMask = 0;
-    for (int edge = 0; edge < 4; ++edge) {
-        const glm::ivec3 neighbor = chunkCoord + neighborOffsets[edge];
-        const int neighborRing = world->getChunkManager()->calculateRingNumber(neighbor, center);
-        const int neighborLOD = world->getChunkManager()->calculateLODFromRing(neighborRing);
-        if (world->getTerrainTypeForChunk(neighbor, neighborLOD) != TerrainType::DCCM) {
-            casingMask |= (1 << edge);
-        }
-    }
-
-    return casingMask;
-}
-
-void generateDCCMCasingForEdge(int edge,
-                               const std::vector<MeshData>& mainSubChunks,
-                               uint8_t mainSubChunkCount,
-                               MeshData& outCasing)
-{
-    constexpr uint8_t FACE_DCCM_SURFACE = 6;
-    struct EdgeDef {
-        uint8_t coord;
-        bool    isXBound;
-        bool    reverseWinding;
-    };
-    static constexpr EdgeDef edgeDefs[CHUNK_EDGE_COUNT] = {
-        {   0, true,  false },
-        { 128, true,  true  },
-        {   0, false, true  },
-        { 128, false, false },
-    };
-
-    const auto& def = edgeDefs[edge];
-    std::map<uint8_t, uint16_t> boundaryVerts;
-    for (uint8_t subIndex = 0; subIndex < mainSubChunkCount && subIndex < mainSubChunks.size(); ++subIndex) {
-        for (const Vertex& vertex : mainSubChunks[subIndex].vertices) {
-            const uint32_t packedVert = vertex.packed;
-            const uint8_t vx = packedVert & 0xFF;
-            const uint16_t vy = (packedVert >> 8) & 0x3FF;
-            const uint8_t vz = (packedVert >> 18) & 0xFF;
-            if (def.isXBound) {
-                if (vx == def.coord) {
-                    auto it = boundaryVerts.find(vz);
-                    if (it == boundaryVerts.end() || vy > it->second) {
-                        boundaryVerts[vz] = vy;
-                    }
-                }
-            } else {
-                if (vz == def.coord) {
-                    auto it = boundaryVerts.find(vx);
-                    if (it == boundaryVerts.end() || vy > it->second) {
-                        boundaryVerts[vx] = vy;
-                    }
-                }
-            }
-        }
-    }
-
-    if (boundaryVerts.size() < 2) return;
-
-    auto packVert = [](uint8_t x, uint16_t y, uint8_t z, uint8_t face) -> uint32_t {
-        return uint32_t(x)
-             | (uint32_t(y)        << 8)
-             | (uint32_t(z)        << 18)
-             | (uint32_t(face & 7) << 26);
-    };
-
-    constexpr uint16_t Y_BASE = 1;
-    auto it = boundaryVerts.begin();
-    auto prev = it;
-    ++it;
-    for (; it != boundaryVerts.end(); prev = it, ++it) {
-        const uint8_t pos0 = prev->first;
-        const uint16_t h0 = prev->second;
-        const uint8_t pos1 = it->first;
-        const uint16_t h1 = it->second;
-        if (h0 <= 1 && h1 <= 1) continue;
-
-        uint8_t x0, z0, x1, z1;
-        if (def.isXBound) {
-            x0 = def.coord; z0 = pos0;
-            x1 = def.coord; z1 = pos1;
-        } else {
-            x0 = pos0; z0 = def.coord;
-            x1 = pos1; z1 = def.coord;
-        }
-
-        const uint32_t baseIdx = static_cast<uint32_t>(outCasing.vertices.size());
-        outCasing.vertices.push_back({packVert(x0, Y_BASE, z0, FACE_DCCM_SURFACE)});
-        outCasing.vertices.push_back({packVert(x1, Y_BASE, z1, FACE_DCCM_SURFACE)});
-        outCasing.vertices.push_back({packVert(x1, h1, z1, FACE_DCCM_SURFACE)});
-        outCasing.vertices.push_back({packVert(x0, h0, z0, FACE_DCCM_SURFACE)});
-
-        if (def.reverseWinding) {
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 1));
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 3));
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
-        } else {
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 1));
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 0));
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 2));
-            outCasing.indices.push_back(static_cast<uint16_t>(baseIdx + 3));
-        }
-    }
-}
-
-bool computeTightAABBFromSubChunks(const std::vector<MeshData>& subChunks,
-                                   glm::vec3& outMin,
-                                   glm::vec3& outMax)
-{
-    constexpr float voxelSize = 0.25f;
-    glm::vec3 localMin(1e10f);
-    glm::vec3 localMax(-1e10f);
-    bool hasVerts = false;
-
-    for (const auto& sub : subChunks) {
-        for (const auto& v : sub.vertices) {
-            const uint32_t packed = v.packed;
-            const uint32_t xBits = (packed >> 0) & 0xFF;
-            const uint32_t yBits = (packed >> 8) & 0x3FF;
-            const uint32_t zBits = (packed >> 18) & 0xFF;
-            const float x = static_cast<float>(xBits) * voxelSize;
-            const float y = static_cast<float>(yBits) * voxelSize;
-            const float z = static_cast<float>(zBits) * voxelSize;
-            localMin = glm::min(localMin, glm::vec3(x, y, z));
-            localMax = glm::max(localMax, glm::vec3(x, y, z));
-            hasVerts = true;
-        }
-    }
-
-    if (!hasVerts) {
-        return false;
-    }
-
-    const float padding = voxelSize * 0.5f;
-    outMin = localMin - padding;
-    outMax = localMax + padding;
-    return true;
-}
-
-void releaseEditRemeshInFlight(const std::shared_ptr<ChunkVersionState>& versionState,
-                               uint32_t version)
-{
-    if (!versionState) {
-        return;
-    }
-
-    const uint32_t prev = versionState->editRemeshInFlightCount.fetch_sub(
-        1, std::memory_order_acq_rel);
-    const uint32_t remaining = (prev > 0) ? (prev - 1) : 0;
-
-    // Only clear the shared inFlight flag when the edit scheduler is still the
-    // owner of the latest version token. If another pipeline already claimed a
-    // newer version, leave inFlight alone so we do not stomp its ownership.
-    const uint32_t currentVersion = versionState->version.load(std::memory_order_acquire);
-    const uint32_t latestEditVersion =
-        versionState->editRemeshLatestVersion.load(std::memory_order_acquire);
-    if (remaining == 0 &&
-        currentVersion == latestEditVersion &&
-        currentVersion >= version) {
-        versionState->inFlight.store(false, std::memory_order_release);
-    }
-}
-
-constexpr uint16_t kChunkEditPagesPerAxis =
-    static_cast<uint16_t>(WorldConfig::CHUNK_SIZE / ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS);
-constexpr uint16_t kChunkEditPageCount = kChunkEditPagesPerAxis * kChunkEditPagesPerAxis;
-constexpr uint16_t kChunkVoxelHeight =
-    static_cast<uint16_t>(WorldConfig::CHUNK_HEIGHT);
-
-void ensurePagedRuntimeScaffold(ChunkEditRuntime& editRuntime)
-{
-    editRuntime.targetMode = ChunkMeshMode::PagedEditable;
-    if (!editRuntime.pages.empty()) {
-        return;
-    }
-
-    editRuntime.pages.reserve(kChunkEditPageCount);
-    for (uint16_t pageZ = 0; pageZ < kChunkEditPagesPerAxis; ++pageZ) {
-        for (uint16_t pageX = 0; pageX < kChunkEditPagesPerAxis; ++pageX) {
-            ChunkEditPageRuntime page{};
-            page.pageId = static_cast<uint16_t>(pageZ * kChunkEditPagesPerAxis + pageX);
-            page.bounds.minX = static_cast<uint16_t>(pageX * ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS);
-            page.bounds.maxX = static_cast<uint16_t>(page.bounds.minX + ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS - 1);
-            page.bounds.minY = 0;
-            page.bounds.maxY = 0;
-            page.bounds.minZ = static_cast<uint16_t>(pageZ * ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS);
-            page.bounds.maxZ = static_cast<uint16_t>(page.bounds.minZ + ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS - 1);
-            editRuntime.pages.push_back(page);
-        }
-    }
-}
-
-uint8_t decodePackedX(const Vertex& vertex)
-{
-    return static_cast<uint8_t>(vertex.packed & 0xFFu);
-}
-
-uint16_t decodePackedY(const Vertex& vertex)
-{
-    return static_cast<uint16_t>((vertex.packed >> 8) & 0x3FFu);
-}
-
-uint8_t decodePackedZ(const Vertex& vertex)
-{
-    return static_cast<uint8_t>((vertex.packed >> 18) & 0xFFu);
-}
-
-void offsetPackedVerticesXZ(std::vector<Vertex>& vertices, uint8_t offsetX, uint8_t offsetZ)
-{
-    if (offsetX == 0 && offsetZ == 0) {
-        return;
-    }
-
-    for (auto& vertex : vertices) {
-        const uint32_t packed = vertex.packed;
-        const uint32_t x = (packed & 0xFFu) + offsetX;
-        const uint32_t z = ((packed >> 18) & 0xFFu) + offsetZ;
-        vertex.packed = (packed & ~((0xFFu << 0) | (0xFFu << 18)))
-            | ((x & 0xFFu) << 0)
-            | ((z & 0xFFu) << 18);
-    }
-}
-
-bool computeAABBFromVertices(const std::vector<Vertex>& vertices,
-                             glm::vec3& outMin,
-                             glm::vec3& outMax)
-{
-    if (vertices.empty()) {
-        outMin = glm::vec3(1e10f);
-        outMax = glm::vec3(-1e10f);
-        return false;
-    }
-
-    constexpr float kVoxelSize = WorldConfig::VOXEL_SIZE_M;
-    outMin = glm::vec3(1e10f);
-    outMax = glm::vec3(-1e10f);
-    for (const auto& vertex : vertices) {
-        const glm::vec3 pos(
-            static_cast<float>(decodePackedX(vertex)) * kVoxelSize,
-            static_cast<float>(decodePackedY(vertex)) * kVoxelSize,
-            static_cast<float>(decodePackedZ(vertex)) * kVoxelSize);
-        outMin = glm::min(outMin, pos);
-        outMax = glm::max(outMax, pos);
-    }
-
-    const float pad = kVoxelSize * 0.5f;
-    outMin -= glm::vec3(pad);
-    outMax += glm::vec3(pad);
-    return true;
-}
-
-uint16_t pageIdFromTriangle(const Vertex& a, const Vertex& b, const Vertex& c)
-{
-    const float cx =
-        (static_cast<float>(decodePackedX(a)) +
-         static_cast<float>(decodePackedX(b)) +
-         static_cast<float>(decodePackedX(c))) / 3.0f;
-    const float cz =
-        (static_cast<float>(decodePackedZ(a)) +
-         static_cast<float>(decodePackedZ(b)) +
-         static_cast<float>(decodePackedZ(c))) / 3.0f;
-    const uint16_t pageX = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(cx) / ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS, 0, kChunkEditPagesPerAxis - 1));
-    const uint16_t pageZ = static_cast<uint16_t>(std::clamp<int>(static_cast<int>(cz) / ChunkEditRuntime::PAGE_SIZE_XZ_VOXELS, 0, kChunkEditPagesPerAxis - 1));
-    return static_cast<uint16_t>(pageZ * kChunkEditPagesPerAxis + pageX);
-}
-
-void storePageCpuMesh(ChunkEditPageRuntime& page,
-                      std::vector<Vertex>&& vertices,
-                      std::vector<uint16_t>&& indices)
-{
-    page.cpuVertices = std::move(vertices);
-    page.cpuIndices = std::move(indices);
-    if (!page.cpuVertices.empty() && !page.cpuIndices.empty()) {
-        computeAABBFromVertices(page.cpuVertices, page.localAabbMin, page.localAabbMax);
-        uint16_t minY = kChunkVoxelHeight - 1;
-        uint16_t maxY = 0;
-        for (const auto& vertex : page.cpuVertices) {
-            const uint16_t y = decodePackedY(vertex);
-            minY = std::min<uint16_t>(minY, y);
-            maxY = std::max<uint16_t>(maxY, y);
-        }
-        page.bounds.minY = minY;
-        page.bounds.maxY = maxY;
-        page.resident = true;
-    } else {
-        page.cpuVertices.clear();
-        page.cpuIndices.clear();
-        page.localAabbMin = glm::vec3(1e10f);
-        page.localAabbMax = glm::vec3(-1e10f);
-        page.resident = false;
-    }
-}
-
-void clearPageCpuMesh(ChunkEditPageRuntime& page)
-{
-    page.cpuVertices.clear();
-    page.cpuIndices.clear();
-    page.localAabbMin = glm::vec3(1e10f);
-    page.localAabbMax = glm::vec3(-1e10f);
-    page.resident = false;
-}
-
-void partitionMergedMeshIntoPages(const std::vector<Vertex>& vertices,
-                                  const std::vector<uint32_t>& indices,
-                                  ChunkEditRuntime& editRuntime)
-{
-    struct PageBuilder {
-        std::vector<Vertex> vertices;
-        std::vector<uint16_t> indices;
-        std::unordered_map<uint32_t, uint16_t> remap;
-    };
-
-    std::array<PageBuilder, kChunkEditPageCount> builders;
-    for (size_t i = 0; i + 2 < indices.size(); i += 3) {
-        const uint32_t i0 = indices[i + 0];
-        const uint32_t i1 = indices[i + 1];
-        const uint32_t i2 = indices[i + 2];
-        if (i0 >= vertices.size() || i1 >= vertices.size() || i2 >= vertices.size()) {
-            continue;
-        }
-
-        const uint16_t pageId = pageIdFromTriangle(vertices[i0], vertices[i1], vertices[i2]);
-        auto& builder = builders[pageId];
-
-        auto addVertex = [&](uint32_t sourceIndex) -> uint16_t {
-            auto it = builder.remap.find(sourceIndex);
-            if (it != builder.remap.end()) {
-                return it->second;
-            }
-
-            const uint16_t newIndex = static_cast<uint16_t>(builder.vertices.size());
-            builder.vertices.push_back(vertices[sourceIndex]);
-            builder.remap.emplace(sourceIndex, newIndex);
-            return newIndex;
-        };
-
-        builder.indices.push_back(addVertex(i0));
-        builder.indices.push_back(addVertex(i1));
-        builder.indices.push_back(addVertex(i2));
-    }
-
-    for (uint16_t pageId = 0; pageId < editRuntime.pages.size(); ++pageId) {
-        auto& page = editRuntime.pages[pageId];
-        auto& builder = builders[pageId];
-        if (!builder.vertices.empty() && !builder.indices.empty()) {
-            storePageCpuMesh(page, std::move(builder.vertices), std::move(builder.indices));
-        } else {
-            clearPageCpuMesh(page);
-        }
-        page.dirtyData = false;
-        page.dirtyMesh = false;
-        page.uploadPending = false;
-    }
-}
-
-void mergeSubChunksToIndexedMesh(const std::vector<SubChunkMesh>& subChunks,
-                                 std::vector<Vertex>& outVertices,
-                                 std::vector<uint32_t>& outIndices)
-{
-    outVertices.clear();
-    outIndices.clear();
-
-    for (const auto& subChunk : subChunks) {
-        if (subChunk.isEmpty()) {
-            continue;
-        }
-
-        const uint32_t baseIndex = static_cast<uint32_t>(outVertices.size());
-        outVertices.reserve(outVertices.size() + subChunk.vertices.size());
-        for (uint32_t packedVertex : subChunk.vertices) {
-            outVertices.push_back(Vertex{packedVertex});
-        }
-        outIndices.reserve(outIndices.size() + subChunk.indices.size());
-        for (uint16_t index : subChunk.indices) {
-            outIndices.push_back(baseIndex + index);
-        }
-    }
-}
-
-TerrainEditRemeshScheduler::CachedArtifact combinePagedArtifact(
-    const ChunkEditRuntime& editRuntime,
-    TerrainType terrainType,
-    int lodLevel)
-{
-    TerrainEditRemeshScheduler::CachedArtifact artifact;
-    artifact.terrainType = terrainType;
-    artifact.lodLevel = lodLevel;
-    artifact.isEmpty = true;
-
-    for (const auto& page : editRuntime.pages) {
-        if (!page.hasCpuMesh()) {
-            continue;
-        }
-
-        const uint32_t baseIndex = static_cast<uint32_t>(artifact.vertices.size());
-        artifact.vertices.insert(
-            artifact.vertices.end(),
-            page.cpuVertices.begin(),
-            page.cpuVertices.end());
-        artifact.indices.reserve(artifact.indices.size() + page.cpuIndices.size());
-        for (uint16_t index : page.cpuIndices) {
-            artifact.indices.push_back(baseIndex + index);
-        }
-        artifact.aabbMin = glm::min(artifact.aabbMin, page.localAabbMin);
-        artifact.aabbMax = glm::max(artifact.aabbMax, page.localAabbMax);
-        artifact.isEmpty = false;
-    }
-
-    if (artifact.isEmpty) {
-        artifact.aabbMin = glm::vec3(1e10f);
-        artifact.aabbMax = glm::vec3(-1e10f);
-    }
-
-    return artifact;
-}
-
-void applyDirtyPageUpdate(ChunkEditRuntime& editRuntime, const DirtyChunkPages& dirtyPages)
-{
-    ensurePagedRuntimeScaffold(editRuntime);
-    editRuntime.targetMode = ChunkMeshMode::PagedEditable;
-    editRuntime.needsPromotion = true;
-    editRuntime.needsTopologyRebuild = true;
-    ++editRuntime.dataGeneration;
-
-    const size_t pageCount = std::min(dirtyPages.pageIds.size(), dirtyPages.pageBounds.size());
-    for (size_t i = 0; i < pageCount; ++i) {
-        const uint16_t pageId = dirtyPages.pageIds[i];
-        if (pageId >= editRuntime.pages.size()) {
-            continue;
-        }
-
-        auto& page = editRuntime.pages[pageId];
-        const auto& src = dirtyPages.pageBounds[i];
-        if (page.dataGeneration == 0 && !page.resident && !page.dirtyData && !page.dirtyMesh) {
-            page.bounds.minY = std::min<uint16_t>(src.minY, kChunkVoxelHeight - 1);
-            page.bounds.maxY = std::min<uint16_t>(src.maxY, kChunkVoxelHeight - 1);
-        } else {
-            page.bounds.minY = std::min<uint16_t>(page.bounds.minY, std::min<uint16_t>(src.minY, kChunkVoxelHeight - 1));
-            page.bounds.maxY = std::max<uint16_t>(page.bounds.maxY, std::min<uint16_t>(src.maxY, kChunkVoxelHeight - 1));
-        }
-
-        page.dataGeneration = editRuntime.dataGeneration;
-        page.dirtyData = true;
-        page.dirtyMesh = true;
-        page.uploadPending = false;
-        if (std::find(editRuntime.dirtyPageIds.begin(), editRuntime.dirtyPageIds.end(), pageId) ==
-            editRuntime.dirtyPageIds.end()) {
-            editRuntime.dirtyPageIds.push_back(pageId);
-        }
-    }
-}
-
-uint16_t countResidentPages(const ChunkEditRuntime& editRuntime)
-{
-    uint16_t resident = 0;
-    for (const auto& page : editRuntime.pages) {
-        if (page.resident) {
-            ++resident;
-        }
-    }
-    return resident;
-}
-
-bool shouldExposePagedEditableMode(TerrainType terrainType,
-                                   int lodLevel,
-                                   const ChunkEditRuntime* editRuntime = nullptr)
-{
-    (void)editRuntime;
-    if (terrainType != TerrainType::Voxel || lodLevel != 0) {
-        return false;
-    }
-
-    // Cross-LOD edits may leave a chunk carrying a stale monolithic target
-    // from a coarser data LOD. Once we are back at full voxel LOD, that old
-    // target must not block promotion into the paged editable path, or the
-    // next full-res edit can punch temporary holes until enough nearby edits
-    // rebuild the missing local pages.
-    return true;
-}
-
-void fillPagedDebugInfo(const ChunkEditRuntime& editRuntime, ChunkDebugAttribution& debugInfo)
-{
-    debugInfo.workModel = ChunkWorkModel::PagedLocal;
-    debugInfo.meshMode = static_cast<uint8_t>(ChunkMeshMode::PagedEditable);
-    debugInfo.dirtyPages = static_cast<uint16_t>(
-        std::min<size_t>(editRuntime.dirtyPageIds.size(), UINT16_MAX));
-    debugInfo.residentPages = countResidentPages(editRuntime);
-}
-
-void finalizePagedRuntime(ChunkEditRuntime& editRuntime, ChunkDebugAttribution& debugInfo)
-{
-    fillPagedDebugInfo(editRuntime, debugInfo);
-    debugInfo.rebuiltPages = debugInfo.dirtyPages;
-
-    if (debugInfo.dirtyPages == 0) {
-        return;
-    }
-
-    ++editRuntime.meshGeneration;
-    for (const uint16_t pageId : editRuntime.dirtyPageIds) {
-        if (pageId >= editRuntime.pages.size()) {
-            continue;
-        }
-        auto& page = editRuntime.pages[pageId];
-        page.meshGeneration = editRuntime.meshGeneration;
-        page.dirtyData = false;
-        page.dirtyMesh = false;
-        page.uploadPending = false;
-        page.resident = page.hasCpuMesh();
-    }
-    editRuntime.dirtyPageIds.clear();
-    editRuntime.needsPromotion = false;
-    debugInfo.residentPages = countResidentPages(editRuntime);
-}
-
-void mergePendingDirtyPages(DirtyChunkPages& dst, const DirtyChunkPages& src)
-{
-    const size_t pageCount = std::min(src.pageIds.size(), src.pageBounds.size());
-    for (size_t i = 0; i < pageCount; ++i) {
-        const uint16_t pageId = src.pageIds[i];
-        const auto existing = std::find(dst.pageIds.begin(), dst.pageIds.end(), pageId);
-        if (existing == dst.pageIds.end()) {
-            dst.pageIds.push_back(pageId);
-            dst.pageBounds.push_back(src.pageBounds[i]);
-            continue;
-        }
-
-        const size_t existingIdx = static_cast<size_t>(existing - dst.pageIds.begin());
-        auto& bounds = dst.pageBounds[existingIdx];
-        bounds.minY = std::min(bounds.minY, src.pageBounds[i].minY);
-        bounds.maxY = std::max(bounds.maxY, src.pageBounds[i].maxY);
-    }
-    dst.directPages = static_cast<uint16_t>(
-        std::min<size_t>(dst.pageIds.size(), UINT16_MAX));
-    dst.haloPages = src.haloPages;
-}
-
-} // namespace
-
-// ---------------------------------------------------------------------------
-// markChunksDirty — thread-safe
-// ---------------------------------------------------------------------------
-
-void TerrainEditRemeshScheduler::markChunksDirty(
-    const std::unordered_set<ChunkCoord, IVec3Hash, IVec3Equal>& chunks,
-    const DirtyChunkPageMap* dirtyChunkPages)
-{
-    std::lock_guard lock(m_mutex);
-    m_dirty.insert(chunks.begin(), chunks.end());
-    if (!dirtyChunkPages) {
-        return;
-    }
-
-    for (const auto& [coord, pages] : *dirtyChunkPages) {
-        mergePendingDirtyPages(m_pendingDirtyPages[coord], pages);
-    }
-}
-
-void TerrainEditRemeshScheduler::markMaterialChunksDirty(
-    const std::unordered_set<ChunkCoord, IVec3Hash, IVec3Equal>& chunks)
-{
-    if (chunks.empty()) {
-        return;
-    }
-
-    std::lock_guard lock(m_mutex);
-    m_materialDirty.insert(chunks.begin(), chunks.end());
-}
-
-
-size_t TerrainEditRemeshScheduler::pendingCount() const {
-    std::lock_guard lock(m_mutex);
-    return m_dirty.size()
-         + m_materialDirty.size()
-         + m_qualityDirty.size()
-         + m_inFlightCount.load(std::memory_order_relaxed);
-}
-
-void TerrainEditRemeshScheduler::pushCompletion(CompletedRemesh&& c) {
-    std::lock_guard lock(m_completionMutex);
-    m_completions.push_back(std::move(c));
-}
-
-bool TerrainEditRemeshScheduler::consumeChunkTiming(const glm::ivec3& coord, ChunkTimingRecord& out) {
-    std::lock_guard lock(m_timingMutex);
-    auto it = m_chunkTimings.find(coord);
-    if (it == m_chunkTimings.end()) return false;
-    out = it->second;
-    m_chunkTimings.erase(it);
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Background job payload & function
-// ---------------------------------------------------------------------------
-
-struct RemeshJobPayload {
-    TerrainEditRemeshScheduler* scheduler;
-    entt::entity    entity;
-    glm::ivec3      chunkCoord;
-    glm::ivec3      centerAtEnqueue;
-    std::shared_ptr<ChunkVersionState> versionState;
-    uint32_t        version;
-    int             currentLodLevel;
-    TerrainType     currentTerrainType;
-    bool            currentUsesDCCM;
-    int             hintMinY;
-    int             hintMaxY;
-    std::vector<TerrainEditRemeshScheduler::CachedArtifact> deferredTargets;
-
-    // Pointers to engine data (immutable or internally-synchronised)
-    const TerrainFieldSource*       fieldSource;
-    const HeightmapBaseSampler*     heightmap;
-    const VoxelBaseSampler*         voxelBase{nullptr};
-    const TerrainEditOverlayStore*  overlay;
-    bool                            fastMode{false};
-    std::chrono::steady_clock::time_point dispatchTime{};
-    TerrainEditRemeshScheduler::LoadManagementSnapshot loadSnapshot{};
-    // Tier A.1 — union of dirty page voxel AABBs for this chunk. Used by the
-    // mesher to do a region-only LOD downsample instead of full chunk. Sentinel
-    // hasEditDirtyAabb=false → mesher does full downsample (current behaviour).
-    bool                            hasEditDirtyAabb{false};
-    glm::ivec3                      editDirtyVoxelMin{0};
-    glm::ivec3                      editDirtyVoxelMax{0};
-    // Tier B Phase 1 scaffolding — chunk-local Y band derived from edit AABB.
-    // -1/-1 = full chunk (no band). Plumbed but not yet acted on by the mesher.
-    int                             bandLocalYMin{-1};
-    int                             bandLocalYMax{-1};
-};
-
-static TerrainEditRemeshScheduler::CachedArtifact buildArtifact(
-    const TerrainFieldSource& fieldSource,
-    const HeightmapBaseSampler& heightmap,
-    const VoxelBaseSampler* voxelBase,
-    const TerrainEditOverlayStore* overlay,
-    const glm::ivec3& chunkCoord,
-    int hintMinY,
-    int hintMaxY,
-    TerrainType terrainType,
-    int lodLevel,
-    bool useDCCM,
-    bool fastMode = false,
-    const RemeshCancellationToken* cancelToken = nullptr,
-    const glm::ivec3* editDirtyVoxelMin = nullptr,
-    const glm::ivec3* editDirtyVoxelMax = nullptr,
-    int bandLocalYMin = -1,
-    int bandLocalYMax = -1)
-{
-    TerrainEditRemeshScheduler::CachedArtifact artifact;
-    artifact.terrainType = terrainType;
-    artifact.lodLevel = lodLevel;
-
-    if (useDCCM) {
-        auto dccm = TerrainEditDCCMMesher::meshChunk(
-            heightmap, nullptr,
-            chunkCoord.x, chunkCoord.z,
-            WorldConfig::CHUNK_SIZE,
-            WorldConfig::CHUNK_HEIGHT,
-            lodLevel);
-        artifact.vertices = std::move(dccm.vertices);
-        artifact.indices.assign(dccm.indices.begin(), dccm.indices.end());
-        artifact.aabbMin  = dccm.aabbMin;
-        artifact.aabbMax  = dccm.aabbMax;
-    } else {
-        auto voxel = TerrainEditMesher::meshChunk(
-            fieldSource, chunkCoord,
-            WorldConfig::CHUNK_SIZE,
-            WorldConfig::CHUNK_HEIGHT,
-            WorldConfig::VOXEL_SIZE_M,
-            hintMinY, hintMaxY,
-            heightmap.isLoaded() ? &heightmap : nullptr,
+    // --- Terrain edit diagnostics: see WorldDiag::TerrainEditDiag / TerrainEditStats ---
+
+    const TerrainEditDiag& getLastEditDiag() const { return m_lastEditDiag; }
+    TerrainEditDiag& editDiagMut() { return m_lastEditDiag; }
+    const TerrainEditStats& getEditStats() const { return m_editStats; }
+    TerrainEditStats& editStatsMut() { return m_editStats; }
+
+    // --- Terrain edit history: see WorldDiag::TerrainEditHistoryEntry / TerrainEditHistory ---
+
+    const TerrainEditHistory& getEditHistory() const { return m_editHistory; }
+    TerrainEditHistory& editHistoryMut() { return m_editHistory; }
+
+    // --- Load management diagnostics: see WorldDiag::LoadManagementDiag ---
+    LoadManagementDiag getLoadManagementDiag() const;
+
+    // --- Chunk visual history: see WorldDiag::ChunkVisualHistoryEntry / ChunkVisualHistory ---
+
+    const ChunkVisualHistory& getChunkVisualHistory() const { return m_chunkVisualHistory; }
+
+    // --- Chunk visual error history: see WorldDiag::ChunkVisualErrorEntry / ChunkVisualErrorHistory ---
+
+    const ChunkVisualErrorHistory& getChunkVisualErrorHistory() const { return m_chunkVisualErrorHistory; }
+    void appendChunkVisualError(
+        const glm::ivec3* coord,
+        int lodLevel,
+        const char* stage,
+        const char* reason,
+        uint32_t batchId = 0,
+        uint32_t expectedVersion = 0,
+        uint32_t actualVersion = 0,
+        const ChunkDebugAttribution* debugInfo = nullptr)
+    {
+        noteChunkVisualError(
+            coord,
             lodLevel,
-            /*skipPostProcess=*/fastMode,
-            /*skipAmbientOcclusion=*/false,
-            cancelToken,
-            voxelBase && voxelBase->isLoaded() ? voxelBase : nullptr,
-            editDirtyVoxelMin,
-            editDirtyVoxelMax,
-            bandLocalYMin,
-            bandLocalYMax);
-        artifact.vertices = std::move(voxel.vertices);
-        artifact.indices  = std::move(voxel.indices);
-        artifact.aabbMin  = voxel.aabbMin;
-        artifact.aabbMax  = voxel.aabbMax;
-        artifact.meshStats = voxel.stats;
+            stage,
+            reason,
+            batchId,
+            expectedVersion,
+            actualVersion,
+            debugInfo);
     }
 
-    artifact.isEmpty = artifact.vertices.empty() || artifact.indices.empty();
-    return artifact;
-}
+    // --- Finalize diagnostics: see WorldDiag::FinalizeDiagFrame ---
+    static constexpr size_t FINALIZE_DIAG_CAPACITY = 1200; // 20 seconds at 60fps
+    const std::vector<FinalizeDiagFrame>& getFinalizeDiagHistory() const { return m_finalizeDiagHistory; }
+    size_t getFinalizeDiagWriteIndex() const { return m_finalizeDiagWriteIdx; }
+    std::string generateFinalizeDiagReport(float spikeThresholdMs = 2.0f) const;
 
-static void editRemeshJobFn(JobCtx& /*ctx*/, void* ud) {
-    auto* p = static_cast<RemeshJobPayload*>(ud);
+    // --- LOD Switch diagnostics: see WorldDiag::LODSwitchDiag ---
 
-    const auto jobStartTime = std::chrono::steady_clock::now();
+    const LODSwitchDiag& getLODSwitchDiag() const { return m_lodSwitchDiag; }
+    void updateLODSwitchDiag();
+    std::string formatLODSwitchDiagReport() const;
 
-    // Bail if version was bumped (new edit arrived before we ran).
-    if (p->versionState->version.load(std::memory_order_acquire) != p->version) {
-        releaseEditRemeshInFlight(p->versionState, p->version);
-        p->scheduler->m_inFlightCount.fetch_sub(1, std::memory_order_relaxed);
-        delete p;
-        return;
+    explicit World();
+    ~World();
+
+    /**
+     * Update full terrain system
+     * @param deltaTime Frame time
+     * @param cameraPos World position of camera
+     * @param vbAllocator Vertex buffer allocator
+     * @param ibAllocator Index buffer allocator
+     * @param uploadArena Upload staging arena
+     * @param uploader Upload manager
+     * @param uploadReadyValue Timeline semaphore value for upload gating
+     */
+    void update(float deltaTime, 
+                const glm::vec3& cameraPos,
+                float cameraYaw,
+                BufferSuballocator* vbAllocator = nullptr,
+                BufferSuballocator* ibAllocator = nullptr,
+                UploadArena* uploadArena = nullptr,
+                ResourceUploader* uploader = nullptr,
+                uint64_t uploadReadyValue = 0,
+                float cpuFrameMs = 0.0f,
+                float gpuFrameMs = 0.0f,
+                uint64_t deviceTimeline = 0);
+
+    /**
+     * Gather draw commands for visible chunks
+     * @param viewProj View-projection matrix for frustum culling
+     * @param outCmds Output buffer for indirect draw commands
+     * @param outOrigins Output buffer for chunk origins (vec4)
+     * @param maxDraws Maximum number of draws
+     * @param deviceTimeline Current timeline value (for upload gating)
+     * @return Number of draw commands written
+     */
+    uint32_t gatherDrawCommands(const glm::mat4& viewProj,
+                                 VkDrawIndexedIndirectCommand* outCmds,
+                                 glm::vec4* outOrigins,
+                                 uint32_t maxDraws,
+                                 uint64_t deviceTimeline);
+
+    /**
+     * Gather draw commands for chunks intersecting a world-space sphere.
+     * Used by per-light point shadow rendering to avoid world-scale terrain draws.
+     */
+    uint32_t gatherDrawCommandsInSphere(const glm::vec3& center,
+                                        float radius,
+                                        VkDrawIndexedIndirectCommand* outCmds,
+                                        glm::vec4* outOrigins,
+                                        uint32_t maxDraws,
+                                        uint64_t deviceTimeline);
+
+    static constexpr uint32_t SUN_GATHER_DIAG_MAX_CASCADES = 6;
+
+    struct SunCascadeGatherDiagnostics {
+        float totalMs{0.0f};
+        float stateMapScanMs{0.0f};
+        float candidateSortMs{0.0f};
+        float registryWalkMs{0.0f};
+
+        uint32_t cascadeCount{0};
+        uint32_t maxDraws{0};
+        bool truncated{false};
+
+        glm::ivec3 minChunk{0};
+        glm::ivec3 maxChunk{0};
+        uint32_t loadedChunkMapSize{0};
+        uint32_t bboxCandidateChunks{0};
+        uint32_t visitedCandidateChunks{0};
+
+        uint32_t invalidEntityRejects{0};
+        uint32_t missingComponentRejects{0};
+        uint32_t invisibleRejects{0};
+        uint32_t notReadyRejects{0};
+        uint32_t invalidMeshRejects{0};
+        uint32_t emptyMeshRejects{0};
+        uint32_t uploadPendingRejects{0};
+        uint32_t cascadeCullRejects{0};
+        uint32_t cascadeInnerCullRejects{0};
+        uint32_t acceptedChunks{0};
+        uint32_t emittedDraws{0};
+
+        float maxHalfExtent{0.0f};
+        float sinElevation{0.0f};
+        float shearX{0.0f};
+        float shearZ{0.0f};
+        float shearMax{0.0f};
+        float casterReach{0.0f};
+        float padding{0.0f};
+        float halfX{0.0f};
+        float halfZ{0.0f};
+
+        std::array<uint32_t, SUN_GATHER_DIAG_MAX_CASCADES> cascadeChunkHits{};
+        std::array<uint32_t, SUN_GATHER_DIAG_MAX_CASCADES> cascadeDrawHits{};
+    };
+
+    /**
+     * Gather draw commands for the sun shadow cascades in a single walk.
+     *
+     * Walks chunks intersecting the UNION of per-cascade extruded XZ
+     * footprints (cascade footprint = halfExtent + chunkHeight * |shear|),
+     * then tests each candidate against every cascade clip-AABB. Returns
+     * a per-draw cascade bitmask (`outCascadeMasks[i]`, bit c = 1 means
+     * draw `i` is needed by cascade `c`). Skips chunks that don't
+     * intersect ANY cascade.
+     *
+     * This replaces the legacy "single huge sphere then per-cascade
+     * AABB cull" pipeline: the walk bounding box is shrunk to the
+     * actual visible cascade volume, and each chunk is tested once
+     * against all cascades instead of once per cascade per render.
+     *
+     * @param cameraPos  Camera world position.
+     * @param sunDir     Normalised sun direction (towards ground, y < 0).
+     * @param cascadeVPs Per-cascade view-projection matrices (length = cascadeCount).
+     * @param cascadeHalfExtents Per-cascade ortho half-extent in metres (length = cascadeCount).
+     * @param cascadeCount Number of cascades (1..MAX_SUN_SHADOW_CASCADES).
+     * @param outCmds   Output draw commands.
+     * @param outOrigins Output chunk origin in chunk coordinates.
+     * @param outCascadeMasks Output bitmask (bit c = needed by cascade c).
+     * @param maxDraws  Output capacity.
+     * @param deviceTimeline Upload timeline gate.
+     * @param diagnostics Optional detailed counters/timings for debug UI.
+     * @param extraChunkPadding Extra X/Z chunk padding for reusable gather supersets.
+     * @param includeZeroMaskCandidates Emit ready chunks even when they miss current cascades.
+     * @return Number of draws emitted.
+     */
+    uint32_t gatherDrawCommandsForSunCascades(const glm::vec3& cameraPos,
+                                              const glm::vec3& sunDir,
+                                              const glm::mat4* cascadeVPs,
+                                              const float* cascadeHalfExtents,
+                                              uint32_t cascadeCount,
+                                              VkDrawIndexedIndirectCommand* outCmds,
+                                              glm::vec4* outOrigins,
+                                              uint16_t* outCascadeMasks,
+                                              uint32_t maxDraws,
+                                              uint64_t deviceTimeline,
+                                              SunCascadeGatherDiagnostics* diagnostics = nullptr,
+                                              int32_t extraChunkPadding = 0,
+                                              bool includeZeroMaskCandidates = false);
+
+    uint32_t gatherDrawCommandsForSunCascadeChunk(const glm::ivec3& chunkCoord,
+                                                  const glm::mat4* cascadeVPs,
+                                                  uint32_t cascadeCount,
+                                                  VkDrawIndexedIndirectCommand* outCmds,
+                                                  glm::vec4* outOrigins,
+                                                  uint16_t* outCascadeMasks,
+                                                  uint32_t maxDraws,
+                                                  uint64_t deviceTimeline,
+                                                  bool includeZeroMaskCandidate = false);
+
+
+
+    /**
+     * Enqueue mesh for upload to GPU
+     * Called by job pipeline after meshing completes
+     */
+    void enqueueMeshForUpload(entt::entity entity,
+                              MeshData&& mesh,
+                              bool fromTerrainEdit,
+                              std::shared_ptr<struct ChunkVersionState> versionState,
+                              uint32_t version,
+                              ChunkDebugAttribution debugInfo = {});
+    
+    /**
+     * Enqueue multiple SubChunks for a single entity (v4 format)
+     * SubChunks are NEVER merged - each becomes a separate draw call
+     * @param mainSubChunkCount How many subChunks are main mesh (rest are seams)
+     * @param isRemesh If true, stages to PendingMeshHandle for batch swap
+     * @param batchId LOD transition batch ID (0 = none)
+     */
+    void enqueueMeshForUpload(entt::entity entity,
+                              std::vector<MeshData>&& subChunks,
+                              uint8_t mainSubChunkCount,
+                              bool fromTerrainEdit,
+                              std::shared_ptr<struct ChunkVersionState> versionState,
+                              uint32_t version,
+                              glm::vec3 tightMin = glm::vec3(1e10f),
+                              glm::vec3 tightMax = glm::vec3(-1e10f),
+                              bool hasTight = false,
+                              bool isRemesh = false,
+                              uint32_t batchId = 0,
+                              ChunkDebugAttribution debugInfo = {});
+
+    /**
+     * Access to debug overlay
+     */
+    InGameDebug& getDebugOverlay() { return *m_inGameDebug; }
+    const InGameDebug& getDebugOverlay() const { return *m_inGameDebug; }
+
+    /**
+     * Runtime voxel chunk tracking (chunks that need voxel meshing due to edits)
+     */
+    void markRuntimeVoxelChunks(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords);
+    void clearRuntimeVoxelChunks();
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet getRuntimeVoxelChunkCoords() const;
+    bool chunkNeedsRuntimeVoxel(const glm::ivec3& chunkCoord) const;
+
+    /**
+     * Access to the sparse runtime terrain edit overlay.
+     * This is the new mutable terrain layer; untouched terrain still uses
+     * the precomputed mesh/collision fast path.
+     */
+    TerrainEdit::TerrainEditOverlayStore& getTerrainEditOverlay() { return m_terrainEditOverlay; }
+    const TerrainEdit::TerrainEditOverlayStore& getTerrainEditOverlay() const { return m_terrainEditOverlay; }
+
+    /// Sparse voxel-face material assignments authored by the texture brush.
+    TextureOverlay::TextureOverlayStore& getTextureMaterialStore() { return m_textureMaterialStore; }
+    const TextureOverlay::TextureOverlayStore& getTextureMaterialStore() const { return m_textureMaterialStore; }
+
+    /**
+     * Access to the merged terrain field source (base + edit overlay).
+     * The base sampler is not wired yet; this is the foundation for the
+     * editable terrain pipeline.
+     */
+    TerrainEdit::TerrainFieldSource& getTerrainFieldSource() { return m_terrainFieldSource; }
+    const TerrainEdit::TerrainFieldSource& getTerrainFieldSource() const { return m_terrainFieldSource; }
+
+    /// Access the heightmap base sampler (for height-range queries).
+    const TerrainEdit::HeightmapBaseSampler& getHeightmapSampler() const { return m_heightmapSampler; }
+
+    /// Access the voxel base sampler (for 3D voxel range queries).
+    const TerrainEdit::VoxelBaseSampler& getVoxelBaseSampler() const { return m_voxelBaseSampler; }
+
+    /// Access the chunk hole tracker (for diagnosing LOD swap visual holes).
+    ChunkHoleTracker& getChunkHoleTracker() { return m_chunkHoleTracker; }
+    const ChunkHoleTracker& getChunkHoleTracker() const { return m_chunkHoleTracker; }
+
+    /// Mark edited chunks dirty for remeshing.
+    void markEditsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks);
+    void markTextureMaterialsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks);
+
+    struct SnapshotInfo {
+        std::string id;
+        std::string displayName;
+        std::string createdAt;
+        bool isBase{false};
+        uint64_t editedCells{0};
+        uint64_t editedBricks{0};
+    };
+
+    struct TerrainBoxRecord {
+        glm::vec3 minCorner{0.0f};
+        glm::vec3 maxCorner{0.0f};
+    };
+
+    const std::vector<SnapshotInfo>& getSnapshotInfos() const { return m_snapshotInfos; }
+    const std::vector<TerrainBoxRecord>& getTerrainBoxes() const { return m_terrainBoxes; }
+    uint64_t getTerrainBoxRevision() const { return m_terrainBoxRevision; }
+    struct MeshTopologyChange {
+        uint64_t revision{0};
+        glm::ivec3 coord{0};
+    };
+    uint64_t getMeshTopologyVersion() const {
+        return m_meshTopologyVersion.load(std::memory_order_relaxed);
+    }
+    bool getMeshTopologyChangesSince(uint64_t revision,
+                                     std::vector<MeshTopologyChange>& outChanges,
+                                     size_t maxChanges = 8192) const;
+    int getActiveSnapshotIndex() const { return m_activeSnapshotIndex; }
+    std::string getActiveSnapshotName() const {
+        if (m_activeSnapshotIndex >= 0 &&
+            m_activeSnapshotIndex < static_cast<int>(m_snapshotInfos.size())) {
+            return m_snapshotInfos[static_cast<size_t>(m_activeSnapshotIndex)].displayName;
+        }
+        return m_worldName;
+    }
+    bool hasActiveEditableSnapshot() const {
+        return m_activeSnapshotIndex > 0 &&
+               m_activeSnapshotIndex < static_cast<int>(m_snapshotInfos.size());
     }
 
-    TerrainEditRemeshScheduler::CompletedRemesh comp;
-    comp.entity       = p->entity;
-    comp.chunkCoord   = p->chunkCoord;
-    comp.centerAtEnqueue = p->centerAtEnqueue;
-    comp.dispatchTime = p->dispatchTime;
-    comp.jobStartTime = jobStartTime;
-    const RemeshCancellationToken cancelToken{&p->versionState->version, p->version};
-    comp.currentArtifact = buildArtifact(
-        *p->fieldSource,
-        *p->heightmap,
-        p->voxelBase,
-        p->overlay,
-        p->chunkCoord,
-        p->hintMinY,
-        p->hintMaxY,
-        p->currentTerrainType,
-        p->currentLodLevel,
-        p->currentUsesDCCM,
-        /*fastMode=*/p->fastMode,
-        /*cancelToken=*/&cancelToken,
-        p->hasEditDirtyAabb ? &p->editDirtyVoxelMin : nullptr,
-        p->hasEditDirtyAabb ? &p->editDirtyVoxelMax : nullptr,
-        p->bandLocalYMin,
-        p->bandLocalYMax);
+    void markSnapshotDirty() { m_snapshotDirty = true; }
 
-    // A newer edit arrived while we were meshing. Drop the obsolete artifact
-    // here so it never enters collision/upload/finalize queues.
-    if (p->versionState->version.load(std::memory_order_acquire) != p->version) {
-        releaseEditRemeshInFlight(p->versionState, p->version);
-        p->scheduler->m_inFlightCount.fetch_sub(1, std::memory_order_relaxed);
-        delete p;
-        return;
-    }
+    const std::string& getLastSnapshotStatusMessage() const { return m_lastSnapshotStatusMessage; }
+    bool lastSnapshotStatusIsError() const { return m_lastSnapshotStatusIsError; }
 
-    comp.collVerts   = comp.currentArtifact.vertices;
-    comp.collIndices = comp.currentArtifact.indices;
+    bool createSnapshot(const std::string& desiredName = "");
+    bool selectSnapshotByIndex(int index);
+    bool saveActiveSnapshot();
+    bool deleteSnapshot(int index);
+    void deleteAllSnapshots();
+    void flushDirtySnapshot();
 
-    // Push the primary mesh immediately so the visual update is not
-    // blocked by deferred LOD variant generation.
-    comp.versionState = p->versionState;
-    comp.version      = p->version;
-    comp.isFastMode   = p->fastMode;
-    comp.meshDoneTime = std::chrono::steady_clock::now();
-    comp.loadSnapshot = p->loadSnapshot;
-    p->scheduler->pushCompletion(std::move(comp));
+    struct TerrainEditPlacementContext {
+        bool valid{false};
+        glm::ivec3 chunkCoord{0, 0, 0};
+        int bandLodLevel{0};
+        int previewLodLevel{0};
+        TerrainType terrainType{TerrainType::Voxel};
+        float voxelSizeM{WorldConfig::VOXEL_SIZE_M};
+    };
 
-    // Generate deferred LOD/terrain-type variants AFTER pushing the
-    // primary completion.
-    //
-    // Previously this loop ran *synchronously inside the same worker job*,
-    // adding ~50 ms × N (typically 3) of cache-rebuild work onto every fast
-    // edit job. Under brush spam that single change could turn a 55 ms job
-    // into a 200 ms job, saturating the worker pool and producing the
-    // 2.5 – 3 s `queue` stalls visible in the chunk visual history.
-    //
-    // New behavior: push each deferred target into a scheduler-owned queue.
-    // `dispatchPendingDeferredLODs()` (called from processRemeshQueue once the
-    // brush has been idle for ~200 ms) drains it as separate low-priority
-    // worker jobs. This lets active fast edits always pass through workers
-    // unobstructed, while the LOD prewarm still happens — just slightly
-    // later, when no one is looking.
-    if (!p->deferredTargets.empty()) {
-        std::vector<TerrainEditRemeshScheduler::PendingDeferredLOD> requests;
-        requests.reserve(p->deferredTargets.size());
-        for (const auto& deferred : p->deferredTargets) {
-            TerrainEditRemeshScheduler::PendingDeferredLOD req;
-            req.chunkCoord = p->chunkCoord;
-            req.terrainType = deferred.terrainType;
-            req.lodLevel = deferred.lodLevel;
-            req.hintMinY = p->hintMinY;
-            req.hintMaxY = p->hintMaxY;
-            req.versionState = p->versionState;
-            req.version = p->version;
-            req.hasEditDirtyAabb = p->hasEditDirtyAabb;
-            req.editDirtyVoxelMin = p->editDirtyVoxelMin;
-            req.editDirtyVoxelMax = p->editDirtyVoxelMax;
-            requests.push_back(std::move(req));
-        }
-        std::lock_guard lock(p->scheduler->m_pendingDeferredLODMutex);
-        for (auto& req : requests) {
-            p->scheduler->m_pendingDeferredLODs.push_back(std::move(req));
-        }
-    }
-    p->scheduler->m_inFlightCount.fetch_sub(1, std::memory_order_relaxed);
+    TerrainEditPlacementContext getTerrainEditPlacementContext(const glm::vec3& worldPos) const;
 
-    delete p;
-}
+    bool applyTerrainBoxEdit(const glm::vec3& minCorner,
+                             const glm::vec3& maxCorner,
+                             bool additive,
+                             float requestedStep,
+                             int brushShape = 0);
 
-void TerrainEditRemeshScheduler::pushDeferredArtifact(DeferredArtifactResult&& r) {
-    std::lock_guard lock(m_deferredArtifactMutex);
-    m_deferredArtifacts.push_back(std::move(r));
-}
+    /**
+     * Store collision data for an edited chunk and enqueue a physics body.
+     * Called by TerrainEditRemeshScheduler after re-meshing.
+     */
+    void enqueueEditCollision(entt::entity entity,
+                              const glm::ivec3& chunkCoord,
+                              std::vector<Vertex>&& packedVerts,
+                              std::vector<uint32_t>&& indices32,
+                              std::shared_ptr<struct ChunkVersionState> versionState = {},
+                              uint32_t version = 0,
+                              ChunkCollisionSource source = ChunkCollisionSource::EditMeshPacked);
 
-// ---------------------------------------------------------------------------
-// drainCompletions — main thread: enqueue uploads + collision
-// ---------------------------------------------------------------------------
+    /**
+     * Immediately create physics bodies for all chunks in m_editCollisionData.
+     * Called after loading a snapshot's collision file.
+     */
+    void applyEditCollisionData();
 
-size_t TerrainEditRemeshScheduler::drainCompletions(World* world) {
-    std::vector<CompletedRemesh> batch;
-    {
-        std::lock_guard lock(m_completionMutex);
-        if (m_completions.empty()) return 0;
-        batch.swap(m_completions);
-    }
+    struct EditArtifactKey {
+        glm::ivec3 chunkCoord{0, 0, 0};
+        TerrainType terrainType{TerrainType::Voxel};
+        int lodLevel{0};
 
-    auto& registry = world->getRegistry();
-    auto& diag = world->editDiagMut();
-
-    using Clock = std::chrono::high_resolution_clock;
-    float collAccum = 0.0f;
-    float gpuAccum  = 0.0f;
-    size_t uploadsQueued = 0;
-
-    for (auto& comp : batch) {
-        // Stale check (entity destroyed or version bumped since dispatch)
-        if (comp.versionState->version.load(std::memory_order_acquire) != comp.version) {
-            releaseEditRemeshInFlight(comp.versionState, comp.version);
-            continue;
-        }
-
-        {
-            std::shared_lock regLock(world->registryMutex());
-            if (!registry.valid(comp.entity)) {
-                releaseEditRemeshInFlight(comp.versionState, comp.version);
-                continue;
-            }
-        }
-
-        // Record per-chunk timing for pipeline breakdown diagnostics
-        {
-            ChunkTimingRecord timing;
-            timing.dispatchTime = comp.dispatchTime;
-            timing.jobStartTime = comp.jobStartTime;
-            timing.meshDoneTime = comp.meshDoneTime;
-            timing.drainTime    = std::chrono::steady_clock::now();
-            timing.isFastMode   = comp.isFastMode;
-            timing.meshLodLevel = comp.currentArtifact.lodLevel;
-            timing.meshStats    = comp.currentArtifact.meshStats;
-            timing.loadSnapshot = comp.loadSnapshot;
-            std::lock_guard tlock(m_timingMutex);
-            m_chunkTimings[comp.chunkCoord] = timing;
-        }
-
-        world->storeEditArtifact(
-            comp.chunkCoord,
-            comp.currentArtifact.terrainType,
-            comp.currentArtifact.lodLevel,
-            std::vector<Vertex>(comp.currentArtifact.vertices.begin(), comp.currentArtifact.vertices.end()),
-            std::vector<uint32_t>(comp.currentArtifact.indices.begin(), comp.currentArtifact.indices.end()),
-            comp.currentArtifact.aabbMin,
-            comp.currentArtifact.aabbMax,
-            comp.currentArtifact.isEmpty);
-
-        ChunkDebugAttribution debugInfo{};
-        debugInfo.artifactSource = ChunkArtifactSource::RuntimeEditBuild;
-        debugInfo.collisionSource = ChunkCollisionSource::EditMeshPacked;
-        debugInfo.workModel = ChunkWorkModel::MonolithicChunk;
-        debugInfo.meshMode = static_cast<uint8_t>(ChunkMeshMode::MonolithicEdited);
-        debugInfo.artifactCacheResident = true;
-        debugInfo.fromTerrainEdit = true;
-        debugInfo.artifactGeneration = world->getEditArtifactGeneration(
-            comp.chunkCoord,
-            comp.currentArtifact.terrainType,
-            comp.currentArtifact.lodLevel);
-        const glm::ivec3 maskCenter = world->getChunkManager()
-            ? world->getChunkManager()->getCenterChunk()
-            : comp.centerAtEnqueue;
-
-        if (comp.currentArtifact.isEmpty) {
-            {
-                std::unique_lock regLock(world->registryMutex());
-                if (registry.valid(comp.entity) && registry.all_of<Chunk>(comp.entity)) {
-                    auto& chunk = registry.get<Chunk>(comp.entity);
-                    const int chunkLodLevel = chunk.lodLevel;
-                    chunk.isEmpty = true;
-                    if (registry.any_of<ChunkEditRuntime>(comp.entity)) {
-                        auto& editRuntime = registry.get<ChunkEditRuntime>(comp.entity);
-                        if (shouldExposePagedEditableMode(
-                                comp.currentArtifact.terrainType,
-                                comp.currentArtifact.lodLevel,
-                                &editRuntime)) {
-                            ensurePagedRuntimeScaffold(editRuntime);
-                            partitionMergedMeshIntoPages(
-                                comp.currentArtifact.vertices,
-                                comp.currentArtifact.indices,
-                                editRuntime);
-                            finalizePagedRuntime(editRuntime, debugInfo);
-                            chunk.meshMode = ChunkMeshMode::PagedEditable;
-                        } else {
-                            chunk.meshMode = ChunkMeshMode::MonolithicEdited;
-                        }
-                    } else {
-                        chunk.meshMode = ChunkMeshMode::MonolithicEdited;
-                    }
-                    // Keep metadata aligned to the chunk's logical LOD band, not the
-                    // artifact data LOD. Using artifact LOD here causes periodic LOD
-                    // scans to see false mismatches and enqueue endless remesh/swap work.
-                    chunk.effectiveDataLod = static_cast<uint8_t>(
-                        std::clamp(world->getEffectiveLODForChunk(
-                            comp.chunkCoord, chunkLodLevel), 0, 255));
-                    if (comp.currentArtifact.terrainType == TerrainType::DCCM) {
-                        chunk.voxelSeamMask = 0;
-                        chunk.casingSeamMask = computeDCCMCasingMask(
-                            world, comp.chunkCoord, maskCenter);
-                    } else {
-                        chunk.casingSeamMask = 0;
-                        // Even empty chunks must carry the expected seam metadata for
-                        // reconciliation logic; otherwise they get re-queued forever.
-                        chunk.voxelSeamMask = (chunkLodLevel > 0 && world->getChunkManager())
-                            ? world->getChunkManager()->getSeamEdgeMask(
-                                comp.chunkCoord, maskCenter)
-                            : 0;
-                    }
-                }
-            }
-            auto t0 = Clock::now();
-            world->enqueueEditCollision(
-                comp.entity,
-                comp.chunkCoord,
-                {},
-                {},
-                comp.versionState,
-                comp.version,
-                ChunkCollisionSource::EditMeshPacked);
-            collAccum += std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
-
-            {
-                auto t0Upload = Clock::now();
-                world->enqueueMeshForUpload(
-                    comp.entity,
-                    std::vector<MeshData>{},
-                    /*mainSubChunkCount=*/0,
-                    /*fromTerrainEdit=*/true,
-                    comp.versionState,
-                    comp.version,
-                    comp.currentArtifact.aabbMin,
-                    comp.currentArtifact.aabbMax,
-                    /*hasTight=*/false,
-                    /*isRemesh=*/false,
-                    /*batchId=*/0,
-                    debugInfo);
-                gpuAccum += std::chrono::duration<float, std::milli>(Clock::now() - t0Upload).count();
-            }
-
-            releaseEditRemeshInFlight(comp.versionState, comp.version);
-
-            // Record edit remesh completion for chunk hole tracking
-            {
-                ChunkHoleEvent ev;
-                ev.type = ChunkHoleEvent::Type::EditRemeshCompleted;
-                ev.timestampSec = std::chrono::duration<float>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count();
-                ev.detail = "empty_artifact";
-                world->getChunkHoleTracker().recordEvent(
-                    ChunkCoord{comp.chunkCoord.x, comp.chunkCoord.y, comp.chunkCoord.z},
-                    std::move(ev));
-            }
-            if (comp.isFastMode) {
-                std::lock_guard qlock(m_mutex);
-                m_qualityDirty.insert(ChunkCoord{comp.chunkCoord.x, comp.chunkCoord.y, comp.chunkCoord.z});
-            }
-            ++diag.chunksRemeshed;
-            continue;
-        }
-
-        // Touch chunk component
-        {
-            std::unique_lock regLock(world->registryMutex());
-            if (registry.valid(comp.entity) && registry.all_of<Chunk>(comp.entity)) {
-                auto& chunk = registry.get<Chunk>(comp.entity);
-                const int chunkLodLevel = chunk.lodLevel;
-                chunk.isEmpty = false;
-                if (registry.any_of<ChunkEditRuntime>(comp.entity)) {
-                    auto& editRuntime = registry.get<ChunkEditRuntime>(comp.entity);
-                    if (shouldExposePagedEditableMode(
-                            comp.currentArtifact.terrainType,
-                            comp.currentArtifact.lodLevel,
-                            &editRuntime)) {
-                        ensurePagedRuntimeScaffold(editRuntime);
-                        partitionMergedMeshIntoPages(
-                            comp.currentArtifact.vertices,
-                            comp.currentArtifact.indices,
-                            editRuntime);
-                        finalizePagedRuntime(editRuntime, debugInfo);
-                        chunk.meshMode = ChunkMeshMode::PagedEditable;
-                    } else {
-                        chunk.meshMode = ChunkMeshMode::MonolithicEdited;
-                    }
-                } else {
-                    chunk.meshMode = ChunkMeshMode::MonolithicEdited;
-                }
-                // Keep data-LOD metadata tied to the chunk's render LOD band.
-                chunk.effectiveDataLod = static_cast<uint8_t>(
-                    std::clamp(world->getEffectiveLODForChunk(
-                        comp.chunkCoord, chunkLodLevel), 0, 255));
-                if (comp.currentArtifact.terrainType == TerrainType::DCCM) {
-                    chunk.voxelSeamMask = 0;
-                    chunk.casingSeamMask = computeDCCMCasingMask(world, comp.chunkCoord, maskCenter);
-                } else {
-                    chunk.casingSeamMask = 0;
-                    // Match the value the LOD scan compares against, otherwise the
-                    // scan re-queues this chunk every frame -> RELOAD STORM / flicker.
-                    chunk.voxelSeamMask = (chunkLodLevel > 0 && world->getChunkManager())
-                        ? world->getChunkManager()->getSeamEdgeMask(comp.chunkCoord, maskCenter)
-                        : 0;
-                }
-            }
-        }
-
-        // Collision — count diagnostic sizes BEFORE std::move empties the vectors.
-        ++diag.chunksRemeshed;
-        diag.vertexCount += static_cast<uint32_t>(comp.collVerts.size());
-        diag.indexCount  += static_cast<uint32_t>(comp.collIndices.size());
-
-        {
-            auto t0 = Clock::now();
-            world->enqueueEditCollision(comp.entity, comp.chunkCoord,
-                                        std::move(comp.collVerts),
-                                        std::move(comp.collIndices),
-                                        comp.versionState,
-                                        comp.version,
-                                        ChunkCollisionSource::EditMeshPacked);
-            collAccum += std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
-        }
-
-        // GPU upload — split into sub-meshes if vertex count exceeds 65535
-        std::vector<MeshData> subChunks;
-        uint8_t mainSubChunkCount = 0;
-        {
-            // Build a temporary MeshResult for the split utility
-            TerrainEditMesher::MeshResult tmpResult;
-            tmpResult.vertices = std::move(comp.currentArtifact.vertices);
-            tmpResult.indices  = std::move(comp.currentArtifact.indices);
-            tmpResult.aabbMin  = comp.currentArtifact.aabbMin;
-            tmpResult.aabbMax  = comp.currentArtifact.aabbMax;
-
-            auto subs = TerrainEditMesher::splitToSubMeshes(tmpResult);
-            for (auto& sub : subs) {
-                MeshData md(comp.entity);
-                md.vertices = std::move(sub.vertices);
-                md.indices  = std::move(sub.indices);
-                subChunks.push_back(std::move(md));
-            }
-            mainSubChunkCount = static_cast<uint8_t>(subChunks.size());
-        }
-        if (comp.currentArtifact.terrainType == TerrainType::DCCM) {
-            const uint8_t casingMask = computeDCCMCasingMask(world, comp.chunkCoord, maskCenter);
-            for (int edge = 0; edge < CHUNK_EDGE_COUNT; ++edge) {
-                if ((casingMask & (1 << edge)) == 0) continue;
-                MeshData casingData(comp.entity);
-                generateDCCMCasingForEdge(edge, subChunks, mainSubChunkCount, casingData);
-                if (!casingData.isEmpty()) {
-                    subChunks.push_back(std::move(casingData));
-                }
-            }
-        }
-        debugInfo.subChunkCount = static_cast<uint16_t>(subChunks.size());
-
-        glm::vec3 tightMin(1e10f);
-        glm::vec3 tightMax(-1e10f);
-        const bool hasTight = computeTightAABBFromSubChunks(subChunks, tightMin, tightMax);
-
-        {
-            auto t0 = Clock::now();
-            world->enqueueMeshForUpload(
-                comp.entity,
-                std::move(subChunks),
-                mainSubChunkCount,
-                /*fromTerrainEdit=*/true,
-                comp.versionState,
-                comp.version,
-                tightMin,
-                tightMax,
-                hasTight,
-                /*isRemesh=*/false,
-                /*batchId=*/0,
-                debugInfo);
-            ++uploadsQueued;
-            gpuAccum += std::chrono::duration<float, std::milli>(Clock::now() - t0).count();
-        }
-
-        releaseEditRemeshInFlight(comp.versionState, comp.version);
-
-        // Record edit remesh completion for chunk hole tracking
-        {
-            ChunkHoleEvent ev;
-            ev.type = ChunkHoleEvent::Type::EditRemeshCompleted;
-            ev.timestampSec = std::chrono::duration<float>(
-                std::chrono::steady_clock::now().time_since_epoch()).count();
-            ev.detail = "verts=" + std::to_string(diag.vertexCount)
-                      + " idx=" + std::to_string(diag.indexCount);
-            world->getChunkHoleTracker().recordEvent(
-                ChunkCoord{comp.chunkCoord.x, comp.chunkCoord.y, comp.chunkCoord.z},
-                std::move(ev));
-        }
-        if (comp.isFastMode) {
-            std::lock_guard qlock(m_mutex);
-            m_qualityDirty.insert(ChunkCoord{comp.chunkCoord.x, comp.chunkCoord.y, comp.chunkCoord.z});
-        }
-    }
-
-    if (!batch.empty()) {
-        diag.collisionEnqueueMs += collAccum;
-        diag.gpuUploadEnqueueMs += gpuAccum;
-    }
-    return uploadsQueued;
-}
-
-// ---------------------------------------------------------------------------
-// dispatchJobs — main thread: kick background jobs for dirty chunks
-// ---------------------------------------------------------------------------
-
-void TerrainEditRemeshScheduler::dispatchJobs(
-    World* world,
-    const std::vector<ChunkCoord>& chunks,
-    size_t budget,
-    bool fastMode,
-    bool materialOnly)
-{
-    const auto& fieldSource = world->getTerrainFieldSource();
-    const auto& heightmap   = world->getHeightmapSampler();
-    const auto& voxelBase   = world->getVoxelBaseSampler();
-    auto& registry = world->getRegistry();
-    auto& diag = world->editDiagMut();
-    diag.chunksRemeshed = 0;
-    diag.vertexCount = 0;
-    diag.indexCount = 0;
-
-    using DispClk = std::chrono::high_resolution_clock;
-    float heightAccum = 0.0f;
-    float yRangeAccum = 0.0f;
-    uint32_t inFlightSkipCount = 0;
-    const auto* overlay = fieldSource.getOverlay();
-    const bool hasOverlay = overlay && overlay->hasAnyEdits();
-
-    auto requeueDirtyChunk = [&](const ChunkCoord& coord) {
-        std::lock_guard lock(m_mutex);
-        if (materialOnly) {
-            m_materialDirty.insert(coord);
-        } else {
-            m_dirty.insert(coord);
+        bool operator==(const EditArtifactKey& other) const {
+            return chunkCoord == other.chunkCoord &&
+                   terrainType == other.terrainType &&
+                   lodLevel == other.lodLevel;
         }
     };
 
-    auto requeueDirtyRange = [&](size_t first) {
-        std::lock_guard lock(m_mutex);
-        auto& dst = materialOnly ? m_materialDirty : m_dirty;
-        for (size_t i = first; i < chunks.size(); ++i) {
-            dst.insert(chunks[i]);
+    struct EditArtifactKeyHash {
+        size_t operator()(const EditArtifactKey& key) const noexcept {
+            size_t hash = IVec3Hash{}(key.chunkCoord);
+            hash ^= (static_cast<size_t>(key.lodLevel) + 0x9e3779b9u + (hash << 6) + (hash >> 2));
+            hash ^= (static_cast<size_t>(key.terrainType) + 0x9e3779b9u + (hash << 6) + (hash >> 2));
+            return hash;
         }
     };
 
-    size_t dispatched = 0;
-    for (const auto& chunkCoord : chunks) {
-        if (dispatched >= budget) {
-            requeueDirtyRange(dispatched);
-            break;
+    struct EditArtifact {
+        TerrainType terrainType{TerrainType::Voxel};
+        int lodLevel{0};
+        bool isEmpty{true};
+        bool deferredBuild{false};
+        std::vector<Vertex> vertices;
+        std::vector<uint32_t> indices;
+        glm::vec3 aabbMin{1e10f};
+        glm::vec3 aabbMax{-1e10f};
+        uint64_t generation{0};  // bumped on every storeEditArtifact
+    };
+
+    void clearEditArtifactCache();
+    void invalidateEditArtifact(const glm::ivec3& chunkCoord);
+    void invalidateEditArtifacts(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords);
+    void storeEditArtifact(const glm::ivec3& chunkCoord,
+                           TerrainType terrainType,
+                           int lodLevel,
+                           std::vector<Vertex>&& vertices,
+                           std::vector<uint32_t>&& indices,
+                           glm::vec3 aabbMin,
+                           glm::vec3 aabbMax,
+                           bool isEmpty,
+                           bool deferredBuild = false);
+    bool tryGetEditArtifact(const glm::ivec3& chunkCoord,
+                            TerrainType terrainType,
+                            int lodLevel,
+                            EditArtifact& outArtifact) const;
+    uint64_t getEditArtifactGeneration(const glm::ivec3& chunkCoord,
+                                       TerrainType terrainType,
+                                       int lodLevel) const;
+    
+    /**
+     * Access to terrain file loader (for heightmap-based terrain)
+     */
+    TerrainFileLoader* getTerrainLoader() { return m_terrainLoader.get(); }
+    
+    /**
+     * Access to DCCM terrain file loader
+     */
+    TerrainFileLoader* getDCCMTerrainLoader() { return m_dccmTerrainLoader.get(); }
+    
+    /**
+     * Get the appropriate terrain loader for a given LOD level
+     * Returns DCCM or voxel loader based on per-LOD terrain type config
+     */
+    TerrainFileLoader* getTerrainLoaderForLOD(int lodLevel) {
+        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS &&
+            m_terrainTypePerLOD[lodLevel] == TerrainType::DCCM &&
+            m_dccmTerrainLoader && m_dccmTerrainLoader->isLoaded()) {
+            return m_dccmTerrainLoader.get();
         }
-
-        const glm::ivec3 worldChunkCoord(chunkCoord.x, chunkCoord.y, chunkCoord.z);
-
-        entt::entity entity = world->findChunk(worldChunkCoord);
-        if (entity == entt::null) {
-            entity = world->createChunk(worldChunkCoord);
+        return m_terrainLoader.get();
+    }
+    
+    /**
+     * Get the effective LOD level for mesh loading
+     * DCCM always uses LOD 0 regardless of actual LOD
+     */
+    int getEffectiveLOD(int lodLevel) const {
+        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS &&
+            m_terrainTypePerLOD[lodLevel] == TerrainType::DCCM) {
+            return 0; // DCCM always uses LOD 0
         }
-        if (entity == entt::null) continue;
-
-        auto versionState = ensureChunkVersionState(world, entity);
-        if (!versionState) continue;
-
-        DirtyChunkPages pendingDirtyPages;
-        bool hasPendingDirtyPages = false;
-        if (!materialOnly) {
-            std::lock_guard lock(m_mutex);
-            auto pendingIt = m_pendingDirtyPages.find(chunkCoord);
-            if (pendingIt != m_pendingDirtyPages.end()) {
-                pendingDirtyPages = pendingIt->second;
-                m_pendingDirtyPages.erase(pendingIt);
-                hasPendingDirtyPages = !pendingDirtyPages.pageIds.empty();
-            }
+        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS) {
+            return m_dataLODPerBand[lodLevel];
         }
-
-        const bool anyPipelineInFlight = versionState->inFlight.load(std::memory_order_acquire);
-        const uint32_t editJobsInFlight =
-            versionState->editRemeshInFlightCount.load(std::memory_order_acquire);
-
-        // Terrain edits may supersede older edit mesh jobs so the newest shape
-        // wins. Texture/material-only rebakes must NOT do that: the previous
-        // material upload may already be built but not yet swapped to screen.
-        // Repeatedly bumping the version here is exactly what makes big brush
-        // spam appear to freeze until another tiny edit finally lets one upload
-        // survive. Coalesce material-only dirties behind the current visual
-        // pipeline and dispatch the newest rebake once the chunk is clear.
-        if (anyPipelineInFlight) {
-            if (materialOnly || !fastMode || editJobsInFlight == 0) {
-                if (fastMode && !materialOnly) {
-                    versionState->version.fetch_add(1, std::memory_order_acq_rel);
-                }
-                {
-                    std::lock_guard skipLock(m_skipCountMutex);
-                    ++m_inFlightSkipCounts[chunkCoord];
-                }
-                requeueDirtyChunk(chunkCoord);
-                ++inFlightSkipCount;
-                continue;
-            }
+        return lodLevel;
+    }
+    int getEffectiveLODForChunk(const glm::ivec3& chunkCoord, int lodLevel) const {
+        if (getTerrainTypeForChunk(chunkCoord, lodLevel) == TerrainType::DCCM) {
+            return 0;
         }
-
-        if (materialOnly) {
-            bool hasPendingVisualSwap = false;
-            {
-                std::shared_lock regLock(world->registryMutex());
-                hasPendingVisualSwap =
-                    registry.valid(entity) &&
-                    registry.all_of<PendingMeshHandle>(entity);
-            }
-            if (hasPendingVisualSwap) {
-                std::lock_guard skipLock(m_skipCountMutex);
-                ++m_inFlightSkipCounts[chunkCoord];
-                requeueDirtyChunk(chunkCoord);
-                ++inFlightSkipCount;
-                continue;
-            }
+        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS) {
+            return m_dataLODPerBand[lodLevel];
         }
-
-        // For fast-mode (new edit/material): bump version to invalidate stale
-        // non-visible work. Material-only requests only reach this point when
-        // no previous upload/swap for the chunk is pending, so this is a single
-        // coalesced latest-version claim instead of a cancellation storm.
-        // For quality refinement: reuse current version so a fast upload already
-        // in the ChunkUploadSystem pipeline is NOT rejected as stale.
-        uint32_t ver;
-        if (fastMode) {
-            ver = versionState->version.fetch_add(1, std::memory_order_acq_rel) + 1;
-        } else {
-            ver = versionState->version.load(std::memory_order_acquire);
+        return lodLevel;
+    }
+    
+    /**
+     * Per-LOD terrain type configuration
+     */
+    void setTerrainTypeForLOD(int lodLevel, TerrainType type);
+    void setDataLODForBand(int band, int dataLOD);
+    void setTerrainTypesForStartup(const std::array<TerrainType, MAX_LOD_LEVELS>& types);
+    TerrainType getTerrainTypeForLOD(int lodLevel) const {
+        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS) return m_terrainTypePerLOD[lodLevel];
+        return TerrainType::Voxel;
+    }
+    TerrainType getTerrainTypeForChunk(const glm::ivec3& chunkCoord, int lodLevel) const {
+        if (chunkCoord.y != 0 || m_terrainEditOverlay.hasEditsInChunk(chunkCoord)) {
+            return TerrainType::Voxel;
         }
-        versionState->editRemeshLatestVersion.store(ver, std::memory_order_release);
-        versionState->editRemeshInFlightCount.fetch_add(1, std::memory_order_acq_rel);
-        versionState->inFlight.store(true, std::memory_order_release);
-
-        LoadManagementSnapshot loadSnapshot{};
-        {
-            const auto worldLoad = world->getLoadManagementDiag();
-            loadSnapshot.baseRenderDist = worldLoad.baseRenderDist;
-            loadSnapshot.effectiveRenderDist = worldLoad.effectiveRenderDist;
-            loadSnapshot.extensionRings = worldLoad.extensionRings;
-            loadSnapshot.measuredThroughput = worldLoad.measuredThroughput;
-            loadSnapshot.pendingCreates = worldLoad.pendingCreates;
-            loadSnapshot.pendingDestroys = worldLoad.pendingDestroys;
-            loadSnapshot.lodRemeshQueue = worldLoad.lodRemeshQueue;
-            loadSnapshot.pendingLodRemeshes = worldLoad.pendingLodRemeshes;
-            loadSnapshot.editRemeshPending = worldLoad.editRemeshPending;
-            loadSnapshot.uploadQueue = worldLoad.uploadQueue;
-            loadSnapshot.finalizeQueue = worldLoad.finalizeQueue;
-            loadSnapshot.bufferPressure = worldLoad.bufferPressure;
+        return getTerrainTypeForLOD(lodLevel);
+    }
+    const std::array<TerrainType, MAX_LOD_LEVELS>& getTerrainTypePerLOD() const { return m_terrainTypePerLOD; }
+    int getDataLODForBand(int band) const {
+        if (band >= 0 && band < MAX_LOD_LEVELS) return m_dataLODPerBand[band];
+        return band;
+    }
+    const std::array<int, MAX_LOD_LEVELS>& getDataLODPerBand() const { return m_dataLODPerBand; }
+    
+    /**
+     * Returns true when chunks are loading/meshing/uploading.
+     * Used to block terrain type changes that would corrupt GPU state.
+     */
+    bool isTerrainBusy() const {
+        return m_loadingCount.load(std::memory_order_relaxed) > 0
+            || m_meshingCount.load(std::memory_order_relaxed) > 0
+            || m_uploadSystem.getQueueSize() > 0;
+    }
+    
+    /**
+     * Check if any LOD uses a specific terrain type
+     */
+    bool anyLODUsesType(TerrainType type) const {
+        for (int i = 0; i < MAX_LOD_LEVELS; ++i) {
+            if (m_terrainTypePerLOD[i] == type) return true;
         }
-        loadSnapshot.editJobsInFlight = static_cast<uint32_t>(
-            m_inFlightCount.load(std::memory_order_relaxed));
-        {
-            std::lock_guard skipLock(m_skipCountMutex);
-            auto skipIt = m_inFlightSkipCounts.find(chunkCoord);
-            if (skipIt != m_inFlightSkipCounts.end()) {
-                loadSnapshot.inFlightSkips = skipIt->second;
-                m_inFlightSkipCounts.erase(skipIt);
-            }
+        return false;
+    }
+    
+    /**
+     * Switch to a different terrain file (e.g. voxel <-> DCCM)
+     * Destroys all chunks, reloads the terrain file, and restarts generation.
+     * @param newTerrainPath Full path to the new terrain .bin file
+     */
+    void switchTerrainFile(const std::string& newTerrainPath);
+    const std::string& getBaseTerrainPath() const { return m_baseTerrainPath; }
+    
+    /**
+     * Get terrain dimensions in chunks (from loaded terrain.bin)
+     * Returns {chunksX, chunksZ, lodLevels} or {0,0,0} if not loaded
+     */
+    TerrainFileLoader::Dimensions getTerrainDimensions() const {
+        if (m_terrainLoader && m_terrainLoader->isLoaded()) {
+            return m_terrainLoader->getDimensions();
         }
-
-        int lodLevel = 0;
-        {
-            std::shared_lock regLock(world->registryMutex());
-            if (registry.valid(entity) && registry.all_of<Chunk>(entity)) {
-                lodLevel = registry.get<Chunk>(entity).lodLevel;
-            }
-        }
-        TerrainType terrainType = world->getTerrainTypeForChunk(worldChunkCoord, lodLevel);
-        int effectiveLOD = world->getEffectiveLODForChunk(worldChunkCoord, lodLevel);
-        bool useDCCM = (terrainType == TerrainType::DCCM) && heightmap.isLoaded();
-        const bool supportsPagedEditable = !useDCCM &&
-            shouldExposePagedEditableMode(terrainType, effectiveLOD);
-
-        {
-            std::unique_lock regLock(world->registryMutex());
-            if (registry.valid(entity) && registry.all_of<Chunk>(entity)) {
-                auto& chunk = registry.get<Chunk>(entity);
-                const bool hasEditOwnership = materialOnly ||
-                    hasPendingDirtyPages ||
-                    registry.any_of<ChunkEditRuntime>(entity) ||
-                    (overlay && overlay->hasEditsInChunk(worldChunkCoord));
-                if (hasEditOwnership) {
-                    auto& editRuntime = registry.get_or_emplace<ChunkEditRuntime>(entity);
-                    editRuntime.targetMode = supportsPagedEditable
-                        ? ChunkMeshMode::PagedEditable
-                        : ChunkMeshMode::MonolithicEdited;
-
-                    if (supportsPagedEditable) {
-                        ensurePagedRuntimeScaffold(editRuntime);
-                        if (hasPendingDirtyPages) {
-                            applyDirtyPageUpdate(editRuntime, pendingDirtyPages);
-                        }
-
-                        chunk.meshMode = ChunkMeshMode::PagedEditable;
-                    } else {
-                        chunk.meshMode = ChunkMeshMode::MonolithicEdited;
-                    }
-                }
-            }
-        }
-
-        if (useDCCM) {
-            releaseEditRemeshInFlight(versionState, ver);
-            continue;
-        }
-
-        TerrainType currentTerrainType = TerrainType::Voxel;
-
-        int hintMinY = -1, hintMaxY = -1;
-        if (!useDCCM && heightmap.isLoaded()) {
-            const int chunkBaseY = worldChunkCoord.y * WorldConfig::CHUNK_HEIGHT;
-            if (worldChunkCoord.y < 0) {
-                hintMinY = chunkBaseY;
-                hintMaxY = chunkBaseY + WorldConfig::CHUNK_HEIGHT - 1;
-            } else if (worldChunkCoord.y == 0) {
-                const auto tH0 = DispClk::now();
-                auto [hMin, hMax] = heightmap.getHeightRangeForChunk(
-                    worldChunkCoord.x, worldChunkCoord.z, WorldConfig::CHUNK_SIZE);
-                heightAccum += std::chrono::duration<float, std::milli>(DispClk::now() - tH0).count();
-                hintMinY = hMin;
-                hintMaxY = hMax;
-            }
-
-            if (hasOverlay) {
-                const auto tY0 = DispClk::now();
-                auto [editMinY, editMaxY] = overlay->getEditVoxelYRange(
-                    worldChunkCoord.x * WorldConfig::CHUNK_SIZE,
-                    worldChunkCoord.z * WorldConfig::CHUNK_SIZE,
-                    WorldConfig::CHUNK_SIZE);
-                yRangeAccum += std::chrono::duration<float, std::milli>(DispClk::now() - tY0).count();
-                if (editMinY <= editMaxY) {
-                    if (hintMinY < 0) { hintMinY = editMinY; hintMaxY = editMaxY; }
-                    else {
-                        if (editMinY < hintMinY) hintMinY = editMinY;
-                        if (editMaxY > hintMaxY) hintMaxY = editMaxY;
-                    }
-                }
-            }
-        } else if (!useDCCM && voxelBase.isLoaded()) {
-            auto [vMin, vMax] = voxelBase.getYRangeForChunk(
-                worldChunkCoord.x, worldChunkCoord.z, WorldConfig::CHUNK_SIZE);
-            if (vMin <= vMax) { hintMinY = vMin; hintMaxY = vMax; }
-
-            if (hasOverlay) {
-                const auto tY0 = DispClk::now();
-                auto [editMinY, editMaxY] = overlay->getEditVoxelYRange(
-                    worldChunkCoord.x * WorldConfig::CHUNK_SIZE,
-                    worldChunkCoord.z * WorldConfig::CHUNK_SIZE,
-                    WorldConfig::CHUNK_SIZE);
-                yRangeAccum += std::chrono::duration<float, std::milli>(DispClk::now() - tY0).count();
-                if (editMinY <= editMaxY) {
-                    if (hintMinY < 0) { hintMinY = editMinY; hintMaxY = editMaxY; }
-                    else {
-                        if (editMinY < hintMinY) hintMinY = editMinY;
-                        if (editMaxY > hintMaxY) hintMaxY = editMaxY;
-                    }
-                }
-            }
-        }
-
-        auto* payload     = new RemeshJobPayload{};
-        payload->scheduler   = this;
-        payload->entity      = entity;
-        payload->chunkCoord  = worldChunkCoord;
-        payload->centerAtEnqueue = world->getChunkManager()
-            ? world->getChunkManager()->getCenterChunk()
-            : glm::ivec3(0, 0, 0);
-        payload->versionState = versionState;
-        payload->version     = ver;
-        payload->currentLodLevel = effectiveLOD;
-        payload->currentTerrainType = currentTerrainType;
-        payload->currentUsesDCCM = useDCCM;
-        payload->hintMinY    = hintMinY;
-        payload->hintMaxY    = hintMaxY;
-        payload->fieldSource = &fieldSource;
-        payload->heightmap   = &heightmap;
-        payload->voxelBase   = voxelBase.isLoaded() ? &voxelBase : nullptr;
-        payload->overlay     = fieldSource.getOverlay();
-        payload->fastMode    = fastMode && !materialOnly;
-        payload->dispatchTime = std::chrono::steady_clock::now();
-        payload->loadSnapshot = loadSnapshot;
-
-        if (!materialOnly && hasPendingDirtyPages && !pendingDirtyPages.pageBounds.empty()) {
-            int wMinX = INT_MAX, wMinY = INT_MAX, wMinZ = INT_MAX;
-            int wMaxX = INT_MIN, wMaxY = INT_MIN, wMaxZ = INT_MIN;
-            for (const auto& pb : pendingDirtyPages.pageBounds) {
-                if (!pb.isValid()) continue;
-                wMinX = std::min(wMinX, static_cast<int>(pb.minX));
-                wMaxX = std::max(wMaxX, static_cast<int>(pb.maxX));
-                wMinY = std::min(wMinY, static_cast<int>(pb.minY));
-                wMaxY = std::max(wMaxY, static_cast<int>(pb.maxY));
-                wMinZ = std::min(wMinZ, static_cast<int>(pb.minZ));
-                wMaxZ = std::max(wMaxZ, static_cast<int>(pb.maxZ));
-            }
-            if (wMinX <= wMaxX && wMinY <= wMaxY && wMinZ <= wMaxZ) {
-                const int chunkBaseVX = worldChunkCoord.x * WorldConfig::CHUNK_SIZE;
-                const int chunkBaseVY = worldChunkCoord.y * WorldConfig::CHUNK_HEIGHT;
-                const int chunkBaseVZ = worldChunkCoord.z * WorldConfig::CHUNK_SIZE;
-                payload->hasEditDirtyAabb = true;
-                payload->editDirtyVoxelMin = glm::ivec3(
-                    chunkBaseVX + wMinX, chunkBaseVY + wMinY, chunkBaseVZ + wMinZ);
-                payload->editDirtyVoxelMax = glm::ivec3(
-                    chunkBaseVX + wMaxX, chunkBaseVY + wMaxY, chunkBaseVZ + wMaxZ);
-                payload->bandLocalYMin = std::max(0, wMinY - 1);
-                payload->bandLocalYMax = std::min(WorldConfig::CHUNK_HEIGHT - 1, wMaxY + 1);
-            }
-        }
-
-        if (!fastMode && !materialOnly && !useDCCM) {
-            for (int altLod = 0; altLod < MAX_LOD_LEVELS; ++altLod) {
-                if (altLod == effectiveLOD) {
-                    continue;
-                }
-                if (world->getEditArtifactGeneration(
-                        worldChunkCoord,
-                        TerrainType::Voxel,
-                        altLod) != 0) {
-                    continue;
-                }
-
-                CachedArtifact deferredTarget{};
-                deferredTarget.terrainType = TerrainType::Voxel;
-                deferredTarget.lodLevel = altLod;
-                payload->deferredTargets.push_back(std::move(deferredTarget));
-            }
-        }
-
-        m_inFlightCount.fetch_add(1, std::memory_order_relaxed);
-
-        int priority = fastMode
-            ? (1000000 - lodLevel * 100000)
-            : (500000 - lodLevel * 100000);
-        if (materialOnly) {
-            priority += 50000;
-        }
-        JobHandle job = world->getJobSystem().makeWithPriority(
-            editRemeshJobFn, payload, 0, priority);
-        world->getJobSystem().schedule(job);
-
-        ++dispatched;
+        return {0, 0, 0};
+    }
+    
+    /**
+     * Get maximum render distance in rings based on terrain size
+     * This is the furthest ring that can contain any terrain data
+     */
+    int getMaxRenderDistanceRings() const {
+        auto dims = getTerrainDimensions();
+        if (dims.chunksX == 0 || dims.chunksZ == 0) return 500; // Default fallback
+        // Max ring = max distance from center to corner
+        // For NxN grid, center is at (N/2, N/2), corner is at (N-1, N-1)
+        // Max Chebyshev distance = max(N/2, N/2) = N/2 (roughly)
+        int maxDim = static_cast<int>(std::max(dims.chunksX, dims.chunksZ));
+        return (maxDim + 1) / 2 + 1;
     }
 
-    diag.dispatchHeightMs += heightAccum;
-    diag.dispatchYRangeMs += yRangeAccum;
-    diag.dispatchInFlightSkip += inFlightSkipCount;
-    diag.editJobsInFlight = static_cast<uint32_t>(
-        m_inFlightCount.load(std::memory_order_relaxed));
-}
-
-// ---------------------------------------------------------------------------
-// drainDeferredArtifacts — main thread: store LOD variant meshes in cache
-// ---------------------------------------------------------------------------
-
-void TerrainEditRemeshScheduler::drainDeferredArtifacts(World* world) {
-    std::vector<DeferredArtifactResult> batch;
-    {
-        std::lock_guard lock(m_deferredArtifactMutex);
-        if (m_deferredArtifacts.empty()) return;
-        batch.swap(m_deferredArtifacts);
+    /**
+     * Get the number of LOD levels available in the loaded terrain
+     * Returns terrain file's lodLevels (typically 5 for LOD 0-4), or 5 as default
+     */
+    int getAvailableLODLevels() const {
+        auto dims = getTerrainDimensions();
+        if (dims.lodLevels > 0) return static_cast<int>(dims.lodLevels);
+        return 5; // Default: LOD 0-4
     }
 
-    for (auto& r : batch) {
-        world->storeEditArtifact(
-            r.chunkCoord,
-            r.artifact.terrainType,
-            r.artifact.lodLevel,
-            std::move(r.artifact.vertices),
-            std::move(r.artifact.indices),
-            r.artifact.aabbMin,
-            r.artifact.aabbMax,
-            r.artifact.isEmpty,
-            /*deferredBuild=*/true);
+    /**
+     * Set physics world for collision generation
+     * Call after physics system is initialized
+     */
+    void setPhysicsWorld(class Physics::PhysicsWorld* physics) { 
+        m_physics = physics; 
+        m_collisionSystem.setPhysicsWorld(physics);
+        m_collisionSystem.setCollisionCache(m_collisionCache.get());
     }
-}
+    
+    /**
+     * Set GPU culling system for persistent slot allocation
+     * Call after GPUCullingSystem is initialized
+     */
+    void setGPUCullingSystem(GPUCullingSystem* gpuCulling) {
+        m_gpuCulling = gpuCulling;
+        m_uploadSystem.setGPUCullingSystem(gpuCulling);
+    }
+    
+    /**
+     * Set culling statistics for debug display
+     * Called from Engine after culling is complete
+     */
+    void setCullingStats(const CullingStats& stats) {
+        m_cullingStats = stats;
+    }
 
-// ---------------------------------------------------------------------------
-// Deferred LOD pre-warm: separate worker job (low priority).
-// Runs only when the brush has been idle long enough to not steal worker
-// capacity from interactive fast edits.
-// ---------------------------------------------------------------------------
-struct DeferredLODJobPayload {
-    TerrainEditRemeshScheduler* scheduler;
-    World* world;
-    TerrainEditRemeshScheduler::PendingDeferredLOD req;
+    const LastUpdateBreakdown& getLastUpdateBreakdown() const { return m_lastUpdateBreakdown; }
+    int getLoadingCount() const { return m_loadingCount.load(std::memory_order_relaxed); }
+    int getMeshingCount() const { return m_meshingCount.load(std::memory_order_relaxed); }
+    int getReadyCount() const { return m_readyCount.load(std::memory_order_relaxed); }
+
+    /**
+     * Create a chunk entity at given chunk coordinates
+     * @return Entity handle (entt::null if failed)
+     */
+    entt::entity createChunk(const glm::ivec3& chunkCoord);
+
+    /**
+     * OPTIMIZATION: Create multiple chunks in a single batch (1.5x speedup)
+     * Reduces lock overhead by creating all entities under one registry lock
+     * @param coords Vector of chunk coordinates to create
+     * @return Vector of created entities (same order as coords)
+     */
+    std::vector<entt::entity> createChunksBatch(const std::vector<glm::ivec3>& coords);
+
+    /**
+     * Find chunk entity by coordinate
+     * @return Entity handle (entt::null if not found)
+     */
+    entt::entity findChunk(const glm::ivec3& chunkCoord) const;
+
+    /**
+     * Get count of active chunks
+     */
+    size_t getChunkCount() const;
+
+    // Direct registry access for external systems
+    Registry& getRegistry() { return m_registry; }
+    const Registry& getRegistry() const { return m_registry; }
+    std::shared_mutex& registryMutex() const { return m_registryMutex; }
+
+    // C-nits 8: Job system and synchronization accessors
+    JobSystem& getJobSystem() { return m_jobSystem; }
+    PayloadPool& getPayloadPool() { return m_payloadPool; }
+    ChunkManager* getChunkManager() { return m_chunkManager.get(); }
+    
+    /**
+     * Pre-deserialize all collision shapes for instant runtime access
+     * MUST be called AFTER Jolt physics is initialized
+     */
+    void preDeserializeCollisionShapes();
+    
+    /**
+     * Chunk generation control
+     */
+    void resetChunkGeneration();
+    
+    /**
+     * Apply LOD parameter changes incrementally.
+     * Instead of destroying all chunks and rebuilding, this:
+     * 1. Compares each chunk's current LOD vs desired LOD under new thresholds
+     * 2. Only destroys+recreates chunks whose LOD actually changed
+     * 3. Creates new chunks for increased render distance / destroys for decreased
+     * 
+     * Much faster than resetChunkGeneration() for small parameter tweaks.
+     * @param newRenderDistance  The new total render distance in rings
+     */
+    void applyLODChangesIncrementally(int newRenderDistance);
+    
+    /**
+     * Release mesh data for all chunks at a specific LOD level
+     * Used when switching LOD from Mesh to SVO mode - frees VRAM without destroying chunks
+     * @param lodLevel The LOD level (0-4) to release meshes for
+     */
+    void releaseMeshesForLOD(int lodLevel);
+    
+    /**
+     * Queue mesh reload for all chunks at a specific LOD level
+     * Used when switching LOD from SVO back to Mesh mode
+     * @param lodLevel The LOD level (0-4) to reload meshes for
+     */
+    void reloadMeshesForLOD(int lodLevel);
+    
+    std::mutex& chunkVersionMutex() const { return m_chunkVersionMutex; }
+    std::unordered_map<entt::entity, std::shared_ptr<struct ChunkVersionState>, struct EntityHash>& 
+        getChunkVersionStates() { return m_chunkVersionStates; }
+
+    void transitionChunkState(entt::entity entity, ChunkState::State state);
+
+private:
+    /**
+     * Chunk loading system - creates/destroys/remeshes chunks in circular area
+     * @param deltaTime Frame time for speed-adaptive LOD
+     */
+    void updateChunkLoader(float deltaTime, const glm::vec3& cameraPos, float cameraYaw);
+
+    /**
+     * LOD transition scan + remesh drain (called from updateChunkLoader)
+     */
+    void updateLODTransitions(float deltaTime, bool centerChanged);
+
+    /**
+     * Mark newly generated chunks as dirty for meshing
+     */
+    void updateMarkDirtyOnGeneration();
+
+    /**
+     * Meshing system - kicks off mesh generation jobs for dirty chunks
+     */
+    void updateMeshingSystem();
+
+    /**
+     * Upload queue system - uploads finished meshes to GPU
+     * @return Number of meshes uploaded this frame
+     */
+    size_t updateUploadQueueSystem(BufferSuballocator* vbAllocator,
+                                  BufferSuballocator* ibAllocator,
+                                  UploadArena* uploadArena,
+                                  ResourceUploader* uploader,
+                                  uint64_t uploadReadyValue,
+                                  size_t maxUploadsOverride = 0,
+                                  bool terrainEditOnly = false);
+
+    /**
+     * Finalize queue - processes chunks after GPU upload completes
+     * @return Number of chunks finalized this frame
+     */
+    size_t processFinalizeQueue(size_t maxFinalizeCount = 0);
+    
+    /**
+     * Process LOD batch swaps - atomically swap PendingMeshHandle → MeshHandle
+     * for all chunks in a completed LOD transition batch.
+     * This eliminates visual holes at LOD boundaries.
+     * @return Number of chunks swapped this frame
+     */
+    size_t processLODSwaps(BufferSuballocator* vbAllocator,
+                           BufferSuballocator* ibAllocator,
+                           uint64_t deviceTimeline);
+
+    /**
+     * Old mesh buffers retired by LOD swaps. GPU culling slots are freed
+     * immediately; buffer allocator reclamation is deferred until the upload
+     * and swap path drains it.
+     */
+    void enqueueDeferredMeshBufferFree(const BufferSlice& vb, const BufferSlice& ib);
+    void processDeferredMeshBufferFrees(BufferSuballocator* vbAllocator,
+                                        BufferSuballocator* ibAllocator,
+                                        size_t maxFreeCount = 0);
+
+    /**
+     * Process solo edit swaps - swap PendingMeshHandle (batchId=0) → MeshHandle
+     * once deviceTimeline >= pending.handle.gpuReadyValue.
+     * Used for terrain edit remeshes where the old mesh must keep rendering
+     * until the GPU has finished reading the replacement upload.
+     * @return Number of chunks swapped this frame
+     */
+    size_t processSoloPendingSwaps(BufferSuballocator* vbAllocator,
+                                   BufferSuballocator* ibAllocator,
+                                   uint64_t deviceTimeline);
+    
+    /**
+     * Clean up orphaned PendingMeshHandles from cancelled LOD batches.
+     * Frees GPU resources (VB, IB, culling slots) and removes the component.
+     * Called when center changes and old batches are invalidated.
+     */
+    void cleanupStalePendingMeshHandles();
+    
+    // --- Pending LOD remesh queue ---
+    // LOD transition detection lives in World (not ChunkManager) because we
+    // need access to chunk.lodLevel (the ACTUAL mesh LOD, not the calculated one).
+    // On center change: scan all Ready chunks, find mismatches, populate queue.
+    // Drain it eagerly so movement can converge as quickly as the rest of the
+    // pipeline allows.
+    std::vector<ChunkManager::ChunkRemeshRequest> m_pendingLODRemeshes;
+    size_t m_lodScanCounter = 0;
+
+    // --- Burst recovery (explosion knockbacks, teleports) ---
+    // After a large center jump (moveDist > 5 chunks), accelerate LOD scans
+    // and skip upload throttling so the world fills in quickly.
+    int m_burstRecoveryFrames{0};
+
+    struct PendingMeshBufferFree {
+        BufferSlice vb;
+        BufferSlice ib;
+    };
+    std::deque<PendingMeshBufferFree> m_pendingMeshBufferFrees;
+    std::vector<BufferSlice> m_deferredFreeVbScratch;
+    std::vector<BufferSlice> m_deferredFreeIbScratch;
+
+    // --- Core ECS ---
+    Registry m_registry;
+
+    // --- Chunk loading ---
+    std::unique_ptr<ChunkManager> m_chunkManager;
+
+    // --- C-nits 8: Job system and synchronization (de-globalized) ---
+    JobSystem m_jobSystem;
+    PayloadPool m_payloadPool;  // Thread-safe pool for ChunkPipelinePayload
+    mutable std::mutex m_chunkVersionMutex;  // Protects m_chunkVersionStates
+    std::unordered_map<entt::entity, std::shared_ptr<struct ChunkVersionState>, struct EntityHash> m_chunkVersionStates;
+
+    // --- Streaming queues ---
+    mutable std::mutex m_pendingChunksMutex;  // Protects m_pendingChunks (accessed from main + lifecycle threads)
+    std::unordered_set<glm::ivec3, IVec3Hash> m_pendingChunks;
+    std::unordered_map<glm::ivec3, entt::entity, IVec3Hash> m_chunkEntityMap;
+    std::unordered_set<glm::ivec3, IVec3Hash> m_existingChunkSet;
+    std::unordered_set<glm::ivec3, IVec3Hash> m_readyChunkSet;
+    mutable std::shared_mutex m_chunkSetMutex;
+    // --- LOD system (extracted) ---
+    ChunkLODSystem m_lodSystem;
+    
+    // --- Lifecycle manager (extracted) ---
+    ChunkLifecycleManager m_lifecycleManager;
+    
+    // IChunkLifecycleCallback implementation
+    std::vector<entt::entity> createChunkEntities(const std::vector<glm::ivec3>& coords) override;
+    void scheduleChunkJobs(entt::entity entity, const glm::ivec3& coord, const glm::ivec3& playerChunk) override;
+    int destroyChunks(const std::vector<glm::ivec3>& coords) override;
+    glm::vec3 getCameraPosition() const override { return m_lastCameraPos; }
+    void cleanupStaleVersionStates() override;
+
+    // --- Upload system (extracted) ---
+    ChunkUploadSystem m_uploadSystem;
+    
+    // IUploadCallback implementation
+    void onMeshUploaded(
+        entt::entity entity,
+        const glm::ivec3& chunkCoord,
+        const std::vector<Vertex>& vertices,
+        const std::vector<uint16_t>& indices,
+        int lodLevel) override;
+    void onUploadPipelineEvent(
+        entt::entity entity,
+        const glm::ivec3* chunkCoord,
+        int lodLevel,
+        const char* stage,
+        const char* reason,
+        uint32_t batchId,
+        uint32_t expectedVersion,
+        uint32_t actualVersion,
+        const ChunkDebugAttribution* debugInfo = nullptr) override;
+    void onMeshHandleAdded(const MeshHandle& h) override { meshStatsAdd(h); }
+    void onMeshHandleRemoved(const MeshHandle& h) override { meshStatsSub(h); }
+    
+    // IBatchSignalCallback implementation
+    bool onBatchChunkReady(uint32_t batchId) override;
+    bool isBatchActive(uint32_t batchId) const override;
+
+    // --- Camera tracking for directional priority ---
+    glm::vec3 m_lastCameraPos{0.0f};
+    float m_lastCameraYaw{0.0f};  // For minimap view cone
+    glm::vec3 m_cameraVelocity{0.0f};
+
+    // --- Collision system (extracted) ---
+    ChunkCollisionSystem m_collisionSystem;
+    
+    // --- GPU buffer allocators (for cleanup) ---
+    BufferSuballocator* m_vbAllocator = nullptr;
+    BufferSuballocator* m_ibAllocator = nullptr;
+
+    // --- Chunk state tracking for worker threads ---
+    mutable std::shared_mutex m_chunkStateMutex;
+    std::unordered_map<glm::ivec3, ChunkState::State, IVec3Hash> m_chunkStateMap;
+
+    // --- Registry synchronization ---
+    mutable std::shared_mutex m_registryMutex;
+
+    // --- Helpers ---
+    void setChunkState(entt::entity entity, ChunkState::State state);
+    void setChunkState(const glm::ivec3& coord, ChunkState::State state);
+    void removeChunkState(const glm::ivec3& coord);
+    ChunkState::State getChunkStateSnapshot(const glm::ivec3& coord) const;
+    void markChunkPending(const glm::ivec3& coord);
+    void clearChunkPending(const glm::ivec3& coord);
+    bool isChunkPending(const glm::ivec3& coord) const;
+    bool tryDestroyChunk(const glm::ivec3& coord);
+    int tryDestroyChunksBatch(const std::vector<glm::ivec3>& coords);
+    int getDesiredLODForChunk(const glm::ivec3& coord) const;
+
+    // --- Debug metrics assembly (implementation in WorldDebugMetrics.cpp) ---
+    struct UpdateTimings {
+        std::chrono::high_resolution_clock::time_point startTime;
+        std::chrono::high_resolution_clock::time_point chunkLoadStart, chunkLoadEnd;
+        std::chrono::high_resolution_clock::time_point meshingStart, meshingEnd;
+        std::chrono::high_resolution_clock::time_point uploadStart, uploadEnd;
+        std::chrono::high_resolution_clock::time_point collisionStart, collisionEnd;
+        std::chrono::high_resolution_clock::time_point finalizeStart, finalizeEnd;
+        std::chrono::high_resolution_clock::time_point worldUpdateEnd;
+    };
+    void assembleDebugInfo(const UpdateTimings& timings,
+                           BufferSuballocator* vbAllocator,
+                           BufferSuballocator* ibAllocator,
+                           float cpuFrameMs,
+                           float gpuFrameMs);
+
+public:
+    // --- Streaming metrics ---
+    struct StreamingMetrics {
+        std::atomic<uint64_t> chunksCreatedTotal{0};
+        std::atomic<uint64_t> chunksDestroyedTotal{0};
+        std::atomic<uint64_t> meshesUploaded{0};
+        uint32_t creationQueueSize{0};
+        uint32_t uploadQueueSize{0};
+        uint32_t currentBurstSize{0};
+        uint32_t currentUploadBudget{0};
+        
+        void reset() {
+            chunksCreatedTotal.store(0, std::memory_order_relaxed);
+            chunksDestroyedTotal.store(0, std::memory_order_relaxed);
+            meshesUploaded.store(0, std::memory_order_relaxed);
+            creationQueueSize = 0;
+            uploadQueueSize = 0;
+            currentBurstSize = 0;
+            currentUploadBudget = 0;
+        }
+    };
+    
+    StreamingMetrics& getStreamingMetrics() { return m_streamingMetrics; }
+    const StreamingMetrics& getStreamingMetrics() const { return m_streamingMetrics; }
+
+    // Phase E1: expose passes this world contributes to (currently voxel opaque only)
+    std::vector<FramePassKind> enumerateFramePasses() const;
+
+private:
+    StreamingMetrics m_streamingMetrics;
+    std::unique_ptr<InGameDebug> m_inGameDebug;  // Debug overlay display
+    TerrainEdit::TerrainEditOverlayStore m_terrainEditOverlay; // Sparse mutable terrain edits
+    TextureOverlay::TextureOverlayStore m_textureMaterialStore; // Sparse voxel-face material edits
+    TerrainEdit::TerrainFieldSource m_terrainFieldSource;      // Merged base/edit terrain view
+    TerrainEdit::HeightmapBaseSampler m_heightmapSampler;      // Base heightmap for terrain edits
+    TerrainEdit::VoxelBaseSampler m_voxelBaseSampler;            // 3D voxel base for terrain edits
+    TerrainEdit::TerrainEditRemeshScheduler m_editRemeshScheduler; // Dirty-chunk re-mesh scheduler
+    std::vector<SnapshotInfo> m_snapshotInfos;
+    std::vector<TerrainBoxRecord> m_terrainBoxes;
+    uint64_t m_terrainBoxRevision{1};
+    int m_activeSnapshotIndex{0};
+    std::string m_snapshotRootDir;
+    std::string m_baseTerrainPath;
+    std::string m_baseCollisionPath;
+    std::unique_ptr<TerrainFileLoader> m_terrainLoader;      // Voxel terrain loader
+    std::unique_ptr<TerrainFileLoader> m_dccmTerrainLoader;  // DCCM terrain loader
+    std::array<TerrainType, MAX_LOD_LEVELS> m_terrainTypePerLOD{TerrainType::Voxel, TerrainType::Voxel, TerrainType::Voxel, TerrainType::Voxel, TerrainType::Voxel};
+    std::array<int, MAX_LOD_LEVELS> m_dataLODPerBand{0, 1, 2, 3, 4};  // Per-band data LOD override (Voxel only)
+    std::unique_ptr<Collision::CollisionCache> m_collisionCache;  // Precomputed collision data
+
+    bool m_snapshotDirty{false}; // Deferred save flag — set by edits, flushed on switch/save
+    std::string m_lastSnapshotStatusMessage;
+    bool m_lastSnapshotStatusIsError{false};
+    TerrainEditDiag m_lastEditDiag; // Last terrain edit timing diagnostics
+    TerrainEditStats m_editStats;   // Rolling history + averages
+    TerrainEditHistory m_editHistory; // Individual edit log entries
+    ChunkVisualHistory m_chunkVisualHistory; // End-to-end chunk upload/finalize history
+    ChunkVisualErrorHistory m_chunkVisualErrorHistory; // Upload/LOD/finalize error timeline
+
+    // Persisted edit collision map (saved/loaded with each snapshot)
+    std::unordered_map<glm::ivec3, EditCollisionEntry, IVec3Hash> m_editCollisionData;
+    mutable std::shared_mutex m_editArtifactCacheMutex;
+    std::unordered_map<EditArtifactKey, EditArtifact, EditArtifactKeyHash> m_editArtifactCache;
+    uint64_t m_editArtifactGenCounter{0};  // monotonic, bumped per storeEditArtifact
+    class Physics::PhysicsWorld* m_physics{nullptr};     // Physics world for collision (non-owning)
+    GPUCullingSystem* m_gpuCulling{nullptr};             // GPU culling system for persistent slots (non-owning)
+    CullingStats m_cullingStats;                          // Culling statistics from Engine
+    LastUpdateBreakdown m_lastUpdateBreakdown;            // Always-on timings for perf HUD / runtime metrics
+    
+    // Runtime voxel chunk tracking
+    mutable std::shared_mutex m_runtimeVoxelChunkMutex;
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet m_runtimeVoxelChunks;
+    std::atomic<uint64_t> m_meshTopologyVersion{0};  // Bumped when mesh topology changes
+    mutable std::mutex m_meshTopologyChangeMutex;
+    std::deque<MeshTopologyChange> m_meshTopologyChanges;
+    uint64_t m_meshTopologyOldestDroppedRevision{0};
+    ChunkHoleTracker m_chunkHoleTracker;              // Tracks chunk visual hole events
+    
+    // --- Render system (extracted) ---
+    ChunkRenderSystem m_renderSystem;
+    
+    // World metadata
+    std::string m_worldName;
+    std::string m_worldGenerationDate;
+    
+    // --- Atomic state counters for O(1) tracking instead of O(N) iteration ---
+    std::atomic<int> m_loadingCount{0};
+    std::atomic<int> m_meshingCount{0};
+    std::atomic<int> m_readyCount{0};
+    
+    // Track whether any uploads/copies were recorded this frame (for skipping empty submits)
+    bool m_hadUploadsThisFrame{false};
+    // Track whether any of those uploads were topology-changing replacements.
+    // Initial chunk loads and LOD batch swaps do NOT set this. Used to suppress
+    // temporal visibility reuse after frames that may have exposed previously
+    // occluded neighbor chunks, breaking the temporal occlusion death spiral on edits.
+    bool m_hadEditUploadsThisFrame{false};
+    // Cooldown frames remaining after the last edit/remesh upload. While > 0, the
+    // temporal-coherence shortcut is suppressed so chunks re-run Hi-Z depth tests
+    // instead of reusing potentially stale temporal visibility bits.
+    uint32_t m_hiZEditCooldown{0};
+    uint64_t m_nextTerrainEditId{1};
+
+    struct PendingEditVisualChunk {
+        uint64_t editId{0};
+        std::chrono::steady_clock::time_point startTime{};
+    };
+    struct PendingEditVisualAggregate {
+        std::chrono::steady_clock::time_point startTime{};
+        uint32_t totalChunks{0};
+        uint32_t readyChunks{0};
+        uint32_t supersededChunks{0};
+        float visualFirstChunkMs{0.0f};
+        float visualCompleteMs{0.0f};
+        uint64_t uploadBytes{0};
+        uint32_t artifactBuilds{0};
+        uint32_t artifactCacheHits{0};
+        uint32_t precomputedLoads{0};
+        uint32_t collisionBaseCache{0};
+        uint32_t collisionEditPacked{0};
+        uint32_t collisionArtifactRefresh{0};
+        uint32_t collisionExistingEdit{0};
+        uint32_t gpuResidentChunks{0};
+        uint32_t artifactResidentChunks{0};
+        uint32_t monolithicChunks{0};
+        uint32_t pagedChunks{0};
+        uint32_t dirtyPages{0};
+        uint32_t rebuiltPages{0};
+        uint32_t residentPages{0};
+        uint32_t evictedPages{0};
+    };
+    std::unordered_map<glm::ivec3, PendingEditVisualChunk, IVec3Hash> m_pendingEditVisualChunks;
+    std::unordered_map<uint64_t, PendingEditVisualAggregate> m_pendingEditVisuals;
+    std::unordered_map<glm::ivec3, ChunkCollisionSource, IVec3Hash> m_chunkCollisionSources;
+
+    // Edit→Load correlation tracker: counts consecutive [Load] entries per chunk
+    // since the last [Edit], propagating the editId to subsequent [Load] entries.
+    struct ChunkLoadTracker {
+        uint64_t editId{0};
+        uint32_t loadCount{0};
+    };
+    std::unordered_map<glm::ivec3, ChunkLoadTracker, IVec3Hash> m_chunkLoadTrackers;
+
+    // --- Finalize diagnostics ring buffer ---
+    std::vector<FinalizeDiagFrame> m_finalizeDiagHistory;
+    size_t m_finalizeDiagWriteIdx{0};
+    uint64_t m_finalizeDiagFrameCounter{0};
+    FinalizeDiagFrame m_currentFinalizeDiag;  // populated by processFinalizeQueue + processLODSwaps each frame
+    LODSwitchDiag m_lodSwitchDiag;
+
+    // Running subchunk stats (D3: avoid periodic full-entity scan)
+    std::atomic<uint32_t> m_statsChunksWithMesh{0};
+    std::atomic<uint32_t> m_statsTotalSubChunks{0};
+    std::atomic<uint32_t> m_statsSplitChunks{0};
+    std::atomic<uint32_t> m_statsSeamSubChunks{0};
+    void meshStatsAdd(const MeshHandle& h);
+    void meshStatsSub(const MeshHandle& h);
+    void refreshSnapshots();
+    void updateWorldIdentityFromActiveSnapshot();
+    bool ensureEditableSnapshot();
+    void beginTerrainEditVisualTracking(
+        uint64_t editId,
+        const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks,
+        const std::chrono::steady_clock::time_point& startTime);
+    void noteChunkVisualReady(
+        const glm::ivec3& coord,
+        const std::chrono::steady_clock::time_point& uploadEnqueueTime,
+        const std::chrono::steady_clock::time_point& finalizeTime,
+        int lodLevel,
+        uint64_t vramBytes,
+        uint32_t vertexCount,
+        uint32_t indexCount,
+        const ChunkDebugAttribution* debugInfo = nullptr);
+    void noteChunkVisualError(
+        const glm::ivec3* coord,
+        int lodLevel,
+        const char* stage,
+        const char* reason,
+        uint32_t batchId = 0,
+        uint32_t expectedVersion = 0,
+        uint32_t actualVersion = 0,
+        const ChunkDebugAttribution* debugInfo = nullptr);
+    void recordMeshTopologyChange(const glm::ivec3& coord);
+    void recordMeshTopologyChanges(const std::vector<glm::ivec3>& coords);
+    void recordGlobalMeshTopologyChange();
+
+    // --- Ghost-geometry detector ---
+    // Periodic scan that flags LOD-0 chunks with valid render meshes but no
+    // valid physics collider. The actual culprit (edit-collision drop, async
+    // BVH null, stale-version drop, missing collision cache, etc.) is logged
+    // into the chunk visual error history so VRAM panel inspection can show
+    // the cause directly per chunk.
+    void scanForGhostGeometry();
+    struct GhostGeometryState {
+        uint32_t consecutiveBrokenScans{0};
+        uint64_t lastReportedScanIndex{0};
+    };
+    std::unordered_map<glm::ivec3, GhostGeometryState, IVec3Hash> m_ghostGeometryState;
+    int m_ghostScanFrameCounter{0};
+    uint64_t m_ghostScanIndex{0};
+    void refreshEditedChunkCollisionFromArtifact(
+        entt::entity entity,
+        const glm::ivec3& chunkCoord,
+        int lodLevel);
+    TerrainEditHistoryEntry* findTerrainEditHistoryEntry(uint64_t editId);
+    void syncTerrainEditVisualState(uint64_t editId, bool eraseIfComplete);
+    
+public:
+    // VRAM budget control (delegated to ChunkRenderSystem)
+    void setVramBudgetMB(uint32_t megabytes) { 
+        m_renderSystem.setVramBudgetMB(megabytes);
+    }
+    uint64_t getVramBudgetBytes() const { 
+        return m_renderSystem.getVramBudgetBytes();
+    }
+    uint64_t getCurrentVramUsage() const { 
+        return m_renderSystem.getCurrentVramUsage();
+    }
+    void setEnableVramLimiting(bool enable) { 
+        m_renderSystem.setEnableVramLimiting(enable);
+    }
+    bool isVramLimitingEnabled() const { 
+        return m_renderSystem.isVramLimitingEnabled();
+    }
+    
+    // Query whether the most recent update() recorded any GPU copies
+    bool hadUploadsThisFrame() const { return m_hadUploadsThisFrame; }
+    // Query whether the most recent update() recorded any topology-changing
+    // replacement uploads (i.e., uploads that may have exposed previously
+    // occluded neighbor chunks).
+    // Returns true during edit upload frames AND for several frames afterward,
+    // suppressing temporal-visibility reuse while fresh depth settles.
+    bool hadEditUploadsThisFrame() const { return m_hadEditUploadsThisFrame || (m_hiZEditCooldown > 0); }
+    
+    // Per-chunk visibility control
+    void setChunkVisible(entt::entity entity, bool visible) {
+        if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
+            m_registry.get<Chunk>(entity).isVisible = visible;
+        }
+    }
 };
-
-void deferredLODJobFn(JobCtx& /*ctx*/, void* ud) {
-    auto* p = static_cast<DeferredLODJobPayload*>(ud);
-
-    // Drop if a newer edit has already invalidated this version.
-    if (p->req.versionState->version.load(std::memory_order_acquire) != p->req.version) {
-        p->scheduler->m_inFlightCount.fetch_sub(1, std::memory_order_relaxed);
-        delete p;
-        return;
-    }
-
-    const RemeshCancellationToken cancelToken{
-        &p->req.versionState->version, p->req.version};
-
-    const auto& fieldSource = p->world->getTerrainFieldSource();
-    const auto& heightmap   = p->world->getHeightmapSampler();
-    const auto& voxelBase   = p->world->getVoxelBaseSampler();
-    const auto* overlay     = fieldSource.getOverlay();
-
-    auto artifact = buildArtifact(
-        fieldSource,
-        heightmap,
-        &voxelBase,
-        overlay,
-        p->req.chunkCoord,
-        p->req.hintMinY,
-        p->req.hintMaxY,
-        p->req.terrainType,
-        p->req.lodLevel,
-        p->req.terrainType == TerrainType::DCCM,
-        /*fastMode=*/false,
-        &cancelToken,
-        p->req.hasEditDirtyAabb ? &p->req.editDirtyVoxelMin : nullptr,
-        p->req.hasEditDirtyAabb ? &p->req.editDirtyVoxelMax : nullptr);
-
-    if (p->req.versionState->version.load(std::memory_order_acquire) != p->req.version) {
-        // Newer edit invalidated us mid-build — drop the partial result.
-        p->scheduler->m_inFlightCount.fetch_sub(1, std::memory_order_relaxed);
-        delete p;
-        return;
-    }
-
-    p->scheduler->pushDeferredArtifact({
-        p->req.chunkCoord,
-        std::move(artifact),
-        p->req.versionState,
-        p->req.version
-    });
-
-    p->scheduler->m_inFlightCount.fetch_sub(1, std::memory_order_relaxed);
-    delete p;
-}
-
-void TerrainEditRemeshScheduler::dispatchPendingDeferredLODs(World* world) {
-    using Clock = std::chrono::steady_clock;
-    // Idle threshold: only kick off LOD pre-warming when the brush has been
-    // quiet for this long. Tunable; 200 ms feels imperceptible to users while
-    // still giving fast edits clear worker headroom.
-    constexpr int64_t IDLE_NS_THRESHOLD = 200LL * 1000LL * 1000LL; // 200 ms
-    // Per-frame cap so we don't suddenly flood every worker with deferred
-    // LOD work (which would re-create the original problem). The remaining
-    // requests stay in the queue and drain over subsequent idle frames.
-    constexpr size_t MAX_DEFERRED_LOD_PER_FRAME = 8;
-
-    const int64_t lastFastNs =
-        m_lastFastDispatchNs.load(std::memory_order_acquire);
-    if (lastFastNs != 0) {
-        const int64_t nowNs =
-            Clock::now().time_since_epoch().count();
-        if (nowNs - lastFastNs < IDLE_NS_THRESHOLD) {
-            return; // brush still active — wait
-        }
-    }
-
-    std::vector<PendingDeferredLOD> batch;
-    {
-        std::lock_guard lock(m_pendingDeferredLODMutex);
-        if (m_pendingDeferredLODs.empty()) return;
-        const size_t take = std::min(m_pendingDeferredLODs.size(),
-                                     MAX_DEFERRED_LOD_PER_FRAME);
-        batch.reserve(take);
-        // Drain newest-first so visually-relevant recent edits win when the
-        // queue overflows (older requests will be dropped by version-check
-        // anyway if they were superseded).
-        for (size_t i = 0; i < take; ++i) {
-            batch.push_back(std::move(m_pendingDeferredLODs.back()));
-            m_pendingDeferredLODs.pop_back();
-        }
-    }
-
-    for (auto& req : batch) {
-        // Skip if already invalidated before we even submit.
-        if (!req.versionState ||
-            req.versionState->version.load(std::memory_order_acquire) != req.version) {
-            continue;
-        }
-        // Skip if the artifact cache already has this combo (race-safe filter).
-        if (world->getEditArtifactGeneration(
-                req.chunkCoord, req.terrainType, req.lodLevel) != 0) {
-            continue;
-        }
-
-        auto* payload = new DeferredLODJobPayload{this, world, std::move(req)};
-        m_inFlightCount.fetch_add(1, std::memory_order_relaxed);
-        // Lower-priority than fast edits AND than quality refinement so that
-        // any incoming brush stroke continues to preempt LOD pre-warm.
-        constexpr int DEFERRED_LOD_PRIORITY = 100000;
-        JobHandle job = world->getJobSystem().makeWithPriority(
-            deferredLODJobFn, payload, 0, DEFERRED_LOD_PRIORITY);
-        world->getJobSystem().schedule(job);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// processRemeshQueue — main thread, per-frame
-// ---------------------------------------------------------------------------
-
-void TerrainEditRemeshScheduler::processRemeshQueue(World* world, size_t budget, bool dispatchOnly)
-{
-    using Clock = std::chrono::high_resolution_clock;
-    auto& diag = world->editDiagMut();
-
-    const auto tDrainStart = Clock::now();
-    drainCompletions(world);
-    if (!dispatchOnly) {
-        drainDeferredArtifacts(world);
-    }
-    const auto tDrainEnd = Clock::now();
-    diag.dispatchDrainMs = std::chrono::duration<float, std::milli>(tDrainEnd - tDrainStart).count();
-
-    std::vector<ChunkCoord> editDirty;
-    std::vector<ChunkCoord> materialDirty;
-    std::vector<ChunkCoord> qualityDirty;
-    {
-        std::lock_guard lock(m_mutex);
-        if (m_dirty.empty() && m_materialDirty.empty() && m_qualityDirty.empty()) {
-            if (diag.chunksRemeshed > 0) {
-                diag.remeshTotalMs = std::chrono::duration<float, std::milli>(
-                    tDrainEnd - tDrainStart).count();
-                diag.grandTotalMs = diag.applyTotalMs + diag.remeshTotalMs;
-            }
-            return;
-        }
-
-        editDirty.reserve(m_dirty.size());
-        for (const auto& c : m_dirty) {
-            editDirty.push_back(c);
-        }
-        m_dirty.clear();
-
-        auto alreadyIn = [](const std::vector<ChunkCoord>& list, const ChunkCoord& c) {
-            for (const ChunkCoord& e : list) {
-                if (e.x == c.x && e.y == c.y && e.z == c.z) {
-                    return true;
-                }
-            }
-            return false;
-        };
-
-        materialDirty.reserve(m_materialDirty.size());
-        for (const auto& c : m_materialDirty) {
-            if (!alreadyIn(editDirty, c)) {
-                materialDirty.push_back(c);
-            }
-        }
-        m_materialDirty.clear();
-
-        for (const auto& c : m_qualityDirty) {
-            if (!alreadyIn(editDirty, c) && !alreadyIn(materialDirty, c)) {
-                qualityDirty.push_back(c);
-            }
-        }
-        m_qualityDirty.clear();
-    }
-
-    auto sortByEditCenter = [&](std::vector<ChunkCoord>& dirty) {
-        if (dirty.size() <= 3) {
-            return;
-        }
-
-        const glm::vec3 editCenter = diag.editCenter;
-        const float invChunkSize = 1.0f / static_cast<float>(WorldConfig::CHUNK_SIZE);
-        std::sort(dirty.begin(), dirty.end(),
-            [&](const ChunkCoord& a, const ChunkCoord& b) {
-                auto dist2 = [&](const ChunkCoord& c) {
-                    const float dx = static_cast<float>(c.x) - editCenter.x * invChunkSize;
-                    const float dz = static_cast<float>(c.z) - editCenter.z * invChunkSize;
-                    return dx * dx + dz * dz;
-                };
-                return dist2(a) < dist2(b);
-            });
-    };
-
-    sortByEditCenter(editDirty);
-    sortByEditCenter(materialDirty);
-
-    if (budget == 0) {
-        budget = editDirty.size() + materialDirty.size() + qualityDirty.size();
-    }
-
-    constexpr size_t MIN_FAST_EDIT_DISPATCH_BUDGET = 64;
-    constexpr size_t MIN_MATERIAL_DISPATCH_BUDGET = 128;
-
-    const auto tDispatchStart = Clock::now();
-
-    const size_t editDispatchBudget = editDirty.empty()
-        ? size_t(0)
-        : std::min(editDirty.size(), std::max(budget, MIN_FAST_EDIT_DISPATCH_BUDGET));
-    dispatchJobs(world, editDirty, editDispatchBudget, /*fastMode=*/true, /*materialOnly=*/false);
-
-    const size_t materialDispatchBudget = materialDirty.empty()
-        ? size_t(0)
-        : std::min(materialDirty.size(), std::max(budget, MIN_MATERIAL_DISPATCH_BUDGET));
-    dispatchJobs(world, materialDirty, materialDispatchBudget, /*fastMode=*/true, /*materialOnly=*/true);
-
-    if (!editDirty.empty() || !materialDirty.empty()) {
-        m_lastFastDispatchNs.store(
-            std::chrono::steady_clock::now().time_since_epoch().count(),
-            std::memory_order_release);
-    }
-
-    if (!qualityDirty.empty()) {
-        const size_t interactiveWave = editDirty.size() + materialDirty.size();
-        const bool largeInteractiveWave = interactiveWave >= 16u;
-        size_t qualityBudget = largeInteractiveWave
-            ? size_t(0)
-            : (interactiveWave == 0 ? size_t(12) : size_t(2));
-        qualityBudget = std::min(qualityBudget, qualityDirty.size());
-        if (qualityBudget > 0) {
-            dispatchJobs(world, qualityDirty, qualityBudget, /*fastMode=*/false, /*materialOnly=*/false);
-        }
-        if (qualityDirty.size() > qualityBudget) {
-            std::lock_guard lock(m_mutex);
-            for (size_t i = qualityBudget; i < qualityDirty.size(); ++i) {
-                m_qualityDirty.insert(qualityDirty[i]);
-            }
-        }
-    }
-    const auto tDispatchEnd = Clock::now();
-
-    if (!dispatchOnly) {
-        dispatchPendingDeferredLODs(world);
-    }
-
-    diag.meshMs = 0.0f;
-    diag.remeshTotalMs = std::chrono::duration<float, std::milli>(
-        tDispatchEnd - tDrainStart).count();
-    diag.grandTotalMs = diag.applyTotalMs + diag.remeshTotalMs;
-}
-
-size_t TerrainEditRemeshScheduler::flushReadyCompletions(World* world)
-{
-    if (!world) {
-        return 0;
-    }
-    const size_t uploadsQueued = drainCompletions(world);
-    drainDeferredArtifacts(world);
-    return uploadsQueued;
-}
-
-} // namespace TerrainEdit
 
 ````
 
-## shaders\terrain\cube.frag
+## include\world\chunks\core\Chunk.h
 
-Description: No CC-DESC found. C++ struct 'PointLight'.
+Description: No CC-DESC found. C++ struct 'ChunkCoord'.
 
-````glsl
-#version 450
+````cpp
+#pragma once
 
-// Input from vertex shader
-layout(location = 0) in vec3 fragWorldPos;
-layout(location = 1) in vec3 fragNormal;
-layout(location = 2) in vec3 fragColor;
-layout(location = 3) in float fragAOLevel;
-layout(location = 4) in vec2 fragUV;
-layout(location = 5) in flat vec3 fragChunkOrigin;  // Chunk origin for voxel coord calculation
-layout(location = 6) in flat uint fragFace;
-layout(location = 7) in flat vec3 fragFlatPos;  // Provoking vertex pos (constant per tri)
-layout(location = 8) in flat float fragFlatAO;  // Provoking vertex AO (constant per tri)
-layout(location = 9) in flat uint fragMaterial;
+#include <glm/glm.hpp>
+#include <array>
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <vector>
+#include "vulkan/BufferSuballocator.h"
+#include "world/WorldTypes.h"
+#include "rendering/common/Mesh.h"
 
-// Output
-layout(location = 0) out vec4 outColor;
+// Forward declare Jolt BodyID to avoid heavy include
+namespace JPH { class BodyID; }
 
-// Point light structure definition
-struct PointLight {
-    vec4 positionRadius;  // xyz = position, w = radius
-    vec4 colorIntensity;  // xyz = color, w = intensity
+// Edge indices for seam meshes (must match converter and TerrainFileLoader)
+// Duplicated here to avoid circular include
+constexpr uint8_t CHUNK_EDGE_NEG_X = 0; // West edge  (-X)
+constexpr uint8_t CHUNK_EDGE_POS_X = 1; // East edge  (+X)
+constexpr uint8_t CHUNK_EDGE_NEG_Z = 2; // South edge (-Z)
+constexpr uint8_t CHUNK_EDGE_POS_Z = 3; // North edge (+Z)
+constexpr uint8_t CHUNK_EDGE_COUNT = 4;
+
+/**
+ * Core chunk data structures for the ECS world
+ * 
+ * These are pure data components - no logic here
+ * Meshing and terrain generation will be implemented separately
+ */
+
+/**
+ * Chunk coordinate in world space
+ * Single-layer terrain: all chunks at y=0, extending upward to 32m
+ * Each chunk is 8m × 32m × 8m in world space (128 × 512 × 128 micro-voxels)
+ */
+struct ChunkCoord {
+    int32_t x;
+    int32_t y;
+    int32_t z;
+    
+    ChunkCoord() : x(0), y(0), z(0) {}
+    ChunkCoord(int32_t _x, int32_t _y, int32_t _z) : x(_x), y(_y), z(_z) {}
+    
+    bool operator==(const ChunkCoord& other) const {
+        return x == other.x && y == other.y && z == other.z;
+    }
+    
+    bool operator!=(const ChunkCoord& other) const {
+        return !(*this == other);
+    }
+    
+    glm::ivec3 toVec3() const {
+        return glm::ivec3(x, y, z);
+    }
 };
 
-const uint MAX_SHADER_LIGHTS = 32u;
-const uint MAX_SUN_SHADOW_CASCADES = 6u;
-const float LIGHT_GRID_WORLD_METERS = 0.250;
-const float LIGHT_GRID_CELLS = 16.0;
-const float LIGHT_GRID_CELL_SIZE = LIGHT_GRID_WORLD_METERS / LIGHT_GRID_CELLS; // 1/64m
-const float LIGHT_GRID_PHASE_OFFSET_CELLS = 0.5;
-const float MIN_LIGHT_BRIGHTNESS = 0.0030;
-const float MIN_SHADOW_BRIGHTNESS = 0.0200;
-
-// Lighting data storage buffer (SSBO for >32 light capacity)
-layout(std430, set = 0, binding = 2) readonly buffer LightingData {
-    // Directional light (sun/moon)
-    vec4 sunDirection;      // xyz = direction, w = intensity
-    vec4 sunColor;          // xyz = color, w = ambient strength
-
-    // Sky/atmosphere
-    vec4 skyColor;          // xyz = sky color, w = fog density
-
-    // Point lights
-    PointLight pointLights[4096];
-
-    uint numPointLights;
-    float time;
-    uint _pad0;
-    uint _pad1;
-
-    // Per-light pulse data (synced with glow billboard system on CPU)
-    // x = pulseStrength, y = breathScale, z = flickerAmount, w = flickerSpeed
-    vec4 lightPulseData[4096];
-} lighting;
-
-// Camera position for fog calculation
-layout(set = 0, binding = 3) uniform CameraData {
-    vec3 cameraPos;
-} camera;
-
-// AO settings for real-time adjustment
-layout(set = 0, binding = 4) uniform AOData {
-    // Voxel AO (7 vec4s)
-    vec4 brightnessLevels;    // x=L0, y=L1, z=L2, w=L3
-    vec4 shadowTint0;         // xyz=tint0, w=aoPowerCurve
-    vec4 shadowTint1;         // xyz=tint1, w=aoPixelSize
-    vec4 shadowTint2;         // xyz=tint2, w=bandThreshold1
-    vec4 shadowTint3;         // xyz=tint3, w=bandThreshold2
-    vec4 ditherWarmTint;      // xyz=ditherWarmTint, w=debugFlags
-    vec4 scatterAmounts;      // x=light, y=medium, z=dark, w=unused
-    // DCCM AO (5 vec4s)
-    vec4 dccmBrightness;      // 4 brightness bands
-    vec4 dccmShadowTintCfg;   // xyz=tint, w=powerCurve
-    vec4 dccmConfig;          // x=pixelSize, y=ditherStrength, z=wireThickness, w=flags
-    vec4 dccmFillCol;         // xyz=fill color
-    vec4 dccmLineCol;         // xyz=line color
-} ao;
-
-// Shadow data SSBO (sun + point light shadow matrices and config + diagnostics)
-layout(std430, set = 0, binding = 5) buffer ShadowData {
-    mat4 sunLightVP[MAX_SUN_SHADOW_CASCADES];
-    vec4 sunCascadeParams[MAX_SUN_SHADOW_CASCADES]; // x=halfExtent, y=texelMeters
-    vec4 sunDirTexelSize;            // xyz=sun direction (towards ground), w=world-space texel footprint
-    vec4 shadowConfig;           // x=sunEnabled, y=pointEnabled, z=sunMapSize, w=pointMapSize
-    vec4 shadowConfig2;          // x=sunCascadeCount, y=cascadeBlendFrac, z=maxCastRadius
-    vec4 pointShadowInfo[32];    // x=near, y=far, z=radius, w=enabled
-    // x=pointShadowSamples, y=lightEvalFragments, z=fullyOccludedFragments, w=litContribFragments
-    uvec4 pointShadowDiag[32];
-    vec4 diagConfig;             // x=enableDetailedDiagnostics
-    // Sky enclosure: x=intensity, y=minAmbient, z=probeMaxHeight (m), w=mode (0=off,1=on,2=visualize)
-    vec4 skyEnclosureParams;
-    // Sky-vis static heightmap mapping:
-    // x=worldOriginXMeters, y=worldOriginZMeters,
-    // z=metersPerTexel (square), w=valueScaleToWorldYMeters (0 = disabled)
-    vec4 skyHeightmapInfo;
-} shadow;
-
-// Shadow map samplers (hardware depth comparison, nearest filter for pixel art)
-layout(set = 0, binding = 6) uniform sampler2DArrayShadow sunShadowMap;
-layout(set = 0, binding = 7) uniform samplerCubeArrayShadow pointShadowMaps;
-
-// Clustered lighting bitmask SSBO
-layout(std430, set = 0, binding = 8) readonly buffer ClusterData {
-    uvec4 clusterGridDims;   // x=tilesX, y=tilesY, z=numSlices, w=totalClusters
-    vec4  clusterZParams;    // x=near, y=far, z=logRatio, w=sliceScale
-    vec4  clusterTileDims;   // x=tileSizeX, y=tileSizeY, z=screenW, w=screenH
-    uint  clusterLightMasks[];
-} clusters;
-
-// Sky-vis static heightmap (sun-independent zenith occlusion source).
-// Stored as R16F voxel-height values; multiply by shadow.skyHeightmapInfo.w to get world Y in meters.
-layout(set = 0, binding = 9) uniform sampler2D skyHeightmap;
-
-struct MaterialOverlayCell {
-    int x;
-    int y;
-    int z;
-    uint face;
-    uint material;
+struct IVec3Hash {
+    std::size_t operator()(const glm::ivec3& value) const noexcept {
+        std::size_t hx = std::hash<int32_t>{}(value.x);
+        std::size_t hy = std::hash<int32_t>{}(value.y);
+        std::size_t hz = std::hash<int32_t>{}(value.z);
+        // Use large primes to mix components and reduce collisions
+        return hx ^ (hy * 0x9e3779b1u) ^ (hz * 0x7f4a7c15u);
+    }
 };
 
-// Sparse LOD0 voxel-face material edits. Capacity is a power-of-two open
-// addressing table built on the CPU; material == 0 marks an empty slot.
-layout(std430, set = 0, binding = 10) readonly buffer MaterialOverlayData {
-    uint capacityMask;
-    uint count;
-    uint maxProbe;
-    uint _pad;
-    MaterialOverlayCell cells[];
-} materialOverlay;
+/**
+ * Chunk lifecycle state machine
+ */
+struct ChunkState {
+    enum class State : uint8_t {
+        Unloaded,   // Chunk entity exists but has no data
+        Loading,    // Data is being generated/loaded
+        Dirty,      // Data changed, needs meshing
+        Meshing,    // Mesh is being built on worker thread
+        Ready       // Has valid mesh, ready to render
+    };
+    
+    State state{State::Unloaded};
+};
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Shared includes: dither/hash/noise utilities, lighting, shadow sampling
-// ═══════════════════════════════════════════════════════════════════════════
-#include "../common/dither_utils.glsl"
-#include "../common/shadow_sampling.glsl"
-#include "../common/clustered_lighting.glsl"
-#include "../common/sky_enclosure.glsl"
+/**
+ * Axis-Aligned Bounding Box for spatial queries
+ * Used for frustum culling and physics
+ */
+struct AABB {
+    glm::vec3 min;
+    glm::vec3 max;
+    
+    AABB() : min(0.0f), max(0.0f) {}
+    AABB(const glm::vec3& _min, const glm::vec3& _max) : min(_min), max(_max) {}
+    
+    bool contains(const glm::vec3& point) const {
+        return point.x >= min.x && point.x <= max.x &&
+               point.y >= min.y && point.y <= max.y &&
+               point.z >= min.z && point.z <= max.z;
+    }
+    
+    bool intersects(const AABB& other) const {
+        return (min.x <= other.max.x && max.x >= other.min.x) &&
+               (min.y <= other.max.y && max.y >= other.min.y) &&
+               (min.z <= other.max.z && max.z >= other.min.z);
+    }
+    
+    glm::vec3 center() const {
+        return (min + max) * 0.5f;
+    }
+    
+    glm::vec3 size() const {
+        return max - min;
+    }
+};
 
-vec3 materialBase(uint type) {
-    if (type == 1u) return vec3(0.33, 0.24, 0.20); // mud
-    if (type == 2u) return vec3(0.50, 0.38, 0.28); // dirt
-    if (type == 3u) return vec3(0.79, 0.64, 0.43); // sand
-    return vec3(0.30, 0.55, 0.16);                 // grass
+/**
+ * PHASE 5A: Chunk metadata component
+ * Stores additional runtime flags for optimization
+ */
+enum class ChunkMeshMode : uint8_t {
+    MonolithicPristine = 0, // Precomputed or full-chunk runtime mesh
+    MonolithicEdited = 1,   // Current edited chunk path (single mesh object)
+    PagedEditable = 2,      // Future local-page runtime mesh path
+    PagedConsolidating = 3, // Future background repack / merge pass
+};
+
+/**
+ * Runtime mesh page bounds within a logical 128x128 chunk.
+ * X/Z pages are fixed-size for fast dirty mapping; Y is adaptive so the
+ * runtime mesher can avoid paying for empty vertical range.
+ */
+struct ChunkEditPageBounds {
+    uint16_t minX{0};
+    uint16_t maxX{0};
+    uint16_t minY{0};
+    uint16_t maxY{0};
+    uint16_t minZ{0};
+    uint16_t maxZ{0};
+
+    bool isValid() const {
+        return minX <= maxX && minY <= maxY && minZ <= maxZ;
+    }
+};
+
+/**
+ * Per-page runtime state for the future editable-chunk mesh pipeline.
+ * These are CPU-side scheduling/ownership fields only; GPU resources stay in
+ * MeshHandle/PendingMeshHandle until the paged renderer path is implemented.
+ */
+struct ChunkEditPageRuntime {
+    uint16_t pageId{0};
+    ChunkEditPageBounds bounds{};
+    uint32_t dataGeneration{0};
+    uint32_t meshGeneration{0};
+    uint32_t lastSurfaceEstimate{0};
+    glm::vec3 localAabbMin{1e10f};
+    glm::vec3 localAabbMax{-1e10f};
+    std::vector<Vertex> cpuVertices;
+    std::vector<uint16_t> cpuIndices;
+    bool dirtyData{false};
+    bool dirtyMesh{false};
+    bool uploadPending{false};
+    bool resident{false};
+
+    bool hasCpuMesh() const {
+        return !cpuVertices.empty() && !cpuIndices.empty();
+    }
+};
+
+/**
+ * ECS component scaffold for the maximum-speed terrain-edit rewrite.
+ * A chunk remains a 128x128 logical streaming/save unit, but edited chunks
+ * can promote from a single monolithic mesh into many local runtime pages.
+ *
+ * This component is intentionally compile-safe scaffolding for the rewrite:
+ * current runtime behavior stays unchanged until systems start consuming it.
+ */
+struct ChunkEditRuntime {
+    static constexpr uint8_t PAGE_SIZE_XZ_VOXELS = 32;
+    static constexpr uint8_t PAGE_HALO_VOXELS = 1;
+
+    ChunkMeshMode targetMode{ChunkMeshMode::MonolithicPristine};
+    uint32_t topologyGeneration{0};
+    uint32_t dataGeneration{0};
+    uint32_t meshGeneration{0};
+    uint32_t lastConsolidationGeneration{0};
+    bool needsPromotion{false};
+    bool needsTopologyRebuild{false};
+    std::vector<ChunkEditPageRuntime> pages;
+    std::vector<uint16_t> dirtyPageIds;
+};
+
+struct Chunk {
+    glm::ivec3 chunkPos;
+    uint32_t id;
+    bool isEmpty;  // True if chunk contains no solid voxels (all air)
+    int32_t lodLevel; // Active LOD level (0 = highest detail)
+    uint8_t effectiveDataLod{0}; // Effective source/data LOD currently rendered
+    ChunkMeshMode meshMode{ChunkMeshMode::MonolithicPristine}; // Runtime mesh representation
+    bool isVisible;  // User-controlled visibility toggle for debugging/VRAM management
+    uint8_t voxelSeamMask{0};  // Voxel seam mask (tracks seam-edge changes for LOD boundary remesh)
+    uint8_t casingSeamMask{0}; // DCCM casing seam mask (tracks which edges have casing for real-time update detection)
+
+    Chunk() : chunkPos(0, 0, 0), id(0), isEmpty(false), lodLevel(0), effectiveDataLod(0), meshMode(ChunkMeshMode::MonolithicPristine), isVisible(true), voxelSeamMask(0), casingSeamMask(0) {}
+    Chunk(const glm::ivec3& pos, uint32_t _id)
+        : chunkPos(pos), id(_id), isEmpty(false), lodLevel(0), effectiveDataLod(0), meshMode(ChunkMeshMode::MonolithicPristine), isVisible(true), voxelSeamMask(0), casingSeamMask(0) {}
+};
+
+/**
+ * Draw range for a single SubChunk
+ * All SubChunks share the same vertex/index buffer, each has its own range
+ */
+struct SubChunkDrawRange {
+    uint32_t firstIndex{0};   // First index in shared index buffer
+    uint32_t indexCount{0};   // Number of indices to draw
+    int32_t vertexOffset{0};  // Vertex offset for this SubChunk
+    
+    bool isValid() const { return indexCount > 0; }
+};
+
+// Maximum number of runtime SubChunks per chunk.
+// Precomputed terrain file v4 still stores up to 4 main/seam SubChunks per chunk,
+// but runtime edited chunks can now spatially split beyond that.
+// Bumped 16->64 to handle very dense edits (e.g. heavily carved chunks producing
+// >16 sub-meshes after greedy meshing). See also GPU_MAX_SUBCHUNKS in
+// rendering/culling/GPUCullingSystem.h and MAX_RUNTIME_SUBMESHES in
+// world/edit/TerrainEditMesher.cpp — must stay in sync.
+constexpr size_t MAX_SUBCHUNKS = 64;
+
+/**
+ * Handle to GPU-side mesh data with SubChunk support
+ * Supports multiple draw calls per chunk when geometry exceeds 65535 vertices
+ * Backward compatible: single-SubChunk chunks work like legacy MeshHandle
+ */
+struct MeshHandle {
+    BufferSlice vb;           // Shared vertex buffer slice for all SubChunks
+    BufferSlice ib;           // Shared index buffer slice for all SubChunks
+    VkBuffer sourceBuffer{VK_NULL_HANDLE}; // Underlying buffer for validation
+    uint64_t gpuReadyValue{0}; // Timeline value required before drawing
+    
+    // GPU culling slot index (UINT32_MAX = not using GPU culling)
+    uint32_t gpuCullingSlot{UINT32_MAX};
+    
+    // SubChunk draw ranges - each becomes a separate draw call
+    std::array<SubChunkDrawRange, MAX_SUBCHUNKS> subChunks;
+    uint8_t subChunkCount{0};      // Total SubChunks (main + seam) - 0 = invalid
+    uint8_t mainSubChunkCount{0};  // How many are main mesh SubChunks (split due to vertex limit)
+    // Remaining (subChunkCount - mainSubChunkCount) are seam SubChunks
+    
+    // Legacy accessors for backward compatibility (returns first SubChunk's values)
+    uint32_t firstIndex() const { return subChunkCount > 0 ? subChunks[0].firstIndex : 0; }
+    uint32_t indexCount() const { return subChunkCount > 0 ? subChunks[0].indexCount : 0; }
+    int32_t vertexOffset() const { return subChunkCount > 0 ? subChunks[0].vertexOffset : 0; }
+
+    bool isValid() const {
+        return subChunkCount > 0 && vb.isValid() && ib.isValid();
+    }
+
+    uint32_t getTotalIndexCount() const {
+        uint32_t total = 0;
+        for (size_t i = 0; i < subChunkCount; ++i) {
+            total += subChunks[i].indexCount;
+        }
+        return total;
+    }
+
+    VkDeviceSize getTotalVertexBytes() const {
+        return vb.isValid() ? vb.size : 0;
+    }
+
+    VkDeviceSize getTotalIndexBytes() const {
+        return ib.isValid() ? ib.size : 0;
+    }
+
+    uint64_t getTotalVramBytes() const {
+        return static_cast<uint64_t>(getTotalVertexBytes() + getTotalIndexBytes());
+    }
+
+    uint32_t getTotalVertexCount() const {
+        return static_cast<uint32_t>(getTotalVertexBytes() / sizeof(Vertex));
+    }
+
+    void collectBufferSlices(std::vector<BufferSlice>& outVBs,
+                             std::vector<BufferSlice>& outIBs) const {
+        if (vb.isValid()) {
+            outVBs.push_back(vb);
+        }
+
+        if (ib.isValid()) {
+            outIBs.push_back(ib);
+        }
+    }
+
+    void clear() {
+        vb = BufferSlice{};
+        ib = BufferSlice{};
+        sourceBuffer = VK_NULL_HANDLE;
+        gpuReadyValue = 0;
+        for (auto& sc : subChunks) {
+            sc = SubChunkDrawRange{};
+        }
+        subChunkCount = 0;
+        mainSubChunkCount = 0;
+        gpuCullingSlot = UINT32_MAX;
+    }
+
+    // Helper to set single SubChunk (legacy compatibility)
+    void setSingleSubChunk(uint32_t _firstIndex, uint32_t _indexCount, int32_t _vertexOffset) {
+        subChunks[0].firstIndex = _firstIndex;
+        subChunks[0].indexCount = _indexCount;
+        subChunks[0].vertexOffset = _vertexOffset;
+        subChunkCount = 1;
+        mainSubChunkCount = 1;
+    }
+};
+
+/**
+ * Handles to GPU-side seam mesh data for LOD boundaries
+ * Each edge has its own mesh that's drawn only when the neighbor has different LOD
+ * Uses MeshHandle with SubChunk support
+ */
+struct SeamMeshHandles {
+    std::array<MeshHandle, CHUNK_EDGE_COUNT> edges;
+    
+    bool hasValidSeam(uint8_t edge) const {
+        return edge < CHUNK_EDGE_COUNT && edges[edge].isValid();
+    }
+    
+    void clear() {
+        for (auto& edge : edges) {
+            edge.clear();
+        }
+    }
+};
+
+/**
+ * Staged mesh waiting for atomic LOD batch swap.
+ * During LOD transitions, the new mesh is uploaded into PendingMeshHandle
+ * while the old MeshHandle keeps rendering.  When ALL chunks in the LOD
+ * transition batch are ready, processLODSwaps() atomically moves
+ * PendingMeshHandle → MeshHandle for the entire batch in one frame.
+ * This eliminates visual holes at LOD boundaries.
+ */
+struct PendingMeshHandle {
+    MeshHandle handle;       // The new mesh (already uploaded to GPU)
+    uint32_t batchId{0};     // Which LOD transition batch this belongs to
+    std::chrono::steady_clock::time_point uploadEnqueueTime{}; // original upload enqueue for visual timing
+    ChunkDebugAttribution debugInfo{};
+};
+
+// Forward declaration for Jolt BodyID
+namespace JPH { class BodyID; }
+
+/**
+ * Physics collision body for chunk terrain
+ * Created when chunk mesh is uploaded, removed when chunk is destroyed
+ * Only created for chunks near the player (within collision distance)
+ */
+struct ChunkCollider {
+    uint32_t bodyIdIndex{0xFFFFFFFF};  // Jolt BodyID index (0xFFFFFFFF = invalid)
+    uint32_t bodyIdSequence{0};         // Jolt BodyID sequence number
+    
+    bool isValid() const { return bodyIdIndex != 0xFFFFFFFF; }
+    void invalidate() { bodyIdIndex = 0xFFFFFFFF; bodyIdSequence = 0; }
+    
+    // Helper to create from JPH::BodyID
+    void setFromBodyId(uint32_t index, uint8_t sequence) {
+        bodyIdIndex = index;
+        bodyIdSequence = sequence;
+    }
+};
+
+````
+
+## include\world\chunks\core\ChunkJobs.h
+
+Description: No CC-DESC found. C++ class 'World'.
+
+````cpp
+#pragma once
+
+#include "core/Jobs.h"
+#include "rendering/common/Mesh.h"
+#include "world/chunks/core/Chunk.h"
+#include <atomic>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+#include <vector>
+#include <stack>
+#include <entt/entt.hpp>
+
+// Forward declarations
+class World;
+
+/**
+ * Version state for chunk pipeline cancellation
+ */
+struct ChunkVersionState {
+    std::atomic<uint32_t> version{0};
+    std::atomic<bool> inFlight{false};
+    std::atomic<bool> pending{false};
+    // Edit remesh path can temporarily allow a newer FAST remesh to overlap an
+    // older edit remesh for the same chunk so brush bursts do not stall behind
+    // one long-running superseded job.
+    std::atomic<uint32_t> editRemeshInFlightCount{0};
+    std::atomic<uint32_t> editRemeshLatestVersion{0};
+};
+
+/**
+ * Mesh data container for chunk meshes
+ * Uses uint16 indices (supports up to 65k vertices per chunk - sufficient for greedy meshing)
+ * OPTIMIZATION: Pre-allocates typical sizes to reduce reallocations
+ */
+struct MeshData {
+    entt::entity entity{entt::null};
+    std::vector<Vertex> vertices;
+    std::vector<uint16_t> indices;
+
+    MeshData() {
+        // OPTIMIZATION: Pre-allocate typical chunk mesh sizes
+        // Average chunk: ~800-1200 vertices, ~1200-1800 indices
+        // Reserve slightly above average to minimize reallocations
+        vertices.reserve(1000);
+        indices.reserve(1500);
+    }
+    
+    explicit MeshData(entt::entity e) : entity(e) {
+        vertices.reserve(1000);
+        indices.reserve(1500);
+    }
+    
+    bool isEmpty() const { return vertices.empty() || indices.empty(); }
+};
+
+/**
+ * Payload passed through the chunk generation pipeline
+ * Supports multiple SubChunks per chunk (v4 format) to stay under 65535 vertex limit
+ */
+struct ChunkPipelinePayload {
+    World* world{nullptr};
+    entt::entity entity{entt::null};
+    ChunkCoord coord{};
+    AABB bounds{};
+    std::shared_ptr<ChunkVersionState> versionState;
+    uint32_t version{0};
+    
+    // SubChunks: each stays under 65535 vertices for 16-bit indices
+    // Most chunks have 1 SubChunk, complex terrain may need 2-4
+    std::vector<MeshData> subChunks;
+    uint8_t mainSubChunkCount{0};  // How many subChunks are main mesh (rest are seams)
+    
+    std::atomic<bool> cancelled{false};
+    bool isEmpty{false};  // OPTIMIZATION: Flag for empty chunks (skip meshing)
+    int distanceFromPlayer{0}; // Distance from player (for priority scheduling)
+    bool fromTerrainEdit{false};
+    std::vector<JobHandle> jobHandles;  // Keep jobs alive through pipeline
+    int lodLevel{0};       // Active LOD level for this chunk
+    
+    // Precomputed tight AABB (computed on worker thread to avoid main-thread stall)
+    glm::vec3 tightAABBMin{1e10f};
+    glm::vec3 tightAABBMax{-1e10f};
+    bool hasTightAABB{false};
+    
+    // LOD transition batch support
+    bool isRemesh{false};      // true = LOD remesh (stage to PendingMeshHandle)
+    uint32_t batchId{0};       // LOD transition batch ID (0 = none)
+    bool affectsShadowGeometry{true};
+    ChunkDebugAttribution debugInfo{};
+    
+    // Center chunk captured at enqueue time — used by LoadPrecomputedMeshJob
+    // to compute a stable seam mask even if the player moves between
+    // enqueue and job execution on the worker thread.
+    glm::ivec3 centerAtEnqueue{0, 0, 0};
+    
+    /**
+     * Reset payload for reuse from pool (avoids re-allocation).
+     * Clears all fields to default state while preserving vector capacity.
+     */
+    void reset() {
+        world = nullptr;
+        entity = entt::null;
+        coord = {};
+        bounds = {};
+        versionState.reset();
+        version = 0;
+        subChunks.clear();  // keeps capacity
+        mainSubChunkCount = 0;
+        cancelled.store(false, std::memory_order_relaxed);
+        isEmpty = false;
+        distanceFromPlayer = 0;
+        fromTerrainEdit = false;
+        jobHandles.clear();  // keeps capacity
+        lodLevel = 0;
+        tightAABBMin = glm::vec3(1e10f);
+        tightAABBMax = glm::vec3(-1e10f);
+        hasTightAABB = false;
+        isRemesh = false;
+        batchId = 0;
+        affectsShadowGeometry = true;
+        debugInfo = {};
+        centerAtEnqueue = glm::ivec3(0, 0, 0);
+    }
+};
+
+/**
+ * Thread-safe pool for ChunkPipelinePayload objects.
+ * Eliminates per-chunk heap allocations during initial world loading
+ * (25,600 chunks × new/delete avoided).
+ */
+class PayloadPool {
+public:
+    ChunkPipelinePayload* acquire() {
+        std::lock_guard lock(m_mutex);
+        if (!m_pool.empty()) {
+            auto* p = m_pool.top();
+            m_pool.pop();
+            p->reset();
+            return p;
+        }
+        return new ChunkPipelinePayload();
+    }
+    
+    void release(ChunkPipelinePayload* p) {
+        if (!p) return;
+        std::lock_guard lock(m_mutex);
+        m_pool.push(p);
+    }
+    
+    ~PayloadPool() {
+        while (!m_pool.empty()) {
+            delete m_pool.top();
+            m_pool.pop();
+        }
+    }
+    
+private:
+    std::stack<ChunkPipelinePayload*> m_pool;
+    std::mutex m_mutex;
+};
+
+/**
+ * EntityHash for chunk version state map
+ */
+struct EntityHash {
+    std::size_t operator()(entt::entity value) const noexcept;
+};
+
+// Upload budget is controlled by ChunkUploadSystem::MAX_UPLOADS_PER_FRAME
+
+/**
+ * Chunk version state management (C-nits 8: now takes World reference)
+ */
+std::shared_ptr<ChunkVersionState> ensureChunkVersionState(class World* world, entt::entity entity);
+void removeChunkVersionState(class World* world, entt::entity entity);
+bool payloadStillCurrent(const ChunkPipelinePayload* payload);
+
+/**
+ * Job functions for precomputed mesh pipeline
+ */
+void LoadPrecomputedMeshJob(JobCtx& ctx, void* user);
+void UploadChunkJob(JobCtx& ctx, void* user);
+void FinalizeChunkJob(JobCtx& ctx, void* user);
+
+/**
+ * Alternative load job for chunks with terrain edits.
+ * Runs the edit mesher (Voxel or DCCM) instead of loading from terrain.bin.
+ * Feeds into the same Upload → Finalize pipeline.
+ */
+void LoadEditMeshJob(JobCtx& ctx, void* user);
+
+````
+
+## include\world\edit\TextureOverlayStore.h
+
+Description: No CC-DESC found. C++ struct 'VoxelTextureData'.
+
+````cpp
+#pragma once
+
+// GPT-DESC: Declares sparse texture material storage and deferred/live surface paint stamps.
+
+#include <array>
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <shared_mutex>
+#include <unordered_map>
+#include <vector>
+
+#include <glm/glm.hpp>
+
+#include "world/WorldTypes.h"
+#include "world/config/WorldConfig.h"
+
+namespace TextureOverlay {
+
+// ---------------------------------------------------------------------------
+// Texture material types and per-voxel storage
+// ---------------------------------------------------------------------------
+
+enum class TextureType : uint8_t {
+    Grass = 0,
+    Mud = 1,
+    Dirt = 2,
+    Sand = 3,
+    COUNT = 4
+};
+
+// Transition edge style used for material boundaries.
+// Stored in VoxelTextureData::edgeMask (2 bits).
+enum class TransitionEdgeStyle : uint8_t {
+    None = 0,
+    Leafy = 1,
+    Sloppy = 2,
+    Grainy = 3
+};
+
+enum class SurfaceBrushShape : uint8_t {
+    Disc = 0,
+    Rect = 1
+};
+
+inline const char* textureTypeName(TextureType t) {
+    switch (t) {
+        case TextureType::Grass: return "grass";
+        case TextureType::Mud:   return "mud";
+        case TextureType::Dirt:  return "dirt";
+        case TextureType::Sand:  return "sand";
+        default: return "?";
+    }
 }
 
-vec3 materialHi(uint type) {
-    if (type == 1u) return vec3(0.48, 0.37, 0.29);
-    if (type == 2u) return vec3(0.66, 0.52, 0.39);
-    if (type == 3u) return vec3(0.94, 0.82, 0.58);
-    return vec3(0.52, 0.72, 0.22);
-}
+// Per-voxel texture assignment.  Packed into 1 byte:
+//   bit 0..1  textureType (4 types)
+//   bit 2..4  variant (8 variants — we only need 5 in practice)
+//   bit 5..6  edgeMask (2 bits, reserved for transition flags)
+//   bit 7     valid flag (1 = painted, 0 = empty)
+//
+// The valid flag is essential: without it, "Grass + variant 0" would collide
+// with "empty" (both packed=0).  It's the only way to clear a cell back to
+// its un-painted state via the same packed byte.
+struct VoxelTextureData {
+    uint8_t packed{0};
+    uint8_t face{3}; // 0..5, same face IDs as the terrain vertex format.
 
-vec3 materialLo(uint type) {
-    if (type == 1u) return vec3(0.18, 0.12, 0.10);
-    if (type == 2u) return vec3(0.30, 0.22, 0.16);
-    if (type == 3u) return vec3(0.58, 0.44, 0.28);
-    return vec3(0.16, 0.29, 0.08);
-}
+    constexpr VoxelTextureData() = default;
+    VoxelTextureData(TextureType type,
+                     uint8_t variant,
+                     uint8_t edgeMask = 0,
+                     uint8_t faceId = 3) {
+        packed = static_cast<uint8_t>(
+            0x80u |  // valid flag
+            (static_cast<uint32_t>(type) & 0x3u) |
+            ((variant & 0x7u) << 2) |
+            ((edgeMask & 0x3u) << 5));
+        face = static_cast<uint8_t>(faceId % 6u);
+    }
 
-vec3 materialAccent(uint type) {
-    if (type == 1u) return vec3(0.13, 0.10, 0.09);
-    if (type == 2u) return vec3(0.22, 0.20, 0.18);
-    if (type == 3u) return vec3(0.68, 0.55, 0.36);
-    return vec3(0.60, 0.82, 0.24);
-}
+    TextureType getType() const {
+        return static_cast<TextureType>(packed & 0x3u);
+    }
+    uint8_t getVariant() const {
+        return static_cast<uint8_t>((packed >> 2) & 0x7u);
+    }
+    uint8_t getEdgeMask() const {
+        return static_cast<uint8_t>((packed >> 5) & 0x3u);
+    }
+    uint8_t getFace() const { return face; }
+    bool isEmpty() const { return (packed & 0x80u) == 0; }
 
-uint hashMaterialOverlayKey(ivec3 voxel, uint face) {
-    uint h = uint(voxel.x) * 0x9E3779B9u;
-    h ^= uint(voxel.y) * 0x85EBCA6Bu;
-    h ^= uint(voxel.z) * 0xC2B2AE35u;
-    h ^= (face & 0x7u) * 0x27D4EB2Du;
+    VoxelTextureData withEdgeMask(uint8_t edgeMask) const {
+        if (isEmpty()) return *this;
+        VoxelTextureData out = *this;
+        out.packed = static_cast<uint8_t>(
+            (out.packed & ~0x60u) | ((edgeMask & 0x3u) << 5));
+        return out;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Per-LOD resolution config
+//
+// Each LOD level has its own pixels-per-voxel-face value. Selectable from
+// 2,4,8,...,1024. The terrain shader uses this to quantize procedural pixel
+// detail on a face emitted for that LOD.
+// ---------------------------------------------------------------------------
+
+struct LODTextureConfig {
+    // Texels per voxel face edge.  Must be a power of two >= 2 and <= 1024.
+    // Default cascade: LOD 0 = 16 px, LOD 1 = 8 px, LOD 2 = 4 px, LOD 3 = 2 px
+    uint16_t pixelsPerVoxel{4};
+    // If false, no painting is authored at this LOD.
+    bool enabled{true};
+};
+
+// ---------------------------------------------------------------------------
+// Sparse storage primitives
+// ---------------------------------------------------------------------------
+
+// 8x8x8 brick of texture cells (matches the edit-overlay brick size).
+struct TextureBrick {
+    static constexpr int SIZE = 8;
+    static constexpr int CELLS = SIZE * SIZE * SIZE;
+
+    std::array<VoxelTextureData, CELLS> cells{};
+    uint32_t activeCount{0};
+
+    static int toIndex(int lx, int ly, int lz) {
+        return lx + ly * SIZE + lz * SIZE * SIZE;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Sparse, per-LOD voxel-face material store
+//
+// LOD storage:
+//   - One independent BrickMap per LOD level (4 levels).
+//   - Coordinates within each LOD's BrickMap are voxel coords *at that LOD*.
+//     i.e. an LOD-1 voxel coordinate = lod0Coord >> 1, LOD-2 = lod0Coord >> 2.
+//
+// Paint operations take the LOD level explicitly so the brush can target the
+// LOD that the hit chunk is currently rendered at, and the radius scales
+// naturally (the stored cell footprint at LOD-N is 1/(2^N) of the LOD-0
+// footprint for the same world distance).
+// ---------------------------------------------------------------------------
+
+class TextureOverlayStore {
+public:
+    struct SurfaceFaceStamp {
+        glm::ivec3 lodCoord{0};
+        uint8_t face{3};
+    };
+
+    // Deferred surface brush command. This is the interactive O(1) authoring path:
+    // one huge brush stroke stores one stamp and affected chunks are rebaked later.
+    // The mesher resolves stamps through getSurfaceTexture() while emitting real
+    // terrain faces, so the click path never expands radius^2 faces.
+    struct SurfacePaintStamp {
+        glm::vec3 centerVoxelLod0{0.0f};
+        glm::ivec3 bboxMinLod0{0};
+        glm::ivec3 bboxMaxLod0{0};
+        int radiusVoxelsLod0{1};
+        SurfaceBrushShape shape{SurfaceBrushShape::Disc};
+        TextureType type{TextureType::Grass};
+        uint8_t variant{0};
+        uint8_t sourceFace{255};
+        uint32_t order{0};
+    };
+
+    struct GPUCell {
+        int32_t x{0};
+        int32_t y{0};
+        int32_t z{0};
+        uint32_t lod{0};
+        uint32_t packed{0};
+        uint32_t face{3};
+    };
+
+    static constexpr int LOD_COUNT = MAX_LOD_LEVELS;
+    static constexpr int RES_OPTION_COUNT = 10;
+    static const uint16_t RES_OPTIONS[RES_OPTION_COUNT];   // {2,4,8,...,1024}
+    static const char*   RES_OPTION_LABELS[RES_OPTION_COUNT];
+
+    TextureOverlayStore();
+
+    // -------- Per-LOD configuration --------
+    void setLODConfig(int lod, const LODTextureConfig& cfg);
+    LODTextureConfig getLODConfig(int lod) const;
+
+    // -------- Single-cell access (LOD-aware) --------
+    // 'lodCoord' is in voxel coords at the requested LOD level.
+    void setTexture(const glm::ivec3& lodCoord, int lod, VoxelTextureData data);
+    VoxelTextureData getTexture(const glm::ivec3& lodCoord, int lod) const;
+    VoxelTextureData getSurfaceTexture(const glm::ivec3& lodCoord,
+                                       int lod,
+                                       uint8_t face) const;
+    bool hasSurfaceTexturesInBox(const glm::ivec3& minLodCoord,
+                                 const glm::ivec3& maxExclusiveLodCoord,
+                                 int lod) const;
+    void clearTexture(const glm::ivec3& lodCoord, int lod);
+
+    // -------- Brush paint operations --------
+    // 'centerLod0' is the world-voxel center *at LOD-0*; the paint operation
+    // automatically converts to the target LOD's resolution.
+    // 'radiusVoxelsLod0' is the brush radius in LOD-0 voxels.
+    // Returns the number of LOD cells written.
+    int paintSphere(const glm::ivec3& centerLod0,
+                    int radiusVoxelsLod0,
+                    int lod,
+                    TextureType type,
+                    uint8_t variant);
+    int paintBox(const glm::ivec3& minLod0,
+                 const glm::ivec3& maxLod0,
+                 int lod,
+                 TextureType type,
+                 uint8_t variant);
+
+    // Fast surface stamps for texture painting. They write only the face plane
+    // under the cursor instead of filling a 3D volume.
+    int paintFaceDisc(const glm::ivec3& centerLod0,
+                      int radiusVoxelsLod0,
+                      int normalAxis,
+                      int lod,
+                      TextureType type,
+                      uint8_t variant,
+                      uint8_t face,
+                      int maxCells = 300000);
+    int paintFaceRect(const glm::ivec3& centerLod0,
+                      int radiusVoxelsLod0,
+                      int normalAxis,
+                      int lod,
+                      TextureType type,
+                      uint8_t variant,
+                      uint8_t face,
+                      int maxCells = 300000);
+    int paintSurfaceFaces(const std::vector<SurfaceFaceStamp>& faces,
+                          int lod,
+                          TextureType type,
+                          uint8_t variant);
+
+    // Theoretical-minimum interactive brush path. Stores one deferred stamp
+    // instead of expanding the brush into per-face cells. Returned value is
+    // the monotonically increasing stamp order, or 0 if the stamp was rejected.
+    uint32_t appendSurfacePaintStamp(const glm::vec3& centerWorld,
+                                     int radiusVoxelsLod0,
+                                     SurfaceBrushShape shape,
+                                     TextureType type,
+                                     uint8_t variant,
+                                     uint8_t sourceFace = 255);
+    size_t getSurfacePaintStampCount() const;
+
+    // Copy newest deferred paint stamps for the bounded live GPU overlay.
+    // Returned stamps stay chronological; the shader scans newest-first.
+    size_t exportLiveSurfacePaintStamps(std::vector<SurfacePaintStamp>& out,
+                                        size_t maxStamps) const;
+
+    int clearSphere(const glm::ivec3& centerLod0,
+                    int radiusVoxelsLod0,
+                    int lod);
+    int clearBox(const glm::ivec3& minLod0,
+                 const glm::ivec3& maxLod0,
+                 int lod);
+
+    // Cascade a paint from sourceLod to all coarser LODs (sourceLod+1..MAX).
+    // Useful when the user paints at LOD 0 and wants the texture to show up
+    // when the chunk later transitions to a coarser LOD.  Returns total cells
+    // written across all cascaded LODs.
+    int cascadeToCoarserLODs(const glm::ivec3& centerLod0,
+                             int radiusVoxelsLod0,
+                             int sourceLod,
+                             TextureType type,
+                             uint8_t variant);
+    int cascadeFaceToCoarserLODs(const glm::ivec3& centerLod0,
+                                 int radiusVoxelsLod0,
+                                 int normalAxis,
+                                 int sourceLod,
+                                 SurfaceBrushShape shape,
+                                 TextureType type,
+                                 uint8_t variant,
+                                 uint8_t face,
+                                 int maxCellsPerLOD = 300000);
+
+    // -------- Stats / state --------
+    struct Stats {
+        size_t bricksByLOD[LOD_COUNT]{};
+        size_t cellsByLOD[LOD_COUNT]{};
+        size_t totalBricks{0};
+        size_t totalCells{0};
+        size_t surfaceStampCount{0};
+        size_t generation{0};
+    };
+    Stats getStats() const;
+    size_t exportGPUCells(std::vector<GPUCell>& out, size_t maxCells) const;
+    size_t exportGPUCellsForLOD(int lod, std::vector<GPUCell>& out, size_t maxCells) const;
+    size_t consumeDirtyGPUCells(std::vector<GPUCell>& out,
+                                size_t maxCells,
+                                bool& requiresFullUpload);
+    bool isEmpty() const;
+    void clear();
+    void clearLOD(int lod);
+
+    // Monotonically incremented every write — used by mesher caches.
+    size_t getGeneration() const {
+        return m_generation.load(std::memory_order_acquire);
+    }
+
+    // -------- Persistence (binary) --------
+    bool saveToFile(const char* path) const;
+    bool loadFromFile(const char* path);
+
+    // -------- LOD/coordinate helpers --------
+    static glm::ivec3 lod0ToLOD(const glm::ivec3& lod0Coord, int lod) {
+        const int shift = lod;
+        // Arithmetic shift handles negative coords correctly for power-of-two
+        // downsampling — equivalent to floor(coord / 2^lod) for negatives too.
+        return glm::ivec3(lod0Coord.x >> shift,
+                          lod0Coord.y >> shift,
+                          lod0Coord.z >> shift);
+    }
+    static glm::ivec3 lodToLOD0(const glm::ivec3& lodCoord, int lod) {
+        return glm::ivec3(lodCoord.x << lod,
+                          lodCoord.y << lod,
+                          lodCoord.z << lod);
+    }
+
+private:
+    struct BrickKey {
+        int32_t bx, by, bz;
+        bool operator==(const BrickKey& o) const noexcept {
+            return bx == o.bx && by == o.by && bz == o.bz;
+        }
+    };
+    struct BrickKeyHash {
+        size_t operator()(const BrickKey& k) const noexcept {
+            // splitmix-style mix; cheap and good distribution
+            uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(k.bx)) * 73856093ull;
+            h ^= static_cast<uint64_t>(static_cast<uint32_t>(k.by)) * 19349663ull;
+            h ^= static_cast<uint64_t>(static_cast<uint32_t>(k.bz)) * 83492791ull;
+            h ^= h >> 33;
+            return static_cast<size_t>(h);
+        }
+    };
+    using BrickMap = std::unordered_map<BrickKey,
+                                        std::unique_ptr<TextureBrick>,
+                                        BrickKeyHash>;
+
+    static BrickKey voxelToBrick(const glm::ivec3& v);
+    static glm::ivec3 voxelLocalInBrick(const glm::ivec3& v);
+    static glm::ivec3 encodeFaceCoord(const glm::ivec3& voxelCoord, uint8_t face);
+    static glm::ivec3 decodeFaceCoord(const glm::ivec3& storageCoord, uint8_t& face);
+
+    TextureBrick* getOrCreateBrickLocked(BrickMap& map, int lod, BrickKey key);
+    TextureBrick* getBrickLocked(BrickMap& map, BrickKey key);
+    const TextureBrick* getBrickLocked(const BrickMap& map, BrickKey key) const;
+
+    void writeCellLocked(BrickMap& map, int lod, BrickKey key,
+                         const glm::ivec3& local,
+                         VoxelTextureData data);
+
+    static uint8_t classifyTransitionEdge(TextureType a,
+                                          TextureType b,
+                                          const glm::ivec3& lodCoord);
+    static uint8_t mergeEdgeStyle(uint8_t lhs, uint8_t rhs);
+    void recordDirtyGPUCellLocked(int lod,
+                                  const glm::ivec3& lodCoord,
+                                  VoxelTextureData data);
+    void requestFullGPUUploadLocked();
+    void refreshTransitionEdgesAroundCellLocked(BrickMap& map,
+                                                int lod,
+                                                const glm::ivec3& lodCoord);
+    void refreshTransitionEdgesAroundFaceLocked(BrickMap& map,
+                                                int lod,
+                                                const glm::ivec3& lodCoord,
+                                                uint8_t face);
+
+    struct SurfacePaintChunkHash {
+        size_t operator()(const glm::ivec3& v) const noexcept {
+            uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(v.x)) * 73856093ull;
+            h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.y)) * 19349663ull;
+            h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.z)) * 83492791ull;
+            h ^= h >> 33;
+            return static_cast<size_t>(h);
+        }
+    };
+    void indexSurfacePaintStampLocked(uint32_t stampIndex);
+    VoxelTextureData sampleSurfacePaintStampsLocked(const glm::ivec3& lodCoord,
+                                                    int lod,
+                                                    uint8_t face) const;
+    static bool surfaceStampTouchesBox(const SurfacePaintStamp& stamp,
+                                       const glm::ivec3& minLod0,
+                                       const glm::ivec3& maxLod0);
+
+    bool isLodValid(int lod) const { return lod >= 0 && lod < LOD_COUNT; }
+
+    // One BrickMap per LOD.  Indices 0..MAX_LOD_LEVEL.
+    std::array<BrickMap, LOD_COUNT> m_lodMaps;
+    std::array<size_t, LOD_COUNT> m_brickCountsByLOD{};
+    std::array<size_t, LOD_COUNT> m_cellCountsByLOD{};
+
+    std::array<LODTextureConfig, LOD_COUNT> m_lodConfigs;
+
+    mutable std::shared_mutex m_mutex;
+    std::atomic<size_t> m_generation{0};
+
+    // Deferred brush stamps indexed by affected native chunk. The stamp vector
+    // is append-only between clears, so chunk index entries can store stable
+    // integer indices. Newest stamp wins during mesher material sampling.
+    std::vector<SurfacePaintStamp> m_surfacePaintStamps;
+    std::unordered_map<glm::ivec3, std::vector<uint32_t>, SurfacePaintChunkHash>
+        m_surfacePaintStampChunkIndex;
+    uint32_t m_nextSurfacePaintStampOrder{1};
+
+    // Dirty LOD0 face cells consumed by the terrain material overlay SSBO.
+    // Full-upload mode is used for clears/config changes and delta overflow.
+    std::vector<GPUCell> m_dirtyGPUCells;
+    bool m_dirtyGPUFullUpload{false};
+};
+
+} // namespace TextureOverlay
+
+````
+
+## src\world\edit\TextureOverlayStore.cpp
+
+Description: No CC-DESC found. C++ struct 'TextureOverlayIvec3Hash'.
+
+````cpp
+#include "world/edit/TextureOverlayStore.h"
+
+#include <algorithm>
+#include <cstring>
+#include <fstream>
+#include <cmath>
+
+namespace TextureOverlay {
+
+namespace {
+constexpr glm::ivec3 kNeighborDirs[6] = {
+    glm::ivec3( 1, 0, 0), glm::ivec3(-1, 0, 0),
+    glm::ivec3( 0, 1, 0), glm::ivec3( 0,-1, 0),
+    glm::ivec3( 0, 0, 1), glm::ivec3( 0, 0,-1)
+};
+uint32_t hashPaintCoord(const glm::ivec3& coord, uint8_t face, uint32_t salt) {
+    uint32_t h = static_cast<uint32_t>(coord.x) * 0x9E3779B9u;
+    h ^= static_cast<uint32_t>(coord.y) * 0x85EBCA6Bu;
+    h ^= static_cast<uint32_t>(coord.z) * 0xC2B2AE35u;
+    h ^= static_cast<uint32_t>(face) * 0x27D4EB2Du;
+    h ^= salt * 0x165667B1u;
     h ^= h >> 16;
     h *= 0x7FEB352Du;
     h ^= h >> 15;
     return h;
 }
-uint lookupMaterialOverlay(vec3 worldPos, vec3 normal, uint face, uint fallbackMaterial) {
-    const uint MATERIAL_OVERLAY_CHUNK_HINT_BIT = 0x40000000u;
-    const uint MATERIAL_PACKED_BIT = 0x80000000u;
-    const uint MATERIAL_LIVE_STAMP_CAPACITY = 64u;
-    const uint MATERIAL_LIVE_STAMP_CELL_STRIDE = 3u;
-    const uint MATERIAL_LIVE_STAMP_CELL_CAPACITY =
-        MATERIAL_LIVE_STAMP_CAPACITY * MATERIAL_LIVE_STAMP_CELL_STRIDE;
 
-    uint cleanFallbackMaterial = fallbackMaterial & ~MATERIAL_OVERLAY_CHUNK_HINT_BIT;
-
-    uint baselineMaterial = cleanFallbackMaterial;
-    if ((baselineMaterial & MATERIAL_PACKED_BIT) == 0u) {
-        uint type = (face == 3u) ? 0u : 2u;
-
-        float h = worldPos.y;
-        float biomeNoise = hash12(floor(worldPos.xz * 0.0625));
-        if (face == 3u) {
-            if (h < 5.0) {
-                type = 3u;
-            } else if (biomeNoise > 0.82) {
-                type = 1u;
-            }
-        }
-
-        uint variant = uint(hash12(floor(worldPos.xz * 0.25) + vec2(float(face) * 13.0, 71.0)) * 8.0) & 0x7u;
-        uint edge = 0u;
-        uint resLog2 = 4u;
-        baselineMaterial = MATERIAL_PACKED_BIT | type | (variant << 2u) | (edge << 5u) | (resLog2 << 7u);
-    }
-
-    // Instant texture-brush path:
-    //
-    // Binding 10 still has the old layout, but cells[] now begins with a tiny
-    // fixed live-stamp prefix. Each big brush click uploads one compact stamp;
-    // the shader tests newest stamps first, then falls back to baked material.
-    const uint liveStampCount = min(materialOverlay._pad, MATERIAL_LIVE_STAMP_CAPACITY);
-    if (liveStampCount > 0u) {
-        ivec3 voxel = ivec3(floor(worldPos * 4.0 - normal * 0.01));
-
-        const uint queryFace = face & 0x7u;
-        const uint queryAxis = queryFace / 2u;
-        const float querySign = ((queryFace & 1u) != 0u) ? 1.0 : -1.0;
-
-        vec3 faceCenter = vec3(voxel) + vec3(0.5);
-        faceCenter[int(queryAxis)] += querySign * 0.5;
-
-        for (uint reverseIdx = 0u; reverseIdx < liveStampCount; ++reverseIdx) {
-            const uint stampIdx = liveStampCount - 1u - reverseIdx;
-            const uint cellBase = stampIdx * MATERIAL_LIVE_STAMP_CELL_STRIDE;
-
-            MaterialOverlayCell c0 = materialOverlay.cells[cellBase + 0u];
-            MaterialOverlayCell c1 = materialOverlay.cells[cellBase + 1u];
-            MaterialOverlayCell c2 = materialOverlay.cells[cellBase + 2u];
-
-            ivec3 bboxMin = ivec3(c1.x, c1.y, c1.z);
-            ivec3 bboxMax = ivec3(c2.x, c2.y, c2.z);
-            if (voxel.x < bboxMin.x || voxel.y < bboxMin.y || voxel.z < bboxMin.z ||
-                voxel.x > bboxMax.x || voxel.y > bboxMax.y || voxel.z > bboxMax.z) {
-                continue;
-            }
-
-            vec3 center = vec3(
-                intBitsToFloat(c0.x),
-                intBitsToFloat(c0.y),
-                intBitsToFloat(c0.z));
-            float radius = uintBitsToFloat(c0.face) + 1.0;
-
-            vec3 d = faceCenter - center;
-            bool inside = false;
-            if ((c1.face & 0xFFu) == 0u) {
-                inside = dot(d, d) <= radius * radius;
-            } else {
-                inside = abs(d.x) <= radius &&
-                         abs(d.y) <= radius &&
-                         abs(d.z) <= radius;
-            }
-
-            if (!inside) {
-                continue;
-            }
-
-            uint type = c2.face & 0x3u;
-            uint variantSeed = c2.material & 0x7u;
-            uint variant = (variantSeed + (hashMaterialOverlayKey(voxel, queryFace) & 0x7u)) & 0x7u;
-            uint edge = 0u;
-            uint resLog2 = 4u;
-            return MATERIAL_PACKED_BIT | type | (variant << 2u) | (edge << 5u) | (resLog2 << 7u);
-        }
-    }
-
-    if (materialOverlay.count == 0u || materialOverlay.capacityMask == 0u) {
-        return baselineMaterial;
-    }
-
-    uint capacity = materialOverlay.capacityMask + 1u;
-
-    if ((materialOverlay.count * 4u) > (capacity * 3u)) {
-        return baselineMaterial;
-    }
-
-    if ((fallbackMaterial & MATERIAL_OVERLAY_CHUNK_HINT_BIT) == 0u) {
-        return baselineMaterial;
-    }
-
-    const uint probeLimit = min(materialOverlay.maxProbe, 8u);
-
-    ivec3 voxel = ivec3(floor(worldPos * 4.0 - normal * 0.01));
-    uint idx = hashMaterialOverlayKey(voxel, face) & materialOverlay.capacityMask;
-
-    for (uint probe = 0u; probe <= probeLimit; ++probe) {
-        MaterialOverlayCell cell =
-            materialOverlay.cells[MATERIAL_LIVE_STAMP_CELL_CAPACITY + idx];
-
-        if (cell.material == 0u) {
-            return baselineMaterial;
-        }
-
-        if (cell.x == voxel.x &&
-            cell.y == voxel.y &&
-            cell.z == voxel.z &&
-            (cell.face & 0x7u) == (face & 0x7u)) {
-            return cell.material;
-        }
-
-        uint residentIdeal = hashMaterialOverlayKey(
-            ivec3(cell.x, cell.y, cell.z),
-            cell.face & 0x7u) & materialOverlay.capacityMask;
-        uint residentProbe = (idx - residentIdeal) & materialOverlay.capacityMask;
-        if (residentProbe < probe) {
-            return baselineMaterial;
-        }
-
-        idx = (idx + 1u) & materialOverlay.capacityMask;
-    }
-
-    return baselineMaterial;
+uint8_t variedVariant(const glm::ivec3& coord,
+                      uint8_t face,
+                      TextureType type,
+                      uint8_t seed) {
+    const uint32_t h = hashPaintCoord(coord, face, static_cast<uint32_t>(type));
+    return static_cast<uint8_t>((seed + (h & 0x7u)) & 0x7u);
 }
 
-vec3 sampleVoxelMaterial(vec3 worldPos, uint face, uint material, vec3 fallbackColor) {
-    if ((material & 0x80000000u) == 0u) {
-        return fallbackColor;
-    }
+constexpr uint32_t GPU_OVERLAY_CHUNK_SENTINEL_FACE = 7u;
+constexpr uint32_t GPU_OVERLAY_CHUNK_SENTINEL_MATERIAL = 0x40000000u;
 
-    uint type = material & 0x3u;
-    uint variant = (material >> 2) & 0x7u;
-    uint edge = (material >> 5) & 0x3u;
-    uint resLog2 = clamp((material >> 7) & 0xFu, 1u, 10u);
-    float res = float(1u << resLog2);
-
-    vec2 faceCoord = faceCell(worldPos * 4.0 + vec3(0.0001), face);
-    vec2 voxelCoord = floor(faceCoord);
-    vec2 uv = fract(faceCoord);
-    vec2 texel = floor(uv * res);
-    vec2 seed = voxelCoord * vec2(37.0, 71.0)
-              + texel
-              + vec2(float(variant) * 19.0 + float(type) * 113.0,
-                     float(face) * 29.0);
-
-    float n0 = hash12(seed);
-    float n1 = hash12(seed + vec2(13.7, 91.3));
-    float n2 = hash12(floor(texel * 0.25) + voxelCoord + vec2(float(type) * 17.0, float(variant) * 43.0));
-
-    vec3 base = materialBase(type);
-    vec3 hi = materialHi(type);
-    vec3 lo = materialLo(type);
-    vec3 accent = materialAccent(type);
-    vec3 color = base;
-
-    if (type == 0u) {
-        float blade = step(0.56, n0) * step(0.22, fract((texel.y + n2 * 5.0) * 0.5));
-        float darkBlade = step(0.78, n1);
-        color = mix(color, hi, blade * 0.55);
-        color = mix(color, lo, darkBlade * 0.35);
-        color = mix(color, accent, step(0.92, n2) * 0.25);
-    } else if (type == 1u) {
-        float wet = smoothstep(0.28, 0.86, n2);
-        float puddle = step(0.82, n0) * step(0.45, n1);
-        color = mix(color, lo, wet * 0.45);
-        color = mix(color, hi, (1.0 - wet) * 0.20);
-        color = mix(color, vec3(0.10, 0.08, 0.07), puddle * 0.45);
-    } else if (type == 2u) {
-        float grain = (n0 - 0.5) * 0.20;
-        float pebble = step(0.90, n1);
-        float grassBit = step(0.965, n2);
-        color = color + vec3(grain);
-        color = mix(color, accent, pebble * 0.35);
-        color = mix(color, materialHi(0u), grassBit * 0.30);
-    } else {
-        float fine = (n0 - 0.5) * 0.16;
-        float dune = smoothstep(0.35, 0.95, n2) * 0.18;
-        float speck = step(0.91, n1);
-        color = color + vec3(fine + dune);
-        color = mix(color, lo, speck * 0.22);
-    }
-
-    if (edge != 0u) {
-        float d = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-        float edgeBand = 1.0 - smoothstep(0.035, 0.16, d);
-        float ragged = step(0.48, hash12(seed + vec2(211.0, 53.0)));
-        if (edge == 1u) {          // leafy/poky
-            color = mix(color, materialHi(0u), edgeBand * ragged * 0.45);
-        } else if (edge == 2u) {   // sloppy/muddy
-            color = mix(color, materialLo(1u), edgeBand * (0.45 + 0.35 * n1));
-        } else {                   // grainy/sandy/dirt scatter
-            color = mix(color, materialHi(3u), edgeBand * ragged * 0.35);
-            color = mix(color, materialLo(2u), edgeBand * step(0.78, n1) * 0.25);
-        }
-    }
-
-    return clamp(color, vec3(0.02), vec3(1.0));
+glm::ivec3 materialOverlayChunkSentinelCoord(const glm::ivec3& lod0Coord) {
+    return WorldConfig::microVoxelToChunk(lod0Coord);
 }
 
-float sampleAOPixelCenter(float aoValue, vec2 faceCoord, vec2 cellCenterCoord) {
-    vec2 faceDx = dFdx(faceCoord);
-    vec2 faceDy = dFdy(faceCoord);
-    float aoDx = dFdx(aoValue);
-    float aoDy = dFdy(aoValue);
+TextureOverlayStore::GPUCell makeChunkSentinelGPUCell(const glm::ivec3& lod0Coord) {
+    const glm::ivec3 chunk = materialOverlayChunkSentinelCoord(lod0Coord);
 
-    vec2 deltaFace = cellCenterCoord - faceCoord;
-    float det = faceDx.x * faceDy.y - faceDx.y * faceDy.x;
-    if (abs(det) < 1e-6) {
-        return aoValue;
-    }
-
-    vec2 deltaScreen = vec2(
-        (deltaFace.x * faceDy.y - deltaFace.y * faceDy.x) / det,
-        (faceDx.x * deltaFace.y - faceDx.y * deltaFace.x) / det);
-    return aoValue + aoDx * deltaScreen.x + aoDy * deltaScreen.y;
+    TextureOverlayStore::GPUCell sentinel{};
+    sentinel.x = chunk.x;
+    sentinel.y = chunk.y;
+    sentinel.z = chunk.z;
+    sentinel.lod = 0u;
+    sentinel.packed = GPU_OVERLAY_CHUNK_SENTINEL_MATERIAL;
+    sentinel.face = GPU_OVERLAY_CHUNK_SENTINEL_FACE;
+    return sentinel;
 }
 
-void main() {
-    vec3 normal = normalize(fragNormal);
-    uint material = lookupMaterialOverlay(fragWorldPos, normal, fragFace, fragMaterial);
-    vec3 baseColor = sampleVoxelMaterial(fragWorldPos, fragFace, material, fragColor);
-    
-    uint face = fragFace;
-    if (face == 6u) {
-        discard;
+struct TextureOverlayIvec3Hash {
+    size_t operator()(const glm::ivec3& v) const noexcept {
+        uint64_t h = static_cast<uint64_t>(static_cast<uint32_t>(v.x)) * 73856093ull;
+        h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.y)) * 19349663ull;
+        h ^= static_cast<uint64_t>(static_cast<uint32_t>(v.z)) * 83492791ull;
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdull;
+        h ^= h >> 33;
+        return static_cast<size_t>(h);
     }
-
-    // === VOXEL TERRAIN ===
-    // Keep AO driven by the mesher's interpolated per-vertex field only.
-    // That preserves the "tri-side" wedge created by the chosen quad diagonal,
-    // while the shader just pixelates and bands it on a world-aligned grid.
-    float AO_PIXEL_SIZE = ao.shadowTint1.w;
-    float aoPixelRes = clamp(ao.scatterAmounts.w, 1.0, 64.0);
-
-    vec2 faceVoxelCoord = faceCell(fragWorldPos * 4.0 + vec3(0.0001), face);
-    vec2 voxelPixelCoord = floor(faceVoxelCoord * aoPixelRes + 0.0001);
-    vec2 voxelPixelCenter = (voxelPixelCoord + 0.5) / aoPixelRes;
-
-    float aoInterp = clamp(fragAOLevel, 0.0, 1.0);
-    float aoCell = clamp(sampleAOPixelCenter(aoInterp, faceVoxelCoord, voxelPixelCenter), 0.0, 1.0);
-    float aoInset = mix(0.010, 0.032, smoothstep(0.35, 1.0, aoCell));
-    float aoLevel = max(aoCell - aoInset, 0.0);
-    float originalAO = aoLevel;
-    vec3 aoMul = vec3(1.0);
-
-    if (aoLevel > 0.0) {
-        float aoPowerCurve = max(ao.shadowTint0.w, 0.0001);
-        aoLevel = pow(aoLevel, aoPowerCurve);
-
-        float brightnessBands[4] = float[](
-            ao.brightnessLevels.x,
-            ao.brightnessLevels.y,
-            ao.brightnessLevels.z,
-            ao.brightnessLevels.w
-        );
-        vec3 shadowTints[4] = vec3[](
-            ao.shadowTint0.xyz,
-            ao.shadowTint1.xyz,
-            ao.shadowTint2.xyz,
-            ao.shadowTint3.xyz
-        );
-        vec3 ditherWarmTint = ao.ditherWarmTint.xyz;
-
-        float bandThreshold1 = max(ao.shadowTint2.w, 0.0001);
-        float bandThreshold2 = max(ao.shadowTint3.w, bandThreshold1 + 0.0001);
-        float midRange = max(bandThreshold2 - bandThreshold1, 0.0001);
-        float darkRange = max(1.0 - bandThreshold2, 0.0001);
-
-        float scaledAO;
-        if (aoLevel < bandThreshold1) {
-            scaledAO = aoLevel / bandThreshold1;
-        } else if (aoLevel < bandThreshold2) {
-            scaledAO = 1.0 + (aoLevel - bandThreshold1) / midRange;
-        } else {
-            scaledAO = 2.0 + (aoLevel - bandThreshold2) / darkRange;
-        }
-        scaledAO = clamp(scaledAO, 0.0, 3.0);
-
-        int lowerBand = int(floor(scaledAO));
-        int upperBand = min(lowerBand + 1, 3);
-        float bandPosition = fract(scaledAO);
-
-        float ordered = bayerDither8x8(mod(voxelPixelCoord, 8.0));
-        float chunky = segaDither2x2(voxelPixelCoord);
-        float scatterStrength = ao.scatterAmounts.x;
-        if (aoLevel >= bandThreshold2) {
-            scatterStrength = ao.scatterAmounts.z;
-        } else if (aoLevel >= bandThreshold1) {
-            scatterStrength = ao.scatterAmounts.y;
-        }
-        float scatter = (hash12(voxelPixelCoord + vec2(17.0, 59.0)) - 0.5) * scatterStrength;
-        float transition = clamp(ordered + scatter, 0.0, 1.0);
-        int selectedBand = (transition < bandPosition) ? upperBand : lowerBand;
-
-        float brightness = brightnessBands[selectedBand];
-        vec3 tint = shadowTints[selectedBand];
-
-        float warmMask = step(0.5, chunky) * smoothstep(0.32, 1.0, aoLevel);
-        tint *= mix(vec3(1.0), ditherWarmTint, warmMask * 0.35);
-
-        // Apply the stylized shading wherever the mesher actually says AO exists,
-        // including the lighter one-side corners that were getting suppressed.
-        float aoCoverage = smoothstep(0.01, 0.16, originalAO);
-        aoMul = mix(vec3(1.0), vec3(brightness) * tint, aoCoverage);
-        baseColor *= aoMul;
-    }
-    
-    // Start with ambient lighting - base illumination for all faces.
-    // Modulate by "sky enclosure" so deep pits / cave mouths / behind-wall
-    // pixels genuinely darken (places sky light cannot reach). Open ground
-    // is unaffected because raw enclosure ≈ 0 there → multiplier = 1.
-    // The same multiplier is applied to the sun-direct contribution below
-    // so a fragment that is geometrically buried gets darkened regardless
-    // of whether the sun shadow map happens to cover it (this fixes the
-    // sun-area-fade leak that lit caves in the distance).
-    // Compute sun shadow up-front so the enclosure can react to actual sun
-    // reach ("shadows dissolve from light"). Cheap: same shadow tap we'd do
-    // anyway, just hoisted above the visualize/ambient block.
-    float sunIntensity = shadow.shadowConfig.x;
-    float sunShadow = 1.0;
-    if (lighting.sunDirection.w > 0.0 && sunIntensity > 0.001) {
-        float rawShadow = sampleSunShadow(fragWorldPos, normal);
-        float sunAreaRadius = shadow.diagConfig.z;
-        if (sunAreaRadius > 0.0) {
-            float horizDist = length(fragWorldPos.xz - camera.cameraPos.xz);
-            float fade = smoothstep(sunAreaRadius * 0.85, sunAreaRadius, horizDist);
-            rawShadow = mix(rawShadow, 1.0, fade);
-        }
-        sunShadow = 1.0 - sunIntensity * (1.0 - rawShadow);
-    }
-    float sunReach = sunShadow * lighting.sunDirection.w;
-
-    // Ambient enclosure: NO dissolve → deep holes go fully dark at night /
-    // when no sun rays hit them, exactly as before.
-    float ambientEnclosure = computeSkyEnclosure(fragWorldPos, normal, 0.0);
-    vec3 finalColor = baseColor * lighting.sunColor.xyz * lighting.sunColor.w * ambientEnclosure;
-    if (skyEnclosureVisualizeEnabled()) {
-        outColor = vec4(skyEnclosureDebugColor(fragWorldPos, normal, sunReach), 1.0);
-        return;
-    }
-
-    // Add directional light (sun/moon) with face-aware adjustment
-    // Since we have proper AO now, we use softer directional shading
-    // to avoid side faces being too dark
-    if (lighting.sunDirection.w > 0.0) {
-        // Sun shadow debug visualization (diagConfig.y > 0)
-        vec4 sunDebug = debugSunShadow(fragWorldPos, normal);
-        if (sunDebug.a > 0.5) {
-            outColor = sunDebug;
-            return;
-        }
-
-        vec3 sunDir = normalize(lighting.sunDirection.xyz);
-        float rawDiffuse = max(dot(normal, -sunDir), 0.0);
-
-        // Lift the minimum diffuse to 0.5 so side faces aren't too dark
-        // This gives a more stylized, cartoon look that works with our AO
-        float liftedDiffuse = mix(0.5, 1.0, rawDiffuse);
-
-        // Still apply quantization for retro look
-        float diffuse = quantizeLight(liftedDiffuse, 5);
-
-        // Sun-direct enclosure: dissolved by sunReach. Where the sun hits,
-        // the geometric darkness softens (red → yellow / green) which
-        // simulates light dispelling shadow without losing the deep-hole
-        // darkness in unreached areas.
-        float sunEnclosure = computeSkyEnclosure(fragWorldPos, normal, sunReach);
-        finalColor += baseColor * lighting.sunColor.xyz * diffuse * lighting.sunDirection.w * sunShadow * sunEnclosure;
-    }
-    
-    // Add point lights (accumulate-then-quantize for organic light blending)
-    float totalBrightnessRawForAO = 0.0;
-
-    // Night-only cosmetic: screen-space edge dithering fades out during day
-    // where ambient sunlight makes dissolve patterns look unnatural.
-    float nightStrength = 1.0 - smoothstep(0.08, 0.45, lighting.sunDirection.w);
-
-    {
-        vec3  totalLightContrib = vec3(0.0);
-        vec3  totalLightContribRaw = vec3(0.0);
-        float totalBrightness  = 0.0;
-        float totalBrightnessRaw = 0.0;
-        float peakBrightnessRaw = 0.0;
-        float shadowEvidence = 0.0;
-        float pulseEvidence = 0.0;
-        bool diagEnabled = (shadow.diagConfig.x > 0.5);
-        uvec2 diagPix = uvec2(gl_FragCoord.xy);
-        bool diagSample = diagEnabled && ((diagPix.x & 7u) == 0u) && ((diagPix.y & 7u) == 0u);
-        const uint DIAG_SCALE = 64u;
-        // --- Clustered lighting: fetch bitmask for this fragment's cluster ---
-        uint clTileX = min(uint(gl_FragCoord.x / clusters.clusterTileDims.x), clusters.clusterGridDims.x - 1u);
-        uint clTileY = min(uint(gl_FragCoord.y / clusters.clusterTileDims.y), clusters.clusterGridDims.y - 1u);
-        float clViewDist = length(fragWorldPos - camera.cameraPos);
-        uint clSlice = clamp(uint(log(clViewDist / clusters.clusterZParams.x) * clusters.clusterZParams.w),
-                             0u, clusters.clusterGridDims.z - 1u);
-        uint clIdx = (clTileY * clusters.clusterGridDims.x + clTileX) * clusters.clusterGridDims.z + clSlice;
-        uint lightMask = (clIdx < clusters.clusterGridDims.w) ? clusters.clusterLightMasks[clIdx] : 0u;
-
-        while (lightMask != 0u) {
-            uint i = findLSB(lightMask);
-            lightMask &= lightMask - 1u; // clear lowest set bit
-
-            vec4 contrib = calculatePointLightSmooth(fragWorldPos, normal, baseColor, i, face);
-            if (contrib.a <= MIN_LIGHT_BRIGHTNESS) continue;
-            if (diagSample && i < 32u) {
-                atomicAdd(shadow.pointShadowDiag[i].y, DIAG_SCALE);
-            }
-            totalLightContribRaw += contrib.rgb;
-            totalBrightnessRaw += contrib.a;
-            peakBrightnessRaw = max(peakBrightnessRaw, contrib.a);
-            float pulseStrengthNow = clamp(lighting.lightPulseData[i].x, 0.0, 1.0);
-            float breathPulseNow = clamp((lighting.lightPulseData[i].y - 1.0) / 0.45, 0.0, 1.0);
-            pulseEvidence = max(pulseEvidence, max(pulseStrengthNow, breathPulseNow));
-
-            // Check point light shadow before expensive light calculation
-            float ptShadow = 1.0;
-            if (shadow.shadowConfig.y > 0.0 &&
-                i < 32u &&
-                shadow.pointShadowInfo[i].w > 0.0 &&
-                contrib.a >= MIN_SHADOW_BRIGHTNESS) {
-                if (diagSample) {
-                    atomicAdd(shadow.pointShadowDiag[i].x, DIAG_SCALE);
-                }
-                ptShadow = samplePointShadow(fragWorldPos, normal, i);
-                shadowEvidence = max(shadowEvidence, 1.0 - ptShadow);
-                if (ptShadow <= 0.0) {
-                    if (diagSample) {
-                        atomicAdd(shadow.pointShadowDiag[i].z, DIAG_SCALE);
-                    }
-                    continue; // Fully shadowed, skip this light
-                }
-            }
-
-            totalLightContrib += contrib.rgb * ptShadow;
-            totalBrightness  += contrib.a * ptShadow;
-            if (diagSample && i < 32u) {
-                atomicAdd(shadow.pointShadowDiag[i].w, DIAG_SCALE);
-            }
-        }
-
-        totalBrightnessRawForAO = totalBrightness;
-
-        if (totalBrightnessRaw > 0.001) {
-            // Bring back pixel-art pulse styling, but only near strong orb cores.
-            float clampedBright = clamp(totalBrightness, 0.0, 2.0);
-            float clampedBrightRaw = clamp(totalBrightnessRaw, 0.0, 2.0);
-            bool verticalFaceLighting = (face != 2u && face != 3u);
-            float shadowOcclusion = 0.0;
-            if (clampedBrightRaw > 0.001) {
-                shadowOcclusion = clamp(1.0 - (clampedBright / clampedBrightRaw), 0.0, 1.0);
-            }
-
-            // Light-eats-shadow: only RECEIVED light (post shadow-map)
-            // washes out shadows. Stepped for retro feel — bright light
-            // punches through cast shadows in discrete bands, not smooth.
-            {
-                float brightNorm = clamp(clampedBright / 2.0, 0.0, 1.0);
-                // 3-level step: shadow fully eaten above ~0.33 brightness
-                float shadowEat = floor(brightNorm * 3.0 + 0.5) / 3.0;
-                float shadowRetain = 1.0 - shadowEat;
-
-                totalLightContrib = mix(totalLightContribRaw, totalLightContrib, shadowRetain);
-                clampedBright = mix(clampedBrightRaw, clampedBright, shadowRetain);
-                shadowEvidence *= shadowRetain;
-                shadowOcclusion *= shadowRetain;
-            }
-
-            if (clampedBright > 0.0001) {
-                const float LIGHT_BANDS = 8.0;
-                const float MAX_STYLIZED_BRIGHT = 2.0;
-                if (verticalFaceLighting) {
-                    // Stabilize vertical bands against tiny per-fragment shadow variance.
-                    clampedBright = floor(clampedBright * 256.0 + 0.5) / 256.0;
-                }
-
-                // Slightly bias high brightness upward so bright bands feel more dominant
-                // without breaking accumulate-then-quantize light merging.
-                float brightNorm = clamp(clampedBright / MAX_STYLIZED_BRIGHT, 0.0, 1.0);
-                float brightBoost = smoothstep(0.35, 1.0, brightNorm) * 0.24;
-                float bandInput = min(clampedBright * (1.0 + brightBoost), MAX_STYLIZED_BRIGHT);
-
-                // Keep 8 visible light bands (excluding pure darkness), then handle
-                // the final dissolve-to-dark separately so there is no dead strip.
-                float scaledRaw = (bandInput / MAX_STYLIZED_BRIGHT) * LIGHT_BANDS;
-                float quantScaled = clamp(max(scaledRaw, 1.0), 1.0, LIGHT_BANDS);
-                float baseBandIdx = floor(quantScaled - 1.0);
-                float bandFrac = fract(quantScaled);
-
-                float loBand = ((baseBandIdx + 1.0) / LIGHT_BANDS) * MAX_STYLIZED_BRIGHT;
-                float hiBand = min(((baseBandIdx + 2.0) / LIGHT_BANDS) * MAX_STYLIZED_BRIGHT,
-                                   MAX_STYLIZED_BRIGHT);
-                float shadowMask = max(shadowOcclusion, shadowEvidence);
-
-                // When multiple lights have different shadow states (one shadows
-                // while another illuminates), preserve dithered band transitions
-                // so color morphing between differently-colored lights works.
-                float shadowConflict = clamp(shadowEvidence - shadowOcclusion, 0.0, 1.0);
-                float shadowEdgeNoiseGate = 1.0 - smoothstep(0.02, 0.20, shadowMask) * (1.0 - shadowConflict);
-
-                // World-space pixel cell for band transitions:
-                // 1/64m cells => 16x16 grid per 0.250m terrain piece.
-                // Use the same phase/snap as point-light evaluation to prevent broken pixels.
-                vec3 pixWorldBand = snapGridCenterOffset(
-                    fragWorldPos,
-                    LIGHT_GRID_CELL_SIZE,
-                    LIGHT_GRID_PHASE_OFFSET_CELLS);
-                vec2 cellCoord = floor(faceCell(pixWorldBand, face) / LIGHT_GRID_CELL_SIZE + 0.01);
-
-                // ── Pixel-art diffusion at band edges ──────────────────────
-                float diffZoneWidth = 0.125;
-                float diffStart = 0.5 - diffZoneWidth;
-                float diffEnd   = 0.5 + diffZoneWidth;
-
-                float naturalBand;
-                if (bandFrac < diffStart) {
-                    naturalBand = loBand;
-                } else if (bandFrac > diffEnd) {
-                    naturalBand = hiBand;
-                } else {
-                    float t = (bandFrac - diffStart) / (diffEnd - diffStart);
-
-                    vec2 orderedCell = mod(mod(cellCoord, 8.0) + 8.0, 8.0);
-                    float ordered = bayerDither8x8(orderedCell);
-
-                    float heldNoise = bandBlendHeldNoiseCell(
-                        cellCoord + vec2(13.7, 29.3),
-                        lighting.time,
-                        0.22,
-                        0.58);
-                    float driftNoise = bandBlendNoiseCell(
-                        cellCoord * 1.19 + vec2(5.1, 47.3),
-                        lighting.time,
-                        0.48);
-                    float randPattern = clamp(heldNoise * 0.72 + driftNoise * 0.28, 0.0, 1.0);
-                    float localBias = (hash12(cellCoord + vec2(3.7, 91.1)) - 0.5) * 0.05;
-                    float shimmerAmp = 0.09;
-                    float shimmeredT = clamp(
-                        t + localBias + (randPattern - 0.5) * shimmerAmp,
-                        0.0,
-                        1.0);
-
-                    float transitionMask = clamp(ordered * 0.62 + randPattern * 0.38, 0.0, 1.0);
-                    naturalBand = (transitionMask < shimmeredT) ? hiBand : loBand;
-                }
-                float stableBand = quantizeBandsStepped(
-                    bandInput,
-                    LIGHT_BANDS,
-                    MAX_STYLIZED_BRIGHT,
-                    0.0,
-                    0.08);
-                // With dithered binary shadows, shadow edges are already
-                // retro-patterned; only deep full-shadow needs band stabilization.
-                float stableShadowWeight = smoothstep(0.45, 0.85, shadowMask) * (1.0 - shadowConflict);
-                naturalBand = mix(naturalBand, stableBand, stableShadowWeight);
-
-                // ── Dither the darkest band toward the darkness boundary ─────
-                const float SCREEN_DITHER_BAND_LIMIT = 2.0;
-                float ditherPixSize = max(AO_PIXEL_SIZE * 1.5, 3.0);
-                float shadowAwareNight = nightStrength * shadowEdgeNoiseGate;
-                if (shadowAwareNight > 0.001 && scaledRaw < SCREEN_DITHER_BAND_LIMIT && naturalBand > 0.0) {
-                    float ditherT = 1.0 - (scaledRaw / SCREEN_DITHER_BAND_LIMIT);
-                    ditherT = ditherT * ditherT * (3.0 - 2.0 * ditherT);
-                    ditherT *= shadowAwareNight;
-
-                    vec2 ditherCell = floor(gl_FragCoord.xy / ditherPixSize);
-                    float bayer = bayerDither4x4(ditherCell);
-                    float breathe = sin(lighting.time * 0.25 + bayer * 3.14159) * 0.015;
-                    float threshold = clamp(bayer + breathe, 0.0, 1.0);
-
-                    float coverage = ditherT * 0.65;
-                    if (threshold < coverage) {
-                        naturalBand = 0.0;
-                    }
-                }
-
-                // Replace the previous gap before darkness with sparse dark pixels
-                // that get denser toward the edge, then converge to full dark.
-                float darkScatter = (1.0 - smoothstep(0.08, 1.55, scaledRaw)) * shadowEdgeNoiseGate;
-                if (darkScatter > 0.001 && naturalBand > 0.0001) {
-                    vec2 orderedCell = mod(mod(cellCoord, 8.0) + 8.0, 8.0);
-                    float ordered = bayerDither8x8(orderedCell);
-                    float darkNoiseA = bandBlendNoiseCell(cellCoord + vec2(23.7, 79.1), lighting.time + 1.3, 0.30);
-                    float darkNoiseB = bandBlendNoiseCell(cellCoord * 1.33 + vec2(61.9, 5.7), lighting.time, 0.19);
-                    float darkPattern = clamp(ordered * 0.50 + darkNoiseA * 0.35 + darkNoiseB * 0.15, 0.0, 1.0);
-
-                    float scatterCoverage = darkScatter * darkScatter * 0.90;
-                    float scatterMask = smoothstep(1.0 - scatterCoverage - 0.11,
-                                                   1.0 - scatterCoverage + 0.11,
-                                                   darkPattern);
-                    float darknessStrength = mix(0.28, 0.95, darkScatter);
-                    naturalBand = mix(naturalBand, 0.0, scatterMask * darknessStrength);
-                }
-
-                // Very outermost edge should end in solid darkness (no lingering dither).
-                float hardDarkEdge = 1.0 - smoothstep(0.015, 0.11, scaledRaw);
-                if (hardDarkEdge > 0.001) {
-                    naturalBand *= (1.0 - hardDarkEdge);
-                    if (scaledRaw < 0.02) {
-                        naturalBand = 0.0;
-                    }
-                }
-
-                float scale = naturalBand / max(clampedBright, 0.001);
-                totalLightContrib *= scale;
-            }
-
-            finalColor += totalLightContrib;
-        }
-    }
-
-    // AO wash-out from light orbs — aggressive stepped recovery.
-    // Point light brightness determines how much AO darkening to undo.
-    // Uses sqrt curve so even moderate light visibly eats into AO shadows,
-    // matching the retro feel where light orbs punch through dark corners.
-    if (totalBrightnessRawForAO > 0.001 && any(lessThan(aoMul, vec3(0.999)))) {
-        float bandForAO = floor(clamp(totalBrightnessRawForAO / 2.0, 0.0, 1.0) * 8.0);
-        // Sqrt curve: band 1→35%, band 2→50%, band 4→71%, band 8→100%
-        // Much more responsive than linear (band 1 was only 12.5% before).
-        float aoFade = sqrt(clamp(bandForAO / 8.0, 0.0, 1.0));
-        if (aoFade > 0.0) {
-            vec3 aoRecovery = vec3(1.0) / max(aoMul, vec3(0.001));
-            finalColor *= mix(vec3(1.0), aoRecovery, aoFade);
-        }
-    }
-    
-    // Apply simple distance fog
-    float fogDensity = lighting.skyColor.w;
-    if (fogDensity > 0.0) {
-        float distance = length(fragWorldPos - camera.cameraPos);
-        float fogFactor = exp(-fogDensity * distance);
-        fogFactor = clamp(fogFactor, 0.0, 1.0);
-        
-        vec3 skyColor = lighting.skyColor.xyz;
-        finalColor = mix(skyColor, finalColor, fogFactor);
-    }
-    
-    // DEBUG: Extract debug flags from ao.ditherWarmTint.w (bit-cast from uint)
-    uint debugFlags = floatBitsToUint(ao.ditherWarmTint.w);
-    const uint DEBUG_SHOW_CHUNK_BOUNDS = 1u;
-    const uint DEBUG_SHOW_FACE_BOUNDS = 2u;
-    
-    // DEBUG: Highlight chunk boundaries to identify crack locations
-    if ((debugFlags & DEBUG_SHOW_CHUNK_BOUNDS) != 0u) {
-        vec3 chunkRelPos = fragWorldPos - fragChunkOrigin;
-        
-        // Distance from each chunk edge (chunk is 32m)
-        float edgeX_min = chunkRelPos.x;
-        float edgeX_max = 32.0 - chunkRelPos.x;
-        float edgeZ_min = chunkRelPos.z;
-        float edgeZ_max = 32.0 - chunkRelPos.z;
-        
-        float minEdgeDist = min(min(edgeX_min, edgeX_max), min(edgeZ_min, edgeZ_max));
-        
-        // Color code based on edge proximity (within 0.5m of edge)
-        if (minEdgeDist < 0.5) {
-            float intensity = 1.0 - (minEdgeDist / 0.5);
-            
-            // Determine which edge we're near for color coding
-            vec3 edgeColor = vec3(1.0, 0.0, 0.0);  // Default red
-            
-            if (edgeX_min < 0.25) edgeColor = vec3(1.0, 0.0, 0.0);      // -X edge: Red
-            else if (edgeX_max < 0.25) edgeColor = vec3(0.0, 1.0, 0.0); // +X edge: Green
-            else if (edgeZ_min < 0.25) edgeColor = vec3(0.0, 0.0, 1.0); // -Z edge: Blue
-            else if (edgeZ_max < 0.25) edgeColor = vec3(1.0, 1.0, 0.0); // +Z edge: Yellow
-            
-            finalColor = mix(finalColor, edgeColor, intensity * 0.8);
-        }
-        
-        // VERY CLOSE to edge (within 0.1m / ~half voxel) - mark as bright magenta
-        if (minEdgeDist < 0.1) {
-            finalColor = mix(finalColor, vec3(1.0, 0.0, 1.0), 0.7);  // Magenta
-        }
-    }
-    
-    // DEBUG: Highlight face/quad boundaries within chunks (greedy meshing boundaries)
-    // These appear at fractional voxel positions where merged quads meet
-    if ((debugFlags & DEBUG_SHOW_FACE_BOUNDS) != 0u) {
-        vec3 chunkRelPos = fragWorldPos - fragChunkOrigin;
-        
-        // Check distance to any voxel grid line (0.25m spacing)
-        // Faces should align to voxel boundaries
-        vec3 voxelPos = chunkRelPos * 4.0;  // Convert to voxel units
-        vec3 fracPart = fract(voxelPos);
-        
-        // Distance to nearest voxel boundary
-        vec3 distToBoundary = min(fracPart, 1.0 - fracPart);
-        float minDist = min(distToBoundary.x, min(distToBoundary.y, distToBoundary.z));
-        
-        // Highlight pixels very close to voxel boundaries (potential crack source)
-        if (minDist < 0.05) {
-            // Cyan for voxel boundaries
-            float intensity = 1.0 - (minDist / 0.05);
-            finalColor = mix(finalColor, vec3(0.0, 1.0, 1.0), intensity * 0.6);
-        }
-    }
-    
-    // Output final color
-    outColor = vec4(finalColor, 1.0);
-}
-
-
-````
-
-## shaders\terrain\dccm_terrain.frag
-
-Description: No CC-DESC found. C++ struct 'PointLight'.
-
-````glsl
-#version 450
-
-layout(location = 0) in vec3 fragWorldPos;
-layout(location = 1) in float fragAOLevel;
-layout(location = 2) in flat uint fragFace;
-layout(location = 3) in flat vec3 fragFlatPos;
-layout(location = 4) in flat float fragFlatAO;
-layout(location = 5) in flat vec3 fragChunkOrigin;
-
-layout(location = 0) out vec4 outColor;
-
-struct PointLight {
-    vec4 positionRadius;
-    vec4 colorIntensity;
 };
 
-const uint MAX_SHADER_LIGHTS = 32u;
-const uint MAX_SUN_SHADOW_CASCADES = 6u;
-const float LIGHT_GRID_WORLD_METERS = 0.250;
-const float LIGHT_GRID_CELLS = 16.0;
-const float LIGHT_GRID_CELL_SIZE = LIGHT_GRID_WORLD_METERS / LIGHT_GRID_CELLS; // 1/64m
-const float LIGHT_GRID_PHASE_OFFSET_CELLS = 0.5;
-const float MIN_LIGHT_BRIGHTNESS = 0.0030;
-const float MIN_SHADOW_BRIGHTNESS = 0.0200;
-const float HIGH_QUALITY_SHADOW_BRIGHTNESS = 0.1800;
-const float FAST_STYLIZATION_BRIGHTNESS = 0.1400;
 
-layout(std430, set = 0, binding = 2) readonly buffer LightingData {
-    vec4 sunDirection;
-    vec4 sunColor;
-    vec4 skyColor;
-    PointLight pointLights[4096];
-    uint numPointLights;
-    float time;
-    uint _pad0;
-    uint _pad1;
 
-    vec4 lightPulseData[4096];
-} lighting;
-
-layout(set = 0, binding = 3) uniform CameraData {
-    vec3 cameraPos;
-} camera;
-
-layout(set = 0, binding = 4) uniform AOData {
-    vec4 brightnessLevels;
-    vec4 shadowTint0;
-    vec4 shadowTint1;
-    vec4 shadowTint2;
-    vec4 shadowTint3;
-    vec4 ditherWarmTint;
-    vec4 scatterAmounts;
-    vec4 dccmBrightness;
-    vec4 dccmShadowTintCfg;
-    vec4 dccmConfig;
-    vec4 dccmFillCol;
-    vec4 dccmLineCol;
-} ao;
-
-layout(std430, set = 0, binding = 5) buffer ShadowData {
-    mat4 sunLightVP[MAX_SUN_SHADOW_CASCADES];
-    vec4 sunCascadeParams[MAX_SUN_SHADOW_CASCADES]; // x=halfExtent, y=texelMeters
-    vec4 sunDirTexelSize;            // xyz=sun direction (towards ground), w=world-space texel footprint
-    vec4 shadowConfig;
-    vec4 shadowConfig2;          // x=sunCascadeCount, y=cascadeBlendFrac, z=maxCastRadius
-    vec4 pointShadowInfo[32];
-    // x=pointShadowSamples, y=lightEvalFragments, z=fullyOccludedFragments, w=litContribFragments
-    uvec4 pointShadowDiag[32];
-    vec4 diagConfig;             // x=enableDetailedDiagnostics
-    // Sky enclosure: x=intensity, y=minAmbient, z=probeMaxHeight (m), w=mode (0=off,1=on,2=visualize)
-    vec4 skyEnclosureParams;
-    // Sky-vis static heightmap mapping:
-    // x=worldOriginXMeters, y=worldOriginZMeters,
-    // z=metersPerTexel (square), w=valueScaleToWorldYMeters (0 = disabled)
-    vec4 skyHeightmapInfo;
-} shadow;
-
-layout(set = 0, binding = 6) uniform sampler2DArrayShadow sunShadowMap;
-layout(set = 0, binding = 7) uniform samplerCubeArrayShadow pointShadowMaps;
-
-// Clustered lighting bitmask SSBO
-layout(std430, set = 0, binding = 8) readonly buffer ClusterData {
-    uvec4 clusterGridDims;   // x=tilesX, y=tilesY, z=numSlices, w=totalClusters
-    vec4  clusterZParams;    // x=near, y=far, z=logRatio, w=sliceScale
-    vec4  clusterTileDims;   // x=tileSizeX, y=tileSizeY, z=screenW, w=screenH
-    uint  clusterLightMasks[];
-} clusters;
-
-// Sky-vis static heightmap (sun-independent zenith occlusion source).
-// Stored as R16F voxel-height values; multiply by shadow.skyHeightmapInfo.w to get world Y in meters.
-layout(set = 0, binding = 9) uniform sampler2D skyHeightmap;
-
-float quantizeLight(float value, int levels) {
-    value = clamp(value, 0.0, 1.0);
-    float step = 1.0 / float(levels - 1);
-    return floor(value / step + 0.5) * step;
-}
-
-float bayerDither4x4(vec2 screenPos) {
-    int x = int(mod(screenPos.x, 4.0));
-    int y = int(mod(screenPos.y, 4.0));
-    const int bayerMatrix[16] = int[](
-         0,  8,  2, 10,
-        12,  4, 14,  6,
-         3, 11,  1,  9,
-        15,  7, 13,  5
-    );
-    return float(bayerMatrix[y * 4 + x]) / 16.0;
-}
-
-float bayerDither8x8(vec2 screenPos) {
-    const float bayerMatrix[64] = float[](
-        0.0,  32.0,  8.0, 40.0,  2.0, 34.0, 10.0, 42.0,
-        48.0, 16.0, 56.0, 24.0, 50.0, 18.0, 58.0, 26.0,
-        12.0, 44.0,  4.0, 36.0, 14.0, 46.0,  6.0, 38.0,
-        60.0, 28.0, 52.0, 20.0, 62.0, 30.0, 54.0, 22.0,
-        3.0,  35.0, 11.0, 43.0,  1.0, 33.0,  9.0, 41.0,
-        51.0, 19.0, 59.0, 27.0, 49.0, 17.0, 57.0, 25.0,
-        15.0, 47.0,  7.0, 39.0, 13.0, 45.0,  5.0, 37.0,
-        63.0, 31.0, 55.0, 23.0, 61.0, 29.0, 53.0, 21.0
-    );
-
-    int x = int(mod(screenPos.x, 8.0));
-    int y = int(mod(screenPos.y, 8.0));
-    return bayerMatrix[y * 8 + x] / 64.0;
-}
-
-vec2 pixelateCoords(vec2 screenPos, float pixelSize) {
-    return floor(screenPos / pixelSize) * pixelSize;
-}
-
-// Grid snap to cell centers with a configurable pre-snap cell offset.
-// offsetCells=0.5 shifts the phase by half a cell before snapping.
-vec3 snapGridCenterOffset(vec3 pos, float gridSize, float offsetCells) {
-    float g = max(gridSize, 0.000001);
-    // Keep horizontal XZ grid aligned with voxel/cube shading; phase-shift Y only.
-    vec3 off = vec3(0.0, g * offsetCells, 0.0);
-    return (floor((pos + off) / g + 0.01) + 0.5) * g;
-}
-
-float hash12(vec2 p) {
-    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-}
-
-float quantizeBandsStepped(float value,
-                           float bands,
-                           float maxValue,
-                           float edgeBias,
-                           float blendWidth) {
-    float safeBands = max(bands, 1.0);
-    float safeMax = max(maxValue, 0.0001);
-    float v = clamp(value, 0.0, safeMax);
-    float scaled = (v / safeMax) * safeBands;
-    float baseBand = floor(scaled);
-    float frac = fract(scaled);
-
-    float lo = (baseBand / safeBands) * safeMax;
-    float hi = min(((baseBand + 1.0) / safeBands) * safeMax, safeMax);
-
-    float fracBiased = clamp(frac - edgeBias, 0.0, 1.0);
-    float mid = (lo + hi) * 0.5;
-    float width = clamp(blendWidth, 0.01, 0.45);
-    float transitionStart = 0.5 - width;
-    float transitionEnd = 0.5 + width;
-
-    if (fracBiased <= transitionStart) return lo;
-    if (fracBiased >= transitionEnd) return hi;
-    return mid;
-}
-
-float bandBlendNoiseCell(vec2 cellCoord, float time, float speed) {
-    vec2 cellBase = floor(cellCoord + 0.01);
-    vec2 cellJitter = vec2(
-        hash12(cellBase + vec2(11.3, 47.7)),
-        hash12(cellBase + vec2(73.1, 19.9))
-    ) - vec2(0.5);
-    vec2 cell = cellBase + cellJitter * 0.85 + vec2(17.0, 59.0);
-    float t = time * max(speed, 0.001);
-    float frame = floor(t);
-    float blend = fract(t);
-    blend = blend * blend * (3.0 - 2.0 * blend);
-
-    float n0 = hash12(cell + vec2(frame, frame * 0.37));
-    float n1 = hash12(cell + vec2(frame + 1.0, (frame + 1.0) * 0.37));
-    float n2 = hash12(cell * 0.73 + vec2(frame * 1.13, frame * 0.29));
-    float n3 = hash12(cell * 0.73 + vec2((frame + 1.0) * 1.13, (frame + 1.0) * 0.29));
-
-    float a = mix(n0, n1, blend);
-    float b = mix(n2, n3, blend);
-    return clamp(a * 0.66 + b * 0.34, 0.0, 1.0);
-}
-
-float quantizeBandsPixelBlend(float value,
-                              float bands,
-                              float maxValue,
-                              float edgeBias,
-                              float blendWidth,
-                              vec2 blendCellCoord,
-                              float time,
-                              float animSpeed) {
-    float safeBands = max(bands, 1.0);
-    float safeMax = max(maxValue, 0.0001);
-    float v = clamp(value, 0.0, safeMax);
-    float scaled = (v / safeMax) * safeBands;
-    float baseBand = floor(scaled);
-    float frac = fract(scaled);
-
-    float lo = (baseBand / safeBands) * safeMax;
-    float hi = min(((baseBand + 1.0) / safeBands) * safeMax, safeMax);
-    float fracBiased = clamp(frac - edgeBias, 0.0, 1.0);
-
-    float width = clamp(blendWidth, 0.01, 0.45);
-    float transitionStart = 0.5 - width;
-    float transitionEnd = 0.5 + width;
-    if (fracBiased <= transitionStart) return lo;
-    if (fracBiased >= transitionEnd) return hi;
-
-    float transitionT = (fracBiased - transitionStart)
-                      / max(transitionEnd - transitionStart, 0.0001);
-    float noiseT = bandBlendNoiseCell(blendCellCoord, time, animSpeed);
-    return (transitionT >= noiseT) ? hi : lo;
-}
-
-vec2 faceCell(vec3 pixPos, uint face) {
-    // DCCM terrain uses face==6; treat it like top-surface mapping (XZ).
-    if (face == 6u) return pixPos.xz;
-    if (face <= 1u) return pixPos.yz;
-    if (face <= 3u) return pixPos.xz;
-    return pixPos.xy;
-}
-
-vec3 dominantAxisMask(vec3 n) {
-    vec3 a = abs(n);
-    if (a.x >= a.y && a.x >= a.z) return vec3(1.0, 0.0, 0.0);
-    if (a.y >= a.x && a.y >= a.z) return vec3(0.0, 1.0, 0.0);
-    return vec3(0.0, 0.0, 1.0);
-}
-
-void buildFaceTangents(vec3 n, out vec3 t1, out vec3 t2) {
-    vec3 m = dominantAxisMask(n);
-    if (m.x > 0.5) {
-        t1 = vec3(0.0, 1.0, 0.0);
-        t2 = vec3(0.0, 0.0, 1.0);
-    } else if (m.y > 0.5) {
-        t1 = vec3(1.0, 0.0, 0.0);
-        t2 = vec3(0.0, 0.0, 1.0);
+void facePlaneAxes(uint8_t face, int& uAxis, int& vAxis) {
+    face %= 6u;
+    if (face <= 1u) {
+        uAxis = 1; // Y
+        vAxis = 2; // Z
+    } else if (face <= 3u) {
+        uAxis = 0; // X
+        vAxis = 2; // Z
     } else {
-        t1 = vec3(1.0, 0.0, 0.0);
-        t2 = vec3(0.0, 1.0, 0.0);
+        uAxis = 0; // X
+        vAxis = 1; // Y
     }
 }
 
-float resolveBinaryShadowFromNeighborhood(float v0,
-                                          float v1,
-                                          float v2,
-                                          float v3,
-                                          float v4) {
-    // Majority-cleanup keeps pixel-art silhouettes coherent by filling
-    // tiny holes and removing one-pixel outliers before soft blending.
-    float litVotes =
-        step(0.5, v0) +
-        step(0.5, v1) +
-        step(0.5, v2) +
-        step(0.5, v3) +
-        step(0.5, v4);
-    float centerLit = step(0.5, v0);
-    if (litVotes <= 1.0) return 0.0;
-    if (litVotes >= 4.0) return 1.0;
-    if (centerLit < 0.5 && litVotes >= 3.0) return 1.0;
-    if (centerLit > 0.5 && litVotes <= 2.0) return 0.0;
+using IVec3Hash = TextureOverlayIvec3Hash;
 
-    float visibility = v0 * 0.5 + (v1 + v2 + v3 + v4) * 0.125;
-    float voteVisibility = litVotes / 5.0;
-    float blended = mix(visibility, voteVisibility, 0.45);
-    return smoothstep(0.30, 0.70, blended);
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Static resolution options (advertised to the UI)
+// ---------------------------------------------------------------------------
+
+const uint16_t TextureOverlayStore::RES_OPTIONS[RES_OPTION_COUNT] = {
+    2, 4, 8, 16, 32, 64, 128, 256, 512, 1024
+};
+const char* TextureOverlayStore::RES_OPTION_LABELS[RES_OPTION_COUNT] = {
+    "2x2", "4x4", "8x8", "16x16", "32x32", "64x64",
+    "128x128", "256x256", "512x512", "1024x1024"
+};
+
+// ---------------------------------------------------------------------------
+// Construction / config
+// ---------------------------------------------------------------------------
+
+TextureOverlayStore::TextureOverlayStore() {
+    // Default cascade: finer voxels get more pixels.  At LOD 0 a 0.25m voxel
+    // gets 16x16 px (= 64 px/m).  Each coarser LOD halves the pixel density
+    // so the perceived texel size on screen stays roughly constant.
+    m_lodConfigs[0] = LODTextureConfig{16, true};
+    if (LOD_COUNT > 1) m_lodConfigs[1] = LODTextureConfig{8, true};
+    if (LOD_COUNT > 2) m_lodConfigs[2] = LODTextureConfig{4, true};
+    if (LOD_COUNT > 3) m_lodConfigs[3] = LODTextureConfig{2, true};
+    if (LOD_COUNT > 4) m_lodConfigs[4] = LODTextureConfig{2, true};
 }
 
-
-// ═════════════════════════════════════════════════════════════════════════
-// Smooth point light — accumulate-then-quantize (synced with cube.frag)
-// ═════════════════════════════════════════════════════════════════════════
-
-vec4 calculatePointLightSmooth(vec3 worldPos,
-                               vec3 normal,
-                               vec3 baseColor,
-                               vec3 lightPos,
-                               float lightRadius,
-                               vec3 lightColor,
-                               float lightIntensity,
-                               float pulseStrength,
-                               float breathScale,
-                               uint lightIndex) {
-    if (breathScale < 0.01) breathScale = 1.0;
-
-    // Treat the configured light radius as the actual orb radius so the
-    // band shells intersect terrain and placed geometry as true spheres.
-    float effectiveRadius = max(lightRadius * breathScale, 0.0001);
-    vec3 rawLightVec = lightPos - worldPos;
-    float rawLenSq = dot(rawLightVec, rawLightVec);
-    float effectiveRadiusSq = effectiveRadius * effectiveRadius;
-    if (rawLenSq <= 0.00000001 || rawLenSq > effectiveRadiusSq) return vec4(0.0);
-    vec3 rawLightDir = rawLightVec * inversesqrt(rawLenSq);
-    float diffuse = max(dot(normal, rawLightDir), 0.0);
-    if (diffuse <= 0.0) return vec4(0.0);
-
-    const float pixelGrid = LIGHT_GRID_CELL_SIZE;
-    vec3 pixLight = snapGridCenterOffset(lightPos, pixelGrid, LIGHT_GRID_PHASE_OFFSET_CELLS);
-    vec3 pixWorld = snapGridCenterOffset(worldPos, pixelGrid, LIGHT_GRID_PHASE_OFFSET_CELLS);
-
-    // ── Orb distance on the snapped retro grid ─────────────────────
-    vec3  lightVec  = pixLight - pixWorld;
-    float lightLenSq = dot(lightVec, lightVec);
-    if (lightLenSq <= 0.00000001 || lightLenSq > effectiveRadiusSq) return vec4(0.0);
-    float distance3D = sqrt(lightLenSq);
-    float dist01 = clamp(distance3D / effectiveRadius, 0.0, 1.0);
-    float brightness = pow(1.0 - dist01, 2.5);
-    brightness *= (1.0 + pulseStrength * (1.0 - dist01) * 0.30);
-    if (brightness <= 0.0005) return vec4(0.0);
-
-    // Baseline instability remains active even for steady pulse profiles.
-    {
-        const float shimmerAmount = 0.24;
-        float shimmerSpeed = 0.82
-                           + hash12(vec2(float(lightIndex) * 0.73, 4.91)) * 0.28;
-
-        vec2 fc = floor(faceCell(pixWorld, fragFace) / pixelGrid + 0.01);
-        float edgeBoost = 0.25 + dist01 * 0.75;
-        vec2 shimmerSeed = fc + vec2(float(lightIndex) * 7.3, float(lightIndex) * 3.9);
-        float shimmerNoise = bandBlendNoiseCell(
-            shimmerSeed,
-            lighting.time + dist01 * 0.31,
-            shimmerSpeed * 0.43) * 2.0 - 1.0;
-        float shimmerMag = shimmerAmount * edgeBoost * 0.24;
-        brightness *= (1.0 + shimmerNoise * shimmerMag);
-
-        brightness = max(brightness, 0.0);
+void TextureOverlayStore::setLODConfig(int lod, const LODTextureConfig& cfg) {
+    if (!isLodValid(lod)) return;
+    std::unique_lock lock(m_mutex);
+    LODTextureConfig clamped = cfg;
+    // Clamp pixelsPerVoxel to a power of two in [2, 1024].
+    uint16_t v = clamped.pixelsPerVoxel;
+    if (v < 2) v = 2;
+    if (v > 1024) v = 1024;
+    // Round down to nearest power of two.
+    uint16_t pow2 = 2;
+    while ((pow2 << 1) <= v) pow2 <<= 1;
+    clamped.pixelsPerVoxel = pow2;
+    m_lodConfigs[lod] = clamped;
+    if (lod == 0) {
+        requestFullGPUUploadLocked();
     }
-    brightness *= lightIntensity;
-
-    float visibleBrightness = brightness * diffuse;
-    vec3 colorContrib = baseColor * lightColor * visibleBrightness;
-    return vec4(colorContrib, brightness);
+    m_generation.fetch_add(1, std::memory_order_release);
 }
 
-vec3 snapShadowLookupPos(vec3 worldPos) {
-    return snapGridCenterOffset(worldPos, LIGHT_GRID_CELL_SIZE, LIGHT_GRID_PHASE_OFFSET_CELLS);
+LODTextureConfig TextureOverlayStore::getLODConfig(int lod) const {
+    if (!isLodValid(lod)) return {};
+    std::shared_lock lock(m_mutex);
+    return m_lodConfigs[lod];
 }
 
-uint getSunCascadeCount() {
-    return uint(clamp(shadow.shadowConfig2.x + 0.5, 1.0, float(MAX_SUN_SHADOW_CASCADES)));
+// ---------------------------------------------------------------------------
+// Coordinate helpers
+// ---------------------------------------------------------------------------
+
+TextureOverlayStore::BrickKey
+TextureOverlayStore::voxelToBrick(const glm::ivec3& v) {
+    // Arithmetic shift (>>3) gives floor-divide-by-8 for negative coords too.
+    return BrickKey{ v.x >> 3, v.y >> 3, v.z >> 3 };
 }
 
-float getSunCascadeBlendFraction() {
-    return clamp(shadow.shadowConfig2.y, 0.0, 0.45);
+glm::ivec3 TextureOverlayStore::voxelLocalInBrick(const glm::ivec3& v) {
+    // & 0x7 wraps correctly for negative coords (two's complement).
+    return glm::ivec3(v.x & 0x7, v.y & 0x7, v.z & 0x7);
 }
 
-uint chooseSunCascade(float horizontalDistance) {
-    uint count = getSunCascadeCount();
-    for (uint i = 0u; i < count; ++i) {
-        if (horizontalDistance <= shadow.sunCascadeParams[i].x) {
-            return i;
+glm::ivec3 TextureOverlayStore::encodeFaceCoord(const glm::ivec3& voxelCoord,
+                                                uint8_t face) {
+    return glm::ivec3(voxelCoord.x, voxelCoord.y,
+                      voxelCoord.z * 6 + static_cast<int>(face % 6u));
+}
+
+glm::ivec3 TextureOverlayStore::decodeFaceCoord(const glm::ivec3& storageCoord,
+                                                uint8_t& face) {
+    int z = storageCoord.z / 6;
+    int rem = storageCoord.z % 6;
+    if (rem < 0) {
+        rem += 6;
+        --z;
+    }
+    face = static_cast<uint8_t>(rem);
+    return glm::ivec3(storageCoord.x, storageCoord.y, z);
+}
+
+// ---------------------------------------------------------------------------
+// Brick access (caller holds appropriate lock)
+// ---------------------------------------------------------------------------
+
+TextureBrick*
+TextureOverlayStore::getOrCreateBrickLocked(BrickMap& map, int lod, BrickKey key) {
+    auto it = map.find(key);
+    if (it == map.end()) {
+        auto [newIt, _] = map.emplace(key, std::make_unique<TextureBrick>());
+        if (isLodValid(lod)) {
+            ++m_brickCountsByLOD[lod];
+        }
+        return newIt->second.get();
+    }
+    return it->second.get();
+}
+
+const TextureBrick*
+TextureOverlayStore::getBrickLocked(const BrickMap& map, BrickKey key) const {
+    auto it = map.find(key);
+    return (it != map.end()) ? it->second.get() : nullptr;
+}
+
+TextureBrick*
+TextureOverlayStore::getBrickLocked(BrickMap& map, BrickKey key) {
+    auto it = map.find(key);
+    return (it != map.end()) ? it->second.get() : nullptr;
+}
+
+void TextureOverlayStore::writeCellLocked(BrickMap& map,
+                                          int lod,
+                                          BrickKey key,
+                                          const glm::ivec3& local,
+                                          VoxelTextureData data) {
+    TextureBrick* brick = getBrickLocked(map, key);
+    if (!brick) {
+        if (data.isEmpty()) {
+            return;
+        }
+        brick = getOrCreateBrickLocked(map, lod, key);
+    }
+    int idx = TextureBrick::toIndex(local.x, local.y, local.z);
+    VoxelTextureData& slot = brick->cells[idx];
+    const bool wasActive = !slot.isEmpty();
+    const bool willBeActive = !data.isEmpty();
+    slot = data;
+    if (wasActive && !willBeActive) {
+        --brick->activeCount;
+        if (isLodValid(lod) && m_cellCountsByLOD[lod] > 0u) {
+            --m_cellCountsByLOD[lod];
+        }
+    } else if (!wasActive && willBeActive) {
+        ++brick->activeCount;
+        if (isLodValid(lod)) {
+            ++m_cellCountsByLOD[lod];
         }
     }
-    return count - 1u;
+    // Note: empty bricks intentionally retained after an active cell is erased.
+    // Paint operations are bursty, and the next stroke usually re-fills the
+    // same brick. Missing bricks are not created for empty/no-op writes.
 }
 
-bool sunCascadeSampleParams(vec3 sampleWorldPos,
-                            uint cascadeIndex,
-                            out vec2 uv,
-                            out float depth) {
-    vec4 clip = shadow.sunLightVP[cascadeIndex] * vec4(sampleWorldPos, 1.0);
-    vec3 ndc = clip.xyz / clip.w;
-    uv = ndc.xy * 0.5 + 0.5;
-    depth = ndc.z;
+uint8_t TextureOverlayStore::classifyTransitionEdge(TextureType a,
+                                                    TextureType b,
+                                                    const glm::ivec3& lodCoord) {
+    if (a == b) {
+        return static_cast<uint8_t>(TransitionEdgeStyle::None);
+    }
 
-    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 ||
-        depth > 1.0 || depth < 0.0) {
+    const bool hasGrass = (a == TextureType::Grass || b == TextureType::Grass);
+    const bool hasMud = (a == TextureType::Mud || b == TextureType::Mud);
+    const bool hasDirt = (a == TextureType::Dirt || b == TextureType::Dirt);
+    const bool hasSand = (a == TextureType::Sand || b == TextureType::Sand);
+
+    // Cheap deterministic coordinate hash for transition variation.
+    const uint32_t hx = static_cast<uint32_t>(lodCoord.x) * 0x9E3779B9u;
+    const uint32_t hy = static_cast<uint32_t>(lodCoord.y) * 0x85EBCA6Bu;
+    const uint32_t hz = static_cast<uint32_t>(lodCoord.z) * 0xC2B2AE35u;
+    uint32_t h = hx ^ hy ^ hz;
+    h ^= h >> 16;
+
+    if (hasGrass && hasMud) {
+        return static_cast<uint8_t>((h & 1u) ? TransitionEdgeStyle::Leafy
+                                             : TransitionEdgeStyle::Sloppy);
+    }
+    if (hasGrass) {
+        return static_cast<uint8_t>(TransitionEdgeStyle::Leafy);
+    }
+    if (hasMud) {
+        if (hasSand) {
+            return static_cast<uint8_t>((h & 1u) ? TransitionEdgeStyle::Sloppy
+                                                 : TransitionEdgeStyle::Grainy);
+        }
+        if (hasDirt) {
+            return static_cast<uint8_t>((h & 3u) == 0u ? TransitionEdgeStyle::Grainy
+                                                        : TransitionEdgeStyle::Sloppy);
+        }
+        return static_cast<uint8_t>(TransitionEdgeStyle::Sloppy);
+    }
+
+    return static_cast<uint8_t>(TransitionEdgeStyle::Grainy);
+}
+
+uint8_t TextureOverlayStore::mergeEdgeStyle(uint8_t lhs, uint8_t rhs) {
+    auto priority = [](uint8_t style) -> uint8_t {
+        switch (static_cast<TransitionEdgeStyle>(style & 0x3u)) {
+            case TransitionEdgeStyle::Sloppy: return 3u;
+            case TransitionEdgeStyle::Leafy:  return 2u;
+            case TransitionEdgeStyle::Grainy: return 1u;
+            case TransitionEdgeStyle::None:
+            default: return 0u;
+        }
+    };
+    return (priority(rhs) >= priority(lhs)) ? (rhs & 0x3u) : (lhs & 0x3u);
+}
+
+void TextureOverlayStore::recordDirtyGPUCellLocked(int lod,
+                                                   const glm::ivec3& lodCoord,
+                                                   VoxelTextureData data) {
+    (void)lod;
+    (void)lodCoord;
+    (void)data;
+
+    // Phase 3 material-bake path:
+    //
+    // The paint brush must not grow the fragment-time global material overlay.
+    // That overlay was the bottleneck: millions of painted voxel-face cells were
+    // uploaded into one large random-access SSBO/hash table, then cube.frag had
+    // to probe it from the terrain/light pass.
+    //
+    // Painted material remains canonical in this CPU TextureOverlayStore. The
+    // renderable representation is produced by remeshing the touched chunks and
+    // packing the material into Vertex::material, which is the shader fast path.
+    //
+    // Force one empty full-upload so any old/stale overlay cells are removed
+    // from the GPU table, but never enqueue per-cell GPU deltas here.
+    if (!m_dirtyGPUFullUpload) {
+        m_dirtyGPUCells.clear();
+        m_dirtyGPUFullUpload = true;
+    }
+}
+
+void TextureOverlayStore::requestFullGPUUploadLocked() {
+    m_dirtyGPUCells.clear();
+    m_dirtyGPUFullUpload = true;
+}
+
+void TextureOverlayStore::refreshTransitionEdgesAroundCellLocked(BrickMap& map,
+                                                                 int lod,
+                                                                 const glm::ivec3& lodCoord) {
+    TextureBrick* brick = getBrickLocked(map, voxelToBrick(lodCoord));
+    if (!brick) return;
+    const glm::ivec3 local = voxelLocalInBrick(lodCoord);
+    const int idx = TextureBrick::toIndex(local.x, local.y, local.z);
+    VoxelTextureData center = brick->cells[idx];
+    if (center.isEmpty()) return;
+
+    const TextureType centerType = center.getType();
+    uint8_t centerEdge = static_cast<uint8_t>(TransitionEdgeStyle::None);
+
+    for (const glm::ivec3& d : kNeighborDirs) {
+        const glm::ivec3 ncoord = lodCoord + d;
+        TextureBrick* nbrick = getBrickLocked(map, voxelToBrick(ncoord));
+        if (!nbrick) continue;
+
+        const glm::ivec3 nlocal = voxelLocalInBrick(ncoord);
+        const int nidx = TextureBrick::toIndex(nlocal.x, nlocal.y, nlocal.z);
+        VoxelTextureData neighbor = nbrick->cells[nidx];
+        if (neighbor.isEmpty()) continue;
+
+        const TextureType neighborType = neighbor.getType();
+        if (neighborType == centerType) continue;
+
+        const uint8_t centerStyle = classifyTransitionEdge(centerType, neighborType, lodCoord);
+        centerEdge = mergeEdgeStyle(centerEdge, centerStyle);
+
+        const uint8_t neighborStyle = classifyTransitionEdge(neighborType, centerType, ncoord);
+        const uint8_t mergedNeighborEdge = mergeEdgeStyle(neighbor.getEdgeMask(), neighborStyle);
+        if (mergedNeighborEdge != neighbor.getEdgeMask()) {
+            const VoxelTextureData updated = neighbor.withEdgeMask(mergedNeighborEdge);
+            nbrick->cells[nidx] = updated;
+            recordDirtyGPUCellLocked(lod, ncoord, updated);
+        }
+    }
+
+    if (centerEdge != center.getEdgeMask()) {
+        const VoxelTextureData updated = center.withEdgeMask(centerEdge);
+        brick->cells[idx] = updated;
+        recordDirtyGPUCellLocked(lod, lodCoord, updated);
+    }
+}
+
+void TextureOverlayStore::refreshTransitionEdgesAroundFaceLocked(BrickMap& map,
+                                                                 int lod,
+                                                                 const glm::ivec3& lodCoord,
+                                                                 uint8_t face) {
+    face %= 6u;
+    const glm::ivec3 storageCoord = encodeFaceCoord(lodCoord, face);
+    TextureBrick* brick = getBrickLocked(map, voxelToBrick(storageCoord));
+    if (!brick) return;
+
+    const glm::ivec3 local = voxelLocalInBrick(storageCoord);
+    const int idx = TextureBrick::toIndex(local.x, local.y, local.z);
+    VoxelTextureData center = brick->cells[idx];
+    if (center.isEmpty()) return;
+
+    const TextureType centerType = center.getType();
+    uint8_t centerEdge = static_cast<uint8_t>(TransitionEdgeStyle::None);
+
+    int uAxis = 0;
+    int vAxis = 1;
+    facePlaneAxes(face, uAxis, vAxis);
+    glm::ivec3 neighborOffsets[4]{};
+    neighborOffsets[0][uAxis] =  1;
+    neighborOffsets[1][uAxis] = -1;
+    neighborOffsets[2][vAxis] =  1;
+    neighborOffsets[3][vAxis] = -1;
+
+    for (const glm::ivec3& offset : neighborOffsets) {
+        const glm::ivec3 ncoord = lodCoord + offset;
+        const glm::ivec3 nstorage = encodeFaceCoord(ncoord, face);
+        TextureBrick* nbrick = getBrickLocked(map, voxelToBrick(nstorage));
+        if (!nbrick) continue;
+
+        const glm::ivec3 nlocal = voxelLocalInBrick(nstorage);
+        const int nidx = TextureBrick::toIndex(nlocal.x, nlocal.y, nlocal.z);
+        VoxelTextureData neighbor = nbrick->cells[nidx];
+        if (neighbor.isEmpty()) continue;
+
+        const TextureType neighborType = neighbor.getType();
+        if (neighborType == centerType) continue;
+
+        const uint8_t centerStyle = classifyTransitionEdge(centerType, neighborType, lodCoord);
+        centerEdge = mergeEdgeStyle(centerEdge, centerStyle);
+
+        const uint8_t neighborStyle = classifyTransitionEdge(neighborType, centerType, ncoord);
+        const uint8_t mergedNeighborEdge = mergeEdgeStyle(neighbor.getEdgeMask(), neighborStyle);
+        if (mergedNeighborEdge != neighbor.getEdgeMask()) {
+            const VoxelTextureData updated = neighbor.withEdgeMask(mergedNeighborEdge);
+            nbrick->cells[nidx] = updated;
+            recordDirtyGPUCellLocked(lod, ncoord, updated);
+        }
+    }
+
+    if (centerEdge != center.getEdgeMask()) {
+        const VoxelTextureData updated = center.withEdgeMask(centerEdge);
+        brick->cells[idx] = updated;
+        recordDirtyGPUCellLocked(lod, lodCoord, updated);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Single-cell access
+// ---------------------------------------------------------------------------
+
+void TextureOverlayStore::setTexture(const glm::ivec3& lodCoord,
+                                     int lod,
+                                     VoxelTextureData data) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return;
+    std::unique_lock lock(m_mutex);
+    BrickKey key = voxelToBrick(lodCoord);
+    glm::ivec3 local = voxelLocalInBrick(lodCoord);
+    writeCellLocked(m_lodMaps[lod], lod, key, local, data);
+    if (data.isEmpty()) {
+        requestFullGPUUploadLocked();
+    } else {
+        recordDirtyGPUCellLocked(lod, lodCoord, data);
+    }
+    auto& map = m_lodMaps[lod];
+    if (!data.isEmpty()) {
+        refreshTransitionEdgesAroundCellLocked(map, lod, lodCoord);
+        for (const glm::ivec3& d : kNeighborDirs) {
+            refreshTransitionEdgesAroundCellLocked(map, lod, lodCoord + d);
+        }
+    } else {
+        for (const glm::ivec3& d : kNeighborDirs) {
+            refreshTransitionEdgesAroundCellLocked(map, lod, lodCoord + d);
+        }
+    }
+    m_generation.fetch_add(1, std::memory_order_release);
+}
+
+VoxelTextureData
+TextureOverlayStore::getTexture(const glm::ivec3& lodCoord, int lod) const {
+    if (!isLodValid(lod)) return {};
+    std::shared_lock lock(m_mutex);
+    BrickKey key = voxelToBrick(lodCoord);
+    glm::ivec3 local = voxelLocalInBrick(lodCoord);
+    const TextureBrick* brick = getBrickLocked(m_lodMaps[lod], key);
+    if (!brick) return {};
+    return brick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
+}
+
+VoxelTextureData
+TextureOverlayStore::getSurfaceTexture(const glm::ivec3& lodCoord,
+                                       int lod,
+                                       uint8_t face) const {
+    if (!isLodValid(lod)) return {};
+
+    const uint8_t queryFace = static_cast<uint8_t>(face % 6u);
+    const glm::ivec3 storageCoord = encodeFaceCoord(lodCoord, queryFace);
+
+    std::shared_lock lock(m_mutex);
+
+    // Exact expanded/saved per-face cells win over deferred brush stamps.
+    {
+        const BrickKey key = voxelToBrick(storageCoord);
+        const glm::ivec3 local = voxelLocalInBrick(storageCoord);
+        const TextureBrick* brick = getBrickLocked(m_lodMaps[lod], key);
+        if (brick) {
+            const VoxelTextureData cell =
+                brick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
+            if (!cell.isEmpty()) {
+                return cell;
+            }
+        }
+    }
+
+    return sampleSurfacePaintStampsLocked(lodCoord, lod, queryFace);
+}
+
+bool TextureOverlayStore::hasSurfaceTexturesInBox(const glm::ivec3& minLodCoord,
+                                                  const glm::ivec3& maxExclusiveLodCoord,
+                                                  int lod) const {
+    if (!isLodValid(lod)) return false;
+    if (minLodCoord.x >= maxExclusiveLodCoord.x ||
+        minLodCoord.y >= maxExclusiveLodCoord.y ||
+        minLodCoord.z >= maxExclusiveLodCoord.z) {
         return false;
     }
-    return true;
-}
 
-uint chooseSunCascadeForSample(vec3 sampleWorldPos, float horizontalDistance) {
-    uint count = getSunCascadeCount();
-    uint cascade = chooseSunCascade(horizontalDistance);
-    for (uint step = 0u; step < count; ++step) {
-        uint c = min(cascade + step, count - 1u);
-        vec2 uv;
-        float depth;
-        if (sunCascadeSampleParams(sampleWorldPos, c, uv, depth)) {
-            return c;
-        }
-        if (c == count - 1u) {
-            break;
-        }
-    }
-    return count - 1u;
-}
+    const glm::ivec3 storageMin(minLodCoord.x,
+                                minLodCoord.y,
+                                minLodCoord.z * 6);
+    const glm::ivec3 storageMax(maxExclusiveLodCoord.x - 1,
+                                maxExclusiveLodCoord.y - 1,
+                                (maxExclusiveLodCoord.z - 1) * 6 + 5);
+    const BrickKey minBrick = voxelToBrick(storageMin);
+    const BrickKey maxBrick = voxelToBrick(storageMax);
 
-float sampleSunShadowCascade(vec3 sampleWorldPos, uint cascadeIndex) {
-    vec2 uv;
-    float depth;
-    if (!sunCascadeSampleParams(sampleWorldPos, cascadeIndex, uv, depth)) {
-        return 1.0;
-    }
+    std::shared_lock lock(m_mutex);
+    const auto& map = m_lodMaps[lod];
+    const int64_t brickVolume =
+        int64_t(maxBrick.bx - minBrick.bx + 1) *
+        int64_t(maxBrick.by - minBrick.by + 1) *
+        int64_t(maxBrick.bz - minBrick.bz + 1);
 
-    // Per-cascade snap gate: only snap when the cascade's world-space
-    // texel is fine enough that the snap doesn't quantize the receiver
-    // visibly. Far cascades (large texelMeters at high cascadeScale)
-    // would otherwise expose 1 m+ shadow texels directly on the ground,
-    // producing the triangle staircase silhouettes and shape changes
-    // that vary with cascade count/scale.
-    float cascadeTexelMeters = shadow.sunCascadeParams[cascadeIndex].y;
-    if (cascadeTexelMeters <= LIGHT_GRID_CELL_SIZE * 1.5) {
-        float mapSize = max(shadow.shadowConfig.z, 1.0);
-        uv = (floor(uv * mapSize) + 0.5) / mapSize;
-    }
-    return texture(sunShadowMap, vec4(uv, float(cascadeIndex), depth));
-}
-
-float sampleSunShadowAt(vec3 sampleWorldPos) {
-    float horizontalDistance = length(sampleWorldPos.xz - camera.cameraPos.xz);
-    uint cascade = chooseSunCascadeForSample(sampleWorldPos, horizontalDistance);
-    float vis = sampleSunShadowCascade(sampleWorldPos, cascade);
-
-    uint count = getSunCascadeCount();
-    if (cascade + 1u < count) {
-        float blendFrac = getSunCascadeBlendFraction();
-        float cascadeRadius = shadow.sunCascadeParams[cascade].x;
-        float blendStart = cascadeRadius * (1.0 - blendFrac);
-        if (horizontalDistance > blendStart) {
-            vec4 farClip = shadow.sunLightVP[cascade + 1u] * vec4(sampleWorldPos, 1.0);
-            vec3 farNdc = farClip.xyz / farClip.w;
-            bool farValid =
-                farNdc.x >= -1.0 && farNdc.x <= 1.0 &&
-                farNdc.y >= -1.0 && farNdc.y <= 1.0 &&
-                farNdc.z >= 0.0 && farNdc.z <= 1.0;
-            if (farValid) {
-                float denom = max(cascadeRadius - blendStart, 0.0001);
-                float t = clamp((horizontalDistance - blendStart) / denom, 0.0, 1.0);
-                float farVis = sampleSunShadowCascade(sampleWorldPos, cascade + 1u);
-                vis = mix(vis, farVis, t);
+    if (brickVolume > 0 && static_cast<uint64_t>(brickVolume) < map.size()) {
+        for (int32_t bz = minBrick.bz; bz <= maxBrick.bz; ++bz)
+        for (int32_t by = minBrick.by; by <= maxBrick.by; ++by)
+        for (int32_t bx = minBrick.bx; bx <= maxBrick.bx; ++bx) {
+            auto it = map.find(BrickKey{bx, by, bz});
+            if (it != map.end() && it->second && it->second->activeCount > 0) {
+                return true;
             }
         }
-    }
-    return vis;
-}
-
-float sampleSunShadowAtNoSnap(vec3 sampleWorldPos) {
-    float horizontalDistance = length(sampleWorldPos.xz - camera.cameraPos.xz);
-    uint cascade = chooseSunCascadeForSample(sampleWorldPos, horizontalDistance);
-
-    vec2 uv;
-    float depth;
-    if (!sunCascadeSampleParams(sampleWorldPos, cascade, uv, depth)) {
-        return 1.0;
-    }
-    float vis = texture(sunShadowMap, vec4(uv, float(cascade), depth));
-
-    uint count = getSunCascadeCount();
-    if (cascade + 1u < count) {
-        float blendFrac = getSunCascadeBlendFraction();
-        float cascadeRadius = shadow.sunCascadeParams[cascade].x;
-        float blendStart = cascadeRadius * (1.0 - blendFrac);
-        if (horizontalDistance > blendStart) {
-            vec4 farClip = shadow.sunLightVP[cascade + 1u] * vec4(sampleWorldPos, 1.0);
-            vec3 farNdc = farClip.xyz / farClip.w;
-            bool farValid =
-                farNdc.x >= -1.0 && farNdc.x <= 1.0 &&
-                farNdc.y >= -1.0 && farNdc.y <= 1.0 &&
-                farNdc.z >= 0.0 && farNdc.z <= 1.0;
-            if (farValid) {
-                float denom = max(cascadeRadius - blendStart, 0.0001);
-                float t = clamp((horizontalDistance - blendStart) / denom, 0.0, 1.0);
-                vec2 farUv = farNdc.xy * 0.5 + 0.5;
-                float farDepth = farNdc.z;
-                float farVis = texture(sunShadowMap, vec4(farUv, float(cascade + 1u), farDepth));
-                vis = mix(vis, farVis, t);
-            }
-        }
-    }
-    return vis;
-}
-
-vec3 snapToFaceCell(vec3 pos, uint face) {
-    float g = LIGHT_GRID_CELL_SIZE;
-    vec3 s = pos;
-    if (face <= 1u) {
-        s.z = (floor(pos.z / g + 0.01) + 0.5) * g;
-    } else if (face <= 3u || face == 6u) {
-        s.x = (floor(pos.x / g + 0.01) + 0.5) * g;
-        s.z = (floor(pos.z / g + 0.01) + 0.5) * g;
     } else {
-        s.x = (floor(pos.x / g + 0.01) + 0.5) * g;
-    }
-    return s;
-}
-
-float sampleSunShadow(vec3 worldPos, vec3 worldNormal) {
-    if (shadow.shadowConfig.x <= 0.0) return 1.0;
-
-    vec3 normalN = normalize(worldNormal);
-    vec3 sunDir = shadow.sunDirTexelSize.xyz;
-    float ndotl = dot(normalN, -sunDir);
-    float horizontalDistance = length(worldPos.xz - camera.cameraPos.xz);
-    uint activeCascade = chooseSunCascadeForSample(worldPos, horizontalDistance);
-
-    const float kFadeStart = -0.08;
-    const float kFadeEnd   =  0.16;
-    float backfaceFade = smoothstep(kFadeStart, kFadeEnd, ndotl);
-    if (backfaceFade <= 0.0) return 0.0;
-
-    uint derivedFace;
-    vec3 an = abs(normalN);
-    if (an.x >= an.y && an.x >= an.z) derivedFace = (normalN.x > 0.0) ? 0u : 1u;
-    else if (an.y >= an.x && an.y >= an.z) derivedFace = (normalN.y > 0.0) ? 2u : 3u;
-    else derivedFace = (normalN.z > 0.0) ? 4u : 5u;
-
-    bool isVerticalFace = (derivedFace <= 1u || derivedFace >= 4u);
-
-    // ── Vertical-face cast-shadow fade ──────────────────────────────
-    // When the sun is nearly tangential to a vertical face the shear
-    // projection becomes ill-conditioned and small casters render
-    // glitched bands. Mirror the side-face self-shadow fade: as
-    // |sunDir · faceNormal| approaches zero, the cast shadow on this
-    // face fades out smoothly. Horizontal faces are unaffected.
-    float castFade = 1.0;
-    if (isVerticalFace) {
-        float sunFaceCos = abs(dot(sunDir, normalN));
-        castFade = smoothstep(0.05, 0.16, sunFaceCos);
-    }
-
-    // Push along SURFACE NORMAL, not along -sunDir. Sun-direction push
-    // at low elevation is mostly horizontal — it walks the sample into
-    // adjacent walls ("shadow under wall") and shifts silhouettes with
-    // azimuth ("shape breaks as sun rotates / detaches at low sun").
-    // Normal-direction push keeps the sample anchored to the same
-    // surface point regardless of sun direction.
-    float g = LIGHT_GRID_CELL_SIZE;
-    float cascadeTexel = shadow.sunCascadeParams[activeCascade].y;
-    uint cascadeCount = getSunCascadeCount();
-    if (activeCascade + 1u < cascadeCount) {
-        float blendFrac = getSunCascadeBlendFraction();
-        float cascadeRadius = shadow.sunCascadeParams[activeCascade].x;
-        float blendStart = cascadeRadius * (1.0 - blendFrac);
-        if (horizontalDistance > blendStart) {
-            cascadeTexel = max(cascadeTexel, shadow.sunCascadeParams[activeCascade + 1u].y);
-        }
-    }
-    float baseTexel = shadow.sunCascadeParams[0].y;
-    float biasTexel = min(max(baseTexel, cascadeTexel * 0.25), baseTexel * 2.0);
-    float slope = clamp(1.0 / max(ndotl, 0.1), 1.0, 4.0);
-    float pushAlongNormal = max(g, biasTexel * 0.85) * slope;
-
-    if (isVerticalFace) {
-        // Snap Y as well as the in-plane horizontal axis: shadow UV is
-        // (worldX + Y*shearX, worldZ + Y*shearZ), so Y appears in BOTH
-        // UV components. If Y is left continuous, fragments within one
-        // wall cell sweep ~g*|shear| shadow texels and the cell fills
-        // only partially -> jagged outline. Snapping Y collapses each
-        // wall cell to one shadow-UV lookup (matches top-face behaviour).
-        vec3 snapped = snapToFaceCell(worldPos, derivedFace);
-        snapped.y = (floor(worldPos.y / g + 0.01) + 0.5) * g;
-        vec3 pushed = snapped + normalN * pushAlongNormal;
-        return sampleSunShadowAtNoSnap(pushed) * backfaceFade * castFade;
-    }
-
-    vec3 samplePos = worldPos + normalN * pushAlongNormal;
-    return sampleSunShadowAt(samplePos) * backfaceFade;
-}
-
-
-float samplePointShadowPCF(vec3 dirN, uint lightIndex, float compareDepth, float mapSize) {
-    vec3 up = (abs(dirN.y) < 0.99) ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0);
-    vec3 tangent = normalize(cross(up, dirN));
-    vec3 bitangent = cross(dirN, tangent);
-
-    // Smaller kernel: keeps retro hard edges but cuts heavy depth-compare cost.
-    float angleStep = 2.0 / mapSize;
-    float radius = angleStep * 1.25;
-    const vec2 pcfOffsets[4] = vec2[](
-        vec2( 1.0,  0.0),
-        vec2(-1.0,  0.0),
-        vec2( 0.0,  1.0),
-        vec2( 0.0, -1.0)
-    );
-
-    float sum = texture(pointShadowMaps, vec4(dirN, float(lightIndex)), compareDepth);
-    for (int i = 0; i < 4; ++i) {
-        vec2 o = pcfOffsets[i] * radius;
-        vec3 sampleDir = normalize(dirN + tangent * o.x + bitangent * o.y);
-        sum += texture(pointShadowMaps, vec4(sampleDir, float(lightIndex)), compareDepth);
-    }
-    return sum / 5.0;
-}
-
-float samplePointShadowSingle(vec3 dirN, uint lightIndex, float compareDepth) {
-    return texture(pointShadowMaps, vec4(dirN, float(lightIndex)), compareDepth);
-}
-
-float samplePointShadowAt(vec3 sampleWorldPos,
-                          vec3 worldNormalN,
-                          vec3 lightPos,
-                          uint lightIndex,
-                          float farPlane,
-                          float mapSize,
-                          bool usePCF) {
-    vec3 dir = sampleWorldPos - lightPos;
-    float distSq = dot(dir, dir);
-    float farPlaneSq = farPlane * farPlane;
-    if (distSq <= 0.00000001 || distSq >= farPlaneSq) return 1.0;
-
-    float invDist = inversesqrt(distSq);
-    float dist = distSq * invDist;
-    vec3 dirN = dir * invDist;
-
-    // World-space receiver bias derived from cubemap texel footprint.
-    // Prevents lit-edge acne where contact seams quantize to the occluder depth.
-    float ndotl = max(dot(worldNormalN, -dirN), 0.0);
-    float slope = 1.0 - ndotl;
-    float dist01 = clamp(dist / farPlane, 0.0, 1.0);
-    float texelWorld = farPlane / max(mapSize, 1.0);
-    const float SHADOW_LOOKUP_GRID = LIGHT_GRID_CELL_SIZE;
-
-    // Extra bias for grazing angles (slope~1) to prevent self-shadowing
-    // on vertical faces while still catching cast shadows from other objects.
-    float worldBias = texelWorld * (1.15 + slope * 3.50);
-    worldBias = max(worldBias, SHADOW_LOOKUP_GRID * 0.12);
-    worldBias += SHADOW_LOOKUP_GRID * 0.03 * (1.0 - dist01);
-
-    float compareDepth = clamp((dist - worldBias) / farPlane, 0.0, 1.0);
-    return usePCF
-        ? samplePointShadowPCF(dirN, lightIndex, compareDepth, mapSize)
-        : samplePointShadowSingle(dirN, lightIndex, compareDepth);
-}
-
-float samplePointShadow(vec3 worldPos,
-                        vec3 worldNormal,
-                        vec3 lightPos,
-                        uint lightIndex,
-                        float farPlane,
-                        float mapSize,
-                        bool highQuality) {
-    if (farPlane < 0.01) return 1.0;
-    vec3 normalN = normalize(worldNormal);
-    bool verticalFace = (abs(normalN.y) < 0.5);
-
-    const float SHADOW_LOOKUP_GRID = LIGHT_GRID_CELL_SIZE;
-
-    if (verticalFace) {
-        // Vertical faces: evaluate a small neighborhood and resolve to smooth
-        // visibility to avoid contact-line outlines and one-pixel glitches.
-        const float VERT_RECEIVER_PUSH = SHADOW_LOOKUP_GRID * 1.5;
-        const float VERT_KERNEL_RADIUS = SHADOW_LOOKUP_GRID * 0.95;
-        vec3 snapped = snapShadowLookupPos(worldPos);
-        vec3 center = snapped;
-        center += normalN * VERT_RECEIVER_PUSH;
-        center.y = snapped.y + SHADOW_LOOKUP_GRID * 0.35;
-        vec3 t1, t2;
-        buildFaceTangents(normalN, t1, t2);
-
-        float v0 = samplePointShadowAt(center, normalN, lightPos, lightIndex, farPlane, mapSize, true);
-        float v1 = samplePointShadowAt(center + t1 * VERT_KERNEL_RADIUS, normalN, lightPos, lightIndex, farPlane, mapSize, false);
-        float v2 = samplePointShadowAt(center - t1 * VERT_KERNEL_RADIUS, normalN, lightPos, lightIndex, farPlane, mapSize, false);
-        float v3 = samplePointShadowAt(center + t2 * VERT_KERNEL_RADIUS, normalN, lightPos, lightIndex, farPlane, mapSize, false);
-        float v4 = samplePointShadowAt(center - t2 * VERT_KERNEL_RADIUS, normalN, lightPos, lightIndex, farPlane, mapSize, false);
-        return resolveBinaryShadowFromNeighborhood(v0, v1, v2, v3, v4);
-    }
-
-    const float SHADOW_RECEIVER_PUSH = SHADOW_LOOKUP_GRID * 0.22;
-    const float SHADOW_KERNEL_RADIUS = SHADOW_LOOKUP_GRID * 0.92;
-    vec3 center = snapShadowLookupPos(worldPos + normalN * SHADOW_RECEIVER_PUSH);
-
-    vec3 t1, t2;
-    buildFaceTangents(normalN, t1, t2);
-
-    bool usePCF = true;
-    float v0 = samplePointShadowAt(center, normalN, lightPos, lightIndex, farPlane, mapSize, usePCF);
-    float sampleRadius = highQuality ? SHADOW_KERNEL_RADIUS : (SHADOW_KERNEL_RADIUS * 0.88);
-    float v1 = samplePointShadowAt(center + t1 * sampleRadius, normalN, lightPos, lightIndex, farPlane, mapSize, false);
-    float v2 = samplePointShadowAt(center - t1 * sampleRadius, normalN, lightPos, lightIndex, farPlane, mapSize, false);
-    float v3 = samplePointShadowAt(center + t2 * sampleRadius, normalN, lightPos, lightIndex, farPlane, mapSize, false);
-    float v4 = samplePointShadowAt(center - t2 * sampleRadius, normalN, lightPos, lightIndex, farPlane, mapSize, false);
-    float resolved = resolveBinaryShadowFromNeighborhood(v0, v1, v2, v3, v4);
-    if (!highQuality) {
-        return resolved;
-    }
-
-    float visibility = v0 * 0.5 + (v1 + v2 + v3 + v4) * 0.125;
-
-    float litVotes =
-        step(0.5, v0) +
-        step(0.5, v1) +
-        step(0.5, v2) +
-        step(0.5, v3) +
-        step(0.5, v4);
-    float voteVisibility = litVotes / 5.0;
-    float blended = mix(visibility, voteVisibility, 0.25);
-    float smoothVisibility = smoothstep(0.14, 0.90, blended);
-    return mix(smoothVisibility, resolved, 0.60);
-}
-
-// ─── Sky enclosure (inlined copy of shaders/common/sky_enclosure.glsl) ─────
-// "Deeper = darker" geometric enclosure, INDEPENDENT of any light source.
-// Sun adds light back via the normal lighting path; this term only removes
-// ambient contribution as a function of how surrounded the fragment is.
-//   (A) Sky-march column — march upward, find first "sky visible" height.
-//       Enclosure ratio = how deep we are inside terrain.
-//   (B) Y-cavity — sun-independent screen-space derivative term for shallow
-//       depressions the march resolution misses.
-// Probe sampler: depth<0 → LIT (above map), depth>1 or uv-out → next cascade,
-// exhausted → assume open sky → LIT. NEVER exclude probes.
-const int   DCCM_SKY_MARCH_STEPS = 12;
-const float DCCM_SKY_NORMAL_LIFT = 0.05;
-
-float dccmSampleProbeShadow(vec3 pos) {
-    uint count = getSunCascadeCount();
-    for (uint i = 0u; i < count; ++i) {
-        vec4 clip = shadow.sunLightVP[i] * vec4(pos, 1.0);
-        vec3 ndc = clip.xyz / clip.w;
-        vec2 uv = ndc.xy * 0.5 + 0.5;
-        float depth = ndc.z;
-        if (depth < 0.0) return 1.0;
-        if (depth > 1.0) continue;
-        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) continue;
-        float mapSize = max(shadow.shadowConfig.z, 1.0);
-        uv = (floor(uv * mapSize) + 0.5) / mapSize;
-        return texture(sunShadowMap, vec4(uv, float(i), depth));
-    }
-    return 1.0;
-}
-
-float dccmSkyMarchEnclosure(vec3 origin, float maxH) {
-    float stepM = maxH / float(DCCM_SKY_MARCH_STEPS);
-    float occlusionLength = 0.0;
-    for (int i = 0; i < DCCM_SKY_MARCH_STEPS; ++i) {
-        float h = (float(i) + 0.5) * stepM;
-        vec3 probe = origin + vec3(0.0, h, 0.0);
-        float vis = dccmSampleProbeShadow(probe);
-        if (vis > 0.5) {
-            return clamp(occlusionLength / maxH, 0.0, 1.0);
-        }
-        occlusionLength += stepM;
-    }
-    return 1.0;
-}
-
-float dccmYCavityTerm(vec3 worldPos, vec3 N) {
-    // Reject side faces and geometry edges (corner-flicker guard).
-    float floorWeight = clamp(N.y, 0.0, 1.0);
-    if (floorWeight < 0.5) return 0.0;
-    vec2 dy = vec2(dFdx(worldPos.y), dFdy(worldPos.y));
-    vec2 dPx = vec2(dFdx(worldPos.x), dFdy(worldPos.x));
-    vec2 dPz = vec2(dFdx(worldPos.z), dFdy(worldPos.z));
-    float pixelMeters = max(length(vec2(length(dPx), length(dPz))), 1e-4);
-    if (pixelMeters > 0.25) return 0.0; // edge fragment
-    float slopePerMeter = length(dy) / pixelMeters;
-    return clamp(slopePerMeter * floorWeight, 0.0, 1.0);
-}
-
-// Sun-independent zenith term using the static heightmap upload.
-// Floor-faces only (walls would sample at their own XZ producing chaos);
-// uses NEAREST + heightmap-texel-snap so each 2.5 m cell = one flat band.
-float dccmHeightmapZenithTerm(vec3 worldPos, vec3 N, float maxH) {
-    float scale = shadow.skyHeightmapInfo.w;
-    if (scale <= 0.0) return 0.0;
-    float metersPerTexel = max(shadow.skyHeightmapInfo.z, 1e-4);
-    vec2 texSize = vec2(textureSize(skyHeightmap, 0));
-    vec2 worldSpan = texSize * metersPerTexel;
-
-    // Snap to heightmap-texel center → one constant surfaceY per cell.
-    vec2 texelXZ = (floor(worldPos.xz / metersPerTexel) + 0.5) * metersPerTexel;
-    vec2 uv = (texelXZ - shadow.skyHeightmapInfo.xy) / worldSpan;
-    if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) return 0.0;
-    float surfaceY = texture(skyHeightmap, uv).r * scale;
-    // Stable voxel quantization — see sky_enclosure.glsl for full rationale.
-    const float DCCM_VOXEL_M = 0.25;
-    const float DCCM_INV_VOXEL = 1.0 / DCCM_VOXEL_M;
-    const float DCCM_DEAD_VOX = 2.0;
-    float surfaceVox = floor(surfaceY * DCCM_INV_VOXEL + 0.5);
-    float fragVox    = floor((worldPos.y - DCCM_VOXEL_M * 0.5) * DCCM_INV_VOXEL);
-    float depthVox   = max(0.0, surfaceVox - fragVox - DCCM_DEAD_VOX);
-    return clamp(depthVox * DCCM_VOXEL_M / maxH, 0.0, 1.0);
-}
-
-float computeSkyEnclosureRaw(vec3 worldPos, vec3 N) {
-    float maxH = max(shadow.skyEnclosureParams.z, 0.5);
-
-    // Heightmap zenith term — true geometric depth below original surface.
-    // The old sky-march term was removed because it sampled the sun shadow
-    // map and therefore confused sun-shadow with sky-block (triangle
-    // artifacts on walls; false depth on sun-shadowed flat ground).
-    float zenith = dccmHeightmapZenithTerm(worldPos, N, maxH);
-
-    float cavityGain = clamp(shadow.shadowConfig2.w, 0.0, 1.0);
-    float cavity = dccmYCavityTerm(worldPos, N) * cavityGain;
-
-    return clamp(zenith + cavity * (1.0 - zenith), 0.0, 1.0);
-}
-
-float applySunDissolve(float raw, float sunReach) {
-    const float SUN_DISSOLVE_STRENGTH = 0.7;
-    return raw * (1.0 - clamp(sunReach, 0.0, 1.0) * SUN_DISSOLVE_STRENGTH);
-}
-
-float computeSkyEnclosure(vec3 worldPos, vec3 N, float sunReach) {
-    float mode = shadow.skyEnclosureParams.w;
-    if (mode < 0.5) return 1.0;
-
-    float intensity  = max(shadow.skyEnclosureParams.x, 0.0);
-    float minAmbient = clamp(shadow.skyEnclosureParams.y, 0.0, 1.0);
-
-    float raw = computeSkyEnclosureRaw(worldPos, N);
-    raw = applySunDissolve(raw, sunReach);
-
-    float k = max(intensity, 0.05) * 3.0;
-    float occ = 1.0 - exp(-raw * k);
-
-    // Single-quantization (input already voxel-stepped); see sky_enclosure.glsl.
-    return mix(1.0, minAmbient, occ);
-}
-
-float computeSkyEnclosure(vec3 worldPos, vec3 N) {
-    return computeSkyEnclosure(worldPos, N, 0.0);
-}
-
-bool skyEnclosureVisualizeEnabled() {
-    return shadow.skyEnclosureParams.w > 1.5;
-}
-
-vec3 skyEnclosureDebugColor(vec3 worldPos, vec3 N, float sunReach) {
-    float raw = computeSkyEnclosureRaw(worldPos, N);
-    raw = applySunDissolve(raw, sunReach);
-    vec3 lo = vec3(0.10, 0.95, 0.20);
-    vec3 mid = vec3(0.95, 0.85, 0.10);
-    vec3 hi = vec3(0.95, 0.10, 0.10);
-    return raw < 0.5
-        ? mix(lo, mid, raw * 2.0)
-        : mix(mid, hi, (raw - 0.5) * 2.0);
-}
-
-vec3 skyEnclosureDebugColor(vec3 worldPos, vec3 N) {
-    return skyEnclosureDebugColor(worldPos, N, 0.0);
-}
-
-void main() {
-    if (fragFace != 6u) {
-        discard;
-    }
-
-    vec3 fillColor = ao.dccmFillCol.xyz;
-    vec3 lineColor = ao.dccmLineCol.xyz;
-    float contourThickness = ao.dccmLineCol.w;
-
-    float pixelSize = max(ao.dccmConfig.x, 1.0);
-    float slopeStrength = ao.dccmConfig.y;
-    float contourSpacing = ao.dccmConfig.z;
-
-    // Pixelate screen coords for retro chunky look
-    vec2 screenCoord = gl_FragCoord.xy;
-    if (pixelSize > 1.0) {
-        screenCoord = floor(screenCoord / pixelSize) * pixelSize;
-    }
-
-    uint flags = floatBitsToUint(ao.dccmConfig.w);
-    bool slopeOn = (flags & 1u) != 0u;
-    bool contourOn = (flags & 2u) != 0u;
-    bool heightOn = (flags & 4u) != 0u;
-    bool bakedAOOn = (flags & 8u) != 0u;
-    bool debugTri = (flags & 16u) != 0u;
-    bool sideFaceDarkOn = (flags & 32u) != 0u;
-
-    if (debugTri) {
-        float seed = dot(fragFlatPos, vec3(127.1, 311.7, 74.7));
-        vec3 triColor = vec3(
-            fract(sin(seed) * 43758.5453),
-            fract(sin(seed * 1.13 + 3.71) * 22578.1459),
-            fract(sin(seed * 0.97 + 7.13) * 19642.3217)
-        );
-        outColor = vec4(triColor * 0.6 + 0.3, 1.0);
-        return;
-    }
-
-    vec3 dpdx = dFdx(fragWorldPos);
-    vec3 dpdy = dFdy(fragWorldPos);
-    vec3 triNormal = normalize(cross(dpdx, dpdy));
-    if (triNormal.y < 0.0) triNormal = -triNormal;
-
-    vec3 shadingNormal = triNormal;
-
-    float slopeFactor = clamp(1.0 - shadingNormal.y, 0.0, 1.0);
-
-    vec3 shaded = fillColor;
-
-    if (heightOn) {
-        float h0 = ao.dccmBrightness.x;
-        float h1 = ao.dccmBrightness.y;
-        float h2 = ao.dccmBrightness.z;
-        float bandStrength = ao.dccmBrightness.w;
-
-        vec3 col0 = fillColor * vec3(0.72, 0.82, 0.64);
-        vec3 col1 = fillColor * vec3(0.92, 1.00, 0.90);
-        vec3 col2 = fillColor * vec3(1.10, 1.18, 0.96);
-        vec3 col3 = fillColor * vec3(1.28, 1.34, 1.10);
-
-        float worldH = fragWorldPos.y;
-        float t01 = smoothstep(h0 - 0.6, h0 + 0.6, worldH);
-        float t12 = smoothstep(h1 - 0.6, h1 + 0.6, worldH);
-        float t23 = smoothstep(h2 - 0.6, h2 + 0.6, worldH);
-
-        vec3 heightCol = mix(col0, col1, t01);
-        heightCol = mix(heightCol, col2, t12);
-        heightCol = mix(heightCol, col3, t23);
-
-        shaded = mix(shaded, heightCol, clamp(bandStrength, 0.0, 1.0));
-    }
-
-    if (slopeOn) {
-        float powerCurve = ao.dccmShadowTintCfg.w;
-        float curvedSlope = pow(slopeFactor, powerCurve);
-        float slopeStrengthLocal = slopeStrength;
-        float slopeDarkening = 1.0 - curvedSlope * slopeStrengthLocal * 0.56;
-        slopeDarkening = clamp(slopeDarkening, 0.45, 1.0);
-
-        vec3 slopeTint = ao.dccmShadowTintCfg.xyz;
-        vec3 tintApply = mix(vec3(1.0), slopeTint, curvedSlope * clamp(slopeStrengthLocal, 0.0, 3.0));
-
-        shaded *= slopeDarkening * tintApply;
-    }
-
-    float savedAoMul = 1.0; // Tracks AO darkening multiplier for light-based recovery
-
-    if (bakedAOOn) {
-        // Volume-aware AO: prefer interpolated AO and blend with slope/height cues.
-        // This avoids patchy per-triangle color islands from provoking-vertex AO.
-        float aoInterp = clamp(fragAOLevel, 0.0, 1.0);
-
-        float h0 = ao.dccmBrightness.x;
-        float h2 = max(ao.dccmBrightness.z, h0 + 0.001);
-        float height01 = clamp((fragWorldPos.y - h0) / (h2 - h0), 0.0, 1.0);
-        float valleyOcclusion = 1.0 - height01;
-
-        float slopeOcclusion = smoothstep(0.18, 0.92, slopeFactor);
-        float volumeAO = clamp(aoInterp * 0.55 + valleyOcclusion * 0.20 + slopeOcclusion * 0.25, 0.0, 1.0);
-
-        float aoMul = 1.0 - pow(volumeAO, 1.25) * 0.34;
-        aoMul = clamp(aoMul, 0.58, 1.0);
-        shaded *= aoMul;
-        savedAoMul = aoMul;
-    }
-
-    if (contourOn && contourSpacing > 0.0) {
-        float contourVal = mod(fragWorldPos.y, contourSpacing);
-        float contourEdge = min(contourVal, contourSpacing - contourVal);
-
-        // Treat contourThickness as width along the terrain surface (meters), then
-        // convert to an equivalent Y-threshold. Using a raw Y-threshold causes the
-        // same setting to look thicker on shallow slopes and thinner on steep slopes.
-        float lineWidthSurface = max(contourThickness, 0.000625);
-        float slopeSpan = sqrt(max(1.0 - shadingNormal.y * shadingNormal.y, 0.0));
-
-        // Flat horizontal faces have no well-defined contour crossings; drawing there
-        // fills whole regions with lines, so suppress near-flat surfaces.
-        bool isFlat = slopeSpan < 0.01;
-
-        if (!isFlat) {
-            float lineThickY = lineWidthSurface * slopeSpan;
-            if (contourEdge < lineThickY) {
-                shaded = lineColor;
+        for (const auto& [key, brick] : map) {
+            if (!brick || brick->activeCount == 0) {
+                continue;
+            }
+            if (key.bx >= minBrick.bx && key.bx <= maxBrick.bx &&
+                key.by >= minBrick.by && key.by <= maxBrick.by &&
+                key.bz >= minBrick.bz && key.bz <= maxBrick.bz) {
+                return true;
             }
         }
     }
 
-    if (sideFaceDarkOn) {
-        float sideFaceShade = clamp(ao.dccmFillCol.w, 0.35, 1.0);
-        float verticality = smoothstep(0.30, 0.92, 1.0 - abs(shadingNormal.y));
-        shaded *= mix(1.0, sideFaceShade, verticality);
-    }
+    if (!m_surfacePaintStamps.empty()) {
+        const int step = (lod > 0) ? (1 << lod) : 1;
+        const glm::ivec3 minLod0 = lodToLOD0(minLodCoord, lod);
+        const glm::ivec3 maxLod0 =
+            lodToLOD0(maxExclusiveLodCoord - glm::ivec3(1), lod) + glm::ivec3(step - 1);
 
-    // Compute sun shadow up-front so enclosure can dissolve where sun reaches.
-    float sunIntensity = shadow.shadowConfig.x;
-    float sunShadow = 1.0;
-    if (lighting.sunDirection.w > 0.0 && sunIntensity > 0.001) {
-        float rawShadow = sampleSunShadow(fragWorldPos, shadingNormal);
-        float sunAreaRadius = shadow.diagConfig.z;
-        if (sunAreaRadius > 0.0) {
-            float horizDist = length(fragWorldPos.xz - camera.cameraPos.xz);
-            float fade = smoothstep(sunAreaRadius * 0.85, sunAreaRadius, horizDist);
-            rawShadow = mix(rawShadow, 1.0, fade);
-        }
-        sunShadow = 1.0 - sunIntensity * (1.0 - rawShadow);
-    }
-    float sunReach = sunShadow * lighting.sunDirection.w;
-
-    // Ambient enclosure: full (sunReach=0) so deep holes still go fully dark.
-    float ambientEnclosure = computeSkyEnclosure(fragWorldPos, shadingNormal, 0.0);
-    vec3 finalColor = shaded * lighting.sunColor.xyz * lighting.sunColor.w * ambientEnclosure;
-    if (skyEnclosureVisualizeEnabled()) {
-        outColor = vec4(skyEnclosureDebugColor(fragWorldPos, shadingNormal, sunReach), 1.0);
-        return;
-    }
-
-    if (lighting.sunDirection.w > 0.0) {
-        vec3 sunDir = normalize(lighting.sunDirection.xyz);
-        float diffuse = max(dot(shadingNormal, -sunDir), 0.0);
-        // Stepped inter-band transition (no gradients/dithering).
-        diffuse = quantizeBandsStepped(diffuse, 5.0, 1.0, 0.0, 0.10);
-        float lit = mix(0.52, 1.0, diffuse);
-
-        // Sun-direct enclosure: dissolved by sunReach so light visibly
-        // dispels the deep darkness (red → yellow) where sun rays hit,
-        // while unreached areas keep the deep darkness.
-        float sunEnclosure = computeSkyEnclosure(fragWorldPos, shadingNormal, sunReach);
-        finalColor += shaded * lighting.sunColor.xyz * lit * lighting.sunDirection.w * sunShadow * sunEnclosure;
-    }
-
-    // Add point lights (accumulate-then-quantize for organic light blending)
-    float totalBrightnessRawForAO = 0.0;
-
-    {
-        vec3  totalLightContrib = vec3(0.0);
-        float totalBrightness  = 0.0;
-        float totalBrightnessRaw = 0.0;
-        float shadowEvidence = 0.0;
-        float pulseEvidence = 0.0;
-        bool diagEnabled = (shadow.diagConfig.x > 0.5);
-        uvec2 diagPix = uvec2(gl_FragCoord.xy);
-        bool diagSample = diagEnabled && ((diagPix.x & 7u) == 0u) && ((diagPix.y & 7u) == 0u);
-        bool pointShadowsEnabled = (shadow.shadowConfig.y > 0.0);
-        float pointShadowMapSize = max(shadow.shadowConfig.w, 1.0);
-        const uint DIAG_SCALE = 64u;
-        // --- Clustered lighting: fetch bitmask for this fragment's cluster ---
-        uint clTileX = min(uint(gl_FragCoord.x / clusters.clusterTileDims.x), clusters.clusterGridDims.x - 1u);
-        uint clTileY = min(uint(gl_FragCoord.y / clusters.clusterTileDims.y), clusters.clusterGridDims.y - 1u);
-        float clViewDist = length(fragWorldPos - camera.cameraPos);
-        uint clSlice = clamp(uint(log(clViewDist / clusters.clusterZParams.x) * clusters.clusterZParams.w),
-                             0u, clusters.clusterGridDims.z - 1u);
-        uint clIdx = (clTileY * clusters.clusterGridDims.x + clTileX) * clusters.clusterGridDims.z + clSlice;
-        uint lightMask = (clIdx < clusters.clusterGridDims.w) ? clusters.clusterLightMasks[clIdx] : 0u;
-
-        while (lightMask != 0u) {
-            uint i = findLSB(lightMask);
-            lightMask &= lightMask - 1u; // clear lowest set bit
-
-            vec4 posRadius = lighting.pointLights[i].positionRadius;
-            vec4 colorIntensity = lighting.pointLights[i].colorIntensity;
-            vec2 pulseData = lighting.lightPulseData[i].xy;
-            vec3 lightPos = posRadius.xyz;
-            float lightRadius = posRadius.w;
-            vec3 lightColor = colorIntensity.xyz;
-            float lightIntensity = colorIntensity.w;
-            float pulseStrength = pulseData.x;
-            float breathScale = pulseData.y;
-            if (breathScale < 0.01) breathScale = 1.0;
-
-            vec4 contrib = calculatePointLightSmooth(
-                fragWorldPos,
-                shadingNormal,
-                shaded,
-                lightPos,
-                lightRadius,
-                lightColor,
-                lightIntensity,
-                pulseStrength,
-                breathScale,
-                i);
-            if (contrib.a <= MIN_LIGHT_BRIGHTNESS) continue;
-            if (diagSample) {
-                atomicAdd(shadow.pointShadowDiag[i].y, DIAG_SCALE);
+        for (const SurfacePaintStamp& stamp : m_surfacePaintStamps) {
+            if (surfaceStampTouchesBox(stamp, minLod0, maxLod0)) {
+                return true;
             }
-            totalBrightnessRaw += contrib.a;
-            float pulseStrengthNow = clamp(pulseStrength, 0.0, 1.0);
-            float breathPulseNow = clamp((pulseData.y - 1.0) / 0.45, 0.0, 1.0);
-            pulseEvidence = max(pulseEvidence, max(pulseStrengthNow, breathPulseNow));
+        }
+    }
 
-            float pointShadow = 1.0;
-            float shadowFarPlane = shadow.pointShadowInfo[i].y;
-            if (pointShadowsEnabled &&
-                shadow.pointShadowInfo[i].w > 0.0 &&
-                contrib.a >= MIN_SHADOW_BRIGHTNESS) {
-                if (diagSample) {
-                    atomicAdd(shadow.pointShadowDiag[i].x, DIAG_SCALE);
+    return false;
+}
+
+void TextureOverlayStore::clearTexture(const glm::ivec3& lodCoord, int lod) {
+    setTexture(lodCoord, lod, VoxelTextureData{});
+}
+
+// ---------------------------------------------------------------------------
+// Brush paint operations
+//
+// Strategy: we work in the *target LOD's voxel grid*.  The brush bounding box
+// is converted from LOD-0 to the target LOD once, and we iterate that
+// (smaller) volume directly.  This is dramatically cheaper than the previous
+// "iterate every LOD-0 voxel" approach for high LOD levels.
+// ---------------------------------------------------------------------------
+
+int TextureOverlayStore::paintSphere(const glm::ivec3& centerLod0,
+                                     int radiusVoxelsLod0,
+                                     int lod,
+                                     TextureType type,
+                                     uint8_t variant) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
+    if (radiusVoxelsLod0 <= 0) return 0;
+
+    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
+    // Ceiling-divide so a radius that doesn't divide evenly still covers
+    // every LOD cell touched by the LOD-0 sphere.
+    const int shift = lod;
+    const int rLod = (radiusVoxelsLod0 + (1 << shift) - 1) >> shift;
+    if (rLod <= 0) return 0;
+    const int rSq = rLod * rLod;
+
+    VoxelTextureData data(type, variant);
+    int written = 0;
+
+    std::unique_lock lock(m_mutex);
+    auto& map = m_lodMaps[lod];
+
+    for (int dz = -rLod; dz <= rLod; ++dz) {
+        for (int dy = -rLod; dy <= rLod; ++dy) {
+            for (int dx = -rLod; dx <= rLod; ++dx) {
+                if (dx*dx + dy*dy + dz*dz > rSq) continue;
+                glm::ivec3 v = centerLod + glm::ivec3(dx, dy, dz);
+                BrickKey key = voxelToBrick(v);
+                glm::ivec3 local = voxelLocalInBrick(v);
+                writeCellLocked(map, lod, key, local, data);
+                recordDirtyGPUCellLocked(lod, v, data);
+                refreshTransitionEdgesAroundCellLocked(map, lod, v);
+                for (const glm::ivec3& d : kNeighborDirs) {
+                    refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
                 }
-                bool highQualityShadow = (contrib.a >= HIGH_QUALITY_SHADOW_BRIGHTNESS);
-                pointShadow = samplePointShadow(
-                    fragWorldPos,
-                    shadingNormal,
-                    lightPos,
-                    i,
-                    shadowFarPlane,
-                    pointShadowMapSize,
-                    highQualityShadow);
-                shadowEvidence = max(shadowEvidence, 1.0 - pointShadow);
-                if (pointShadow <= 0.0) {
-                    if (diagSample) {
-                        atomicAdd(shadow.pointShadowDiag[i].z, DIAG_SCALE);
-                    }
+                ++written;
+            }
+        }
+    }
+    if (written) m_generation.fetch_add(1, std::memory_order_release);
+    return written;
+}
+
+int TextureOverlayStore::paintBox(const glm::ivec3& minLod0,
+                                  const glm::ivec3& maxLod0,
+                                  int lod,
+                                  TextureType type,
+                                  uint8_t variant) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
+
+    glm::ivec3 a = lod0ToLOD(minLod0, lod);
+    glm::ivec3 b = lod0ToLOD(maxLod0, lod);
+    glm::ivec3 mn(std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z));
+    glm::ivec3 mx(std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z));
+
+    VoxelTextureData data(type, variant);
+    int written = 0;
+
+    std::unique_lock lock(m_mutex);
+    auto& map = m_lodMaps[lod];
+
+    for (int z = mn.z; z <= mx.z; ++z) {
+        for (int y = mn.y; y <= mx.y; ++y) {
+            for (int x = mn.x; x <= mx.x; ++x) {
+                glm::ivec3 v(x, y, z);
+                writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v), data);
+                recordDirtyGPUCellLocked(lod, v, data);
+                refreshTransitionEdgesAroundCellLocked(map, lod, v);
+                for (const glm::ivec3& d : kNeighborDirs) {
+                    refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
+                }
+                ++written;
+            }
+        }
+    }
+    if (written) m_generation.fetch_add(1, std::memory_order_release);
+    return written;
+}
+
+int TextureOverlayStore::paintFaceDisc(const glm::ivec3& centerLod0,
+                                       int radiusVoxelsLod0,
+                                       int normalAxis,
+                                       int lod,
+                                       TextureType type,
+                                       uint8_t variant,
+                                       uint8_t face,
+                                       int maxCells) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
+    if (radiusVoxelsLod0 <= 0 || maxCells <= 0) return 0;
+
+    face = static_cast<uint8_t>(face % 6u);
+    normalAxis = std::clamp(normalAxis, 0, 2);
+    const int uAxis = (normalAxis == 0) ? 1 : 0;
+    const int vAxis = (normalAxis == 2) ? 1 : 2;
+    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
+    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
+    if (rLod <= 0) return 0;
+
+    const int rSq = rLod * rLod;
+    int candidateCells = 0;
+    for (int v = -rLod; v <= rLod; ++v) {
+        for (int u = -rLod; u <= rLod; ++u) {
+            if (u * u + v * v <= rSq) ++candidateCells;
+        }
+    }
+    if (candidateCells > maxCells) return 0;
+
+    int written = 0;
+    std::unique_lock lock(m_mutex);
+    auto& map = m_lodMaps[lod];
+
+    for (int v = -rLod; v <= rLod; ++v) {
+        for (int u = -rLod; u <= rLod; ++u) {
+            if (u * u + v * v > rSq) continue;
+            glm::ivec3 coord = centerLod;
+            coord[uAxis] += u;
+            coord[vAxis] += v;
+            VoxelTextureData data(type, variedVariant(coord, face, type, variant), 0, face);
+            const glm::ivec3 storageCoord = encodeFaceCoord(coord, face);
+            writeCellLocked(map, lod, voxelToBrick(storageCoord), voxelLocalInBrick(storageCoord), data);
+            recordDirtyGPUCellLocked(lod, coord, data);
+            ++written;
+        }
+    }
+
+    const int inner = std::max(0, rLod - 1);
+    const int innerSq = inner * inner;
+    const int outer = rLod + 1;
+    const int outerSq = outer * outer;
+    for (int v = -outer; v <= outer; ++v) {
+        for (int u = -outer; u <= outer; ++u) {
+            const int dSq = u * u + v * v;
+            if (dSq > outerSq || dSq < innerSq) continue;
+            glm::ivec3 coord = centerLod;
+            coord[uAxis] += u;
+            coord[vAxis] += v;
+            refreshTransitionEdgesAroundFaceLocked(map, lod, coord, face);
+        }
+    }
+
+    if (written) m_generation.fetch_add(1, std::memory_order_release);
+    return written;
+}
+
+int TextureOverlayStore::paintFaceRect(const glm::ivec3& centerLod0,
+                                       int radiusVoxelsLod0,
+                                       int normalAxis,
+                                       int lod,
+                                       TextureType type,
+                                       uint8_t variant,
+                                       uint8_t face,
+                                       int maxCells) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled) return 0;
+    if (radiusVoxelsLod0 <= 0 || maxCells <= 0) return 0;
+
+    face = static_cast<uint8_t>(face % 6u);
+    normalAxis = std::clamp(normalAxis, 0, 2);
+    const int uAxis = (normalAxis == 0) ? 1 : 0;
+    const int vAxis = (normalAxis == 2) ? 1 : 2;
+    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
+    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
+    if (rLod <= 0) return 0;
+
+    const int side = rLod * 2 + 1;
+    const int64_t candidateCells = static_cast<int64_t>(side) * static_cast<int64_t>(side);
+    if (candidateCells > maxCells) return 0;
+
+    int written = 0;
+    std::unique_lock lock(m_mutex);
+    auto& map = m_lodMaps[lod];
+
+    for (int v = -rLod; v <= rLod; ++v) {
+        for (int u = -rLod; u <= rLod; ++u) {
+            glm::ivec3 coord = centerLod;
+            coord[uAxis] += u;
+            coord[vAxis] += v;
+            VoxelTextureData data(type, variedVariant(coord, face, type, variant), 0, face);
+            const glm::ivec3 storageCoord = encodeFaceCoord(coord, face);
+            writeCellLocked(map, lod, voxelToBrick(storageCoord), voxelLocalInBrick(storageCoord), data);
+            recordDirtyGPUCellLocked(lod, coord, data);
+            ++written;
+        }
+    }
+
+    const int outer = rLod + 1;
+    const int inner = std::max(0, rLod - 1);
+    for (int v = -outer; v <= outer; ++v) {
+        for (int u = -outer; u <= outer; ++u) {
+            if (std::abs(u) < inner && std::abs(v) < inner) continue;
+            glm::ivec3 coord = centerLod;
+            coord[uAxis] += u;
+            coord[vAxis] += v;
+            refreshTransitionEdgesAroundFaceLocked(map, lod, coord, face);
+        }
+    }
+
+    if (written) m_generation.fetch_add(1, std::memory_order_release);
+    return written;
+}
+
+int TextureOverlayStore::paintSurfaceFaces(const std::vector<SurfaceFaceStamp>& faces,
+                                           int lod,
+                                           TextureType type,
+                                           uint8_t variant) {
+    if (!isLodValid(lod) || !m_lodConfigs[lod].enabled || faces.empty()) return 0;
+
+    // Huge brush stamps must be authoring-fast. Transition edge masks are
+    // cosmetic material-boundary metadata; refreshing them through an
+    // unordered_set for every changed cell is exactly the wrong cost model for
+    // 50k-300k cell stamps. Large stamps skip transition refresh in the
+    // interactive path. The procedural material remains correct; only fancy
+    // edge blending may be absent until a future offline/idle edge pass.
+    constexpr size_t kLargeInteractiveStampThreshold = 32768u;
+    const bool fastLargeStamp = faces.size() >= kLargeInteractiveStampThreshold;
+
+    int written = 0;
+
+    std::unique_lock lock(m_mutex);
+    auto& map = m_lodMaps[lod];
+
+    if (fastLargeStamp) {
+        for (const SurfaceFaceStamp& faceStamp : faces) {
+            const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
+            const VoxelTextureData data(type, variedVariant(faceStamp.lodCoord, face, type, variant), 0, face);
+            const glm::ivec3 storageCoord = encodeFaceCoord(faceStamp.lodCoord, face);
+
+            if (const TextureBrick* existingBrick = getBrickLocked(map, voxelToBrick(storageCoord))) {
+                const glm::ivec3 local = voxelLocalInBrick(storageCoord);
+                const VoxelTextureData existing =
+                    existingBrick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
+                if (!existing.isEmpty() &&
+                    existing.getType() == data.getType() &&
+                    existing.getVariant() == data.getVariant() &&
+                    existing.getFace() == data.getFace()) {
                     continue;
                 }
             }
 
-            totalLightContrib += contrib.rgb * pointShadow;
-            totalBrightness  += contrib.a * pointShadow;
-            if (diagSample) {
-                atomicAdd(shadow.pointShadowDiag[i].w, DIAG_SCALE);
+            writeCellLocked(map,
+                            lod,
+                            voxelToBrick(storageCoord),
+                            voxelLocalInBrick(storageCoord),
+                            data);
+            recordDirtyGPUCellLocked(lod, faceStamp.lodCoord, data);
+            ++written;
+        }
+
+        if (written) m_generation.fetch_add(1, std::memory_order_release);
+        return written;
+    }
+
+    std::vector<SurfaceFaceStamp> changedFaces;
+    changedFaces.reserve(faces.size());
+
+    // Boundary-only transition refresh acceleration. For one brush stroke,
+    // every changed face is usually painted to the same material. Interior
+    // changed-vs-changed neighbors cannot form a transition boundary, so there
+    // is no reason to refresh all 5 cells around every painted face.
+    std::unordered_set<glm::ivec3, IVec3Hash> changedStorageCoords;
+    changedStorageCoords.reserve(faces.size() * 2u + 16u);
+
+    for (const SurfaceFaceStamp& faceStamp : faces) {
+        const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
+        const VoxelTextureData data(type, variedVariant(faceStamp.lodCoord, face, type, variant), 0, face);
+        const glm::ivec3 storageCoord = encodeFaceCoord(faceStamp.lodCoord, face);
+
+        if (const TextureBrick* existingBrick = getBrickLocked(map, voxelToBrick(storageCoord))) {
+            const glm::ivec3 local = voxelLocalInBrick(storageCoord);
+            const VoxelTextureData existing =
+                existingBrick->cells[TextureBrick::toIndex(local.x, local.y, local.z)];
+            if (!existing.isEmpty() &&
+                existing.getType() == data.getType() &&
+                existing.getVariant() == data.getVariant() &&
+                existing.getFace() == data.getFace()) {
+                continue;
             }
         }
 
-        totalBrightnessRawForAO = totalBrightness;
+        writeCellLocked(map,
+                        lod,
+                        voxelToBrick(storageCoord),
+                        voxelLocalInBrick(storageCoord),
+                        data);
+        recordDirtyGPUCellLocked(lod, faceStamp.lodCoord, data);
+        changedFaces.push_back(faceStamp);
+        changedStorageCoords.insert(storageCoord);
+        ++written;
+    }
 
-        if (totalBrightnessRaw > 0.001) {
-            float clampedBright = clamp(totalBrightness, 0.0, 2.0);
-            float clampedBrightRaw = clamp(totalBrightnessRaw, 0.0, 2.0);
-            float shadowOcclusion = 0.0;
-            if (clampedBrightRaw > 0.001) {
-                shadowOcclusion = clamp(1.0 - (clampedBright / clampedBrightRaw), 0.0, 1.0);
+    for (const SurfaceFaceStamp& faceStamp : changedFaces) {
+        const uint8_t face = static_cast<uint8_t>(faceStamp.face % 6u);
+
+        int uAxis = 0;
+        int vAxis = 1;
+        facePlaneAxes(face, uAxis, vAxis);
+
+        glm::ivec3 neighborOffsets[4]{};
+        neighborOffsets[0][uAxis] =  1;
+        neighborOffsets[1][uAxis] = -1;
+        neighborOffsets[2][vAxis] =  1;
+        neighborOffsets[3][vAxis] = -1;
+
+        bool isBoundary = false;
+        for (const glm::ivec3& offset : neighborOffsets) {
+            const glm::ivec3 neighborStorage =
+                encodeFaceCoord(faceStamp.lodCoord + offset, face);
+            if (changedStorageCoords.find(neighborStorage) == changedStorageCoords.end()) {
+                isBoundary = true;
+                break;
             }
+        }
 
-            if (clampedBright > 0.0001) {
-                const float LIGHT_BANDS = 8.0;
-                const float MAX_STYLIZED_BRIGHT = 2.0;
-                float brightNorm = clamp(clampedBright / MAX_STYLIZED_BRIGHT, 0.0, 1.0);
-                float brightBoost = smoothstep(0.35, 1.0, brightNorm) * 0.24;
-                float bandInput = min(clampedBright * (1.0 + brightBoost), MAX_STYLIZED_BRIGHT);
+        if (!isBoundary) {
+            continue;
+        }
 
-                // Fade shadow-only edge treatment from the visible stepped band
-                // field, not from blocked raw light. This keeps cross-light
-                // washout aligned to the real orb rings and avoids leaking the
-                // caster's hidden light back into its own ground shadow.
-                float visibleShadowBand = quantizeBandsStepped(
-                    bandInput,
-                    LIGHT_BANDS,
-                    MAX_STYLIZED_BRIGHT,
-                    0.0,
-                    0.08);
-                float shadowRetain = clamp(
-                    1.0 - (visibleShadowBand / MAX_STYLIZED_BRIGHT),
-                    0.0,
-                    1.0);
-                shadowEvidence *= shadowRetain;
-                shadowOcclusion *= shadowRetain;
-
-                if (clampedBright < FAST_STYLIZATION_BRIGHTNESS) {
-                    float fastBand = quantizeBandsStepped(
-                        clampedBright,
-                        LIGHT_BANDS,
-                        MAX_STYLIZED_BRIGHT,
-                        0.0,
-                        0.08);
-                    float fastScale = fastBand / max(clampedBright, 0.001);
-                    totalLightContrib *= fastScale;
-                } else {
-                    float stableBand = quantizeBandsStepped(
-                        bandInput,
-                        LIGHT_BANDS,
-                        MAX_STYLIZED_BRIGHT,
-                        0.0,
-                        0.08);
-
-                    // Keep DCCM ground shadows clean: use the same stable stepped
-                    // band field for the visible light and the shadow suppression
-                    // logic. This removes the dotted/glitter edge artifact and
-                    // stops shadow bands from drifting away from the actual orb
-                    // band shape on the terrain.
-                    float scale = stableBand / max(clampedBright, 0.001);
-                    totalLightContrib *= scale;
-                }
-            }
-
-            finalColor += totalLightContrib;
+        refreshTransitionEdgesAroundFaceLocked(map, lod, faceStamp.lodCoord, face);
+        for (const glm::ivec3& offset : neighborOffsets) {
+            refreshTransitionEdgesAroundFaceLocked(map, lod, faceStamp.lodCoord + offset, face);
         }
     }
 
-    // AO wash-out from light orbs — aggressive stepped recovery.
-    // Sqrt curve makes even moderate light visibly eat into AO shadows.
-    if (totalBrightnessRawForAO > 0.001 && savedAoMul < 0.999) {
-        float bandForAO = floor(clamp(totalBrightnessRawForAO / 2.0, 0.0, 1.0) * 8.0);
-        float aoFade = sqrt(clamp(bandForAO / 8.0, 0.0, 1.0));
-        if (aoFade > 0.0) {
-            float aoRecovery = 1.0 / max(savedAoMul, 0.001);
-            finalColor *= mix(1.0, aoRecovery, aoFade);
-        }
-    }
-
-    float fogDensity = lighting.skyColor.w;
-    if (fogDensity > 0.0) {
-        float distance = length(fragWorldPos - camera.cameraPos);
-        float fogFactor = clamp(exp(-fogDensity * distance), 0.0, 1.0);
-        finalColor = mix(lighting.skyColor.xyz, finalColor, fogFactor);
-    }
-
-    // ── Sun shadow debug visualization ────────────────────────────────
-    // diagConfig.y == 5 → tint terrain by which cascade samples it.
-    // Palette MUST match shaders/common/shadow_sampling.glsl
-    // cascadeDebugColor() and DirectionalShadowWindow.cpp cascadeColor()
-    // so wireframe boxes and on-terrain coloring use the SAME color.
-    if (lighting.sunDirection.w > 0.0 && shadow.diagConfig.y > 4.5 && shadow.diagConfig.y < 5.5) {
-        float horizontalDistance = length(fragWorldPos.xz - camera.cameraPos.xz);
-        uint cascade = chooseSunCascadeForSample(fragWorldPos, horizontalDistance);
-        vec3 tint;
-        if      (cascade == 0u) tint = vec3(1.00, 0.25, 0.25);
-        else if (cascade == 1u) tint = vec3(1.00, 0.65, 0.20);
-        else if (cascade == 2u) tint = vec3(1.00, 1.00, 0.30);
-        else if (cascade == 3u) tint = vec3(0.30, 1.00, 0.40);
-        else if (cascade == 4u) tint = vec3(0.30, 0.85, 1.00);
-        else                    tint = vec3(1.00, 0.40, 1.00);
-        vec3 sunDir = shadow.sunDirTexelSize.xyz;
-        float diffuse = max(dot(shadingNormal, -sunDir), 0.0);
-        float lit = mix(0.55, 1.0, diffuse);
-        outColor = vec4(tint * lit, 1.0);
-        return;
-    }
-
-    outColor = vec4(finalColor, 1.0);
+    if (written) m_generation.fetch_add(1, std::memory_order_release);
+    return written;
 }
 
-````
+int TextureOverlayStore::clearSphere(const glm::ivec3& centerLod0,
+                                     int radiusVoxelsLod0,
+                                     int lod) {
+    if (!isLodValid(lod)) return 0;
+    if (radiusVoxelsLod0 <= 0) return 0;
 
-## FUNCTION src/world/World.cpp :: World::markTextureMaterialsDirty
+    const glm::ivec3 centerLod = lod0ToLOD(centerLod0, lod);
+    const int rLod = (radiusVoxelsLod0 + (1 << lod) - 1) >> lod;
+    if (rLod <= 0) return 0;
+    const int rSq = rLod * rLod;
 
-Source: src/world/World.cpp lines 511-525
+    int cleared = 0;
+    std::unique_lock lock(m_mutex);
+    requestFullGPUUploadLocked();
+    auto& map = m_lodMaps[lod];
+    for (int dz = -rLod; dz <= rLod; ++dz)
+    for (int dy = -rLod; dy <= rLod; ++dy)
+    for (int dx = -rLod; dx <= rLod; ++dx) {
+        if (dx*dx + dy*dy + dz*dz > rSq) continue;
+        glm::ivec3 v = centerLod + glm::ivec3(dx, dy, dz);
+        writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v),
+                        VoxelTextureData{});
+        for (const glm::ivec3& d : kNeighborDirs) {
+            refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
+        }
+        ++cleared;
+    }
+    if (cleared) m_generation.fetch_add(1, std::memory_order_release);
+    return cleared;
+}
 
-````cpp
-void World::markTextureMaterialsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks) {
-    if (touchedChunks.empty()) return;
+int TextureOverlayStore::clearBox(const glm::ivec3& minLod0,
+                                  const glm::ivec3& maxLod0,
+                                  int lod) {
+    if (!isLodValid(lod)) return 0;
+    glm::ivec3 a = lod0ToLOD(minLod0, lod);
+    glm::ivec3 b = lod0ToLOD(maxLod0, lod);
+    glm::ivec3 mn(std::min(a.x, b.x), std::min(a.y, b.y), std::min(a.z, b.z));
+    glm::ivec3 mx(std::max(a.x, b.x), std::max(a.y, b.y), std::max(a.z, b.z));
 
-    // Texture paint changes material only, not occupancy/collision.
+    int cleared = 0;
+    std::unique_lock lock(m_mutex);
+    requestFullGPUUploadLocked();
+    auto& map = m_lodMaps[lod];
+    for (int z = mn.z; z <= mx.z; ++z)
+    for (int y = mn.y; y <= mx.y; ++y)
+    for (int x = mn.x; x <= mx.x; ++x) {
+        glm::ivec3 v(x, y, z);
+        writeCellLocked(map, lod, voxelToBrick(v), voxelLocalInBrick(v),
+                        VoxelTextureData{});
+        for (const glm::ivec3& d : kNeighborDirs) {
+            refreshTransitionEdgesAroundCellLocked(map, lod, v + d);
+        }
+        ++cleared;
+    }
+    if (cleared) m_generation.fetch_add(1, std::memory_order_release);
+    return cleared;
+}
+
+int TextureOverlayStore::cascadeToCoarserLODs(const glm::ivec3& centerLod0,
+                                              int radiusVoxelsLod0,
+                                              int sourceLod,
+                                              TextureType type,
+                                              uint8_t variant) {
+    int total = 0;
+    for (int l = sourceLod + 1; l < LOD_COUNT; ++l) {
+        if (!m_lodConfigs[l].enabled) continue;
+        total += paintSphere(centerLod0, radiusVoxelsLod0, l, type, variant);
+    }
+    return total;
+}
+
+int TextureOverlayStore::cascadeFaceToCoarserLODs(const glm::ivec3& centerLod0,
+                                                  int radiusVoxelsLod0,
+                                                  int normalAxis,
+                                                  int sourceLod,
+                                                  SurfaceBrushShape shape,
+                                                  TextureType type,
+                                                  uint8_t variant,
+                                                  uint8_t face,
+                                                  int maxCellsPerLOD) {
+    int total = 0;
+    for (int l = sourceLod + 1; l < LOD_COUNT; ++l) {
+        if (!m_lodConfigs[l].enabled) continue;
+        if (shape == SurfaceBrushShape::Disc) {
+            total += paintFaceDisc(centerLod0, radiusVoxelsLod0, normalAxis,
+                                   l, type, variant, face, maxCellsPerLOD);
+        } else {
+            total += paintFaceRect(centerLod0, radiusVoxelsLod0, normalAxis,
+                                   l, type, variant, face, maxCellsPerLOD);
+        }
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------------------
+// Stats / state
+// ---------------------------------------------------------------------------
+
+TextureOverlayStore::Stats TextureOverlayStore::getStats() const {
+    Stats s{};
+    std::shared_lock lock(m_mutex);
+    s.generation = m_generation.load(std::memory_order_acquire);
+    s.surfaceStampCount = m_surfacePaintStamps.size();
+    for (int lod = 0; lod < LOD_COUNT; ++lod) {
+        s.bricksByLOD[lod] = m_brickCountsByLOD[lod];
+        s.cellsByLOD[lod] = m_cellCountsByLOD[lod];
+        s.totalBricks += s.bricksByLOD[lod];
+        s.totalCells += s.cellsByLOD[lod];
+    }
+    return s;
+}
+
+size_t TextureOverlayStore::exportGPUCells(std::vector<GPUCell>& out, size_t maxCells) const {
+    (void)maxCells;
+
+    // Disabled by design.
     //
-    // Route it through a dedicated material-dirty queue instead of the normal
-    // terrain-edit dirty queue. The normal fast-edit path intentionally bumps
-    // chunk versions to cancel obsolete topology work; for texture paint spam
-    // that cancellation policy can invalidate the very uploads that would make
-    // the brush visible. Material dirties are coalesced until the current
-    // visual upload/swap for a chunk has landed, then the latest stamp state is
-    // rebaked once.
-    markRuntimeVoxelChunks(touchedChunks);
-    m_editRemeshScheduler.markMaterialChunksDirty(touchedChunks);
+    // The old path exported every painted voxel face into a global GPU hash
+    // table. With millions of brush cells this becomes a terrain/light-pass
+    // tax even when the world itself can render fully textured at native speed.
+    //
+    // Painting now stays in the CPU sparse store and is made visible by rebaking
+    // affected chunks into the compact per-vertex material stream. Returning
+    // zero here keeps the shader overlay table empty, so unbaked/normal terrain
+    // remains on the procedural/native fast path.
+    out.clear();
+    return 0;
 }
-````
 
+size_t TextureOverlayStore::exportGPUCellsForLOD(int lod,
+                                                 std::vector<GPUCell>& out,
+                                                 size_t maxCells) const {
+    (void)lod;
+    (void)maxCells;
 
-## FUNCTION src/world/World*.cpp :: World::beginTerrainEditVisualTracking
-
-Resolved FUNCTION target to 13 candidate files. Exporting only matching function bodies.
-
-Source: src/world/WorldTerrainEditCollision.cpp lines 240-264
-
-````cpp
-void World::beginTerrainEditVisualTracking(
-    uint64_t editId,
-    const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks,
-    const std::chrono::steady_clock::time_point& startTime)
-{
-    PendingEditVisualAggregate agg{};
-    agg.startTime = startTime;
-    agg.totalChunks = static_cast<uint32_t>(std::min<size_t>(touchedChunks.size(), UINT32_MAX));
-    m_pendingEditVisuals[editId] = agg;
-
-    for (const auto& chunkCoord : touchedChunks) {
-        auto existing = m_pendingEditVisualChunks.find(chunkCoord);
-        if (existing != m_pendingEditVisualChunks.end() && existing->second.editId != editId) {
-            auto oldAggIt = m_pendingEditVisuals.find(existing->second.editId);
-            if (oldAggIt != m_pendingEditVisuals.end() &&
-                (oldAggIt->second.readyChunks + oldAggIt->second.supersededChunks) < oldAggIt->second.totalChunks) {
-                ++oldAggIt->second.supersededChunks;
-                syncTerrainEditVisualState(existing->second.editId, /*eraseIfComplete=*/true);
-            }
-        }
-        m_pendingEditVisualChunks[chunkCoord] = PendingEditVisualChunk{editId, startTime};
-    }
-
-    syncTerrainEditVisualState(editId, /*eraseIfComplete=*/false);
+    // Same as exportGPUCells(): no per-cell material overlay is uploaded to the
+    // GPU. LOD-specific painted data is still stored for persistence/tools and
+    // for chunk material rebake, but it must not become a fragment shader hash
+    // table.
+    out.clear();
+    return 0;
 }
-````
 
+size_t TextureOverlayStore::consumeDirtyGPUCells(std::vector<GPUCell>& out,
+                                                 size_t maxCells,
+                                                 bool& requiresFullUpload) {
+    out.clear();
+    requiresFullUpload = false;
 
-## FUNCTION src/world/World*.cpp :: World::noteChunkVisualReady
+    std::unique_lock lock(m_mutex);
+    if (m_dirtyGPUFullUpload || m_dirtyGPUCells.size() > maxCells) {
+        requiresFullUpload = true;
+        m_dirtyGPUCells.clear();
+        m_dirtyGPUFullUpload = false;
+        return 0;
+    }
 
-Resolved FUNCTION target to 13 candidate files. Exporting only matching function bodies.
+    out.swap(m_dirtyGPUCells);
+    m_dirtyGPUCells.clear();
+    return out.size();
+}
 
-Source: src/world/WorldTerrainEditCollision.cpp lines 323-718
+bool TextureOverlayStore::isEmpty() const {
+    std::shared_lock lock(m_mutex);
+    if (!m_surfacePaintStamps.empty()) {
+        return false;
+    }
+    for (size_t cells : m_cellCountsByLOD) {
+        if (cells != 0u) return false;
+    }
+    return true;
+}
 
-````cpp
-void World::noteChunkVisualReady(
-    const glm::ivec3& coord,
-    const std::chrono::steady_clock::time_point& uploadEnqueueTime,
-    const std::chrono::steady_clock::time_point& finalizeTime,
-    int lodLevel,
-    uint64_t vramBytes,
-    uint32_t vertexCount,
-    uint32_t indexCount,
-    const ChunkDebugAttribution* debugInfo)
-{
-    const float pipelineMs = (uploadEnqueueTime == std::chrono::steady_clock::time_point{})
-        ? 0.0f
-        : std::chrono::duration<float, std::milli>(finalizeTime - uploadEnqueueTime).count();
+void TextureOverlayStore::clear() {
+    std::unique_lock lock(m_mutex);
+    for (auto& map : m_lodMaps) map.clear();
+    m_brickCountsByLOD.fill(0u);
+    m_cellCountsByLOD.fill(0u);
+    m_surfacePaintStamps.clear();
+    m_surfacePaintStampChunkIndex.clear();
+    m_nextSurfacePaintStampOrder = 1u;
+    requestFullGPUUploadLocked();
+    m_generation.fetch_add(1, std::memory_order_release);
+}
 
-    auto mergeMissingDebug = [](ChunkDebugAttribution& dst, const ChunkDebugAttribution& src) {
-        if (dst.artifactSource == ChunkArtifactSource::Unknown &&
-            src.artifactSource != ChunkArtifactSource::Unknown) {
-            dst.artifactSource = src.artifactSource;
-        }
-        if (dst.collisionSource == ChunkCollisionSource::Unknown &&
-            src.collisionSource != ChunkCollisionSource::Unknown) {
-            dst.collisionSource = src.collisionSource;
-        }
-        if (dst.residency == ChunkResidencyKind::Unknown &&
-            src.residency != ChunkResidencyKind::Unknown) {
-            dst.residency = src.residency;
-        }
-        if (dst.workModel == ChunkWorkModel::Unknown &&
-            src.workModel != ChunkWorkModel::Unknown) {
-            dst.workModel = src.workModel;
-        }
-        if (dst.meshMode == 0xFF && src.meshMode != 0xFF) {
-            dst.meshMode = src.meshMode;
-        }
-        if (dst.subChunkCount == 0 && src.subChunkCount != 0) {
-            dst.subChunkCount = src.subChunkCount;
-        }
-        if (dst.dirtyPages == 0 && src.dirtyPages != 0) {
-            dst.dirtyPages = src.dirtyPages;
-        }
-        if (dst.rebuiltPages == 0 && src.rebuiltPages != 0) {
-            dst.rebuiltPages = src.rebuiltPages;
-        }
-        if (dst.residentPages == 0 && src.residentPages != 0) {
-            dst.residentPages = src.residentPages;
-        }
-        if (dst.evictedPages == 0 && src.evictedPages != 0) {
-            dst.evictedPages = src.evictedPages;
-        }
-        if (dst.artifactGeneration == 0 && src.artifactGeneration != 0) {
-            dst.artifactGeneration = src.artifactGeneration;
-        }
-        if (dst.uploadBytes == 0 && src.uploadBytes != 0) {
-            dst.uploadBytes = src.uploadBytes;
-        }
-        dst.artifactCacheHit = dst.artifactCacheHit || src.artifactCacheHit;
-        dst.artifactCacheResident = dst.artifactCacheResident || src.artifactCacheResident;
-        dst.fromLodBatch = dst.fromLodBatch || src.fromLodBatch;
-        dst.fromTerrainEdit = dst.fromTerrainEdit || src.fromTerrainEdit;
-    };
+void TextureOverlayStore::clearLOD(int lod) {
+    if (!isLodValid(lod)) return;
+    std::unique_lock lock(m_mutex);
+    m_lodMaps[lod].clear();
+    m_brickCountsByLOD[lod] = 0u;
+    m_cellCountsByLOD[lod] = 0u;
+    if (lod == 0) {
+        m_surfacePaintStamps.clear();
+        m_surfacePaintStampChunkIndex.clear();
+        m_nextSurfacePaintStampOrder = 1u;
+    }
+    requestFullGPUUploadLocked();
+    m_generation.fetch_add(1, std::memory_order_release);
+}
 
-    auto inferWorkModel = [](uint8_t meshMode) {
-        if (meshMode == static_cast<uint8_t>(ChunkMeshMode::PagedEditable) ||
-            meshMode == static_cast<uint8_t>(ChunkMeshMode::PagedConsolidating)) {
-            return ChunkWorkModel::PagedLocal;
-        }
-        if (meshMode != 0xFF) {
-            return ChunkWorkModel::MonolithicChunk;
-        }
-        return ChunkWorkModel::Unknown;
-    };
+// ---------------------------------------------------------------------------
+// Persistence
+// File layout:
+//   magic(4) version(4)
+//   For each LOD: pixelsPerVoxel(2) enabled(1) pad(1) brickCount(4)
+//     For each brick: key(12) activeCount(4) cells(512)
+// ---------------------------------------------------------------------------
 
-    ChunkDebugAttribution resolvedDebug = debugInfo ? *debugInfo : ChunkDebugAttribution{};
-    bool gpuResident = false;
-    bool pendingBatchResident = false;
-    const bool needsRegistryProbe =
-        resolvedDebug.meshMode == 0xFF ||
-        resolvedDebug.subChunkCount == 0 ||
-        resolvedDebug.uploadBytes == 0 ||
-        resolvedDebug.residency == ChunkResidencyKind::Unknown ||
-        resolvedDebug.residency == ChunkResidencyKind::PendingBatch;
-    if (needsRegistryProbe) {
-        const entt::entity entity = findChunk(coord);
-        if (entity != entt::null) {
-            std::shared_lock regLock(m_registryMutex);
-            if (m_registry.valid(entity)) {
-                if (m_registry.all_of<Chunk>(entity)) {
-                    const auto& chunk = m_registry.get<Chunk>(entity);
-                    if (resolvedDebug.meshMode == 0xFF) {
-                        resolvedDebug.meshMode = static_cast<uint8_t>(chunk.meshMode);
-                    }
-                }
-                if (m_registry.all_of<MeshHandle>(entity)) {
-                    const auto& mesh = m_registry.get<MeshHandle>(entity);
-                    gpuResident = true;
-                    if (resolvedDebug.subChunkCount == 0) {
-                        resolvedDebug.subChunkCount = mesh.subChunkCount;
-                    }
-                    if (resolvedDebug.uploadBytes == 0) {
-                        resolvedDebug.uploadBytes = mesh.vb.size + mesh.ib.size;
-                    }
-                }
-                if (m_registry.all_of<PendingMeshHandle>(entity)) {
-                    const auto& pending = m_registry.get<PendingMeshHandle>(entity);
-                    pendingBatchResident = true;
-                    mergeMissingDebug(resolvedDebug, pending.debugInfo);
-                }
-            }
+static constexpr uint32_t TEXTURE_OVERLAY_MAGIC = 0x54585050; // "TXPP"
+static constexpr uint32_t TEXTURE_OVERLAY_VERSION = 3;
+
+bool TextureOverlayStore::saveToFile(const char* path) const {
+    std::shared_lock lock(m_mutex);
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+
+    uint32_t magic = TEXTURE_OVERLAY_MAGIC;
+    uint32_t ver = 4u;
+    f.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    f.write(reinterpret_cast<const char*>(&ver), sizeof(ver));
+
+    uint32_t lodCount = LOD_COUNT;
+    f.write(reinterpret_cast<const char*>(&lodCount), sizeof(lodCount));
+
+    for (int lod = 0; lod < LOD_COUNT; ++lod) {
+        const auto& cfg = m_lodConfigs[lod];
+        uint16_t res = cfg.pixelsPerVoxel;
+        uint8_t en = cfg.enabled ? 1 : 0;
+        uint8_t pad = 0;
+        f.write(reinterpret_cast<const char*>(&res), sizeof(res));
+        f.write(reinterpret_cast<const char*>(&en),  sizeof(en));
+        f.write(reinterpret_cast<const char*>(&pad), sizeof(pad));
+
+        const auto& map = m_lodMaps[lod];
+        uint32_t brickCount = static_cast<uint32_t>(map.size());
+        f.write(reinterpret_cast<const char*>(&brickCount), sizeof(brickCount));
+
+        for (const auto& [key, brick] : map) {
+            f.write(reinterpret_cast<const char*>(&key), sizeof(key));
+            f.write(reinterpret_cast<const char*>(&brick->activeCount),
+                    sizeof(brick->activeCount));
+            f.write(reinterpret_cast<const char*>(brick->cells.data()),
+                    sizeof(VoxelTextureData) * TextureBrick::CELLS);
         }
     }
 
-    if (resolvedDebug.collisionSource == ChunkCollisionSource::Unknown) {
-        if (lodLevel > 0) {
-            resolvedDebug.collisionSource = ChunkCollisionSource::None;
-        } else {
-            auto collisionIt = m_chunkCollisionSources.find(coord);
-            if (collisionIt != m_chunkCollisionSources.end()) {
-                resolvedDebug.collisionSource = collisionIt->second;
-            }
-        }
+    // Version 4: persist canonical deferred surface stamps. The live GPU stamp
+    // buffer is intentionally bounded, but the world/snapshot state must not be.
+    // LOD remeshes and snapshot reloads can now resolve the complete paint
+    // history from this canonical list instead of only the newest live entries.
+    const uint32_t stampCount = (m_surfacePaintStamps.size() > static_cast<size_t>(UINT32_MAX))
+        ? UINT32_MAX
+        : static_cast<uint32_t>(m_surfacePaintStamps.size());
+    f.write(reinterpret_cast<const char*>(&stampCount), sizeof(stampCount));
+
+    for (uint32_t i = 0; i < stampCount; ++i) {
+        const SurfacePaintStamp& stamp = m_surfacePaintStamps[i];
+        f.write(reinterpret_cast<const char*>(&stamp.centerVoxelLod0.x), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&stamp.centerVoxelLod0.y), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&stamp.centerVoxelLod0.z), sizeof(float));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMinLod0.x), sizeof(int32_t));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMinLod0.y), sizeof(int32_t));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMinLod0.z), sizeof(int32_t));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMaxLod0.x), sizeof(int32_t));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMaxLod0.y), sizeof(int32_t));
+        f.write(reinterpret_cast<const char*>(&stamp.bboxMaxLod0.z), sizeof(int32_t));
+
+        int32_t radius = static_cast<int32_t>(stamp.radiusVoxelsLod0);
+        uint8_t shape = static_cast<uint8_t>(stamp.shape);
+        uint8_t type = static_cast<uint8_t>(stamp.type);
+        uint8_t variant = stamp.variant;
+        uint8_t sourceFace = stamp.sourceFace;
+        uint32_t order = stamp.order;
+
+        f.write(reinterpret_cast<const char*>(&radius), sizeof(radius));
+        f.write(reinterpret_cast<const char*>(&shape), sizeof(shape));
+        f.write(reinterpret_cast<const char*>(&type), sizeof(type));
+        f.write(reinterpret_cast<const char*>(&variant), sizeof(variant));
+        f.write(reinterpret_cast<const char*>(&sourceFace), sizeof(sourceFace));
+        f.write(reinterpret_cast<const char*>(&order), sizeof(order));
     }
-    if (resolvedDebug.artifactGeneration == 0 &&
-        resolvedDebug.artifactSource != ChunkArtifactSource::PrecomputedTerrain) {
-        const int effectiveLod = getEffectiveLODForChunk(coord, lodLevel);
-        const TerrainType terrainType = getTerrainTypeForChunk(coord, lodLevel);
-        const uint64_t artifactGen = getEditArtifactGeneration(coord, terrainType, effectiveLod);
-        if (artifactGen != 0) {
-            resolvedDebug.artifactGeneration = artifactGen;
-            resolvedDebug.artifactCacheResident = true;
-        }
-    }
-    if (resolvedDebug.workModel == ChunkWorkModel::Unknown) {
-        resolvedDebug.workModel = inferWorkModel(resolvedDebug.meshMode);
-    }
-    if (resolvedDebug.residency == ChunkResidencyKind::Unknown ||
-        resolvedDebug.residency == ChunkResidencyKind::PendingBatch) {
-        resolvedDebug.residency = deriveChunkResidencyKind(
-            gpuResident,
-            resolvedDebug.artifactCacheResident,
-            pendingBatchResident && !gpuResident);
-    }
-    if (resolvedDebug.uploadBytes == 0) {
-        resolvedDebug.uploadBytes = vramBytes;
-    }
 
-    ChunkVisualHistoryEntry visualEntry{};
-    visualEntry.sequence = m_chunkVisualHistory.totalCount + 1;
-    visualEntry.chunkCoord = coord;
-    visualEntry.lodLevel = lodLevel;
-    visualEntry.vramBytes = vramBytes;
-    visualEntry.vertexCount = vertexCount;
-    visualEntry.indexCount = indexCount;
-    visualEntry.pipelineMs = pipelineMs;
-    visualEntry.visibleMs = pipelineMs;
-    visualEntry.timestampSec = std::chrono::duration<float>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    visualEntry.uploadBytes = resolvedDebug.uploadBytes;
-    visualEntry.artifactGeneration = resolvedDebug.artifactGeneration;
-    visualEntry.artifactSource = resolvedDebug.artifactSource;
-    visualEntry.collisionSource = resolvedDebug.collisionSource;
-    visualEntry.residency = resolvedDebug.residency;
-    visualEntry.workModel = resolvedDebug.workModel;
-    visualEntry.meshMode = resolvedDebug.meshMode;
-    visualEntry.subChunkCount = resolvedDebug.subChunkCount;
-    visualEntry.dirtyPages = resolvedDebug.dirtyPages;
-    visualEntry.rebuiltPages = resolvedDebug.rebuiltPages;
-    visualEntry.residentPages = resolvedDebug.residentPages;
-    visualEntry.evictedPages = resolvedDebug.evictedPages;
-    visualEntry.artifactCacheHit = resolvedDebug.artifactCacheHit;
-    visualEntry.artifactCacheResident = resolvedDebug.artifactCacheResident;
-    visualEntry.fromLodBatch = resolvedDebug.fromLodBatch;
+    return f.good();
+}
 
-    auto pendingIt = m_pendingEditVisualChunks.find(coord);
-    if (pendingIt != m_pendingEditVisualChunks.end() &&
-        uploadEnqueueTime >= pendingIt->second.startTime) {
-        visualEntry.fromEdit = true;
-        visualEntry.editId = pendingIt->second.editId;
-        visualEntry.visibleMs = std::chrono::duration<float, std::milli>(
-            finalizeTime - pendingIt->second.startTime).count();
+bool TextureOverlayStore::loadFromFile(const char* path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
 
-        // Populate per-stage breakdown from the remesh scheduler's timing record
-        TerrainEdit::TerrainEditRemeshScheduler::ChunkTimingRecord timing;
-        if (m_editRemeshScheduler.consumeChunkTiming(coord, timing)) {
-            const auto editStart = pendingIt->second.startTime;
-            visualEntry.waitDispatchMs = std::chrono::duration<float, std::milli>(
-                timing.dispatchTime - editStart).count();
-            visualEntry.waitJobMs = std::chrono::duration<float, std::milli>(
-                timing.jobStartTime - timing.dispatchTime).count();
-            visualEntry.meshMs = std::chrono::duration<float, std::milli>(
-                timing.meshDoneTime - timing.jobStartTime).count();
-            visualEntry.waitDrainMs = std::chrono::duration<float, std::milli>(
-                timing.drainTime - timing.meshDoneTime).count();
-            visualEntry.uploadMs = std::chrono::duration<float, std::milli>(
-                finalizeTime - timing.drainTime).count();
-            visualEntry.isFastMode = timing.isFastMode;
-            visualEntry.meshLodLevel = timing.meshLodLevel;
+    uint32_t magic = 0, ver = 0;
+    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    f.read(reinterpret_cast<char*>(&ver), sizeof(ver));
+    constexpr uint32_t kTextureOverlayMaxReadableVersion = 4u;
+    if (magic != TEXTURE_OVERLAY_MAGIC || ver > kTextureOverlayMaxReadableVersion) return false;
 
-            // Mesh sub-stage breakdown + workload from MeshStats
-            visualEntry.cacheBuildMs  = timing.meshStats.cacheBuildMs;
-            visualEntry.greedyMeshMs  = timing.meshStats.greedyMeshMs;
-            visualEntry.postProcessMs = timing.meshStats.postProcessMs;
-            visualEntry.downsampleMs  = timing.meshStats.downsampleMs;
-            visualEntry.downsampleCacheState = timing.meshStats.downsampleCacheState;
-            visualEntry.bandLocalYMin = timing.meshStats.bandLocalYMin;
-            visualEntry.bandLocalYMax = timing.meshStats.bandLocalYMax;
-            visualEntry.bandActive    = timing.meshStats.bandActive;
-            visualEntry.bandFacesEmitted = timing.meshStats.bandFacesEmitted;
-            visualEntry.cacheVoxels   = timing.meshStats.cacheVoxels;
-            visualEntry.solidVoxels   = timing.meshStats.solidVoxels;
-            visualEntry.facesEmitted  = timing.meshStats.facesEmitted;
-            visualEntry.scanYRange    = timing.meshStats.scanYRange;
-            visualEntry.cacheDimXZ    = timing.meshStats.cacheDimXZ;
-            visualEntry.adaptiveEnabled = timing.meshStats.adaptiveEnabled;
-            visualEntry.adaptiveLeafRegions = timing.meshStats.adaptiveLeafRegions;
-            visualEntry.adaptiveSplitRegions = timing.meshStats.adaptiveSplitRegions;
-            visualEntry.adaptiveMaxDepth = timing.meshStats.adaptiveMaxDepth;
-            visualEntry.adaptivePeakRegionVoxels = timing.meshStats.adaptivePeakRegionVoxels;
-            visualEntry.adaptivePeakYRange = timing.meshStats.adaptivePeakYRange;
-            visualEntry.adaptiveWorkVoxels = timing.meshStats.adaptiveWorkVoxels;
-            visualEntry.monolithicWorkVoxels = timing.meshStats.monolithicWorkVoxels;
+    uint32_t lodCount = 0;
+    f.read(reinterpret_cast<char*>(&lodCount), sizeof(lodCount));
+    if (lodCount > LOD_COUNT) return false;
 
-            visualEntry.loadBaseRenderDist = timing.loadSnapshot.baseRenderDist;
-            visualEntry.loadEffectiveRenderDist = timing.loadSnapshot.effectiveRenderDist;
-            visualEntry.loadExtensionRings = timing.loadSnapshot.extensionRings;
-            visualEntry.loadMeasuredThroughput = timing.loadSnapshot.measuredThroughput;
-            visualEntry.loadPendingCreates = timing.loadSnapshot.pendingCreates;
-            visualEntry.loadPendingDestroys = timing.loadSnapshot.pendingDestroys;
-            visualEntry.loadLodRemeshQueue = timing.loadSnapshot.lodRemeshQueue;
-            visualEntry.loadPendingLodRemeshes = timing.loadSnapshot.pendingLodRemeshes;
-            visualEntry.loadEditRemeshPending = timing.loadSnapshot.editRemeshPending;
-            visualEntry.loadUploadQueue = timing.loadSnapshot.uploadQueue;
-            visualEntry.loadFinalizeQueue = timing.loadSnapshot.finalizeQueue;
-            visualEntry.loadInFlightSkips = timing.loadSnapshot.inFlightSkips;
-            visualEntry.loadBufferPressure = timing.loadSnapshot.bufferPressure;
-            visualEntry.loadEditJobsInFlight = timing.loadSnapshot.editJobsInFlight;
-        }
+    std::unique_lock lock(m_mutex);
+    for (auto& m : m_lodMaps) m.clear();
+    m_brickCountsByLOD.fill(0u);
+    m_cellCountsByLOD.fill(0u);
+    m_surfacePaintStamps.clear();
+    m_surfacePaintStampChunkIndex.clear();
+    m_nextSurfacePaintStampOrder = 1u;
 
-        // Capture overlay fill state at edit time for diagnostics
-        visualEntry.sphereFills   = m_lastEditDiag.sphereFillCount;
-        visualEntry.boxFills      = m_lastEditDiag.boxFillCount;
-        visualEntry.cylinderFills = m_lastEditDiag.cylinderFillCount;
-        visualEntry.bricks        = m_lastEditDiag.brickCount;
+    for (uint32_t lod = 0; lod < lodCount; ++lod) {
+        uint16_t res = 0; uint8_t en = 0; uint8_t pad = 0;
+        f.read(reinterpret_cast<char*>(&res), sizeof(res));
+        f.read(reinterpret_cast<char*>(&en),  sizeof(en));
+        f.read(reinterpret_cast<char*>(&pad), sizeof(pad));
+        m_lodConfigs[lod] = LODTextureConfig{ res, en != 0 };
 
-        auto aggIt = m_pendingEditVisuals.find(pendingIt->second.editId);
-        if (aggIt != m_pendingEditVisuals.end()) {
-            if (aggIt->second.readyChunks == 0) {
-                aggIt->second.visualFirstChunkMs = visualEntry.visibleMs;
-            }
-            aggIt->second.visualCompleteMs =
-                std::max(aggIt->second.visualCompleteMs, visualEntry.visibleMs);
-            ++aggIt->second.readyChunks;
-            aggIt->second.uploadBytes += visualEntry.uploadBytes;
-            if (visualEntry.artifactSource == ChunkArtifactSource::RuntimeEditBuild) {
-                ++aggIt->second.artifactBuilds;
-            } else if (visualEntry.artifactSource == ChunkArtifactSource::EditArtifactCache ||
-                       visualEntry.artifactSource == ChunkArtifactSource::DeferredArtifactCache) {
-                ++aggIt->second.artifactCacheHits;
-            } else if (visualEntry.artifactSource == ChunkArtifactSource::PrecomputedTerrain) {
-                ++aggIt->second.precomputedLoads;
-            }
-            if (visualEntry.collisionSource == ChunkCollisionSource::BaseCollisionCache) {
-                ++aggIt->second.collisionBaseCache;
-            } else if (visualEntry.collisionSource == ChunkCollisionSource::EditMeshPacked) {
-                ++aggIt->second.collisionEditPacked;
-            } else if (visualEntry.collisionSource == ChunkCollisionSource::ArtifactRefresh) {
-                ++aggIt->second.collisionArtifactRefresh;
-            } else if (visualEntry.collisionSource == ChunkCollisionSource::ExistingEditedCollision) {
-                ++aggIt->second.collisionExistingEdit;
-            }
-            if (visualEntry.residency == ChunkResidencyKind::GPUResident ||
-                visualEntry.residency == ChunkResidencyKind::GPUAndArtifactCache) {
-                ++aggIt->second.gpuResidentChunks;
-            }
-            if (visualEntry.artifactCacheResident) {
-                ++aggIt->second.artifactResidentChunks;
-            }
-            if (visualEntry.workModel == ChunkWorkModel::PagedLocal) {
-                ++aggIt->second.pagedChunks;
+        uint32_t brickCount = 0;
+        f.read(reinterpret_cast<char*>(&brickCount), sizeof(brickCount));
+        for (uint32_t b = 0; b < brickCount; ++b) {
+            BrickKey key{};
+            uint32_t active = 0;
+            f.read(reinterpret_cast<char*>(&key), sizeof(key));
+            f.read(reinterpret_cast<char*>(&active), sizeof(active));
+            auto brick = std::make_unique<TextureBrick>();
+            brick->activeCount = active;
+            if (ver >= 3) {
+                f.read(reinterpret_cast<char*>(brick->cells.data()),
+                       sizeof(VoxelTextureData) * TextureBrick::CELLS);
             } else {
-                ++aggIt->second.monolithicChunks;
+                for (auto& cell : brick->cells) {
+                    uint8_t packed = 0;
+                    f.read(reinterpret_cast<char*>(&packed), sizeof(packed));
+                    cell.packed = packed;
+                    cell.face = 3;
+                }
             }
-            aggIt->second.dirtyPages += visualEntry.dirtyPages;
-            aggIt->second.rebuiltPages += visualEntry.rebuiltPages;
-            aggIt->second.residentPages += visualEntry.residentPages;
-            aggIt->second.evictedPages += visualEntry.evictedPages;
-            syncTerrainEditVisualState(pendingIt->second.editId, /*eraseIfComplete=*/true);
-        }
-        m_pendingEditVisualChunks.erase(pendingIt);
-    }
-
-    if (m_lodSwitchDiag.active &&
-        m_lodSwitchDiag.completedMs == 0.0f &&
-        visualEntry.lodLevel == m_lodSwitchDiag.band) {
-        ++m_lodSwitchDiag.readyVisualEntries;
-        m_lodSwitchDiag.uploadedBytesTotal += visualEntry.uploadBytes;
-        if (visualEntry.artifactSource == ChunkArtifactSource::RuntimeEditBuild) {
-            ++m_lodSwitchDiag.artifactBuilds;
-        } else if (visualEntry.artifactSource == ChunkArtifactSource::EditArtifactCache ||
-                   visualEntry.artifactSource == ChunkArtifactSource::DeferredArtifactCache) {
-            ++m_lodSwitchDiag.artifactCacheHits;
-        } else if (visualEntry.artifactSource == ChunkArtifactSource::PrecomputedTerrain) {
-            ++m_lodSwitchDiag.precomputedLoads;
-        }
-        if (visualEntry.collisionSource == ChunkCollisionSource::BaseCollisionCache) {
-            ++m_lodSwitchDiag.collisionBaseCache;
-        } else if (visualEntry.collisionSource == ChunkCollisionSource::EditMeshPacked) {
-            ++m_lodSwitchDiag.collisionEditPacked;
-        } else if (visualEntry.collisionSource == ChunkCollisionSource::ArtifactRefresh) {
-            ++m_lodSwitchDiag.collisionArtifactRefresh;
-        } else if (visualEntry.collisionSource == ChunkCollisionSource::ExistingEditedCollision) {
-            ++m_lodSwitchDiag.collisionExistingEdit;
-        }
-        if (visualEntry.residency == ChunkResidencyKind::GPUResident ||
-            visualEntry.residency == ChunkResidencyKind::GPUAndArtifactCache) {
-            ++m_lodSwitchDiag.gpuResidentChunks;
-        }
-        if (visualEntry.artifactCacheResident) {
-            ++m_lodSwitchDiag.artifactResidentChunks;
-        }
-        if (visualEntry.workModel == ChunkWorkModel::PagedLocal) {
-            ++m_lodSwitchDiag.pagedChunks;
-        } else {
-            ++m_lodSwitchDiag.monolithicChunks;
-        }
-        m_lodSwitchDiag.dirtyPages += visualEntry.dirtyPages;
-        m_lodSwitchDiag.rebuiltPages += visualEntry.rebuiltPages;
-        m_lodSwitchDiag.residentPages += visualEntry.residentPages;
-        m_lodSwitchDiag.evictedPages += visualEntry.evictedPages;
-    }
-
-    const bool loadLikeEntry = !visualEntry.fromEdit &&
-        !(!visualEntry.fromLodBatch &&
-          visualEntry.artifactSource == ChunkArtifactSource::RuntimeEditBuild &&
-          visualEntry.collisionSource == ChunkCollisionSource::EditMeshPacked &&
-          visualEntry.meshMode != static_cast<uint8_t>(ChunkMeshMode::MonolithicPristine));
-    const bool precomputedSource =
-        visualEntry.artifactSource == ChunkArtifactSource::PrecomputedTerrain;
-    const bool runtimeVoxelNeedsNonPrecomputed =
-        precomputedSource && chunkNeedsRuntimeVoxel(coord);
-
-    if (visualEntry.fromEdit) {
-        m_chunkLoadTrackers[coord] = ChunkLoadTracker{visualEntry.editId, 0};
-    } else if (loadLikeEntry) {
-        auto trackerIt = m_chunkLoadTrackers.find(coord);
-        if (trackerIt != m_chunkLoadTrackers.end() && trackerIt->second.editId != 0) {
-            trackerIt->second.loadCount += 1;
-            visualEntry.editId = trackerIt->second.editId;
-            visualEntry.consecutiveReloads = trackerIt->second.loadCount;
-        }
-
-        if (runtimeVoxelNeedsNonPrecomputed) {
-            std::string reason = "RuntimeVoxelChunkLoadedPrecomputed";
-            if (visualEntry.editId != 0) {
-                reason += " edit=" + std::to_string(visualEntry.editId);
+            uint32_t actualActive = 0u;
+            for (const auto& cell : brick->cells) {
+                if (!cell.isEmpty()) {
+                    ++actualActive;
+                }
             }
-            noteChunkVisualError(
-                &coord,
-                lodLevel,
-                "VisualReady",
-                reason.c_str(),
-                0,
-                0,
-                0,
-                &resolvedDebug);
-
-            // Flag this as a visual hole — runtime voxel chunk got precomputed data
-            m_chunkHoleTracker.flagHole(coord, reason);
+            brick->activeCount = actualActive;
+            ++m_brickCountsByLOD[lod];
+            m_cellCountsByLOD[lod] += brick->activeCount;
+            m_lodMaps[lod].emplace(key, std::move(brick));
         }
     }
 
-    m_chunkVisualHistory.push(visualEntry);
+    if (ver >= 4) {
+        uint32_t stampCount = 0;
+        f.read(reinterpret_cast<char*>(&stampCount), sizeof(stampCount));
+        constexpr uint32_t kMaxSerializedSurfacePaintStamps = 1000000u;
+        if (stampCount > kMaxSerializedSurfacePaintStamps) {
+            return false;
+        }
 
-    // Record VisualReady event and try to resolve holes if correct source loaded
-    {
-        ChunkHoleEvent holeEv;
-        holeEv.type = ChunkHoleEvent::Type::MeshLoaded;
-        holeEv.timestampSec = ChunkHoleEvent::nowSec();
-        holeEv.toLOD = lodLevel;
-        holeEv.vertexCount = visualEntry.vertexCount;
-        holeEv.indexCount = visualEntry.indexCount;
-        holeEv.subChunkCount = visualEntry.subChunkCount;
-        holeEv.artifactSource = visualEntry.artifactSource;
-        holeEv.detail = "VisualReady";
-        m_chunkHoleTracker.recordMeshLoadedAndResolve(
-            coord,
-            std::move(holeEv),
-            !runtimeVoxelNeedsNonPrecomputed);
+        m_surfacePaintStamps.reserve(stampCount);
+        uint32_t maxOrder = 0u;
+        for (uint32_t i = 0; i < stampCount; ++i) {
+            SurfacePaintStamp stamp{};
+            f.read(reinterpret_cast<char*>(&stamp.centerVoxelLod0.x), sizeof(float));
+            f.read(reinterpret_cast<char*>(&stamp.centerVoxelLod0.y), sizeof(float));
+            f.read(reinterpret_cast<char*>(&stamp.centerVoxelLod0.z), sizeof(float));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMinLod0.x), sizeof(int32_t));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMinLod0.y), sizeof(int32_t));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMinLod0.z), sizeof(int32_t));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMaxLod0.x), sizeof(int32_t));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMaxLod0.y), sizeof(int32_t));
+            f.read(reinterpret_cast<char*>(&stamp.bboxMaxLod0.z), sizeof(int32_t));
+
+            int32_t radius = 1;
+            uint8_t shape = 0u;
+            uint8_t type = 0u;
+            uint8_t variant = 0u;
+            uint8_t sourceFace = 3u;
+            uint32_t order = 0u;
+
+            f.read(reinterpret_cast<char*>(&radius), sizeof(radius));
+            f.read(reinterpret_cast<char*>(&shape), sizeof(shape));
+            f.read(reinterpret_cast<char*>(&type), sizeof(type));
+            f.read(reinterpret_cast<char*>(&variant), sizeof(variant));
+            f.read(reinterpret_cast<char*>(&sourceFace), sizeof(sourceFace));
+            f.read(reinterpret_cast<char*>(&order), sizeof(order));
+
+            stamp.radiusVoxelsLod0 = std::max(1, radius);
+            stamp.shape = (shape == static_cast<uint8_t>(SurfaceBrushShape::Rect))
+                ? SurfaceBrushShape::Rect
+                : SurfaceBrushShape::Disc;
+            stamp.type = (type < static_cast<uint8_t>(TextureType::COUNT))
+                ? static_cast<TextureType>(type)
+                : TextureType::Grass;
+            stamp.variant = static_cast<uint8_t>(variant & 0x7u);
+            stamp.sourceFace = (sourceFace < 6u) ? sourceFace : 3u;
+            stamp.order = (order != 0u) ? order : (i + 1u);
+            maxOrder = std::max(maxOrder, stamp.order);
+
+            m_surfacePaintStamps.push_back(stamp);
+        }
+
+        for (uint32_t i = 0; i < static_cast<uint32_t>(m_surfacePaintStamps.size()); ++i) {
+            indexSurfacePaintStampLocked(i);
+        }
+        m_nextSurfacePaintStampOrder = maxOrder + 1u;
+        if (m_nextSurfacePaintStampOrder == 0u) {
+            m_nextSurfacePaintStampOrder = 1u;
+        }
     }
 
-    if (m_lastEditDiag.editId != 0) {
-        m_lastEditDiag.visualPendingChunks =
-            static_cast<uint32_t>(std::min<size_t>(m_pendingEditVisualChunks.size(), UINT32_MAX));
-        m_lastEditDiag.visualPendingEdits =
-            static_cast<uint32_t>(std::min<size_t>(m_pendingEditVisuals.size(), UINT32_MAX));
-    }
+    requestFullGPUUploadLocked();
+    m_generation.fetch_add(1, std::memory_order_release);
+    return f.good() || f.eof();
 }
-````
 
 
-## FUNCTION src/world/World*.cpp :: World::syncTerrainEditVisualState
+// ---------------------------------------------------------------------------
+// Deferred surface paint stamps — O(1) interactive brush authoring.
+// ---------------------------------------------------------------------------
 
-Resolved FUNCTION target to 13 candidate files. Exporting only matching function bodies.
+uint32_t TextureOverlayStore::appendSurfacePaintStamp(const glm::vec3& centerWorld,
+                                                     int radiusVoxelsLod0,
+                                                     SurfaceBrushShape shape,
+                                                     TextureType type,
+                                                     uint8_t variant,
+                                                     uint8_t sourceFace) {
+    if (radiusVoxelsLod0 <= 0) {
+        return 0u;
+    }
 
-Source: src/world/WorldTerrainEditCollision.cpp lines 181-238
+    SurfacePaintStamp stamp{};
+    stamp.centerVoxelLod0 = centerWorld * static_cast<float>(WorldConfig::VOXELS_PER_METER);
+    stamp.radiusVoxelsLod0 = std::max(1, radiusVoxelsLod0);
+    stamp.shape = shape;
+    stamp.type = type;
+    stamp.variant = static_cast<uint8_t>(variant & 0x7u);
+    stamp.sourceFace = (sourceFace < 6u) ? sourceFace : 3u;
 
-````cpp
-void World::syncTerrainEditVisualState(uint64_t editId, bool eraseIfComplete)
-{
-    auto aggIt = m_pendingEditVisuals.find(editId);
-    if (aggIt == m_pendingEditVisuals.end()) {
-        if (m_lastEditDiag.editId != 0) {
-            m_lastEditDiag.visualPendingChunks =
-                static_cast<uint32_t>(std::min<size_t>(m_pendingEditVisualChunks.size(), UINT32_MAX));
-            m_lastEditDiag.visualPendingEdits =
-                static_cast<uint32_t>(std::min<size_t>(m_pendingEditVisuals.size(), UINT32_MAX));
-        }
+    // Deferred material stamps are bounded 3D surface volumes. They are O(1)
+    // to author and are consumed by the live material-overlay shader path.
+    // The brush must not require a chunk material rebake just to become
+    // visible; rebaking is expensive, delayed, and can produce chunk-wide
+    // material changes after the instant visual stamp has already appeared.
+    //
+    // The +2 voxel pad keeps chunk indexing conservative at exact integer face
+    // planes and LOD boundaries. sampleSurfacePaintStampsLocked() performs the
+    // exact sphere/box test before returning material for any offline/explicit
+    // bake path that still asks the CPU store.
+    const float r = static_cast<float>(stamp.radiusVoxelsLod0) + 2.0f;
+    stamp.bboxMinLod0 = glm::ivec3(
+        static_cast<int>(std::floor(stamp.centerVoxelLod0.x - r)),
+        static_cast<int>(std::floor(stamp.centerVoxelLod0.y - r)),
+        static_cast<int>(std::floor(stamp.centerVoxelLod0.z - r)));
+    stamp.bboxMaxLod0 = glm::ivec3(
+        static_cast<int>(std::ceil(stamp.centerVoxelLod0.x + r)),
+        static_cast<int>(std::ceil(stamp.centerVoxelLod0.y + r)),
+        static_cast<int>(std::ceil(stamp.centerVoxelLod0.z + r)));
+
+    std::unique_lock lock(m_mutex);
+    if (!m_lodConfigs[0].enabled) {
+        return 0u;
+    }
+
+    if (m_nextSurfacePaintStampOrder == 0u) {
+        m_nextSurfacePaintStampOrder = 1u;
+    }
+    stamp.order = m_nextSurfacePaintStampOrder++;
+
+    const uint32_t stampIndex = static_cast<uint32_t>(m_surfacePaintStamps.size());
+    m_surfacePaintStamps.push_back(stamp);
+    indexSurfacePaintStampLocked(stampIndex);
+
+    // Wake the bounded GPU live-stamp upload path without generating per-cell
+    // overlay deltas. This keeps painting on the compact shader path and leaves
+    // chunk meshes/topology untouched.
+    requestFullGPUUploadLocked();
+    m_generation.fetch_add(1, std::memory_order_release);
+    return stamp.order;
+}
+
+size_t TextureOverlayStore::getSurfacePaintStampCount() const {
+    std::shared_lock lock(m_mutex);
+    return m_surfacePaintStamps.size();
+}
+
+size_t TextureOverlayStore::exportLiveSurfacePaintStamps(
+    std::vector<SurfacePaintStamp>& out,
+    size_t maxStamps) const {
+    (void)maxStamps;
+
+    // Final material rendering must not depend on a bounded live-stamp list.
+    // The texture brush now writes permanent per-face cells and schedules a
+    // material-only chunk rebake, so the visible result is packed into the
+    // normal Vertex::material path. Returning zero here disables the old
+    // fragment-time live overlay and removes the "oldest strokes disappear
+    // after maxStamps" failure mode instead of merely raising the limit.
+    out.clear();
+    return 0u;
+}
+
+
+void TextureOverlayStore::indexSurfacePaintStampLocked(uint32_t stampIndex) {
+    if (stampIndex >= m_surfacePaintStamps.size()) {
         return;
     }
 
-    const auto applyVisualFields = [](auto& target, const PendingEditVisualAggregate& agg) {
-        target.visualFirstChunkMs = agg.visualFirstChunkMs;
-        target.visualCompleteMs = agg.visualCompleteMs;
-        target.visualChunksTotal = agg.totalChunks;
-        target.visualChunksReady = agg.readyChunks;
-        target.visualChunksSuperseded = agg.supersededChunks;
-        target.visualComplete = (agg.readyChunks + agg.supersededChunks) >= agg.totalChunks;
-        target.visualUploadBytes = agg.uploadBytes;
-        target.visualArtifactBuilds = agg.artifactBuilds;
-        target.visualArtifactCacheHits = agg.artifactCacheHits;
-        target.visualPrecomputedLoads = agg.precomputedLoads;
-        target.visualCollisionBaseCache = agg.collisionBaseCache;
-        target.visualCollisionEditPacked = agg.collisionEditPacked;
-        target.visualCollisionArtifactRefresh = agg.collisionArtifactRefresh;
-        target.visualCollisionExistingEdit = agg.collisionExistingEdit;
-        target.visualGpuResidentChunks = agg.gpuResidentChunks;
-        target.visualArtifactResidentChunks = agg.artifactResidentChunks;
-        target.visualMonolithicChunks = agg.monolithicChunks;
-        target.visualPagedChunks = agg.pagedChunks;
-        target.visualDirtyPages = agg.dirtyPages;
-        target.visualRebuiltPages = agg.rebuiltPages;
-        target.visualResidentPages = agg.residentPages;
-        target.visualEvictedPages = agg.evictedPages;
-    };
+    const SurfacePaintStamp& stamp = m_surfacePaintStamps[stampIndex];
+    const glm::ivec3 c0 = WorldConfig::microVoxelToChunk(stamp.bboxMinLod0);
+    const glm::ivec3 c1 = WorldConfig::microVoxelToChunk(stamp.bboxMaxLod0);
 
-    if (m_lastEditDiag.editId == editId) {
-        applyVisualFields(m_lastEditDiag, aggIt->second);
-    }
-    if (auto* histEntry = findTerrainEditHistoryEntry(editId)) {
-        applyVisualFields(*histEntry, aggIt->second);
-    }
-
-    const bool completeNow =
-        (aggIt->second.readyChunks + aggIt->second.supersededChunks) >= aggIt->second.totalChunks;
-    if (completeNow && eraseIfComplete) {
-        m_pendingEditVisuals.erase(aggIt);
-    }
-
-    if (m_lastEditDiag.editId != 0) {
-        m_lastEditDiag.visualPendingChunks =
-            static_cast<uint32_t>(std::min<size_t>(m_pendingEditVisualChunks.size(), UINT32_MAX));
-        m_lastEditDiag.visualPendingEdits =
-            static_cast<uint32_t>(std::min<size_t>(m_pendingEditVisuals.size(), UINT32_MAX));
+    for (int z = std::min(c0.z, c1.z); z <= std::max(c0.z, c1.z); ++z) {
+        for (int y = std::min(c0.y, c1.y); y <= std::max(c0.y, c1.y); ++y) {
+            for (int x = std::min(c0.x, c1.x); x <= std::max(c0.x, c1.x); ++x) {
+                m_surfacePaintStampChunkIndex[glm::ivec3(x, y, z)].push_back(stampIndex);
+            }
+        }
     }
 }
+
+bool TextureOverlayStore::surfaceStampTouchesBox(const TextureOverlayStore::SurfacePaintStamp& stamp,
+                                                 const glm::ivec3& minLod0,
+                                                 const glm::ivec3& maxLod0) {
+    return !(stamp.bboxMaxLod0.x < minLod0.x || stamp.bboxMinLod0.x > maxLod0.x ||
+             stamp.bboxMaxLod0.y < minLod0.y || stamp.bboxMinLod0.y > maxLod0.y ||
+             stamp.bboxMaxLod0.z < minLod0.z || stamp.bboxMinLod0.z > maxLod0.z);
+}
+
+VoxelTextureData TextureOverlayStore::sampleSurfacePaintStampsLocked(const glm::ivec3& lodCoord,
+                                                                     int lod,
+                                                                     uint8_t face) const {
+    if (m_surfacePaintStamps.empty()) {
+        return {};
+    }
+
+    const int step = std::max(1, (lod > 0) ? (1 << lod) : 1);
+    const int halfStep = step / 2;
+    const glm::ivec3 lod0Base = lodToLOD0(lodCoord, lod);
+    const glm::ivec3 lod0Max = lod0Base + glm::ivec3(step - 1);
+    const glm::ivec3 lod0Sample = lod0Base + glm::ivec3(halfStep);
+
+    const uint8_t queryFace = static_cast<uint8_t>(face % 6u);
+    const int queryAxis = queryFace / 2;
+    const float querySign = (queryFace & 1u) ? 1.0f : -1.0f;
+
+    // Query the chunk-index range covered by this LOD face, not only the face
+    // center. Coarse LOD faces can straddle a chunk boundary; center-only lookup
+    // is why lower LODs sometimes missed paint that was perfect at LOD0.
+    glm::ivec3 queryMin = lod0Base;
+    glm::ivec3 queryMax = lod0Max;
+    if ((queryFace & 1u) != 0u) {
+        queryMax[queryAxis] += 1;
+    } else {
+        queryMin[queryAxis] -= 1;
+    }
+
+    const glm::ivec3 chunkMin = WorldConfig::microVoxelToChunk(queryMin);
+    const glm::ivec3 chunkMax = WorldConfig::microVoxelToChunk(queryMax);
+
+    auto clampf = [](float v, float lo, float hi) {
+        return std::max(lo, std::min(v, hi));
+    };
+
+    auto faceCenterPoint = [&]() {
+        glm::vec3 p = glm::vec3(lod0Sample) + glm::vec3(0.5f);
+        p[queryAxis] += querySign * 0.5f * static_cast<float>(step);
+        return p;
+    };
+
+    auto stampContainsQueryFace = [&](const SurfacePaintStamp& stamp) -> bool {
+        const float radius = static_cast<float>(stamp.radiusVoxelsLod0);
+
+        // LOD0 keeps the exact original authoring rule: the exposed face center
+        // must be inside the brush. This removes the old +1 voxel bleed that
+        // caused visible material changes around the brush edge.
+        if (step == 1) {
+            const glm::vec3 p = faceCenterPoint();
+            const glm::vec3 d = p - stamp.centerVoxelLod0;
+            if (stamp.shape == SurfaceBrushShape::Disc) {
+                return glm::dot(d, d) <= radius * radius + 1e-5f;
+            }
+            return std::abs(d.x) <= radius + 1e-5f &&
+                   std::abs(d.y) <= radius + 1e-5f &&
+                   std::abs(d.z) <= radius + 1e-5f;
+        }
+
+        // Coarser LODs use face-rectangle intersection against the same exact
+        // brush volume. This fills the lower-LOD representation whenever the
+        // coarse face actually intersects the brush, without inflating the
+        // brush radius globally.
+        const float plane = (queryFace & 1u)
+            ? static_cast<float>(lod0Base[queryAxis] + step)
+            : static_cast<float>(lod0Base[queryAxis]);
+
+        if (stamp.shape == SurfaceBrushShape::Disc) {
+            glm::vec3 closest = stamp.centerVoxelLod0;
+            closest[queryAxis] = plane;
+            for (int axis = 0; axis < 3; ++axis) {
+                if (axis == queryAxis) {
+                    continue;
+                }
+                closest[axis] = clampf(
+                    stamp.centerVoxelLod0[axis],
+                    static_cast<float>(lod0Base[axis]),
+                    static_cast<float>(lod0Base[axis] + step));
+            }
+            const glm::vec3 d = closest - stamp.centerVoxelLod0;
+            return glm::dot(d, d) <= radius * radius + 1e-5f;
+        }
+
+        if (std::abs(stamp.centerVoxelLod0[queryAxis] - plane) > radius + 1e-5f) {
+            return false;
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+            if (axis == queryAxis) {
+                continue;
+            }
+            const float a0 = static_cast<float>(lod0Base[axis]);
+            const float a1 = static_cast<float>(lod0Base[axis] + step);
+            const float b0 = stamp.centerVoxelLod0[axis] - radius;
+            const float b1 = stamp.centerVoxelLod0[axis] + radius;
+            if (a1 < b0 || b1 < a0) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    uint32_t bestOrder = 0u;
+    VoxelTextureData best{};
+
+    for (int cz = std::min(chunkMin.z, chunkMax.z); cz <= std::max(chunkMin.z, chunkMax.z); ++cz) {
+        for (int cy = std::min(chunkMin.y, chunkMax.y); cy <= std::max(chunkMin.y, chunkMax.y); ++cy) {
+            for (int cx = std::min(chunkMin.x, chunkMax.x); cx <= std::max(chunkMin.x, chunkMax.x); ++cx) {
+                auto it = m_surfacePaintStampChunkIndex.find(glm::ivec3(cx, cy, cz));
+                if (it == m_surfacePaintStampChunkIndex.end()) {
+                    continue;
+                }
+
+                const auto& candidates = it->second;
+                for (auto rit = candidates.rbegin(); rit != candidates.rend(); ++rit) {
+                    const uint32_t stampIndex = *rit;
+                    if (stampIndex >= m_surfacePaintStamps.size()) {
+                        continue;
+                    }
+
+                    const SurfacePaintStamp& stamp = m_surfacePaintStamps[stampIndex];
+                    if (stamp.order <= bestOrder) {
+                        break;
+                    }
+                    if (!surfaceStampTouchesBox(stamp, queryMin, queryMax)) {
+                        continue;
+                    }
+                    if (!stampContainsQueryFace(stamp)) {
+                        continue;
+                    }
+
+                    bestOrder = stamp.order;
+                    best = VoxelTextureData(
+                        stamp.type,
+                        variedVariant(lod0Sample, queryFace, stamp.type, stamp.variant),
+                        0u,
+                        queryFace);
+                    break;
+                }
+            }
+        }
+    }
+
+    return best;
+}
+
+} // namespace TextureOverlay
+
 ````
+
+## FIND: Vertex::material
+
+Matched code files only; file contents were not exported.
+Request exact paths or FUNCTION exports from this list in the next cc.ps1 run.
+
+Matched code files:
+- src/ui/debug_menu/world/TexturePaintTool.cpp
+- src/world/edit/TextureOverlayStore.cpp
+
+Occurrence preview:
+- src/ui/debug_menu/world/TexturePaintTool.cpp:141: // only the touched chunks are remeshed so Vertex::material becomes the same
+- src/world/edit/TextureOverlayStore.cpp:305: // packing the material into Vertex::material, which is the shader fast path.
+- src/world/edit/TextureOverlayStore.cpp:1388: // normal Vertex::material path. Returning zero here disables the old
+
+
+## FIND: getSurfaceTexture
+
+Matched code files only; file contents were not exported.
+Request exact paths or FUNCTION exports from this list in the next cc.ps1 run.
+
+Matched code files:
+- include/world/edit/TextureOverlayStore.h
+- src/ui/debug_menu/world/TexturePaintTool.cpp
+- src/world/edit/TerrainEditMesher.cpp
+- src/world/edit/TextureOverlayStore.cpp
+
+Occurrence preview:
+- include/world/edit/TextureOverlayStore.h:159: // The mesher resolves stamps through getSurfaceTexture() while emitting real
+- include/world/edit/TextureOverlayStore.h:197: VoxelTextureData getSurfaceTexture(const glm::ivec3& lodCoord,
+- src/ui/debug_menu/world/TexturePaintTool.cpp:723: // material rebake resolves this stamp through TextureOverlayStore::getSurfaceTexture()
+- src/world/edit/TerrainEditMesher.cpp:1181: const auto tex = textureStore->getSurfaceTexture(glm::ivec3(wx, wy, wz), lodLevel, face);
+- src/world/edit/TextureOverlayStore.cpp:467: TextureOverlayStore::getSurfaceTexture(const glm::ivec3& lodCoord,
+
+
+## FIND: materialOnly
+
+Matched code files only; file contents were not exported.
+Request exact paths or FUNCTION exports from this list in the next cc.ps1 run.
+
+Matched code files:
+- include/world/edit/TerrainEditRemeshScheduler.h
+- src/world/edit/TerrainEditRemeshScheduler.cpp
+
+Occurrence preview:
+- include/world/edit/TerrainEditRemeshScheduler.h:179: bool materialOnly = false);
+- src/world/edit/TerrainEditRemeshScheduler.cpp:1159: bool materialOnly)
+- src/world/edit/TerrainEditRemeshScheduler.cpp:1179: if (materialOnly) {
+- src/world/edit/TerrainEditRemeshScheduler.cpp:1188: auto& dst = materialOnly ? m_materialDirty : m_dirty;
+- src/world/edit/TerrainEditRemeshScheduler.cpp:1214: if (!materialOnly) {
+
+
+## FIND: LoadEditMeshJob
+
+Matched code files only; file contents were not exported.
+Request exact paths or FUNCTION exports from this list in the next cc.ps1 run.
+
+Matched code files:
+- include/world/ChunkHoleTracker.h
+- include/world/chunks/core/ChunkJobs.h
+- src/world/chunks/core/ChunkJobs.cpp
+- src/world/World.cpp
+- src/world/WorldLODSwaps.cpp
+- src/world/WorldLODTransitions.cpp
+- src/world/WorldUpdateMeshing.cpp
+
+Occurrence preview:
+- include/world/ChunkHoleTracker.h:31: MeshLoaded,             // LoadPrecomputedMeshJob or LoadEditMeshJob completed
+- include/world/chunks/core/ChunkJobs.h:192: void LoadEditMeshJob(JobCtx& ctx, void* user);
+- src/world/chunks/core/ChunkJobs.cpp:502: // have selected LoadEditMeshJob.  Redirect here to guarantee correct mesh
+- src/world/chunks/core/ChunkJobs.cpp:505: LoadEditMeshJob(ctx, user);
+- src/world/chunks/core/ChunkJobs.cpp:726: // LoadEditMeshJob — runs edit mesher (Voxel or DCCM) for chunks with overlays
+- src/world/chunks/core/ChunkJobs.cpp:729: void LoadEditMeshJob(JobCtx& /*ctx*/, void* user) {
+- src/world/World.cpp:242: auto loadJobFn = useEditMesher ? LoadEditMeshJob : LoadPrecomputedMeshJob;
+- src/world/WorldLODSwaps.cpp:156: ? LoadEditMeshJob
+- src/world/WorldLODTransitions.cpp:573: ? LoadEditMeshJob
+- src/world/WorldUpdateMeshing.cpp:171: auto loadJobFn = (useEditMesher && !isDCCM) ? LoadEditMeshJob : LoadPrecomputedMeshJob;
+
+
+## FIND: enqueueMeshForUpload
+
+Matched code files only; file contents were not exported.
+Request exact paths or FUNCTION exports from this list in the next cc.ps1 run.
+
+Matched code files:
+- include/world/chunks/streaming/ChunkUploadSystem.h
+- include/world/World.h
+- include/world/WorldDiagnostics.h
+- src/world/chunks/core/ChunkJobs.cpp
+- src/world/chunks/streaming/ChunkUploadSystem.cpp
+- src/world/edit/TerrainEditRemeshScheduler.cpp
+- src/world/World.cpp
+- src/world/WorldRendering.cpp
+
+Occurrence preview:
+- include/world/chunks/streaming/ChunkUploadSystem.h:154: void enqueueMeshForUpload(
+- include/world/chunks/streaming/ChunkUploadSystem.h:170: void enqueueMeshForUpload(
+- include/world/World.h:301: void enqueueMeshForUpload(entt::entity entity,
+- include/world/World.h:315: void enqueueMeshForUpload(entt::entity entity,
+- include/world/WorldDiagnostics.h:59: float gpuUploadEnqueueMs{0.0f}; // enqueueMeshForUpload
+- src/world/chunks/core/ChunkJobs.cpp:1065: payload->world->enqueueMeshForUpload(
+- src/world/chunks/core/ChunkJobs.cpp:1106: payload->world->enqueueMeshForUpload(payload->entity,
+- src/world/chunks/streaming/ChunkUploadSystem.cpp:58: void ChunkUploadSystem::enqueueMeshForUpload(
+- src/world/chunks/streaming/ChunkUploadSystem.cpp:70: enqueueMeshForUpload(entity, std::move(subChunks), 1, fromTerrainEdit, versionState, version,
+- src/world/chunks/streaming/ChunkUploadSystem.cpp:75: void ChunkUploadSystem::enqueueMeshForUpload(
+- src/world/edit/TerrainEditRemeshScheduler.cpp:970: world->enqueueMeshForUpload(
+- src/world/edit/TerrainEditRemeshScheduler.cpp:1106: world->enqueueMeshForUpload(
+- src/world/World.cpp:626: // enqueueMeshForUpload() moved to WorldRendering.cpp
+- src/world/WorldRendering.cpp:12: // enqueueMeshForUpload() extracted from World.cpp
+- src/world/WorldRendering.cpp:541: void World::enqueueMeshForUpload(entt::entity entity,
+- src/world/WorldRendering.cpp:547: m_uploadSystem.enqueueMeshForUpload(entity, std::move(mesh), fromTerrainEdit, versionState, version,
+- src/world/WorldRendering.cpp:551: void World::enqueueMeshForUpload(entt::entity entity,
+
+
+## FIND: storeEditArtifact
+
+Matched code files only; file contents were not exported.
+Request exact paths or FUNCTION exports from this list in the next cc.ps1 run.
+
+Matched code files:
+- include/world/World.h
+- src/world/chunks/core/ChunkJobs.cpp
+- src/world/edit/TerrainEditRemeshScheduler.cpp
+- src/world/World.cpp
+
+Occurrence preview:
+- include/world/World.h:493: uint64_t generation{0};  // bumped on every storeEditArtifact
+- include/world/World.h:499: void storeEditArtifact(const glm::ivec3& chunkCoord,
+- include/world/World.h:1028: uint64_t m_editArtifactGenCounter{0};  // monotonic, bumped per storeEditArtifact
+- src/world/chunks/core/ChunkJobs.cpp:947: world->storeEditArtifact(
+- src/world/chunks/core/ChunkJobs.cpp:956: world->storeEditArtifact(
+- src/world/edit/TerrainEditRemeshScheduler.cpp:885: world->storeEditArtifact(
+- src/world/edit/TerrainEditRemeshScheduler.cpp:1512: world->storeEditArtifact(
+- src/world/World.cpp:552: void World::storeEditArtifact(const glm::ivec3& chunkCoord,
+
+
+## FIND: PendingMeshHandle
+
+Matched code files only; file contents were not exported.
+Request exact paths or FUNCTION exports from this list in the next cc.ps1 run.
+
+Matched code files:
+- include/rendering/culling/GPUCullingSystem.h
+- include/world/ChunkHoleTracker.h
+- include/world/chunks/core/Chunk.h
+- include/world/chunks/core/ChunkJobs.h
+- include/world/chunks/core/ChunkLODSystem.h
+- include/world/chunks/core/ChunkManager.h
+- include/world/chunks/core/ChunkManagerTypes.h
+- include/world/chunks/streaming/ChunkUploadSystem.h
+- include/world/World.h
+- include/world/WorldDiagnostics.h
+- src/core/engine/EngineSubsystemInit.cpp
+- src/core/engine/EngineVulkanInit.cpp
+- src/world/chunks/core/ChunkJobs.cpp
+- src/world/chunks/streaming/ChunkUploadSystem.cpp
+- src/world/edit/TerrainEditRemeshScheduler.cpp
+- src/world/WorldChunkCRUD.cpp
+- src/world/WorldChunkReset.cpp
+- src/world/WorldLODSwaps.cpp
+- src/world/WorldLODTransitions.cpp
+- src/world/WorldTerrainEditCollision.cpp
+- src/world/WorldUpdateFinalize.cpp
+- src/world/WorldUpdateLODScan.cpp
+
+Occurrence preview:
+- include/rendering/culling/GPUCullingSystem.h:169: * Inactive slots are useful for PendingMeshHandle uploads: data can be
+- include/world/ChunkHoleTracker.h:32: UploadCompleted,        // ChunkUploadSystem staged PendingMeshHandle
+- include/world/ChunkHoleTracker.h:33: LODSwapExecuted,        // processLODSwaps moved PendingMeshHandle -> MeshHandle
+- include/world/chunks/core/Chunk.h:146: * MeshHandle/PendingMeshHandle until the paged renderer path is implemented.
+- include/world/chunks/core/Chunk.h:336: * During LOD transitions, the new mesh is uploaded into PendingMeshHandle
+- include/world/chunks/core/Chunk.h:339: * PendingMeshHandle → MeshHandle for the entire batch in one frame.
+- include/world/chunks/core/Chunk.h:342: struct PendingMeshHandle {
+- include/world/chunks/core/ChunkJobs.h:88: bool isRemesh{false};      // true = LOD remesh (stage to PendingMeshHandle)
+- include/world/chunks/core/ChunkLODSystem.h:85: * @param isRemesh If true, this is a LOD remesh (stage to PendingMeshHandle)
+- include/world/chunks/core/ChunkManager.h:248: * Returns the batchId that should be stored in each chunk's PendingMeshHandle.
+- include/world/chunks/core/ChunkManager.h:253: * Signal that one chunk in a batch has its PendingMeshHandle uploaded.
+- include/world/chunks/core/ChunkManagerTypes.h:45: std::atomic<uint32_t> chunksReady{0}; // How many have PendingMeshHandle uploaded
+- include/world/chunks/streaming/ChunkUploadSystem.h:40: bool isRemesh{false};        // true = LOD remesh (stage to PendingMeshHandle), false = initial load
+- include/world/chunks/streaming/ChunkUploadSystem.h:100: * Called by ChunkUploadSystem when a remesh upload stages into PendingMeshHandle.
+- include/world/chunks/streaming/ChunkUploadSystem.h:167: * @param isRemesh If true, stages to PendingMeshHandle instead of replacing MeshHandle
+- include/world/World.h:312: * @param isRemesh If true, stages to PendingMeshHandle for batch swap
+- include/world/World.h:800: * Process LOD batch swaps - atomically swap PendingMeshHandle → MeshHandle
+- include/world/World.h:820: * Process solo edit swaps - swap PendingMeshHandle (batchId=0) → MeshHandle
+- include/world/World.h:831: * Clean up orphaned PendingMeshHandles from cancelled LOD batches.
+- include/world/WorldDiagnostics.h:510: uint32_t errMissingPending{0};        // missing PendingMeshHandle at swap
+- include/world/WorldDiagnostics.h:511: uint32_t errMismatchedBatch{0};       // PendingMeshHandle belonged to wrong batch
+- src/core/engine/EngineSubsystemInit.cpp:392: if (registry.all_of<PendingMeshHandle>(entity)) {
+- src/core/engine/EngineSubsystemInit.cpp:393: applyHandle(registry.get<PendingMeshHandle>(entity).handle);
+- src/core/engine/EngineVulkanInit.cpp:81: // LOD transitions (old + new meshes coexist via PendingMeshHandle).
+- src/world/chunks/core/ChunkJobs.cpp:704: // the entire batch swaps PendingMeshHandle → MeshHandle.
+- src/world/chunks/core/ChunkJobs.cpp:1063: // PendingMeshHandle swap, freezing all chunks in that batch at old LOD.
+- src/world/chunks/streaming/ChunkUploadSystem.cpp:630: // PendingMeshHandle so processLODSwaps can swap it in
+- src/world/chunks/streaming/ChunkUploadSystem.cpp:635: PendingMeshHandle pending;
+- src/world/chunks/streaming/ChunkUploadSystem.cpp:645: // Free any prior PendingMeshHandle's GPU resources
+- src/world/chunks/streaming/ChunkUploadSystem.cpp:646: if (registry.all_of<PendingMeshHandle>(req.entity)) {
+- src/world/edit/TerrainEditRemeshScheduler.cpp:1256: registry.all_of<PendingMeshHandle>(entity);
+- src/world/WorldChunkCRUD.cpp:193: if (m_registry.all_of<PendingMeshHandle>(entity)) {
+- src/world/WorldChunkCRUD.cpp:194: const auto& pending = m_registry.get<PendingMeshHandle>(entity);
+- src/world/WorldChunkCRUD.cpp:279: // Also clean up staged PendingMeshHandle if present
+- src/world/WorldChunkCRUD.cpp:280: if (m_registry.valid(entity) && m_registry.all_of<PendingMeshHandle>(entity)) {
+- src/world/WorldChunkReset.cpp:65: // Also collect PendingMeshHandle resources
+- src/world/WorldChunkReset.cpp:66: if (m_registry.all_of<PendingMeshHandle>(entity)) {
+- src/world/WorldChunkReset.cpp:67: const auto& pending = m_registry.get<PendingMeshHandle>(entity);
+- src/world/WorldLODSwaps.cpp:173: void World::cleanupStalePendingMeshHandles() {
+- src/world/WorldLODSwaps.cpp:174: // Free GPU resources for ALL entities with a PendingMeshHandle.
+- src/world/WorldLODSwaps.cpp:179: auto view = m_registry.view<PendingMeshHandle>();
+- src/world/WorldLODSwaps.cpp:182: auto& pending = view.get<PendingMeshHandle>(entity);
+- src/world/WorldLODTransitions.cpp:54: // PendingMeshHandle GPU resources (buffers + culling slots).
+- src/world/WorldLODTransitions.cpp:67: cleanupStalePendingMeshHandles();
+- src/world/WorldLODTransitions.cpp:145: cleanupStalePendingMeshHandles();
+- src/world/WorldLODTransitions.cpp:200: // PendingMeshHandle GPU resources.  Without this, old batches from
+- src/world/WorldTerrainEditCollision.cpp:425: if (m_registry.all_of<PendingMeshHandle>(entity)) {
+- src/world/WorldTerrainEditCollision.cpp:426: const auto& pending = m_registry.get<PendingMeshHandle>(entity);
+- src/world/WorldUpdateFinalize.cpp:190: bool hasPendingMeshHandle{false};
+- src/world/WorldUpdateFinalize.cpp:233: entry.hasPendingMeshHandle = m_registry.all_of<PendingMeshHandle>(entity);
+- src/world/WorldUpdateFinalize.cpp:234: if (entry.hasPendingMeshHandle) {
+- src/world/WorldUpdateFinalize.cpp:235: entry.pendingBatchId = m_registry.get<PendingMeshHandle>(entity).batchId;
+- src/world/WorldUpdateLODScan.cpp:20: //   2. Clean up orphaned PendingMeshHandles (free GPU resources)
+- src/world/WorldUpdateLODScan.cpp:162: if (m_registry.all_of<PendingMeshHandle>(entity)) return;
+- src/world/WorldUpdateLODScan.cpp:340: if (m_registry.all_of<PendingMeshHandle>(entity)) continue;
+- src/world/WorldUpdateLODScan.cpp:496: if (m_registry.all_of<PendingMeshHandle>(r.entity))

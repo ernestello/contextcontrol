@@ -1,0 +1,2065 @@
+// GPT-DESC: Runtime greedy mesher for edited terrain chunks and baked voxel-face materials.
+#include "world/edit/TerrainEditMesher.h"
+#include "world/edit/VoxelBaseSampler.h"
+#include "world/config/WorldConfig.h"
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+
+namespace TerrainEdit {
+
+// ---------------------------------------------------------------------------
+// Incremental base cache: stores the heightmap-only solid data so that
+// subsequent remeshes of the same chunk skip the heightmap column fill.
+// Thread-safe (multiple background mesher threads read/write concurrently).
+// ---------------------------------------------------------------------------
+
+struct BaseCacheKey {
+    int chunkX, chunkZ;
+    int baseVoxelX, baseVoxelZ;
+    int cacheMinY, cacheDimXZ, cacheDimY;
+
+    bool operator==(const BaseCacheKey& o) const {
+        return chunkX == o.chunkX && chunkZ == o.chunkZ &&
+               baseVoxelX == o.baseVoxelX && baseVoxelZ == o.baseVoxelZ &&
+               cacheMinY == o.cacheMinY && cacheDimXZ == o.cacheDimXZ &&
+               cacheDimY == o.cacheDimY;
+    }
+};
+
+struct BaseCacheKeyHash {
+    size_t operator()(const BaseCacheKey& k) const {
+        // Simple hash combine
+        size_t h = std::hash<int>{}(k.chunkX);
+        h ^= std::hash<int>{}(k.chunkZ) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.cacheMinY) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.cacheDimY) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct BaseCacheEntry {
+    std::vector<uint8_t> heightmapBase;   // Pure heightmap data (no overlay)
+    std::vector<uint8_t> appliedResult;   // heightmap + overlay combined
+    size_t overlayGeneration = 0;         // Generation when appliedResult was built
+};
+
+static std::shared_mutex s_baseCacheMutex;
+static std::unordered_map<BaseCacheKey, BaseCacheEntry, BaseCacheKeyHash> s_baseCache;
+// Raised from 256 to 4096: under intense LOD spam, 4 workers × multiple LODs ×
+// multiple chunks blew through 256 entries quickly, triggering s_baseCache.clear()
+// and forcing 10M-voxel native cache rebuilds (216 ms each). 4096 entries at
+// ~50-200 KB each = ~200-800 MB worst case but typical working set is far smaller.
+static constexpr size_t BASE_CACHE_MAX_ENTRIES = 4096;
+
+// ---------------------------------------------------------------------------
+// Tier A.1 — downsample cache. Stores the result of the expensive overlay-aware
+// LOD downsample loop (LOD>0 only). Keyed per (chunk, lod) plus the geometry
+// params that determine the cache layout. On overlay-generation mismatch with a
+// known dirty AABB, we copy the cached cacheData and re-downsample only LOD
+// voxels intersecting the dirty region (region recompute). Without a dirty
+// AABB we fall back to a full downsample.
+// ---------------------------------------------------------------------------
+struct DownsampleCacheKey {
+    int chunkX, chunkY, chunkZ, lodLevel;
+    int cacheBaseX, cacheBaseZ, cacheMinY, cacheDimXZ, cacheDimY;
+
+    bool operator==(const DownsampleCacheKey& o) const {
+        return chunkX == o.chunkX && chunkY == o.chunkY && chunkZ == o.chunkZ &&
+               lodLevel == o.lodLevel &&
+               cacheBaseX == o.cacheBaseX && cacheBaseZ == o.cacheBaseZ &&
+               cacheMinY == o.cacheMinY &&
+               cacheDimXZ == o.cacheDimXZ && cacheDimY == o.cacheDimY;
+    }
+};
+struct DownsampleCacheKeyHash {
+    size_t operator()(const DownsampleCacheKey& k) const {
+        size_t h = std::hash<int>{}(k.chunkX);
+        h ^= std::hash<int>{}(k.chunkY) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.chunkZ) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.lodLevel) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(k.cacheMinY) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+struct DownsampleCacheEntry {
+    std::vector<uint8_t> cacheData;
+    size_t overlayGeneration{0};
+};
+static std::shared_mutex s_downsampleCacheMutex;
+static std::unordered_map<DownsampleCacheKey, DownsampleCacheEntry,
+                          DownsampleCacheKeyHash> s_downsampleCache;
+static constexpr size_t DOWNSAMPLE_CACHE_MAX_ENTRIES = 8192;
+
+inline bool wasCancelled(const RemeshCancellationToken* token) {
+    return token && token->isCancelled();
+}
+
+// ---------------------------------------------------------------------------
+// Post-process: vertex dedup + Forsyth triangle reorder + fetch reorder
+// ---------------------------------------------------------------------------
+
+static constexpr int RT_VERTEX_CACHE_SIZE = 32;
+static constexpr size_t MAX_VERTS_PER_SUBMESH = 65535;
+static constexpr size_t MAX_RUNTIME_SUBMESHES = 64; // Keep in sync with MAX_SUBCHUNKS in Chunk.h
+// FAST-path compaction is only worth it for truly huge edit meshes. Medium
+// meshes were paying 15-50 ms of dedup work to save only a few milliseconds of
+// upload, which inflated shown latency during normal brush use. Prefer raw
+// uploads until the mesh is so large that it would explode submesh count or
+// memory pressure.
+static constexpr size_t FAST_COMPACT_VERT_THRESHOLD = 450000;
+static constexpr size_t FAST_COMPACT_INDEX_THRESHOLD = 700000;
+static constexpr size_t FAST_COMPACT_SUBMESH_THRESHOLD = 8;
+
+static void optimizeTriangleOrderRT(TerrainEditMesher::MeshResult& mesh) {
+    if (mesh.empty()) return;
+    const size_t triCount = mesh.indices.size() / 3;
+    if (triCount <= 1) return;
+    const size_t vertCount = mesh.vertices.size();
+
+    std::vector<std::vector<uint32_t>> vertToTris(vertCount);
+    for (size_t t = 0; t < triCount; ++t) {
+        vertToTris[mesh.indices[t*3+0]].push_back(static_cast<uint32_t>(t));
+        vertToTris[mesh.indices[t*3+1]].push_back(static_cast<uint32_t>(t));
+        vertToTris[mesh.indices[t*3+2]].push_back(static_cast<uint32_t>(t));
+    }
+
+    std::vector<uint32_t> cache(RT_VERTEX_CACHE_SIZE, UINT32_MAX);
+    std::vector<bool> inCache(vertCount, false);
+    int cachePos = 0;
+
+    auto pushCache = [&](uint32_t v) {
+        if (inCache[v]) return;
+        uint32_t evicted = cache[cachePos];
+        if (evicted != UINT32_MAX) inCache[evicted] = false;
+        cache[cachePos] = v;
+        inCache[v] = true;
+        cachePos = (cachePos + 1) % RT_VERTEX_CACHE_SIZE;
+    };
+
+    std::vector<bool> emitted(triCount, false);
+    std::vector<uint32_t> newIndices;
+    newIndices.reserve(mesh.indices.size());
+
+    auto emitTri = [&](size_t t) {
+        emitted[t] = true;
+        uint32_t v0 = mesh.indices[t*3+0], v1 = mesh.indices[t*3+1], v2 = mesh.indices[t*3+2];
+        newIndices.push_back(v0); newIndices.push_back(v1); newIndices.push_back(v2);
+        pushCache(v0); pushCache(v1); pushCache(v2);
+    };
+
+    emitTri(0);
+    for (size_t ec = 1; ec < triCount; ) {
+        size_t bestTri = SIZE_MAX;
+        int bestScore = -1;
+        for (int ci = 0; ci < RT_VERTEX_CACHE_SIZE && bestScore < 3; ++ci) {
+            uint32_t cv = cache[ci];
+            if (cv == UINT32_MAX) continue;
+            for (uint32_t t : vertToTris[cv]) {
+                if (emitted[t]) continue;
+                int score = 0;
+                if (inCache[mesh.indices[t*3+0]]) ++score;
+                if (inCache[mesh.indices[t*3+1]]) ++score;
+                if (inCache[mesh.indices[t*3+2]]) ++score;
+                if (score > bestScore) { bestScore = score; bestTri = t; }
+                if (score == 3) break;
+            }
+        }
+        if (bestTri == SIZE_MAX) {
+            for (size_t t = 0; t < triCount; ++t)
+                if (!emitted[t]) { bestTri = t; break; }
+        }
+        emitTri(bestTri);
+        ++ec;
+    }
+    mesh.indices = std::move(newIndices);
+}
+
+static void deduplicateMeshVertices(TerrainEditMesher::MeshResult& mesh) {
+    if (mesh.empty()) return;
+
+    const size_t origCount = mesh.vertices.size();
+
+    struct VertexKey {
+        uint32_t packed{0};
+        uint32_t material{0};
+        bool operator==(const VertexKey& o) const noexcept {
+            return packed == o.packed && material == o.material;
+        }
+    };
+    struct VertexKeyHash {
+        size_t operator()(const VertexKey& k) const noexcept {
+            uint64_t h = static_cast<uint64_t>(k.packed);
+            h ^= static_cast<uint64_t>(k.material) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+            return static_cast<size_t>(h);
+        }
+    };
+
+    std::unordered_map<VertexKey, uint32_t, VertexKeyHash> seen;
+    seen.reserve(origCount);
+    std::vector<Vertex> newVerts;
+    newVerts.reserve(origCount);
+    std::vector<uint32_t> remap(origCount);
+
+    for (size_t i = 0; i < origCount; ++i) {
+        VertexKey key{mesh.vertices[i].packed, mesh.vertices[i].material};
+        auto [it, inserted] = seen.try_emplace(key, static_cast<uint32_t>(newVerts.size()));
+        if (inserted) newVerts.push_back(mesh.vertices[i]);
+        remap[i] = it->second;
+    }
+    for (auto& idx : mesh.indices)
+        idx = remap[idx];
+    mesh.vertices = std::move(newVerts);
+}
+
+static void deduplicateAndReorderMesh(TerrainEditMesher::MeshResult& mesh) {
+    if (mesh.empty()) return;
+
+    deduplicateMeshVertices(mesh);
+
+    // Forsyth triangle reorder
+    optimizeTriangleOrderRT(mesh);
+
+    // Vertex fetch reorder: sequential IDs in draw order
+    const size_t vc = mesh.vertices.size();
+    std::vector<uint32_t> fetchRemap(vc, UINT32_MAX);
+    std::vector<Vertex> ordered;
+    ordered.reserve(vc);
+    uint32_t nextId = 0;
+    for (auto& idx : mesh.indices) {
+        if (fetchRemap[idx] == UINT32_MAX) {
+            fetchRemap[idx] = nextId++;
+            ordered.push_back(mesh.vertices[idx]);
+        }
+        idx = fetchRemap[idx];
+    }
+    for (size_t i = 0; i < vc; ++i) {
+        if (fetchRemap[i] == UINT32_MAX)
+            ordered.push_back(mesh.vertices[i]);
+    }
+    mesh.vertices = std::move(ordered);
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+bool TerrainEditMesher::isSolid(const TerrainFieldSource& field,
+                                 int wx, int wy, int wz) {
+    // Convert world-voxel coordinate to edit grid coordinate.
+    // One voxel = 0.25 m = 8 edit cells, but the base sampler in
+    // TerrainFieldSource already operates in edit-grid space
+    // (EDIT_CELLS_PER_VOXEL cells per voxel).
+    // We query at the cell centre of the voxel.
+    const int32_t cellX = wx * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2;
+    const int32_t cellY = wy * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2;
+    const int32_t cellZ = wz * EDIT_CELLS_PER_VOXEL + EDIT_CELLS_PER_VOXEL / 2;
+    const FieldSample s = field.sample(GridCoord(cellX, cellY, cellZ));
+    return s.value.solid;
+}
+
+static float materialHash01(int x, int z, uint32_t salt)
+{
+    uint32_t h = static_cast<uint32_t>(x) * 0x9E3779B9u;
+    h ^= static_cast<uint32_t>(z) * 0x85EBCA6Bu;
+    h ^= salt * 0xC2B2AE35u;
+    h ^= h >> 16;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15;
+    return static_cast<float>(h & 0x00FFFFFFu) * (1.0f / 16777216.0f);
+}
+
+static uint32_t canonicalBlockMaterial(int wx, int wy, int wz, uint8_t face,
+                                       uint16_t pixelsPerVoxel)
+{
+    // Same material layer as painted faces: not a fragment-time overlay.
+    // Top faces get terrain-biome materials; side/bottom faces default to dirt.
+    // Variant is intentionally fixed to 0 so greedy meshing can merge broad
+    // faces. The shader still produces per-texel variation from world position.
+    uint8_t type = (face == 3u) ? 0u : 2u; // top = grass, sides/bottom = dirt
+
+    if (face == 3u) {
+        const float worldY = static_cast<float>(wy) * WorldConfig::VOXEL_SIZE_M;
+        const float biomeNoise = materialHash01(wx >> 2, wz >> 2, 71u);
+        if (worldY < 5.0f) {
+            type = 3u; // sand-like low areas
+        } else if (biomeNoise > 0.82f) {
+            type = 1u; // muddy patches
+        }
+    }
+
+    return VertexPacking::packMaterial(type, 0u, 0u, pixelsPerVoxel);
+}
+
+// ---------------------------------------------------------------------------
+// AO (matches the offline tool: side + corner heuristic)
+// ---------------------------------------------------------------------------
+
+TerrainEditMesher::FaceAO TerrainEditMesher::calcAO(
+        const TerrainFieldSource& field,
+        int wx, int wy, int wz,
+        int axis, int direction)
+{
+    auto solid = [&](int dx, int dy, int dz) -> bool {
+        return isSolid(field, wx + dx, wy + dy, wz + dz);
+    };
+
+    auto vertexAO = [](bool s1, bool s2, bool corner) -> uint8_t {
+        if (s1 && s2) return 3;
+        if (s1 || s2) return corner ? 2u : 1u;
+        return corner ? 1u : 0u;
+    };
+
+    FaceAO ao;
+
+    if (axis == 0) { // X-axis faces (u=Z, v=Y)
+        int nx = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(nx, 0, -1), solid(nx, -1,  0), solid(nx, -1, -1));
+        ao.br = vertexAO(solid(nx, 0,  1), solid(nx, -1,  0), solid(nx, -1,  1));
+        ao.tr = vertexAO(solid(nx, 0,  1), solid(nx,  1,  0), solid(nx,  1,  1));
+        ao.tl = vertexAO(solid(nx, 0, -1), solid(nx,  1,  0), solid(nx,  1, -1));
+    } else if (axis == 1) { // Y-axis faces (u=X, v=Z)
+        int ny = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(-1, ny, 0), solid(0, ny, -1), solid(-1, ny, -1));
+        ao.br = vertexAO(solid( 1, ny, 0), solid(0, ny, -1), solid( 1, ny, -1));
+        ao.tr = vertexAO(solid( 1, ny, 0), solid(0, ny,  1), solid( 1, ny,  1));
+        ao.tl = vertexAO(solid(-1, ny, 0), solid(0, ny,  1), solid(-1, ny,  1));
+    } else { // Z-axis faces (u=X, v=Y)
+        int nz = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(-1, 0, nz), solid(0, -1, nz), solid(-1, -1, nz));
+        ao.br = vertexAO(solid( 1, 0, nz), solid(0, -1, nz), solid( 1, -1, nz));
+        ao.tr = vertexAO(solid( 1, 0, nz), solid(0,  1, nz), solid( 1,  1, nz));
+        ao.tl = vertexAO(solid(-1, 0, nz), solid(0,  1, nz), solid(-1,  1, nz));
+    }
+    return ao;
+}
+
+// ---------------------------------------------------------------------------
+// Quad emission (matches offline tool format exactly)
+// ---------------------------------------------------------------------------
+
+void TerrainEditMesher::addQuad(MeshResult& out,
+                                int axis, int slicePos,
+                                int u, int v,
+                                int quadW, int quadH,
+                                int direction, uint8_t face,
+                                uint32_t material,
+                                const FaceAO& ao)
+{
+    uint16_t x0, y0, z0;
+    uint16_t x1, y1, z1;
+    uint16_t x2, y2, z2;
+    uint16_t x3, y3, z3;
+
+    if (axis == 0) { // X face
+        uint16_t x = static_cast<uint16_t>(slicePos + (direction == 1 ? 1 : 0));
+        x0 = x; y0 = static_cast<uint16_t>(v);             z0 = static_cast<uint16_t>(u);
+        x1 = x; y1 = static_cast<uint16_t>(v);             z1 = static_cast<uint16_t>(u + quadW);
+        x2 = x; y2 = static_cast<uint16_t>(v + quadH);     z2 = static_cast<uint16_t>(u + quadW);
+        x3 = x; y3 = static_cast<uint16_t>(v + quadH);     z3 = static_cast<uint16_t>(u);
+    } else if (axis == 1) { // Y face
+        uint16_t y = static_cast<uint16_t>(slicePos + (direction == 1 ? 1 : 0));
+        x0 = static_cast<uint16_t>(u);         y0 = y; z0 = static_cast<uint16_t>(v);
+        x1 = static_cast<uint16_t>(u + quadW); y1 = y; z1 = static_cast<uint16_t>(v);
+        x2 = static_cast<uint16_t>(u + quadW); y2 = y; z2 = static_cast<uint16_t>(v + quadH);
+        x3 = static_cast<uint16_t>(u);         y3 = y; z3 = static_cast<uint16_t>(v + quadH);
+    } else { // Z face
+        uint16_t z = static_cast<uint16_t>(slicePos + (direction == 1 ? 1 : 0));
+        x0 = static_cast<uint16_t>(u);         y0 = static_cast<uint16_t>(v);         z0 = z;
+        x1 = static_cast<uint16_t>(u + quadW); y1 = static_cast<uint16_t>(v);         z1 = z;
+        x2 = static_cast<uint16_t>(u + quadW); y2 = static_cast<uint16_t>(v + quadH); z2 = z;
+        x3 = static_cast<uint16_t>(u);         y3 = static_cast<uint16_t>(v + quadH); z3 = z;
+    }
+
+    // Pack vertices into engine format: X(8)|Y(10)|Z(8)|face(3)|AO(3)
+    // Y is stored directly (0-512 range fits in 10 bits)
+    auto pack = [face, material](uint16_t px, uint16_t py, uint16_t pz, uint8_t aoVal) -> Vertex {
+        uint32_t packed =
+            (static_cast<uint32_t>(px)       <<  0) |
+            (static_cast<uint32_t>(py)       <<  8) |
+            (static_cast<uint32_t>(pz)       << 18) |
+            (static_cast<uint32_t>(face & 7) << 26) |
+            (static_cast<uint32_t>(aoVal & 7) << 29);
+        return {packed, material};
+    };
+
+    auto baseIdx = static_cast<uint32_t>(out.vertices.size());
+    out.vertices.push_back(pack(x0, y0, z0, ao.bl));
+    out.vertices.push_back(pack(x1, y1, z1, ao.br));
+    out.vertices.push_back(pack(x2, y2, z2, ao.tr));
+    out.vertices.push_back(pack(x3, y3, z3, ao.tl));
+
+    // Update tight AABB in chunk-local METRES (matching precomputed pipeline).
+    // The vertex shader reconstructs: worldVoxel = chunkCoord*(128,512,128) + (ux, uy, uz)
+    // then metres = worldVoxel * 0.25.  In chunk-local space that's just (px, py, pz) * 0.25.
+    constexpr float VS = 0.25f; // WorldConfig::VOXEL_SIZE_M
+    auto updateBB = [&](uint16_t px, uint16_t py, uint16_t pz) {
+        glm::vec3 m(float(px) * VS, float(py) * VS, float(pz) * VS);
+        out.aabbMin = glm::min(out.aabbMin, m);
+        out.aabbMax = glm::max(out.aabbMax, m);
+    };
+    updateBB(x0, y0, z0);
+    updateBB(x1, y1, z1);
+    updateBB(x2, y2, z2);
+    updateBB(x3, y3, z3);
+
+    // Winding order + AO-based diagonal flip (matching offline tool)
+    bool useReversedWinding = (axis == 2) ? (direction == 0) : (direction == 1);
+    bool flipDiag = (ao.bl + ao.tr) > (ao.br + ao.tl);
+
+    if (useReversedWinding) {
+        if (flipDiag) {
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 3); out.indices.push_back(baseIdx + 1);
+            out.indices.push_back(baseIdx + 1); out.indices.push_back(baseIdx + 3); out.indices.push_back(baseIdx + 2);
+        } else {
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 2); out.indices.push_back(baseIdx + 1);
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 3); out.indices.push_back(baseIdx + 2);
+        }
+    } else {
+        if (flipDiag) {
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 1); out.indices.push_back(baseIdx + 3);
+            out.indices.push_back(baseIdx + 1); out.indices.push_back(baseIdx + 2); out.indices.push_back(baseIdx + 3);
+        } else {
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 1); out.indices.push_back(baseIdx + 2);
+            out.indices.push_back(baseIdx + 0); out.indices.push_back(baseIdx + 2); out.indices.push_back(baseIdx + 3);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cache-based AO (matches the offline tool: side + corner heuristic)
+// ---------------------------------------------------------------------------
+
+TerrainEditMesher::FaceAO TerrainEditMesher::calcAOCached(
+        const SolidCache& cache,
+        int wx, int wy, int wz,
+        int axis, int direction)
+{
+    // All AO probes are within the 1-voxel padded cache bounds —
+    // skip bounds checks for ~8× fewer branches per face.
+    auto solid = [&](int dx, int dy, int dz) -> bool {
+        return cache.getUnchecked(wx + dx, wy + dy, wz + dz);
+    };
+
+    auto vertexAO = [](bool s1, bool s2, bool corner) -> uint8_t {
+        if (s1 && s2) return 3;
+        if (s1 || s2) return corner ? 2u : 1u;
+        return corner ? 1u : 0u;
+    };
+
+    FaceAO ao;
+
+    if (axis == 0) {
+        int nx = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(nx, 0, -1), solid(nx, -1,  0), solid(nx, -1, -1));
+        ao.br = vertexAO(solid(nx, 0,  1), solid(nx, -1,  0), solid(nx, -1,  1));
+        ao.tr = vertexAO(solid(nx, 0,  1), solid(nx,  1,  0), solid(nx,  1,  1));
+        ao.tl = vertexAO(solid(nx, 0, -1), solid(nx,  1,  0), solid(nx,  1, -1));
+    } else if (axis == 1) {
+        int ny = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(-1, ny, 0), solid(0, ny, -1), solid(-1, ny, -1));
+        ao.br = vertexAO(solid( 1, ny, 0), solid(0, ny, -1), solid( 1, ny, -1));
+        ao.tr = vertexAO(solid( 1, ny, 0), solid(0, ny,  1), solid( 1, ny,  1));
+        ao.tl = vertexAO(solid(-1, ny, 0), solid(0, ny,  1), solid(-1, ny,  1));
+    } else {
+        int nz = (direction == 1) ? 1 : -1;
+        ao.bl = vertexAO(solid(-1, 0, nz), solid(0, -1, nz), solid(-1, -1, nz));
+        ao.br = vertexAO(solid( 1, 0, nz), solid(0, -1, nz), solid( 1, -1, nz));
+        ao.tr = vertexAO(solid( 1, 0, nz), solid(0,  1, nz), solid( 1,  1, nz));
+        ao.tl = vertexAO(solid(-1, 0, nz), solid(0,  1, nz), solid(-1,  1, nz));
+    }
+    return ao;
+}
+
+// ---------------------------------------------------------------------------
+// Build solid cache — single pass over heightmap + single-lock overlay apply
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> TerrainEditMesher::buildSolidCache(
+        const TerrainFieldSource& field,
+        const HeightmapBaseSampler& heightmap,
+        int baseVoxelX, int baseVoxelZ,
+        int cacheMinY, int cacheDimXZ, int cacheDimY,
+        const RemeshCancellationToken* cancelToken)
+{
+    const size_t totalSize = static_cast<size_t>(cacheDimY) * cacheDimXZ * cacheDimXZ;
+
+    const int chunkX = floorDiv(baseVoxelX + 1, 128);  // +1 compensates for the -1 padding
+    const int chunkZ = floorDiv(baseVoxelZ + 1, 128);
+    const BaseCacheKey key{chunkX, chunkZ, baseVoxelX, baseVoxelZ, cacheMinY, cacheDimXZ, cacheDimY};
+
+    const auto* overlay = field.getOverlay();
+    const size_t currentGen = (overlay && overlay->hasAnyEdits())
+        ? overlay->getOverlayGeneration() : 0;
+
+    // --- Three-tier cache lookup ---
+    {
+        std::shared_lock<std::shared_mutex> rlock(s_baseCacheMutex);
+        auto it = s_baseCache.find(key);
+        if (it != s_baseCache.end()) {
+            const auto& entry = it->second;
+
+            // Full hit: overlay generation matches → skip ALL work.
+            if (entry.overlayGeneration == currentGen
+                && entry.appliedResult.size() == totalSize) {
+                return entry.appliedResult;
+            }
+
+            // Partial hit: heightmap base is valid, re-apply overlay only.
+            if (entry.heightmapBase.size() == totalSize) {
+                std::vector<uint8_t> cache = entry.heightmapBase;
+                rlock.unlock();
+
+                if (overlay && overlay->hasAnyEdits()) {
+                    overlay->bulkApplyToSolidCache(
+                        cache.data(), baseVoxelX, baseVoxelZ,
+                        cacheMinY, cacheDimXZ, cacheDimY, cancelToken);
+                    if (wasCancelled(cancelToken)) {
+                        return {};
+                    }
+                }
+
+                // Update the applied result for next time.
+                {
+                    std::unique_lock<std::shared_mutex> wlock(s_baseCacheMutex);
+                    auto& e = s_baseCache[key];
+                    e.appliedResult = cache;
+                    e.overlayGeneration = currentGen;
+                }
+                return cache;
+            }
+        }
+    }
+
+    // Full miss: build from heightmap.
+    std::vector<uint8_t> cache(totalSize, 0);
+
+    const int mapW = heightmap.getMapWidth();
+    const int mapH = heightmap.getMapHeight();
+
+    for (int cz = 0; cz < cacheDimXZ; ++cz) {
+        if (wasCancelled(cancelToken)) {
+            return {};
+        }
+        const int wz = baseVoxelZ + cz;
+        for (int cx = 0; cx < cacheDimXZ; ++cx) {
+            const int wx = baseVoxelX + cx;
+
+            int height = 0;
+            if (wx >= 0 && wx < mapW && wz >= 0 && wz < mapH) {
+                height = heightmap.getHeightAtVoxel(wx, wz);
+            }
+
+            const int fillMinY = cacheMinY;
+            const int fillMaxY = std::min(height, cacheMinY + cacheDimY);
+            for (int wy = fillMinY; wy < fillMaxY; ++wy) {
+                const int cy = wy - cacheMinY;
+                cache[static_cast<size_t>((cy * cacheDimXZ + cz) * cacheDimXZ + cx)] = 1;
+            }
+        }
+    }
+
+    // Save heightmap base, then apply overlay for the applied result.
+    std::vector<uint8_t> heightmapBase = cache;
+
+    if (overlay && overlay->hasAnyEdits()) {
+        overlay->bulkApplyToSolidCache(
+            cache.data(), baseVoxelX, baseVoxelZ,
+            cacheMinY, cacheDimXZ, cacheDimY, cancelToken);
+        if (wasCancelled(cancelToken)) {
+            return {};
+        }
+    }
+
+    // Store both layers in cache.
+    {
+        std::unique_lock<std::shared_mutex> wlock(s_baseCacheMutex);
+        if (s_baseCache.size() >= BASE_CACHE_MAX_ENTRIES) {
+            // Evict ~half the entries instead of clear(); keeps recent working
+            // set warm so worker threads under spam don't all hit cold misses.
+            const size_t target = BASE_CACHE_MAX_ENTRIES / 2;
+            size_t toRemove = s_baseCache.size() - target;
+            for (auto it = s_baseCache.begin(); it != s_baseCache.end() && toRemove > 0; ) {
+                it = s_baseCache.erase(it);
+                --toRemove;
+            }
+        }
+        auto& entry = s_baseCache[key];
+        entry.heightmapBase = std::move(heightmapBase);
+        entry.appliedResult = cache;
+        entry.overlayGeneration = currentGen;
+    }
+
+    return cache;
+}
+
+
+// ---------------------------------------------------------------------------
+// Build solid cache for 3D voxel base (overhangs / floating islands)
+// ---------------------------------------------------------------------------
+
+std::vector<uint8_t> TerrainEditMesher::buildSolidCacheVoxelBase(
+        const TerrainFieldSource& field,
+        const VoxelBaseSampler& voxelBase,
+        int baseVoxelX, int baseVoxelZ,
+        int cacheMinY, int cacheDimXZ, int cacheDimY)
+{
+    const size_t totalSize = static_cast<size_t>(cacheDimY) * cacheDimXZ * cacheDimXZ;
+    std::vector<uint8_t> cache(totalSize, 0);
+
+    // Bulk-apply the voxel base store (solid/air overrides from base_voxels.bin).
+    voxelBase.getStore().bulkApplyToSolidCache(
+        cache.data(), baseVoxelX, baseVoxelZ,
+        cacheMinY, cacheDimXZ, cacheDimY);
+
+    // Layer edit overlay on top (snapshot edits).
+    const auto* overlay = field.getOverlay();
+    if (overlay && overlay->hasAnyEdits()) {
+        overlay->bulkApplyToSolidCache(
+            cache.data(), baseVoxelX, baseVoxelZ,
+            cacheMinY, cacheDimXZ, cacheDimY);
+    }
+
+    return cache;
+}
+
+// ---------------------------------------------------------------------------
+// Main greedy meshing entry point
+// ---------------------------------------------------------------------------
+
+TerrainEditMesher::MeshResult TerrainEditMesher::meshChunk(
+        const TerrainFieldSource& field,
+        const glm::ivec3& chunkCoord,
+        int chunkSizeVoxels,
+        int chunkHeightVoxels,
+        float /*voxelSize*/,
+        int hintMinY,
+        int hintMaxY,
+        const HeightmapBaseSampler* heightmap,
+        int lodLevel,
+        bool skipPostProcess,
+        bool skipAmbientOcclusion,
+        const RemeshCancellationToken* cancelToken,
+        const VoxelBaseSampler* voxelBase,
+        const glm::ivec3* editDirtyVoxelMin,
+        const glm::ivec3* editDirtyVoxelMax,
+        int bandLocalYMin,
+        int bandLocalYMax)
+{
+    using Clock = std::chrono::steady_clock;
+    MeshResult result;
+    // Tier B Phase 1: record requested band so diagnostics can compare against
+    // the eventually-wired band-clipped path. No-op on the meshing loop today.
+    result.stats.bandLocalYMin = bandLocalYMin;
+    result.stats.bandLocalYMax = bandLocalYMax;
+    result.stats.bandActive    = false;
+
+    // LOD downsampling: at LOD > 0, operate on a coarser voxel grid.
+    // step = 2^lodLevel.  The mesher runs at lodRes = chunkSize/step resolution,
+    // then vertex positions are scaled back to native range after meshing.
+    const int step = (lodLevel > 0) ? (1 << lodLevel) : 1;
+    const int nativeChunkSize = chunkSizeVoxels;
+    const int nativeChunkHeight = chunkHeightVoxels;
+    const bool hasHeightHints = !(hintMinY == -1 && hintMaxY == -1);
+    if (step > 1) {
+        chunkSizeVoxels /= step;
+        chunkHeightVoxels /= step;
+        // Convert height hints from native to LOD voxel units
+        if (hasHeightHints) {
+            hintMinY = floorDiv(hintMinY, step);
+            hintMaxY = floorDiv(hintMaxY + step - 1, step);
+        }
+    }
+
+    // World-voxel origin of this chunk (in LOD voxel units at LOD > 0)
+    const int baseX = chunkCoord.x * chunkSizeVoxels;
+    const int baseY = chunkCoord.y * chunkHeightVoxels;
+    const int baseZ = chunkCoord.z * chunkSizeVoxels;
+
+    // Determine vertical extent of solid voxels in absolute world-voxel units.
+    int minY, maxY;
+    if (hasHeightHints) {
+        minY = std::max(baseY, hintMinY - 1);
+        maxY = std::min(baseY + chunkHeightVoxels - 1, hintMaxY + 1);
+    } else {
+        // Fallback: scan at native resolution, convert to LOD units.
+        const int nBaseX = chunkCoord.x * nativeChunkSize;
+        const int nBaseY = chunkCoord.y * nativeChunkHeight;
+        const int nBaseZ = chunkCoord.z * nativeChunkSize;
+        int nMinY = nBaseY + nativeChunkHeight;
+        int nMaxY = nBaseY - 1;
+        for (int z = 0; z < nativeChunkSize; ++z) {
+            if (wasCancelled(cancelToken)) {
+                return result;
+            }
+            for (int x = 0; x < nativeChunkSize; ++x) {
+                for (int y = 0; y < nativeChunkHeight; ++y) {
+                    const int wy = nBaseY + y;
+                    if (isSolid(field, nBaseX + x, wy, nBaseZ + z)) {
+                        nMinY = std::min(nMinY, wy);
+                        nMaxY = std::max(nMaxY, wy);
+                    }
+                }
+            }
+        }
+        if (nMaxY < nMinY) {
+            return result;
+        }
+        minY = floorDiv(nMinY, step);
+        maxY = floorDiv(nMaxY + step - 1, step);
+    }
+
+    if (minY > maxY) {
+        return result;
+    }
+
+    const int scanMinY = std::max(baseY, minY);
+    const int scanMaxY = std::min(baseY + chunkHeightVoxels - 1, maxY);
+    if (scanMinY > scanMaxY) {
+        return result;
+    }
+    const int scanMinLocalY = scanMinY - baseY;
+    const int scanMaxLocalY = scanMaxY - baseY;
+
+    // --- Build solid cache with 1-voxel padding for neighbor/AO lookups ---
+    auto tCacheBuild = Clock::now();
+    const int cacheDimXZ = chunkSizeVoxels + 2;
+    // Quantize cache Y range so the downsample-cache key (LOD>0) and the
+    // base-cache key (LOD0) remain stable across edits that nudge scanMinY
+    // by a few voxels. Without this, every brush click that grows or shrinks
+    // the solid extent shifts cacheMinY/cacheDimY → key MISS → 5-30 ms of
+    // recompute per chunk per click. Quantum of 16 LOD-voxels means the cache
+    // only changes shape when terrain Y extent crosses a 16-voxel boundary.
+    constexpr int kCacheYQuantize = 16;
+    auto floorQuant = [&](int v) {
+        return (v >= 0)
+            ? (v / kCacheYQuantize) * kCacheYQuantize
+            : -(((-v + kCacheYQuantize - 1) / kCacheYQuantize) * kCacheYQuantize);
+    };
+    auto ceilQuant = [&](int v) {
+        return (v >= 0)
+            ? ((v + kCacheYQuantize - 1) / kCacheYQuantize) * kCacheYQuantize
+            : -((-v / kCacheYQuantize) * kCacheYQuantize);
+    };
+    const int cacheMinY  = floorQuant(scanMinY - 1);
+    const int cacheMaxY  = ceilQuant(scanMaxY + 2);
+    const int cacheDimY  = cacheMaxY - cacheMinY;
+    const int cacheBaseX = baseX - 1;
+    const int cacheBaseZ = baseZ - 1;
+
+    std::vector<uint8_t> cacheData;
+
+    if (step > 1) {
+        // LOD > 0: compute downsampled solid cache.
+        // Two paths depending on whether overlay edits exist:
+        //   - No overlay: O(LOD_voxels) from heightmap directly (~0.1 ms)
+        //   - Overlay:    build native cache + optimized downsample (~14 ms)
+        const auto* overlay = field.getOverlay();
+        const bool hasOverlay = overlay && overlay->hasAnyEdits();
+
+        if (!hasOverlay && heightmap && heightmap->isLoaded()) {
+            // FAST PATH: no overlay edits, compute LOD directly from heightmap.
+            // Matches offline LOD: solid = (nativeBaseWY < baseHeight) at corner.
+            cacheData.resize(static_cast<size_t>(cacheDimY) * cacheDimXZ * cacheDimXZ, 0);
+            for (int lcz = 0; lcz < cacheDimXZ; ++lcz) {
+                if (wasCancelled(cancelToken)) {
+                    return result;
+                }
+                for (int lcx = 0; lcx < cacheDimXZ; ++lcx) {
+                    const int nativeBaseWX = (cacheBaseX + lcx) * step;
+                    const int nativeBaseWZ = (cacheBaseZ + lcz) * step;
+                    const int baseHeight = heightmap->getHeightAtVoxel(nativeBaseWX, nativeBaseWZ);
+                    for (int lcy = 0; lcy < cacheDimY; ++lcy) {
+                        const int nativeBaseWY = (cacheMinY + lcy) * step;
+                        if (nativeBaseWY < baseHeight)
+                            cacheData[static_cast<size_t>((lcy * cacheDimXZ + lcz) * cacheDimXZ + lcx)] = 1;
+                    }
+                }
+            }
+        } else {
+            // OVERLAY PATH: build native cache then downsample.
+            // Optimization: removed per-native-voxel heightmap comparison
+            // from downsample loop.  Uses pure occupancy count + single
+            // heightmap check per LOD voxel for boundary alignment.
+            const int nBaseX = chunkCoord.x * nativeChunkSize;
+            const int nBaseZ = chunkCoord.z * nativeChunkSize;
+            const int nPad = step;
+            const int nDimXZ = nativeChunkSize + 2 * nPad;
+            const int nCacheBaseX = nBaseX - nPad;
+            const int nCacheBaseZ = nBaseZ - nPad;
+            // Quantize Y range to multiples of (step * 16) so that small
+            // changes in height hints between edits don't invalidate the
+            // buildSolidCache key.  Without this, every edit changes
+            // nCacheMinY → full cache miss → 30 ms rebuild.
+            const int yQuantize = step * 16;
+            const int rawNMinY = scanMinY * step - nPad;
+            const int rawNMaxY = (scanMaxY + 1) * step + nPad;
+            const int nCacheMinY = (rawNMinY < 0)
+                ? -(((-rawNMinY + yQuantize - 1) / yQuantize) * yQuantize)
+                : (rawNMinY / yQuantize) * yQuantize;
+            const int nCacheMaxY = ((rawNMaxY + yQuantize - 1) / yQuantize) * yQuantize;
+            const int nDimY = nCacheMaxY - nCacheMinY;
+
+            std::vector<uint8_t> nativeCacheData;
+            if (heightmap && heightmap->isLoaded()) {
+                nativeCacheData = buildSolidCache(field, *heightmap,
+                                                  nCacheBaseX, nCacheBaseZ,
+                                                  nCacheMinY, nDimXZ, nDimY, cancelToken);
+                if (wasCancelled(cancelToken)) {
+                    return result;
+                }
+            } else if (voxelBase && voxelBase->isLoaded()) {
+                nativeCacheData = buildSolidCacheVoxelBase(field, *voxelBase,
+                                                           nCacheBaseX, nCacheBaseZ,
+                                                           nCacheMinY, nDimXZ, nDimY);
+                if (wasCancelled(cancelToken)) {
+                    return result;
+                }
+            } else {
+                nativeCacheData.resize(static_cast<size_t>(nDimY) * nDimXZ * nDimXZ, 0);
+                for (int cz = 0; cz < nDimXZ; ++cz) {
+                    if (wasCancelled(cancelToken)) {
+                        return result;
+                    }
+                    for (int cx = 0; cx < nDimXZ; ++cx) {
+                        const int wx = nCacheBaseX + cx;
+                        const int wz = nCacheBaseZ + cz;
+                        for (int cy = 0; cy < nDimY; ++cy) {
+                            const int wy = nCacheMinY + cy;
+                            if (isSolid(field, wx, wy, wz))
+                                nativeCacheData[static_cast<size_t>((cy * nDimXZ + cz) * nDimXZ + cx)] = 1;
+                        }
+                    }
+                }
+            }
+
+            // Downsample: count solid native voxels per LOD block.
+            // All downsample coordinates are within the padded native cache,
+            // so we use raw array access (no bounds checks).
+            //
+            // Tier A.1 cache: keyed by (chunk, lod, padding params), invalidated
+            // by overlay generation. Three outcomes:
+            //   FULL HIT  — overlayGen matches → reuse cacheData entirely (skip work).
+            //   PARTIAL   — overlayGen mismatch + dirty AABB known → copy old
+            //               cacheData, recompute only LOD voxels intersecting the
+            //               (dirty AABB / step), expanded by 1 for AO border.
+            //   MISS      — recompute every LOD voxel.
+            const auto tDownsampleStart = Clock::now();
+            const auto* overlayPtr = field.getOverlay();
+            const size_t currentOverlayGen = (overlayPtr && overlayPtr->hasAnyEdits())
+                ? overlayPtr->getOverlayGeneration() : 0;
+            const DownsampleCacheKey dsKey{chunkCoord.x, chunkCoord.y, chunkCoord.z, lodLevel,
+                                           cacheBaseX, cacheBaseZ, cacheMinY,
+                                           cacheDimXZ, cacheDimY};
+
+            int dirtyLodMinX = 0, dirtyLodMaxX = cacheDimXZ - 1;
+            int dirtyLodMinY = 0, dirtyLodMaxY = cacheDimY  - 1;
+            int dirtyLodMinZ = 0, dirtyLodMaxZ = cacheDimXZ - 1;
+            const bool hasDirtyAabb = (editDirtyVoxelMin && editDirtyVoxelMax);
+            int dirtyLocalMinX = dirtyLodMinX, dirtyLocalMaxX = dirtyLodMaxX;
+            int dirtyLocalMinY = dirtyLodMinY, dirtyLocalMaxY = dirtyLodMaxY;
+            int dirtyLocalMinZ = dirtyLodMinZ, dirtyLocalMaxZ = dirtyLodMaxZ;
+            if (hasDirtyAabb) {
+                // Convert native dirty voxel AABB → LOD voxel range, expand
+                // by 1 LOD voxel for AO border (since neighbouring solidity
+                // affects this LOD voxel's downsample result via padding cell).
+                const int lminX = floorDiv(editDirtyVoxelMin->x, step) - 1;
+                const int lmaxX = floorDiv(editDirtyVoxelMax->x, step) + 1;
+                const int lminY = floorDiv(editDirtyVoxelMin->y, step) - 1;
+                const int lmaxY = floorDiv(editDirtyVoxelMax->y, step) + 1;
+                const int lminZ = floorDiv(editDirtyVoxelMin->z, step) - 1;
+                const int lmaxZ = floorDiv(editDirtyVoxelMax->z, step) + 1;
+                dirtyLocalMinX = std::max(0, lminX - cacheBaseX);
+                dirtyLocalMaxX = std::min(cacheDimXZ - 1, lmaxX - cacheBaseX);
+                dirtyLocalMinY = std::max(0, lminY - cacheMinY);
+                dirtyLocalMaxY = std::min(cacheDimY  - 1, lmaxY - cacheMinY);
+                dirtyLocalMinZ = std::max(0, lminZ - cacheBaseZ);
+                dirtyLocalMaxZ = std::min(cacheDimXZ - 1, lmaxZ - cacheBaseZ);
+            }
+
+            bool didRecomputeFull = true;
+            bool runDownsampleLoop = true;
+            const size_t expectedSize = static_cast<size_t>(cacheDimY) * cacheDimXZ * cacheDimXZ;
+            {
+                std::shared_lock<std::shared_mutex> rlock(s_downsampleCacheMutex);
+                auto it = s_downsampleCache.find(dsKey);
+                if (it != s_downsampleCache.end() && it->second.cacheData.size() == expectedSize) {
+                    if (it->second.overlayGeneration == currentOverlayGen) {
+                        // FULL HIT — reuse cached data wholesale, skip loop entirely.
+                        cacheData = it->second.cacheData;
+                        result.stats.downsampleCacheState = 1;
+                        didRecomputeFull = false;
+                        runDownsampleLoop = false;
+                    } else if (hasDirtyAabb &&
+                               dirtyLocalMinX <= dirtyLocalMaxX &&
+                               dirtyLocalMinY <= dirtyLocalMaxY &&
+                               dirtyLocalMinZ <= dirtyLocalMaxZ) {
+                        // PARTIAL HIT — copy old, recompute dirty region only.
+                        cacheData = it->second.cacheData;
+                        result.stats.downsampleCacheState = 2;
+                        didRecomputeFull = false;
+                        dirtyLodMinX = dirtyLocalMinX; dirtyLodMaxX = dirtyLocalMaxX;
+                        dirtyLodMinY = dirtyLocalMinY; dirtyLodMaxY = dirtyLocalMaxY;
+                        dirtyLodMinZ = dirtyLocalMinZ; dirtyLodMaxZ = dirtyLocalMaxZ;
+                    }
+                }
+            }
+            if (didRecomputeFull) {
+                cacheData.assign(expectedSize, 0);
+            }
+
+            const int nativeSamplesPerLodVoxel = step * step * step;
+            const int solidThreshold = nativeSamplesPerLodVoxel / 2;
+            const int stepSq = step * step;
+
+            // ---------- Edit-aware partial-block disambiguation ----------
+            // A partial-fill LOD voxel (sc != 0 && sc != stepXY*stepZ) can occur
+            // either because the unedited heightmap varies across the block
+            // (no edit — must keep offline corner rule for boundary alignment
+            // with neighboring precomputed terrain.bin LODs), or because an
+            // overlay edit altered some native cells in the block (must use
+            // the actual majority so the edit is faithfully visualized).
+            //
+            // We disambiguate by reconstructing what the count WOULD be in the
+            // absence of edits. Heightmap-only solid count for native cell
+            // (wx, wy, wz) = (wy < heightmap(wx, wz)). Pre-fetch the step*step
+            // heightmap values per (lcx, lcz) once; the inner Y loop then sums
+            // clamp(h - nativeBaseWY, 0, step) — O(step^2) per LOD voxel.
+            //
+            // When sc == expectedUneditedSc the block is unedited → offline
+            // corner rule. Otherwise → majority of actual count.
+            const bool useEditAwareRule = heightmap && heightmap->isLoaded();
+            std::vector<int> heightSamples;
+            if (useEditAwareRule) {
+                heightSamples.resize(static_cast<size_t>(stepSq));
+            }
+
+            if (runDownsampleLoop) {
+            for (int lcz = dirtyLodMinZ; lcz <= dirtyLodMaxZ; ++lcz) {
+                if (wasCancelled(cancelToken)) {
+                    return result;
+                }
+                for (int lcx = dirtyLodMinX; lcx <= dirtyLodMaxX; ++lcx) {
+                    const int lodWX = cacheBaseX + lcx;
+                    const int lodWZ = cacheBaseZ + lcz;
+                    const int nativeBaseWX = lodWX * step;
+                    const int nativeBaseWZ = lodWZ * step;
+
+                    // Pre-fetch the heightmap samples covering this LOD column
+                    // once per (lcx, lcz) so the inner Y loop has no overlay-
+                    // store / heightmap calls. This is the unedited reference.
+                    if (useEditAwareRule) {
+                        for (int dz = 0; dz < step; ++dz) {
+                            for (int dx = 0; dx < step; ++dx) {
+                                heightSamples[dz * step + dx] =
+                                    heightmap->getHeightAtVoxel(
+                                        nativeBaseWX + dx,
+                                        nativeBaseWZ + dz);
+                            }
+                        }
+                    }
+
+                    for (int lcy = dirtyLodMinY; lcy <= dirtyLodMaxY; ++lcy) {
+                        const int lodWY = cacheMinY + lcy;
+                        const int nativeBaseWY = lodWY * step;
+
+                        // Count solid native voxels using raw array access
+                        int sc = 0;
+                        for (int dy = 0; dy < step; ++dy) {
+                            const int cy = nativeBaseWY + dy - nCacheMinY;
+                            for (int dz = 0; dz < step; ++dz) {
+                                const int cz = nativeBaseWZ + dz - nCacheBaseZ;
+                                const size_t rowBase = static_cast<size_t>((cy * nDimXZ + cz) * nDimXZ
+                                                                          + (nativeBaseWX - nCacheBaseX));
+                                for (int dx = 0; dx < step; ++dx) {
+                                    sc += nativeCacheData[rowBase + dx];
+                                }
+                            }
+                        }
+
+                        bool solid;
+                        if (sc == 0) {
+                            solid = false;
+                        } else if (sc == nativeSamplesPerLodVoxel) {
+                            solid = true;
+                        } else if (useEditAwareRule) {
+                            // Compute the unedited reference count from the
+                            // pre-fetched heightmap samples. Each native column
+                            // contributes clamp(h - nativeBaseWY, 0, step).
+                            int expectedUneditedSc = 0;
+                            for (int i = 0; i < stepSq; ++i) {
+                                const int delta = heightSamples[i] - nativeBaseWY;
+                                if (delta >= step) {
+                                    expectedUneditedSc += step;
+                                } else if (delta > 0) {
+                                    expectedUneditedSc += delta;
+                                }
+                            }
+
+                            if (sc == expectedUneditedSc) {
+                                // Unedited: keep the offline corner rule so
+                                // this LOD chunk seam-matches neighboring
+                                // unedited chunks loaded from terrain.bin.
+                                solid = nativeBaseWY < heightSamples[0];
+                            } else {
+                                // Edited block: flip the unedited base only
+                                // when the edit delta crosses half the LOD
+                                // voxel's native volume. This makes the LOD
+                                // silhouette/volume track the edit faithfully
+                                // (no per-face fattening from a single added
+                                // native cell). Sub-LOD-resolution edits
+                                // (delta below half threshold) keep the base
+                                // result and may not appear at coarse LODs —
+                                // unavoidable cost of volume fidelity.
+                                const bool baseSolid = nativeBaseWY < heightSamples[0];
+                                const int delta = sc - expectedUneditedSc;
+                                if (delta >= solidThreshold) {
+                                    solid = true;   // BUILD majority
+                                } else if (-delta >= solidThreshold) {
+                                    solid = false;  // DIG majority
+                                } else {
+                                    solid = baseSolid;  // Sub-threshold: keep base
+                                }
+                            }
+                        } else {
+                            solid = sc >= solidThreshold;
+                        }
+
+                        // Tier A.1: write unconditionally so PARTIAL HIT path
+                        // can clear LOD voxels that were solid in the cached
+                        // copy but became air after the edit (and vice versa).
+                        cacheData[static_cast<size_t>((lcy * cacheDimXZ + lcz) * cacheDimXZ + lcx)] =
+                            solid ? 1 : 0;
+                    }
+                }
+            }
+            }  // end if (runDownsampleLoop)
+
+            // Tier A.1: store recomputed cacheData under the new overlayGen.
+            // Skip on FULL HIT — cache already holds an identical copy.
+            if (runDownsampleLoop) {
+                std::unique_lock<std::shared_mutex> wlock(s_downsampleCacheMutex);
+                if (s_downsampleCache.size() >= DOWNSAMPLE_CACHE_MAX_ENTRIES) {
+                    // Evict half instead of clear() — same reasoning as s_baseCache.
+                    const size_t target = DOWNSAMPLE_CACHE_MAX_ENTRIES / 2;
+                    size_t toRemove = s_downsampleCache.size() - target;
+                    for (auto it = s_downsampleCache.begin();
+                         it != s_downsampleCache.end() && toRemove > 0; ) {
+                        it = s_downsampleCache.erase(it);
+                        --toRemove;
+                    }
+                }
+                auto& entry = s_downsampleCache[dsKey];
+                entry.cacheData = cacheData;
+                entry.overlayGeneration = currentOverlayGen;
+            }
+            result.stats.downsampleMs = std::chrono::duration<float, std::milli>(
+                Clock::now() - tDownsampleStart).count();
+        }
+    } else if (heightmap && heightmap->isLoaded()) {
+        // LOD 0 fast path: build cache from heightmap + overlay
+        cacheData = buildSolidCache(field, *heightmap,
+                                    cacheBaseX, cacheBaseZ,
+                                    cacheMinY, cacheDimXZ, cacheDimY, cancelToken);
+        if (wasCancelled(cancelToken)) {
+            return result;
+        }
+    } else if (voxelBase && voxelBase->isLoaded()) {
+        // LOD 0 fast path: build cache from 3D voxel base + overlay
+        cacheData = buildSolidCacheVoxelBase(field, *voxelBase,
+                                             cacheBaseX, cacheBaseZ,
+                                             cacheMinY, cacheDimXZ, cacheDimY);
+        if (wasCancelled(cancelToken)) {
+            return result;
+        }
+    } else {
+        // LOD 0 fallback: build cache via isSolid()
+        cacheData.resize(static_cast<size_t>(cacheDimY) * cacheDimXZ * cacheDimXZ, 0);
+        for (int cz = 0; cz < cacheDimXZ; ++cz) {
+            if (wasCancelled(cancelToken)) {
+                return result;
+            }
+            for (int cx = 0; cx < cacheDimXZ; ++cx) {
+                const int wx = cacheBaseX + cx;
+                const int wz = cacheBaseZ + cz;
+                for (int cy = 0; cy < cacheDimY; ++cy) {
+                    const int wy = cacheMinY + cy;
+                    if (isSolid(field, wx, wy, wz)) {
+                        cacheData[static_cast<size_t>((cy * cacheDimXZ + cz) * cacheDimXZ + cx)] = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    SolidCache cache{};
+    cache.data  = cacheData.data();
+    cache.baseX = cacheBaseX;
+    cache.baseZ = cacheBaseZ;
+    cache.minY  = cacheMinY;
+    cache.dimXZ = cacheDimXZ;
+    cache.dimY  = cacheDimY;
+
+    auto tCacheDone = Clock::now();
+
+    // Count solid voxels in the cache for diagnostics
+    uint32_t solidCount = 0;
+    for (uint8_t b : cacheData) solidCount += b;
+    result.stats.cacheVoxels = static_cast<uint32_t>(cacheData.size());
+    result.stats.solidVoxels = solidCount;
+    result.stats.scanYRange  = scanMaxY - scanMinY + 1;
+    result.stats.cacheDimXZ  = cacheDimXZ;
+    result.stats.monolithicWorkVoxels = static_cast<uint64_t>(chunkSizeVoxels)
+        * static_cast<uint64_t>(chunkSizeVoxels)
+        * static_cast<uint64_t>(std::max(result.stats.scanYRange, 0));
+
+    // --- Pre-compute per-Y-level occupancy and per-column Y bounds ---
+    // Used to skip entirely-air Y layers and tighten face scan per column.
+    const int yLevels = scanMaxLocalY - scanMinLocalY + 1;
+
+    // Per-column (x,z) min/max local Y of solid voxels.
+    // Layout: colMinY[z * chunkSizeVoxels + x], indexed by chunk-local coords.
+    const size_t colCount = static_cast<size_t>(chunkSizeVoxels) * chunkSizeVoxels;
+    std::vector<int> colMinY(colCount, scanMaxLocalY + 1);
+    std::vector<int> colMaxY(colCount, scanMinLocalY - 1);
+
+    for (int cz = 1; cz <= chunkSizeVoxels; ++cz) {
+        if (wasCancelled(cancelToken)) {
+            return result;
+        }
+        const int lz = cz - 1;   // chunk-local z
+        for (int cx = 1; cx <= chunkSizeVoxels; ++cx) {
+            const int lx = cx - 1; // chunk-local x
+            const size_t colIdx = static_cast<size_t>(lz * chunkSizeVoxels + lx);
+            for (int ly = scanMinLocalY; ly <= scanMaxLocalY; ++ly) {
+                // Cache coords: cy = (baseY + ly) - cacheMinY, cacheZ = cz, cacheX = cx
+                const int cy = baseY + ly - cacheMinY;
+                if (cacheData[static_cast<size_t>((cy * cacheDimXZ + cz) * cacheDimXZ + cx)] != 0) {
+                    if (ly < colMinY[colIdx]) colMinY[colIdx] = ly;
+                    if (ly > colMaxY[colIdx]) colMaxY[colIdx] = ly;
+                }
+            }
+        }
+    }
+
+    // ---- Adaptive localized meshing ----
+    // Heavy edited chunks keep one shared solid cache, but greedy meshing
+    // now subdivides expensive regions into smaller X/Y/Z work units.
+
+    uint32_t facesEmitted = 0;
+
+    constexpr uint8_t FACE_NEG_X = 0;
+    constexpr uint8_t FACE_POS_X = 1;
+    constexpr uint8_t FACE_NEG_Y = 2;
+    constexpr uint8_t FACE_POS_Y = 3;
+    constexpr uint8_t FACE_NEG_Z = 4;
+    constexpr uint8_t FACE_POS_Z = 5;
+
+    const auto* textureStore = field.getTextureMaterialStore();
+    const bool hasTextureMaterials = textureStore &&
+        textureStore->hasSurfaceTexturesInBox(
+            glm::ivec3(baseX, baseY, baseZ),
+            glm::ivec3(baseX + chunkSizeVoxels,
+                       baseY + chunkHeightVoxels,
+                       baseZ + chunkSizeVoxels),
+            lodLevel);
+    const uint16_t texturePixelsPerVoxel = textureStore
+        ? textureStore->getLODConfig(lodLevel).pixelsPerVoxel
+        : uint16_t{16};
+    auto sampleFaceMaterial = [&](int wx, int wy, int wz, uint8_t face) -> uint32_t {
+        const uint32_t baseMaterial =
+            canonicalBlockMaterial(wx, wy, wz, face, texturePixelsPerVoxel);
+
+        if (!textureStore || !hasTextureMaterials) {
+            return baseMaterial;
+        }
+
+        const auto tex = textureStore->getSurfaceTexture(glm::ivec3(wx, wy, wz), lodLevel, face);
+        if (tex.isEmpty()) {
+            return baseMaterial;
+        }
+
+        // Brush paint now lives in the same baked material word as the block
+        // texture. It replaces the canonical face material for this voxel face;
+        // it is not drawn as a second render-time overlay layer.
+        // Variant stays procedural in the shader from world position. Keeping
+        // it out of the mesh key lets broad regions merge by material class
+        // instead of exploding into one quad per hashed face.
+        return VertexPacking::packMaterial(
+            static_cast<uint8_t>(tex.getType()),
+            0u,
+            tex.getEdgeMask(),
+            texturePixelsPerVoxel);
+    };
+
+    struct SurfaceFace {
+        int16_t u{0};
+        int16_t v{0};
+        FaceAO ao{};
+        uint32_t material{0};
+    };
+
+    struct MeshingRegion {
+        int minX{0};
+        int maxX{0}; // exclusive
+        int minY{0}; // inclusive
+        int maxY{0}; // inclusive
+        int minZ{0};
+        int maxZ{0}; // exclusive
+        int depth{0};
+    };
+
+    auto computeRegionYBounds = [&](const MeshingRegion& region,
+                                    int& outMinY,
+                                    int& outMaxY) -> bool {
+        outMinY = region.maxY;
+        outMaxY = region.minY - 1;
+        for (int lz = region.minZ; lz < region.maxZ; ++lz) {
+            for (int lx = region.minX; lx < region.maxX; ++lx) {
+                const size_t colIdx = static_cast<size_t>(lz * chunkSizeVoxels + lx);
+                const int colLo = std::max(colMinY[colIdx], region.minY);
+                const int colHi = std::min(colMaxY[colIdx], region.maxY);
+                if (colLo > colHi) {
+                    continue;
+                }
+                if (colLo < outMinY) outMinY = colLo;
+                if (colHi > outMaxY) outMaxY = colHi;
+            }
+        }
+        return outMaxY >= outMinY;
+    };
+
+    auto meshRegionLeaf = [&](const MeshingRegion& region) {
+        if (region.minX >= region.maxX || region.minZ >= region.maxZ || region.minY > region.maxY) {
+            return;
+        }
+
+        const int regionWidth = region.maxX - region.minX;
+        const int regionDepth = region.maxZ - region.minZ;
+        const int regionHeight = region.maxY - region.minY + 1;
+        if (regionWidth <= 0 || regionDepth <= 0 || regionHeight <= 0) {
+            return;
+        }
+
+        ++result.stats.adaptiveLeafRegions;
+        result.stats.adaptiveMaxDepth = std::max(
+            result.stats.adaptiveMaxDepth,
+            static_cast<uint32_t>(region.depth));
+        const uint32_t regionWork = static_cast<uint32_t>(regionWidth * regionDepth * regionHeight);
+        result.stats.adaptiveWorkVoxels += static_cast<uint64_t>(regionWork);
+        result.stats.adaptivePeakRegionVoxels = std::max(
+            result.stats.adaptivePeakRegionVoxels,
+            regionWork);
+        result.stats.adaptivePeakYRange = std::max(
+            result.stats.adaptivePeakYRange,
+            static_cast<uint32_t>(regionHeight));
+
+        std::vector<std::vector<SurfaceFace>> faceBins[6];
+        faceBins[FACE_NEG_X].resize(regionWidth);
+        faceBins[FACE_POS_X].resize(regionWidth);
+        faceBins[FACE_NEG_Y].resize(regionHeight);
+        faceBins[FACE_POS_Y].resize(regionHeight);
+        faceBins[FACE_NEG_Z].resize(regionDepth);
+        faceBins[FACE_POS_Z].resize(regionDepth);
+
+        for (int lz = region.minZ; lz < region.maxZ; ++lz) {
+            if (wasCancelled(cancelToken)) {
+                return;
+            }
+            for (int lx = region.minX; lx < region.maxX; ++lx) {
+                const size_t colIdx = static_cast<size_t>(lz * chunkSizeVoxels + lx);
+                const int yStart = std::max(colMinY[colIdx], region.minY);
+                const int yEnd = std::min(colMaxY[colIdx], region.maxY);
+                if (yStart > yEnd) {
+                    continue;
+                }
+
+                for (int ly = yStart; ly <= yEnd; ++ly) {
+                    const int wx = baseX + lx;
+                    const int wy = baseY + ly;
+                    const int wz = baseZ + lz;
+
+                    if (!cache.getUnchecked(wx, wy, wz)) {
+                        continue;
+                    }
+
+                    const int localX = lx - region.minX;
+                    const int localY = ly - region.minY;
+                    const int localZ = lz - region.minZ;
+
+                    if (!cache.getUnchecked(wx - 1, wy, wz)) {
+                        faceBins[FACE_NEG_X][localX].push_back({static_cast<int16_t>(localZ),
+                                                                static_cast<int16_t>(localY),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 0, 0),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_NEG_X)});
+                        ++facesEmitted;
+                    }
+                    if (!cache.getUnchecked(wx + 1, wy, wz)) {
+                        faceBins[FACE_POS_X][localX].push_back({static_cast<int16_t>(localZ),
+                                                                static_cast<int16_t>(localY),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 0, 1),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_POS_X)});
+                        ++facesEmitted;
+                    }
+                    if (!cache.getUnchecked(wx, wy - 1, wz)) {
+                        faceBins[FACE_NEG_Y][localY].push_back({static_cast<int16_t>(localX),
+                                                                static_cast<int16_t>(localZ),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 1, 0),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_NEG_Y)});
+                        ++facesEmitted;
+                    }
+                    if (!cache.getUnchecked(wx, wy + 1, wz)) {
+                        faceBins[FACE_POS_Y][localY].push_back({static_cast<int16_t>(localX),
+                                                                static_cast<int16_t>(localZ),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 1, 1),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_POS_Y)});
+                        ++facesEmitted;
+                    }
+                    if (!cache.getUnchecked(wx, wy, wz - 1)) {
+                        faceBins[FACE_NEG_Z][localZ].push_back({static_cast<int16_t>(localX),
+                                                                static_cast<int16_t>(localY),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 2, 0),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_NEG_Z)});
+                        ++facesEmitted;
+                    }
+                    if (!cache.getUnchecked(wx, wy, wz + 1)) {
+                        faceBins[FACE_POS_Z][localZ].push_back({static_cast<int16_t>(localX),
+                                                                static_cast<int16_t>(localY),
+                                                                skipAmbientOcclusion ? FaceAO{} : calcAOCached(cache, wx, wy, wz, 2, 1),
+                                                                sampleFaceMaterial(wx, wy, wz, FACE_POS_Z)});
+                        ++facesEmitted;
+                    }
+                }
+            }
+        }
+
+        const size_t maxSliceSize = std::max({
+            static_cast<size_t>(regionDepth) * regionHeight,
+            static_cast<size_t>(regionWidth) * regionHeight,
+            static_cast<size_t>(regionWidth) * regionDepth});
+        std::vector<uint8_t> mask(maxSliceSize, 0);
+        std::vector<FaceAO> aoMask(maxSliceSize);
+        std::vector<uint32_t> materialMask(maxSliceSize, 0u);
+        std::vector<uint8_t> visited(maxSliceSize, 0);
+
+        for (int faceId = 0; faceId < 6; ++faceId) {
+            if (wasCancelled(cancelToken)) {
+                return;
+            }
+
+            const int axis = faceId / 2;
+            const int dir = faceId % 2;
+            const uint8_t face = static_cast<uint8_t>(faceId);
+
+            int uDim = 0;
+            int uOffset = 0;
+            int vOffset = 0;
+            if (axis == 0) {
+                uDim = regionDepth;
+                uOffset = region.minZ;
+                vOffset = region.minY;
+            } else if (axis == 1) {
+                uDim = regionWidth;
+                uOffset = region.minX;
+                vOffset = region.minZ;
+            } else {
+                uDim = regionWidth;
+                uOffset = region.minX;
+                vOffset = region.minY;
+            }
+
+            for (size_t sliceIdx = 0; sliceIdx < faceBins[faceId].size(); ++sliceIdx) {
+                if (wasCancelled(cancelToken)) {
+                    return;
+                }
+
+                auto& entries = faceBins[faceId][sliceIdx];
+                if (entries.empty()) {
+                    continue;
+                }
+
+                const int n = (axis == 0)
+                    ? region.minX + static_cast<int>(sliceIdx)
+                    : (axis == 1)
+                        ? region.minY + static_cast<int>(sliceIdx)
+                        : region.minZ + static_cast<int>(sliceIdx);
+
+                int minV = INT_MAX;
+                int maxV = INT_MIN;
+                for (const auto& sf : entries) {
+                    const size_t idx = static_cast<size_t>(sf.u + sf.v * uDim);
+                    mask[idx] = 1;
+                    aoMask[idx] = sf.ao;
+                    materialMask[idx] = sf.material;
+                    if (sf.v < minV) minV = sf.v;
+                    if (sf.v > maxV) maxV = sf.v;
+                }
+
+                const int mergeVLimit = maxV + 1;
+                for (int j = minV; j <= maxV; ++j) {
+                    for (int i = 0; i < uDim; ++i) {
+                        const int idx = i + j * uDim;
+                        if (!mask[static_cast<size_t>(idx)] || visited[static_cast<size_t>(idx)]) continue;
+
+                        const FaceAO curAO = aoMask[static_cast<size_t>(idx)];
+                        const uint32_t curMaterial = materialMask[static_cast<size_t>(idx)];
+                        const int planeBl = static_cast<int>(curAO.bl);
+                        const int planeDu = static_cast<int>(curAO.br) - planeBl;
+                        const int planeDv = static_cast<int>(curAO.tl) - planeBl;
+                        const bool planeValid = static_cast<int>(curAO.tr) == (planeBl + planeDu + planeDv);
+
+                        auto matchesPlane = [&](const FaceAO& ao, int relU, int relV) -> bool {
+                            const int base = planeBl + planeDu * relU + planeDv * relV;
+                            const int expectedBl = base;
+                            const int expectedBr = base + planeDu;
+                            const int expectedTl = base + planeDv;
+                            const int expectedTr = base + planeDu + planeDv;
+
+                            auto inRange = [](int v) { return v >= 0 && v <= 3; };
+                            if (!inRange(expectedBl) || !inRange(expectedBr)
+                                || !inRange(expectedTl) || !inRange(expectedTr)) {
+                                return false;
+                            }
+
+                            return static_cast<int>(ao.bl) == expectedBl
+                                && static_cast<int>(ao.br) == expectedBr
+                                && static_cast<int>(ao.tl) == expectedTl
+                                && static_cast<int>(ao.tr) == expectedTr;
+                        };
+
+                        auto growExact = [&]() -> std::pair<int, int> {
+                            int qwLocal = 1;
+                            while (i + qwLocal < uDim) {
+                                const int ni = idx + qwLocal;
+                                if (!mask[static_cast<size_t>(ni)] || visited[static_cast<size_t>(ni)]
+                                    || aoMask[static_cast<size_t>(ni)] != curAO
+                                    || materialMask[static_cast<size_t>(ni)] != curMaterial) {
+                                    break;
+                                }
+                                ++qwLocal;
+                            }
+
+                            int qhLocal = 1;
+                            bool canExpand = true;
+                            while (canExpand && j + qhLocal < mergeVLimit) {
+                                for (int di = 0; di < qwLocal; ++di) {
+                                    const int ci = (i + di) + (j + qhLocal) * uDim;
+                                    if (!mask[static_cast<size_t>(ci)] || visited[static_cast<size_t>(ci)]
+                                        || aoMask[static_cast<size_t>(ci)] != curAO
+                                        || materialMask[static_cast<size_t>(ci)] != curMaterial) {
+                                        canExpand = false;
+                                        break;
+                                    }
+                                }
+                                if (canExpand) ++qhLocal;
+                            }
+                            return {qwLocal, qhLocal};
+                        };
+
+                        auto growAffine = [&]() -> std::pair<int, int> {
+                            if (!planeValid) {
+                                return {1, 1};
+                            }
+
+                            int qwLocal = 1;
+                            while (i + qwLocal < uDim) {
+                                const int ni = idx + qwLocal;
+                                if (!mask[static_cast<size_t>(ni)] || visited[static_cast<size_t>(ni)]
+                                    || !matchesPlane(aoMask[static_cast<size_t>(ni)], qwLocal, 0)
+                                    || materialMask[static_cast<size_t>(ni)] != curMaterial) {
+                                    break;
+                                }
+                                ++qwLocal;
+                            }
+
+                            int qhLocal = 1;
+                            bool canExpand = true;
+                            while (canExpand && j + qhLocal < mergeVLimit) {
+                                for (int di = 0; di < qwLocal; ++di) {
+                                    const int ci = (i + di) + (j + qhLocal) * uDim;
+                                    if (!mask[static_cast<size_t>(ci)] || visited[static_cast<size_t>(ci)]
+                                        || !matchesPlane(aoMask[static_cast<size_t>(ci)], di, qhLocal)
+                                        || materialMask[static_cast<size_t>(ci)] != curMaterial) {
+                                        canExpand = false;
+                                        break;
+                                    }
+                                }
+                                if (canExpand) ++qhLocal;
+                            }
+                            return {qwLocal, qhLocal};
+                        };
+
+                        auto [exactW, exactH] = growExact();
+                        auto [affineW, affineH] = growAffine();
+                        const int exactArea = exactW * exactH;
+                        const int affineArea = affineW * affineH;
+                        const bool useAffine = planeValid && affineArea > exactArea && affineArea > 1;
+                        const int qw = useAffine ? affineW : exactW;
+                        const int qh = useAffine ? affineH : exactH;
+
+                        FaceAO emitAO = curAO;
+                        if (useAffine) {
+                            const int bl = planeBl;
+                            const int br = planeBl + planeDu * qw;
+                            const int tl = planeBl + planeDv * qh;
+                            const int tr = planeBl + planeDu * qw + planeDv * qh;
+                            emitAO.bl = static_cast<uint8_t>(std::clamp(bl, 0, 3));
+                            emitAO.br = static_cast<uint8_t>(std::clamp(br, 0, 3));
+                            emitAO.tl = static_cast<uint8_t>(std::clamp(tl, 0, 3));
+                            emitAO.tr = static_cast<uint8_t>(std::clamp(tr, 0, 3));
+                        }
+
+                        for (int dj = 0; dj < qh; ++dj) {
+                            for (int di = 0; di < qw; ++di) {
+                                visited[static_cast<size_t>((i + di) + (j + dj) * uDim)] = true;
+                            }
+                        }
+
+                        addQuad(result, axis, n, uOffset + i, vOffset + j, qw, qh, dir, face, curMaterial, emitAO);
+                    }
+                }
+
+                for (int j = minV; j <= maxV; ++j) {
+                    std::fill_n(&mask[static_cast<size_t>(j * uDim)], uDim, uint8_t(0));
+                    std::fill_n(&materialMask[static_cast<size_t>(j * uDim)], uDim, uint32_t(0));
+                    std::fill_n(&visited[static_cast<size_t>(j * uDim)], uDim, uint8_t(0));
+                }
+            }
+        }
+    };
+
+    constexpr int ADAPTIVE_TARGET_XZ = 32;
+    constexpr int ADAPTIVE_TARGET_Y = 128;
+    constexpr int ADAPTIVE_MIN_XZ = 8;
+    constexpr int ADAPTIVE_MIN_Y = 32;
+    constexpr int MAX_ADAPTIVE_DEPTH = 3;
+
+    auto shouldSplitRegion = [&](const MeshingRegion& region) -> bool {
+        if (region.depth >= MAX_ADAPTIVE_DEPTH) {
+            return false;
+        }
+
+        const int sizeX = region.maxX - region.minX;
+        const int sizeZ = region.maxZ - region.minZ;
+        const int yRange = region.maxY - region.minY + 1;
+        const bool splitX = sizeX > ADAPTIVE_TARGET_XZ;
+        const bool splitZ = sizeZ > ADAPTIVE_TARGET_XZ;
+        const bool splitY = yRange > ADAPTIVE_TARGET_Y;
+        if (!splitX && !splitZ && !splitY) {
+            return false;
+        }
+
+        const int64_t approxWork = static_cast<int64_t>(sizeX) * sizeZ * yRange;
+        return approxWork > (static_cast<int64_t>(ADAPTIVE_TARGET_XZ) * ADAPTIVE_TARGET_XZ * 96)
+            || splitY;
+    };
+
+    const bool useAdaptivePartition = step == 1
+        && (result.stats.scanYRange > 96 || solidCount > 350000u);
+
+    const MeshingRegion rootRegion{
+        0,
+        chunkSizeVoxels,
+        scanMinLocalY,
+        scanMaxLocalY,
+        0,
+        chunkSizeVoxels,
+        0};
+
+    if (useAdaptivePartition) {
+        auto processRegion = [&](auto&& self, const MeshingRegion& region) -> void {
+            if (wasCancelled(cancelToken)) {
+                return;
+            }
+
+            int actualMinY = region.minY;
+            int actualMaxY = region.maxY;
+            if (!computeRegionYBounds(region, actualMinY, actualMaxY)) {
+                return;
+            }
+
+            MeshingRegion tightened = region;
+            tightened.minY = actualMinY;
+            tightened.maxY = actualMaxY;
+
+            if (!shouldSplitRegion(tightened)) {
+                meshRegionLeaf(tightened);
+                return;
+            }
+
+            const int sizeX = tightened.maxX - tightened.minX;
+            const int sizeZ = tightened.maxZ - tightened.minZ;
+            const int yRange = tightened.maxY - tightened.minY + 1;
+
+            const bool splitX = sizeX > ADAPTIVE_TARGET_XZ && sizeX > ADAPTIVE_MIN_XZ;
+            const bool splitZ = sizeZ > ADAPTIVE_TARGET_XZ && sizeZ > ADAPTIVE_MIN_XZ;
+            const bool splitY = yRange > ADAPTIVE_TARGET_Y && yRange > ADAPTIVE_MIN_Y;
+
+            if (!splitX && !splitZ && !splitY) {
+                meshRegionLeaf(tightened);
+                return;
+            }
+
+            result.stats.adaptiveEnabled = true;
+            ++result.stats.adaptiveSplitRegions;
+            result.stats.adaptiveMaxDepth = std::max(
+                result.stats.adaptiveMaxDepth,
+                static_cast<uint32_t>(tightened.depth + 1));
+
+            const int xMid = splitX ? (tightened.minX + sizeX / 2) : tightened.maxX;
+            const int zMid = splitZ ? (tightened.minZ + sizeZ / 2) : tightened.maxZ;
+            const int yMid = splitY ? (tightened.minY + yRange / 2) : tightened.maxY;
+
+            const int xParts = splitX ? 2 : 1;
+            const int zParts = splitZ ? 2 : 1;
+            const int yParts = splitY ? 2 : 1;
+
+            for (int yi = 0; yi < yParts; ++yi) {
+                const int childMinY = splitY ? (yi == 0 ? tightened.minY : yMid + 1) : tightened.minY;
+                const int childMaxY = splitY ? (yi == 0 ? yMid : tightened.maxY) : tightened.maxY;
+                if (childMinY > childMaxY) {
+                    continue;
+                }
+
+                for (int zi = 0; zi < zParts; ++zi) {
+                    const int childMinZ = splitZ ? (zi == 0 ? tightened.minZ : zMid) : tightened.minZ;
+                    const int childMaxZ = splitZ ? (zi == 0 ? zMid : tightened.maxZ) : tightened.maxZ;
+                    if (childMinZ >= childMaxZ) {
+                        continue;
+                    }
+
+                    for (int xi = 0; xi < xParts; ++xi) {
+                        const int childMinX = splitX ? (xi == 0 ? tightened.minX : xMid) : tightened.minX;
+                        const int childMaxX = splitX ? (xi == 0 ? xMid : tightened.maxX) : tightened.maxX;
+                        if (childMinX >= childMaxX) {
+                            continue;
+                        }
+
+                        self(self, MeshingRegion{
+                            childMinX,
+                            childMaxX,
+                            childMinY,
+                            childMaxY,
+                            childMinZ,
+                            childMaxZ,
+                            tightened.depth + 1});
+                    }
+                }
+            }
+        };
+
+        processRegion(processRegion, rootRegion);
+    } else {
+        meshRegionLeaf(rootRegion);
+    }
+
+    // LOD vertex rescaling: expand LOD-resolution positions to native range
+    auto tGreedyDone = Clock::now();
+    if (step > 1 && !result.empty()) {
+        for (auto& v : result.vertices) {
+            uint32_t p = v.packed;
+            uint32_t x  = p & 0xFFu;
+            uint32_t ys = (p >> 8) & 0x3FFu;   // stored Y = actual Y (10 bits)
+            uint32_t z  = (p >> 18) & 0xFFu;
+            uint32_t hi = p & 0xFC000000u;      // face(3) + AO(3)
+
+            x  *= static_cast<uint32_t>(step);
+            ys *= static_cast<uint32_t>(step);  // scale Y directly
+            z  *= static_cast<uint32_t>(step);
+
+            v.packed = (x & 0xFFu) | ((ys & 0x3FFu) << 8) | ((z & 0xFFu) << 18) | hi;
+        }
+        const float fStep = static_cast<float>(step);
+        result.aabbMin *= fStep;
+        result.aabbMax *= fStep;
+    }
+
+    if (!result.empty()) {
+        const float lodVoxelSize = 0.25f * static_cast<float>(step);
+        const float pad = lodVoxelSize * 0.5f;
+        result.aabbMin -= pad;
+        result.aabbMax += pad;
+    }
+
+    // Post-process:
+    //  - Quality mode does full dedup + reorder for best draw efficiency.
+    //  - Fast edit mode usually skips it for latency, but very large edited
+    //    meshes still get a lightweight dedup pass so upload/finalize does
+    //    not dominate the visible latency.
+    auto tPostStart = Clock::now();
+    if (!skipPostProcess) {
+        deduplicateAndReorderMesh(result);
+    } else {
+        const size_t rawLinearSubmeshEstimate =
+            (result.vertices.size() + MAX_VERTS_PER_SUBMESH - 1) / MAX_VERTS_PER_SUBMESH;
+        const bool shouldFastCompact =
+            rawLinearSubmeshEstimate > FAST_COMPACT_SUBMESH_THRESHOLD ||
+            result.vertices.size() >= FAST_COMPACT_VERT_THRESHOLD ||
+            result.indices.size() >= FAST_COMPACT_INDEX_THRESHOLD;
+        if (shouldFastCompact) {
+        deduplicateMeshVertices(result);
+        }
+    }
+    auto tPostDone = Clock::now();
+
+    auto toMs = [](auto a, auto b) {
+        return std::chrono::duration<float, std::milli>(b - a).count();
+    };
+    result.stats.cacheBuildMs  = toMs(tCacheBuild, tCacheDone);
+    result.stats.greedyMeshMs  = toMs(tCacheDone, tGreedyDone);
+    result.stats.postProcessMs = toMs(tPostStart, tPostDone);
+    result.stats.facesEmitted  = facesEmitted;
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Split a large mesh into GPU-uploadable sub-meshes (each ≤ 65535 verts)
+// ---------------------------------------------------------------------------
+static uint32_t decodePackedX(const Vertex& v) {
+    return v.packed & 0xFFu;
+}
+
+static uint32_t decodePackedZ(const Vertex& v) {
+    return (v.packed >> 18) & 0xFFu;
+}
+
+static uint32_t decodePackedY(const Vertex& v) {
+    return (v.packed >> 8) & 0x3FFu;
+}
+
+struct OctRegion {
+    int minX{0};
+    int maxX{128};
+    int minY{0};
+    int maxY{512};
+    int minZ{0};
+    int maxZ{128};
+};
+
+static std::vector<TerrainEditMesher::SubMesh> splitLinearlyToSubMeshes(
+        const TerrainEditMesher::MeshResult& mesh)
+{
+    std::vector<TerrainEditMesher::SubMesh> out;
+    if (mesh.empty()) return out;
+
+    if (mesh.vertices.size() <= MAX_VERTS_PER_SUBMESH) {
+        TerrainEditMesher::SubMesh sub;
+        sub.vertices = mesh.vertices;
+        sub.indices.reserve(mesh.indices.size());
+        for (uint32_t idx : mesh.indices)
+            sub.indices.push_back(static_cast<uint16_t>(idx));
+        out.push_back(std::move(sub));
+        return out;
+    }
+
+    TerrainEditMesher::SubMesh current;
+    std::unordered_map<uint32_t, uint32_t> remap;
+
+    auto finalize = [&]() {
+        if (!current.vertices.empty()) {
+            out.push_back(std::move(current));
+            current = TerrainEditMesher::SubMesh{};
+            remap.clear();
+        }
+    };
+
+    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+        const uint32_t i0 = mesh.indices[i + 0];
+        const uint32_t i1 = mesh.indices[i + 1];
+        const uint32_t i2 = mesh.indices[i + 2];
+
+        size_t newVerts = 0;
+        if (remap.find(i0) == remap.end()) ++newVerts;
+        if (remap.find(i1) == remap.end()) ++newVerts;
+        if (remap.find(i2) == remap.end()) ++newVerts;
+
+        if (current.vertices.size() + newVerts > MAX_VERTS_PER_SUBMESH) {
+            finalize();
+        }
+
+        auto addVert = [&](uint32_t oldIdx) -> uint16_t {
+            auto it = remap.find(oldIdx);
+            if (it != remap.end())
+                return static_cast<uint16_t>(it->second);
+            const uint32_t newIdx = static_cast<uint32_t>(current.vertices.size());
+            current.vertices.push_back(mesh.vertices[oldIdx]);
+            remap[oldIdx] = newIdx;
+            return static_cast<uint16_t>(newIdx);
+        };
+
+        current.indices.push_back(addVert(i0));
+        current.indices.push_back(addVert(i1));
+        current.indices.push_back(addVert(i2));
+    }
+
+    finalize();
+    return out;
+}
+
+static std::array<TerrainEditMesher::MeshResult, 8> splitMeshIntoOctants(
+        const TerrainEditMesher::MeshResult& mesh,
+        const OctRegion& region)
+{
+    struct CellBuilder {
+        TerrainEditMesher::MeshResult mesh;
+        std::unordered_map<uint32_t, uint32_t> remap;
+    };
+
+    std::vector<CellBuilder> cells(8);
+    const int midX = region.minX + (region.maxX - region.minX) / 2;
+    const int midY = region.minY + (region.maxY - region.minY) / 2;
+    const int midZ = region.minZ + (region.maxZ - region.minZ) / 2;
+
+    for (size_t i = 0; i + 2 < mesh.indices.size(); i += 3) {
+        const uint32_t i0 = mesh.indices[i + 0];
+        const uint32_t i1 = mesh.indices[i + 1];
+        const uint32_t i2 = mesh.indices[i + 2];
+
+        const Vertex& v0 = mesh.vertices[i0];
+        const Vertex& v1 = mesh.vertices[i1];
+        const Vertex& v2 = mesh.vertices[i2];
+
+        const float centroidX =
+            (static_cast<float>(decodePackedX(v0)) +
+             static_cast<float>(decodePackedX(v1)) +
+             static_cast<float>(decodePackedX(v2))) / 3.0f;
+        const float centroidY =
+            (static_cast<float>(decodePackedY(v0)) +
+             static_cast<float>(decodePackedY(v1)) +
+             static_cast<float>(decodePackedY(v2))) / 3.0f;
+        const float centroidZ =
+            (static_cast<float>(decodePackedZ(v0)) +
+             static_cast<float>(decodePackedZ(v1)) +
+             static_cast<float>(decodePackedZ(v2))) / 3.0f;
+
+        const bool east = centroidX >= static_cast<float>(midX);
+        const bool top = centroidY >= static_cast<float>(midY);
+        const bool north = centroidZ >= static_cast<float>(midZ);
+        const int octant = (east ? 1 : 0) + (top ? 2 : 0) + (north ? 4 : 0);
+        CellBuilder& cell = cells[static_cast<size_t>(octant)];
+
+        auto addVert = [&](uint32_t oldIdx) -> uint32_t {
+            auto it = cell.remap.find(oldIdx);
+            if (it != cell.remap.end()) {
+                return it->second;
+            }
+            const uint32_t newIdx = static_cast<uint32_t>(cell.mesh.vertices.size());
+            cell.mesh.vertices.push_back(mesh.vertices[oldIdx]);
+            cell.remap[oldIdx] = newIdx;
+            return newIdx;
+        };
+
+        cell.mesh.indices.push_back(addVert(i0));
+        cell.mesh.indices.push_back(addVert(i1));
+        cell.mesh.indices.push_back(addVert(i2));
+    }
+
+    std::array<TerrainEditMesher::MeshResult, 8> out{};
+    for (int q = 0; q < 8; ++q) {
+        out[static_cast<size_t>(q)] = std::move(cells[static_cast<size_t>(q)].mesh);
+    }
+    return out;
+}
+
+static bool canSplitOctants(const OctRegion& region) {
+    return (region.maxX - region.minX) > 1 &&
+           (region.maxY - region.minY) > 1 &&
+           (region.maxZ - region.minZ) > 1;
+}
+
+static std::array<OctRegion, 8> childOctants(const OctRegion& region) {
+    const int midX = region.minX + (region.maxX - region.minX) / 2;
+    const int midY = region.minY + (region.maxY - region.minY) / 2;
+    const int midZ = region.minZ + (region.maxZ - region.minZ) / 2;
+    std::array<OctRegion, 8> out{};
+    for (int oct = 0; oct < 8; ++oct) {
+        const bool east = (oct & 1) != 0;
+        const bool top = (oct & 2) != 0;
+        const bool north = (oct & 4) != 0;
+        out[static_cast<size_t>(oct)] = OctRegion{
+            east ? midX : region.minX,
+            east ? region.maxX : midX,
+            top ? midY : region.minY,
+            top ? region.maxY : midY,
+            north ? midZ : region.minZ,
+            north ? region.maxZ : midZ
+        };
+    }
+    return out;
+}
+
+static std::vector<TerrainEditMesher::SubMesh> splitMeshOctreeSelective(
+        const TerrainEditMesher::MeshResult& mesh,
+        const OctRegion& region,
+        size_t remainingBudget)
+{
+    std::vector<TerrainEditMesher::SubMesh> out;
+
+    if (mesh.empty()) {
+        return out;
+    }
+
+    // Leaf: fits in one submesh or can't subdivide further
+    if (mesh.vertices.size() <= MAX_VERTS_PER_SUBMESH || !canSplitOctants(region)) {
+        return splitLinearlyToSubMeshes(mesh);
+    }
+
+    auto childRegions = childOctants(region);
+    auto childMeshes = splitMeshIntoOctants(mesh, region);
+
+    int nonEmptyCount = 0;
+    for (int q = 0; q < 8; ++q) {
+        if (!childMeshes[static_cast<size_t>(q)].empty()) ++nonEmptyCount;
+    }
+    if (nonEmptyCount == 0) {
+        return out;
+    }
+
+    for (int q = 0; q < 8; ++q) {
+        auto& childMesh = childMeshes[static_cast<size_t>(q)];
+        if (childMesh.empty()) continue;
+
+        const size_t budgetForChild = (remainingBudget > out.size())
+            ? (remainingBudget - out.size()) : 0;
+
+        std::vector<TerrainEditMesher::SubMesh> childSubs;
+        if (childMesh.vertices.size() > MAX_VERTS_PER_SUBMESH &&
+            canSplitOctants(childRegions[static_cast<size_t>(q)]) &&
+            budgetForChild >= 2) {
+            childSubs = splitMeshOctreeSelective(
+                childMesh,
+                childRegions[static_cast<size_t>(q)],
+                budgetForChild);
+            // If recursion produced nothing useful, fall back to linear
+            if (childSubs.empty()) {
+                childSubs = splitLinearlyToSubMeshes(childMesh);
+            }
+        } else {
+            childSubs = splitLinearlyToSubMeshes(childMesh);
+        }
+
+        for (auto& sub : childSubs) {
+            out.push_back(std::move(sub));
+        }
+
+        if (remainingBudget > 0 && out.size() >= remainingBudget) {
+            break;
+        }
+    }
+
+    return out;
+}
+
+// Merge two submeshes into one. Requires combined vertex count ≤ 65535.
+static void mergeSubMesh(TerrainEditMesher::SubMesh& dst,
+                         TerrainEditMesher::SubMesh&& src)
+{
+    const uint16_t base = static_cast<uint16_t>(dst.vertices.size());
+    dst.vertices.insert(dst.vertices.end(),
+                        std::make_move_iterator(src.vertices.begin()),
+                        std::make_move_iterator(src.vertices.end()));
+    dst.indices.reserve(dst.indices.size() + src.indices.size());
+    for (uint16_t idx : src.indices) {
+        dst.indices.push_back(static_cast<uint16_t>(idx + base));
+    }
+}
+
+// Consolidate a submesh list that exceeds budget by merging the smallest
+// pairs until we fit within MAX_RUNTIME_SUBMESHES.
+static void consolidateSubmeshes(std::vector<TerrainEditMesher::SubMesh>& subs,
+                                 size_t maxCount)
+{
+    while (subs.size() > maxCount) {
+        // Find the two smallest submeshes that can be merged (combined ≤ 65535)
+        size_t bestA = SIZE_MAX, bestB = SIZE_MAX;
+        size_t bestCombined = SIZE_MAX;
+        for (size_t i = 0; i < subs.size(); ++i) {
+            for (size_t j = i + 1; j < subs.size(); ++j) {
+                size_t combined = subs[i].vertices.size() + subs[j].vertices.size();
+                if (combined <= MAX_VERTS_PER_SUBMESH && combined < bestCombined) {
+                    bestA = i;
+                    bestB = j;
+                    bestCombined = combined;
+                }
+            }
+        }
+        if (bestA == SIZE_MAX) {
+            // No mergeable pair found — can't reduce further
+            break;
+        }
+        mergeSubMesh(subs[bestA], std::move(subs[bestB]));
+        subs.erase(subs.begin() + static_cast<ptrdiff_t>(bestB));
+    }
+}
+
+std::vector<TerrainEditMesher::SubMesh> TerrainEditMesher::splitToSubMeshes(
+        const MeshResult& mesh)
+{
+    std::vector<SubMesh> out;
+    if (mesh.empty()) return out;
+
+    auto linearSubs = splitLinearlyToSubMeshes(mesh);
+    if (linearSubs.size() <= MAX_RUNTIME_SUBMESHES) {
+        return linearSubs;
+    }
+
+    // Only try octree fallback when the minimal linear path still exceeds the
+    // runtime submesh budget. Subchunks are not culled independently, so extra
+    // spatial splits hurt upload/render cost without giving visibility wins.
+    auto octreeSubs = splitMeshOctreeSelective(
+        mesh,
+        OctRegion{
+            0,
+            WorldConfig::CHUNK_SIZE,
+            0,
+            WorldConfig::CHUNK_HEIGHT,
+            0,
+            WorldConfig::CHUNK_SIZE
+        },
+        MAX_RUNTIME_SUBMESHES);
+
+    // Pick whichever produced fewer, then merge to fit budget.
+    auto& best = (octreeSubs.size() > 0 && octreeSubs.size() < linearSubs.size())
+        ? octreeSubs : linearSubs;
+
+    std::cout << "[TerrainEditMesher] WARNING: Mesh with " << mesh.vertices.size()
+              << " vertices produced " << best.size()
+              << " submeshes (max " << MAX_RUNTIME_SUBMESHES
+              << "). Consolidating by merging smallest pairs." << std::endl;
+
+    consolidateSubmeshes(best, MAX_RUNTIME_SUBMESHES);
+
+    if (best.size() > MAX_RUNTIME_SUBMESHES) {
+        std::cerr << "[TerrainEditMesher] CRITICAL: Could not consolidate to "
+                  << MAX_RUNTIME_SUBMESHES << " submeshes (still "
+                  << best.size() << "). ChunkUploadSystem will TRUNCATE \u2014 "
+                  << "expect stretched/missing triangles. Bump MAX_SUBCHUNKS "
+                  << "(Chunk.h / GPUCullingSystem.h / shader #defines / this file)."
+                  << std::endl;
+    }
+
+#ifndef NDEBUG
+    // Post-condition: every submesh must have all indices in-range.
+    for (size_t s = 0; s < best.size(); ++s) {
+        const auto& sub = best[s];
+        const uint32_t vc = static_cast<uint32_t>(sub.vertices.size());
+        for (uint16_t idx : sub.indices) {
+            if (static_cast<uint32_t>(idx) >= vc) {
+                std::cerr << "[TerrainEditMesher] CRITICAL: submesh " << s
+                          << " has out-of-range index " << static_cast<uint32_t>(idx)
+                          << " (vertex count " << vc << ")." << std::endl;
+                break;
+            }
+        }
+    }
+#endif
+
+    return best;
+}
+
+} // namespace TerrainEdit
