@@ -220,6 +220,22 @@ vulkanas/
 │   │   └── snapshot.meta
 │   ├── snapshot_20260507_131233/
 │   │   └── snapshot.meta
+│   ├── snapshot_20260507_194441/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260507_210425/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260507_211647/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260507_214034/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260508_091331/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260508_094602/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260508_094749/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260508_100943/
+│   │   └── snapshot.meta
 │   ├── heightmap.csv
 │   └── heightmap.hbin
 ├── shaders/
