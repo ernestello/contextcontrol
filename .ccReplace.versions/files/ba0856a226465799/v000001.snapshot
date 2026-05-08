@@ -1,0 +1,30 @@
+#pragma once
+
+// GPT-DESC: Defines world streaming metrics shared by runtime and debug UI.
+
+#include <atomic>
+#include <cstdint>
+
+namespace WorldData {
+
+struct StreamingMetrics {
+    std::atomic<uint64_t> chunksCreatedTotal{0};
+    std::atomic<uint64_t> chunksDestroyedTotal{0};
+    std::atomic<uint64_t> meshesUploaded{0};
+    uint32_t creationQueueSize{0};
+    uint32_t uploadQueueSize{0};
+    uint32_t currentBurstSize{0};
+    uint32_t currentUploadBudget{0};
+
+    void reset() {
+        chunksCreatedTotal.store(0, std::memory_order_relaxed);
+        chunksDestroyedTotal.store(0, std::memory_order_relaxed);
+        meshesUploaded.store(0, std::memory_order_relaxed);
+        creationQueueSize = 0;
+        uploadQueueSize = 0;
+        currentBurstSize = 0;
+        currentUploadBudget = 0;
+    }
+};
+
+} // namespace WorldData

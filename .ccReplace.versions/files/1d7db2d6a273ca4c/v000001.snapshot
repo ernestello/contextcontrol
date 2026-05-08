@@ -1,0 +1,35 @@
+#pragma once
+
+// GPT-DESC: Defines snapshot and persisted edit-collision data records used by World.
+
+#include <glm/glm.hpp>
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace WorldData {
+
+// Per-snapshot edit collision data (world-space positions + indices per chunk).
+struct EditCollisionEntry {
+    std::vector<uint32_t> packedVerts;   // Vertex::packed values
+    std::vector<uint32_t> indices;
+    glm::ivec3 chunkCoord{0};            // For reconstructing world positions
+    uint64_t collisionArtifactGen{0};    // last artifact generation synced to collision
+};
+
+struct SnapshotInfo {
+    std::string id;
+    std::string displayName;
+    std::string createdAt;
+    bool isBase{false};
+    uint64_t editedCells{0};
+    uint64_t editedBricks{0};
+};
+
+struct TerrainBoxRecord {
+    glm::vec3 minCorner{0.0f};
+    glm::vec3 maxCorner{0.0f};
+};
+
+} // namespace WorldData

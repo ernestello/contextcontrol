@@ -1,0 +1,23 @@
+#pragma once
+
+// GPT-DESC: Defines mesh-topology revision and deferred mesh free records used by World.
+
+#include <glm/glm.hpp>
+
+#include <cstdint>
+
+#include "rendering/common/Mesh.h"
+
+namespace WorldData {
+
+struct MeshTopologyChange {
+    uint64_t revision{0};
+    glm::ivec3 coord{0};
+};
+
+struct PendingMeshBufferFree {
+    BufferSlice vb;
+    BufferSlice ib;
+};
+
+} // namespace WorldData

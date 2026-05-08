@@ -1,0 +1,1143 @@
+#pragma once
+
+// GPT-DESC: Declares the World facade and preserves public World type aliases.
+
+#include <entt/entt.hpp>
+#include <glm/glm.hpp>
+#include "vulkan/FramePassTypes.h"
+#include "world/WorldTypes.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/chunks/core/ChunkManager.h"
+#include "world/config/WorldConfig.h"
+#include "world/chunks/core/ChunkJobs.h"
+#include "world/TerrainFileLoader.h"
+#include "world/edit/TerrainEditOverlayStore.h"
+#include "world/edit/TerrainFieldSource.h"
+#include "world/edit/TextureOverlayStore.h"
+#include "world/edit/HeightmapBaseSampler.h"
+#include "world/edit/VoxelBaseSampler.h"
+#include "world/edit/TerrainEditRemeshScheduler.h"
+#include "world/ChunkHoleTracker.h"
+#include "world/chunks/physics/CollisionCache.h"
+#include "world/chunks/streaming/ChunkRenderSystem.h"
+#include "world/chunks/streaming/ChunkUploadSystem.h"
+#include "world/chunks/physics/ChunkCollisionSystem.h"
+#include "world/chunks/core/ChunkLODSystem.h"
+#include "world/chunks/core/ChunkLifecycleManager.h"
+#include "world/WorldDiagnostics.h"
+#include "world/WorldSnapshotTypes.h"
+#include "world/WorldEditArtifactTypes.h"
+#include "world/WorldTopologyTypes.h"
+#include "world/WorldStreamingTypes.h"
+#include "rendering/common/Mesh.h"
+#include "ui/InGameDebug.h"
+#include <array>
+#include <memory>
+#include <vector>
+#include <deque>
+#include <queue>
+#include <unordered_set>
+#include <unordered_map>
+#include <mutex>
+#include <shared_mutex>
+#include <atomic>
+#include <string>
+#include <thread>
+#include <condition_variable>
+#include <set>
+#include <chrono>
+#include <vulkan/vulkan.h>
+
+// Forward declarations
+class BufferSuballocator;
+class UploadArena;
+class ResourceUploader;
+class GPUCullingSystem;
+
+namespace Physics { class PhysicsWorld; }
+
+/**
+ * World - Manages chunk entity lifecycle, terrain generation, and rendering
+ * 
+ * Full terrain system with:
+ * - Chunk loading/unloading in circular area around camera
+ * - Job-based terrain generation and meshing pipeline
+ * - Upload queue system for GPU mesh data
+ * - Multi-draw indirect (MDI) rendering with frustum culling
+ */
+class World : public IUploadCallback, public IChunkLifecycleCallback, public IBatchSignalCallback {
+public:
+    using Registry = entt::registry;
+
+    // ---- Diagnostic / stats / history types live in WorldDiagnostics.h ----
+    // These using-aliases preserve the historical `World::*` qualified names
+    // used throughout the codebase.
+    using CullingStats              = WorldDiag::CullingStats;
+    using TerrainEditDiag           = WorldDiag::TerrainEditDiag;
+    using TerrainEditStats          = WorldDiag::TerrainEditStats;
+    using TerrainEditHistoryEntry   = WorldDiag::TerrainEditHistoryEntry;
+    using TerrainEditHistory        = WorldDiag::TerrainEditHistory;
+    using LoadManagementDiag        = WorldDiag::LoadManagementDiag;
+    using ChunkVisualHistoryEntry   = WorldDiag::ChunkVisualHistoryEntry;
+    using ChunkVisualHistory        = WorldDiag::ChunkVisualHistory;
+    using ChunkVisualErrorEntry     = WorldDiag::ChunkVisualErrorEntry;
+    using ChunkVisualErrorHistory   = WorldDiag::ChunkVisualErrorHistory;
+    using FinalizeDiagFrame         = WorldDiag::FinalizeDiagFrame;
+    using LODSwitchDiag             = WorldDiag::LODSwitchDiag;
+    using LastUpdateBreakdown       = WorldDiag::LastUpdateBreakdown;
+
+    // ---- World data types live in focused headers. ----
+    // These aliases preserve historical `World::*` qualified names.
+    using EditCollisionEntry  = WorldData::EditCollisionEntry;
+    using SnapshotInfo        = WorldData::SnapshotInfo;
+    using TerrainBoxRecord    = WorldData::TerrainBoxRecord;
+    using MeshTopologyChange  = WorldData::MeshTopologyChange;
+    using EditArtifactKey     = WorldData::EditArtifactKey;
+    using EditArtifactKeyHash = WorldData::EditArtifactKeyHash;
+    using EditArtifact        = WorldData::EditArtifact;
+    using StreamingMetrics    = WorldData::StreamingMetrics;
+
+    // --- Terrain edit diagnostics: see WorldDiag::TerrainEditDiag / TerrainEditStats ---
+
+    const TerrainEditDiag& getLastEditDiag() const { return m_lastEditDiag; }
+    TerrainEditDiag& editDiagMut() { return m_lastEditDiag; }
+    const TerrainEditStats& getEditStats() const { return m_editStats; }
+    TerrainEditStats& editStatsMut() { return m_editStats; }
+
+    // --- Terrain edit history: see WorldDiag::TerrainEditHistoryEntry / TerrainEditHistory ---
+
+    const TerrainEditHistory& getEditHistory() const { return m_editHistory; }
+    TerrainEditHistory& editHistoryMut() { return m_editHistory; }
+
+    // --- Load management diagnostics: see WorldDiag::LoadManagementDiag ---
+    LoadManagementDiag getLoadManagementDiag() const;
+
+    // --- Chunk visual history: see WorldDiag::ChunkVisualHistoryEntry / ChunkVisualHistory ---
+
+    const ChunkVisualHistory& getChunkVisualHistory() const { return m_chunkVisualHistory; }
+
+    // --- Chunk visual error history: see WorldDiag::ChunkVisualErrorEntry / ChunkVisualErrorHistory ---
+
+    const ChunkVisualErrorHistory& getChunkVisualErrorHistory() const { return m_chunkVisualErrorHistory; }
+    void appendChunkVisualError(
+        const glm::ivec3* coord,
+        int lodLevel,
+        const char* stage,
+        const char* reason,
+        uint32_t batchId = 0,
+        uint32_t expectedVersion = 0,
+        uint32_t actualVersion = 0,
+        const ChunkDebugAttribution* debugInfo = nullptr)
+    {
+        noteChunkVisualError(
+            coord,
+            lodLevel,
+            stage,
+            reason,
+            batchId,
+            expectedVersion,
+            actualVersion,
+            debugInfo);
+    }
+
+    // --- Finalize diagnostics: see WorldDiag::FinalizeDiagFrame ---
+    static constexpr size_t FINALIZE_DIAG_CAPACITY = 1200; // 20 seconds at 60fps
+    const std::vector<FinalizeDiagFrame>& getFinalizeDiagHistory() const { return m_finalizeDiagHistory; }
+    size_t getFinalizeDiagWriteIndex() const { return m_finalizeDiagWriteIdx; }
+    std::string generateFinalizeDiagReport(float spikeThresholdMs = 2.0f) const;
+
+    // --- LOD Switch diagnostics: see WorldDiag::LODSwitchDiag ---
+
+    const LODSwitchDiag& getLODSwitchDiag() const { return m_lodSwitchDiag; }
+    void updateLODSwitchDiag();
+    std::string formatLODSwitchDiagReport() const;
+
+    explicit World();
+    ~World();
+
+    /**
+     * Update full terrain system
+     * @param deltaTime Frame time
+     * @param cameraPos World position of camera
+     * @param vbAllocator Vertex buffer allocator
+     * @param ibAllocator Index buffer allocator
+     * @param uploadArena Upload staging arena
+     * @param uploader Upload manager
+     * @param uploadReadyValue Timeline semaphore value for upload gating
+     */
+    void update(float deltaTime, 
+                const glm::vec3& cameraPos,
+                float cameraYaw,
+                BufferSuballocator* vbAllocator = nullptr,
+                BufferSuballocator* ibAllocator = nullptr,
+                UploadArena* uploadArena = nullptr,
+                ResourceUploader* uploader = nullptr,
+                uint64_t uploadReadyValue = 0,
+                float cpuFrameMs = 0.0f,
+                float gpuFrameMs = 0.0f,
+                uint64_t deviceTimeline = 0);
+
+    /**
+     * Gather draw commands for visible chunks
+     * @param viewProj View-projection matrix for frustum culling
+     * @param outCmds Output buffer for indirect draw commands
+     * @param outOrigins Output buffer for chunk origins (vec4)
+     * @param maxDraws Maximum number of draws
+     * @param deviceTimeline Current timeline value (for upload gating)
+     * @return Number of draw commands written
+     */
+    uint32_t gatherDrawCommands(const glm::mat4& viewProj,
+                                 VkDrawIndexedIndirectCommand* outCmds,
+                                 glm::vec4* outOrigins,
+                                 uint32_t maxDraws,
+                                 uint64_t deviceTimeline);
+
+    /**
+     * Gather draw commands for chunks intersecting a world-space sphere.
+     * Used by per-light point shadow rendering to avoid world-scale terrain draws.
+     */
+    uint32_t gatherDrawCommandsInSphere(const glm::vec3& center,
+                                        float radius,
+                                        VkDrawIndexedIndirectCommand* outCmds,
+                                        glm::vec4* outOrigins,
+                                        uint32_t maxDraws,
+                                        uint64_t deviceTimeline);
+
+    static constexpr uint32_t SUN_GATHER_DIAG_MAX_CASCADES = 6;
+
+    struct SunCascadeGatherDiagnostics {
+        float totalMs{0.0f};
+        float stateMapScanMs{0.0f};
+        float candidateSortMs{0.0f};
+        float registryWalkMs{0.0f};
+
+        uint32_t cascadeCount{0};
+        uint32_t maxDraws{0};
+        bool truncated{false};
+
+        glm::ivec3 minChunk{0};
+        glm::ivec3 maxChunk{0};
+        uint32_t loadedChunkMapSize{0};
+        uint32_t bboxCandidateChunks{0};
+        uint32_t visitedCandidateChunks{0};
+
+        uint32_t invalidEntityRejects{0};
+        uint32_t missingComponentRejects{0};
+        uint32_t invisibleRejects{0};
+        uint32_t notReadyRejects{0};
+        uint32_t invalidMeshRejects{0};
+        uint32_t emptyMeshRejects{0};
+        uint32_t uploadPendingRejects{0};
+        uint32_t cascadeCullRejects{0};
+        uint32_t cascadeInnerCullRejects{0};
+        uint32_t acceptedChunks{0};
+        uint32_t emittedDraws{0};
+
+        float maxHalfExtent{0.0f};
+        float sinElevation{0.0f};
+        float shearX{0.0f};
+        float shearZ{0.0f};
+        float shearMax{0.0f};
+        float casterReach{0.0f};
+        float padding{0.0f};
+        float halfX{0.0f};
+        float halfZ{0.0f};
+
+        std::array<uint32_t, SUN_GATHER_DIAG_MAX_CASCADES> cascadeChunkHits{};
+        std::array<uint32_t, SUN_GATHER_DIAG_MAX_CASCADES> cascadeDrawHits{};
+    };
+
+    /**
+     * Gather draw commands for the sun shadow cascades in a single walk.
+     *
+     * Walks chunks intersecting the UNION of per-cascade extruded XZ
+     * footprints (cascade footprint = halfExtent + chunkHeight * |shear|),
+     * then tests each candidate against every cascade clip-AABB. Returns
+     * a per-draw cascade bitmask (`outCascadeMasks[i]`, bit c = 1 means
+     * draw `i` is needed by cascade `c`). Skips chunks that don't
+     * intersect ANY cascade.
+     *
+     * This replaces the legacy "single huge sphere then per-cascade
+     * AABB cull" pipeline: the walk bounding box is shrunk to the
+     * actual visible cascade volume, and each chunk is tested once
+     * against all cascades instead of once per cascade per render.
+     *
+     * @param cameraPos  Camera world position.
+     * @param sunDir     Normalised sun direction (towards ground, y < 0).
+     * @param cascadeVPs Per-cascade view-projection matrices (length = cascadeCount).
+     * @param cascadeHalfExtents Per-cascade ortho half-extent in metres (length = cascadeCount).
+     * @param cascadeCount Number of cascades (1..MAX_SUN_SHADOW_CASCADES).
+     * @param outCmds   Output draw commands.
+     * @param outOrigins Output chunk origin in chunk coordinates.
+     * @param outCascadeMasks Output bitmask (bit c = needed by cascade c).
+     * @param maxDraws  Output capacity.
+     * @param deviceTimeline Upload timeline gate.
+     * @param diagnostics Optional detailed counters/timings for debug UI.
+     * @param extraChunkPadding Extra X/Z chunk padding for reusable gather supersets.
+     * @param includeZeroMaskCandidates Emit ready chunks even when they miss current cascades.
+     * @return Number of draws emitted.
+     */
+    uint32_t gatherDrawCommandsForSunCascades(const glm::vec3& cameraPos,
+                                              const glm::vec3& sunDir,
+                                              const glm::mat4* cascadeVPs,
+                                              const float* cascadeHalfExtents,
+                                              uint32_t cascadeCount,
+                                              VkDrawIndexedIndirectCommand* outCmds,
+                                              glm::vec4* outOrigins,
+                                              uint16_t* outCascadeMasks,
+                                              uint32_t maxDraws,
+                                              uint64_t deviceTimeline,
+                                              SunCascadeGatherDiagnostics* diagnostics = nullptr,
+                                              int32_t extraChunkPadding = 0,
+                                              bool includeZeroMaskCandidates = false);
+
+    uint32_t gatherDrawCommandsForSunCascadeChunk(const glm::ivec3& chunkCoord,
+                                                  const glm::mat4* cascadeVPs,
+                                                  uint32_t cascadeCount,
+                                                  VkDrawIndexedIndirectCommand* outCmds,
+                                                  glm::vec4* outOrigins,
+                                                  uint16_t* outCascadeMasks,
+                                                  uint32_t maxDraws,
+                                                  uint64_t deviceTimeline,
+                                                  bool includeZeroMaskCandidate = false);
+
+
+
+    /**
+     * Enqueue mesh for upload to GPU
+     * Called by job pipeline after meshing completes
+     */
+    void enqueueMeshForUpload(entt::entity entity,
+                              MeshData&& mesh,
+                              bool fromTerrainEdit,
+                              std::shared_ptr<struct ChunkVersionState> versionState,
+                              uint32_t version,
+                              ChunkDebugAttribution debugInfo = {});
+    
+    /**
+     * Enqueue multiple SubChunks for a single entity (v4 format)
+     * SubChunks are NEVER merged - each becomes a separate draw call
+     * @param mainSubChunkCount How many subChunks are main mesh (rest are seams)
+     * @param isRemesh If true, stages to PendingMeshHandle for batch swap
+     * @param batchId LOD transition batch ID (0 = none)
+     */
+    void enqueueMeshForUpload(entt::entity entity,
+                              std::vector<MeshData>&& subChunks,
+                              uint8_t mainSubChunkCount,
+                              bool fromTerrainEdit,
+                              std::shared_ptr<struct ChunkVersionState> versionState,
+                              uint32_t version,
+                              glm::vec3 tightMin = glm::vec3(1e10f),
+                              glm::vec3 tightMax = glm::vec3(-1e10f),
+                              bool hasTight = false,
+                              bool isRemesh = false,
+                              uint32_t batchId = 0,
+                              ChunkDebugAttribution debugInfo = {});
+
+    /**
+     * Access to debug overlay
+     */
+    InGameDebug& getDebugOverlay() { return *m_inGameDebug; }
+    const InGameDebug& getDebugOverlay() const { return *m_inGameDebug; }
+
+    /**
+     * Runtime voxel chunk tracking (chunks that need voxel meshing due to edits)
+     */
+    void markRuntimeVoxelChunks(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords);
+    void clearRuntimeVoxelChunks();
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet getRuntimeVoxelChunkCoords() const;
+    bool chunkNeedsRuntimeVoxel(const glm::ivec3& chunkCoord) const;
+
+    /**
+     * Access to the sparse runtime terrain edit overlay.
+     * This is the new mutable terrain layer; untouched terrain still uses
+     * the precomputed mesh/collision fast path.
+     */
+    TerrainEdit::TerrainEditOverlayStore& getTerrainEditOverlay() { return m_terrainEditOverlay; }
+    const TerrainEdit::TerrainEditOverlayStore& getTerrainEditOverlay() const { return m_terrainEditOverlay; }
+
+    /// Sparse voxel-face material assignments authored by the texture brush.
+    TextureOverlay::TextureOverlayStore& getTextureMaterialStore() { return m_textureMaterialStore; }
+    const TextureOverlay::TextureOverlayStore& getTextureMaterialStore() const { return m_textureMaterialStore; }
+
+    /**
+     * Access to the merged terrain field source (base + edit overlay).
+     * The base sampler is not wired yet; this is the foundation for the
+     * editable terrain pipeline.
+     */
+    TerrainEdit::TerrainFieldSource& getTerrainFieldSource() { return m_terrainFieldSource; }
+    const TerrainEdit::TerrainFieldSource& getTerrainFieldSource() const { return m_terrainFieldSource; }
+
+    /// Access the heightmap base sampler (for height-range queries).
+    const TerrainEdit::HeightmapBaseSampler& getHeightmapSampler() const { return m_heightmapSampler; }
+
+    /// Access the voxel base sampler (for 3D voxel range queries).
+    const TerrainEdit::VoxelBaseSampler& getVoxelBaseSampler() const { return m_voxelBaseSampler; }
+
+    /// Access the chunk hole tracker (for diagnosing LOD swap visual holes).
+    ChunkHoleTracker& getChunkHoleTracker() { return m_chunkHoleTracker; }
+    const ChunkHoleTracker& getChunkHoleTracker() const { return m_chunkHoleTracker; }
+
+    /// Mark edited chunks dirty for remeshing.
+    void markEditsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks);
+    void markTextureMaterialsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks);
+
+    const std::vector<SnapshotInfo>& getSnapshotInfos() const { return m_snapshotInfos; }
+    const std::vector<TerrainBoxRecord>& getTerrainBoxes() const { return m_terrainBoxes; }
+    uint64_t getTerrainBoxRevision() const { return m_terrainBoxRevision; }
+    uint64_t getMeshTopologyVersion() const {
+        return m_meshTopologyVersion.load(std::memory_order_relaxed);
+    }
+    bool getMeshTopologyChangesSince(uint64_t revision,
+                                     std::vector<MeshTopologyChange>& outChanges,
+                                     size_t maxChanges = 8192) const;
+    int getActiveSnapshotIndex() const { return m_activeSnapshotIndex; }
+    std::string getActiveSnapshotName() const {
+        if (m_activeSnapshotIndex >= 0 &&
+            m_activeSnapshotIndex < static_cast<int>(m_snapshotInfos.size())) {
+            return m_snapshotInfos[static_cast<size_t>(m_activeSnapshotIndex)].displayName;
+        }
+        return m_worldName;
+    }
+    bool hasActiveEditableSnapshot() const {
+        return m_activeSnapshotIndex > 0 &&
+               m_activeSnapshotIndex < static_cast<int>(m_snapshotInfos.size());
+    }
+
+    void markSnapshotDirty() { m_snapshotDirty = true; }
+
+    const std::string& getLastSnapshotStatusMessage() const { return m_lastSnapshotStatusMessage; }
+    bool lastSnapshotStatusIsError() const { return m_lastSnapshotStatusIsError; }
+
+    bool createSnapshot(const std::string& desiredName = "");
+    bool selectSnapshotByIndex(int index);
+    bool saveActiveSnapshot();
+    bool deleteSnapshot(int index);
+    void deleteAllSnapshots();
+    void flushDirtySnapshot();
+
+    struct TerrainEditPlacementContext {
+        bool valid{false};
+        glm::ivec3 chunkCoord{0, 0, 0};
+        int bandLodLevel{0};
+        int previewLodLevel{0};
+        TerrainType terrainType{TerrainType::Voxel};
+        float voxelSizeM{WorldConfig::VOXEL_SIZE_M};
+    };
+
+    TerrainEditPlacementContext getTerrainEditPlacementContext(const glm::vec3& worldPos) const;
+
+    bool applyTerrainBoxEdit(const glm::vec3& minCorner,
+                             const glm::vec3& maxCorner,
+                             bool additive,
+                             float requestedStep,
+                             int brushShape = 0);
+
+    /**
+     * Store collision data for an edited chunk and enqueue a physics body.
+     * Called by TerrainEditRemeshScheduler after re-meshing.
+     */
+    void enqueueEditCollision(entt::entity entity,
+                              const glm::ivec3& chunkCoord,
+                              std::vector<Vertex>&& packedVerts,
+                              std::vector<uint32_t>&& indices32,
+                              std::shared_ptr<struct ChunkVersionState> versionState = {},
+                              uint32_t version = 0,
+                              ChunkCollisionSource source = ChunkCollisionSource::EditMeshPacked);
+
+    /**
+     * Immediately create physics bodies for all chunks in m_editCollisionData.
+     * Called after loading a snapshot's collision file.
+     */
+    void applyEditCollisionData();
+
+    void clearEditArtifactCache();
+    void invalidateEditArtifact(const glm::ivec3& chunkCoord);
+    void invalidateEditArtifacts(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords);
+    void storeEditArtifact(const glm::ivec3& chunkCoord,
+                           TerrainType terrainType,
+                           int lodLevel,
+                           std::vector<Vertex>&& vertices,
+                           std::vector<uint32_t>&& indices,
+                           glm::vec3 aabbMin,
+                           glm::vec3 aabbMax,
+                           bool isEmpty,
+                           bool deferredBuild = false);
+    bool tryGetEditArtifact(const glm::ivec3& chunkCoord,
+                            TerrainType terrainType,
+                            int lodLevel,
+                            EditArtifact& outArtifact) const;
+    uint64_t getEditArtifactGeneration(const glm::ivec3& chunkCoord,
+                                       TerrainType terrainType,
+                                       int lodLevel) const;
+    
+    /**
+     * Access to terrain file loader (for heightmap-based terrain)
+     */
+    TerrainFileLoader* getTerrainLoader() { return m_terrainLoader.get(); }
+    
+    /**
+     * Access to DCCM terrain file loader
+     */
+    TerrainFileLoader* getDCCMTerrainLoader() { return m_dccmTerrainLoader.get(); }
+    
+    /**
+     * Get the appropriate terrain loader for a given LOD level
+     * Returns DCCM or voxel loader based on per-LOD terrain type config
+     */
+    TerrainFileLoader* getTerrainLoaderForLOD(int lodLevel) {
+        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS &&
+            m_terrainTypePerLOD[lodLevel] == TerrainType::DCCM &&
+            m_dccmTerrainLoader && m_dccmTerrainLoader->isLoaded()) {
+            return m_dccmTerrainLoader.get();
+        }
+        return m_terrainLoader.get();
+    }
+    
+    /**
+     * Get the effective LOD level for mesh loading
+     * DCCM always uses LOD 0 regardless of actual LOD
+     */
+    int getEffectiveLOD(int lodLevel) const {
+        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS &&
+            m_terrainTypePerLOD[lodLevel] == TerrainType::DCCM) {
+            return 0; // DCCM always uses LOD 0
+        }
+        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS) {
+            return m_dataLODPerBand[lodLevel];
+        }
+        return lodLevel;
+    }
+    int getEffectiveLODForChunk(const glm::ivec3& chunkCoord, int lodLevel) const {
+        if (getTerrainTypeForChunk(chunkCoord, lodLevel) == TerrainType::DCCM) {
+            return 0;
+        }
+        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS) {
+            return m_dataLODPerBand[lodLevel];
+        }
+        return lodLevel;
+    }
+    
+    /**
+     * Per-LOD terrain type configuration
+     */
+    void setTerrainTypeForLOD(int lodLevel, TerrainType type);
+    void setDataLODForBand(int band, int dataLOD);
+    void setTerrainTypesForStartup(const std::array<TerrainType, MAX_LOD_LEVELS>& types);
+    TerrainType getTerrainTypeForLOD(int lodLevel) const {
+        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS) return m_terrainTypePerLOD[lodLevel];
+        return TerrainType::Voxel;
+    }
+    TerrainType getTerrainTypeForChunk(const glm::ivec3& chunkCoord, int lodLevel) const {
+        if (chunkCoord.y != 0 || m_terrainEditOverlay.hasEditsInChunk(chunkCoord)) {
+            return TerrainType::Voxel;
+        }
+        return getTerrainTypeForLOD(lodLevel);
+    }
+    const std::array<TerrainType, MAX_LOD_LEVELS>& getTerrainTypePerLOD() const { return m_terrainTypePerLOD; }
+    int getDataLODForBand(int band) const {
+        if (band >= 0 && band < MAX_LOD_LEVELS) return m_dataLODPerBand[band];
+        return band;
+    }
+    const std::array<int, MAX_LOD_LEVELS>& getDataLODPerBand() const { return m_dataLODPerBand; }
+    
+    /**
+     * Returns true when chunks are loading/meshing/uploading.
+     * Used to block terrain type changes that would corrupt GPU state.
+     */
+    bool isTerrainBusy() const {
+        return m_loadingCount.load(std::memory_order_relaxed) > 0
+            || m_meshingCount.load(std::memory_order_relaxed) > 0
+            || m_uploadSystem.getQueueSize() > 0;
+    }
+    
+    /**
+     * Check if any LOD uses a specific terrain type
+     */
+    bool anyLODUsesType(TerrainType type) const {
+        for (int i = 0; i < MAX_LOD_LEVELS; ++i) {
+            if (m_terrainTypePerLOD[i] == type) return true;
+        }
+        return false;
+    }
+    
+    /**
+     * Switch to a different terrain file (e.g. voxel <-> DCCM)
+     * Destroys all chunks, reloads the terrain file, and restarts generation.
+     * @param newTerrainPath Full path to the new terrain .bin file
+     */
+    void switchTerrainFile(const std::string& newTerrainPath);
+    const std::string& getBaseTerrainPath() const { return m_baseTerrainPath; }
+    
+    /**
+     * Get terrain dimensions in chunks (from loaded terrain.bin)
+     * Returns {chunksX, chunksZ, lodLevels} or {0,0,0} if not loaded
+     */
+    TerrainFileLoader::Dimensions getTerrainDimensions() const {
+        if (m_terrainLoader && m_terrainLoader->isLoaded()) {
+            return m_terrainLoader->getDimensions();
+        }
+        return {0, 0, 0};
+    }
+    
+    /**
+     * Get maximum render distance in rings based on terrain size
+     * This is the furthest ring that can contain any terrain data
+     */
+    int getMaxRenderDistanceRings() const {
+        auto dims = getTerrainDimensions();
+        if (dims.chunksX == 0 || dims.chunksZ == 0) return 500; // Default fallback
+        // Max ring = max distance from center to corner
+        // For NxN grid, center is at (N/2, N/2), corner is at (N-1, N-1)
+        // Max Chebyshev distance = max(N/2, N/2) = N/2 (roughly)
+        int maxDim = static_cast<int>(std::max(dims.chunksX, dims.chunksZ));
+        return (maxDim + 1) / 2 + 1;
+    }
+
+    /**
+     * Get the number of LOD levels available in the loaded terrain
+     * Returns terrain file's lodLevels (typically 5 for LOD 0-4), or 5 as default
+     */
+    int getAvailableLODLevels() const {
+        auto dims = getTerrainDimensions();
+        if (dims.lodLevels > 0) return static_cast<int>(dims.lodLevels);
+        return 5; // Default: LOD 0-4
+    }
+
+    /**
+     * Set physics world for collision generation
+     * Call after physics system is initialized
+     */
+    void setPhysicsWorld(class Physics::PhysicsWorld* physics) { 
+        m_physics = physics; 
+        m_collisionSystem.setPhysicsWorld(physics);
+        m_collisionSystem.setCollisionCache(m_collisionCache.get());
+    }
+    
+    /**
+     * Set GPU culling system for persistent slot allocation
+     * Call after GPUCullingSystem is initialized
+     */
+    void setGPUCullingSystem(GPUCullingSystem* gpuCulling) {
+        m_gpuCulling = gpuCulling;
+        m_uploadSystem.setGPUCullingSystem(gpuCulling);
+    }
+    
+    /**
+     * Set culling statistics for debug display
+     * Called from Engine after culling is complete
+     */
+    void setCullingStats(const CullingStats& stats) {
+        m_cullingStats = stats;
+    }
+
+    const LastUpdateBreakdown& getLastUpdateBreakdown() const { return m_lastUpdateBreakdown; }
+    int getLoadingCount() const { return m_loadingCount.load(std::memory_order_relaxed); }
+    int getMeshingCount() const { return m_meshingCount.load(std::memory_order_relaxed); }
+    int getReadyCount() const { return m_readyCount.load(std::memory_order_relaxed); }
+
+    /**
+     * Create a chunk entity at given chunk coordinates
+     * @return Entity handle (entt::null if failed)
+     */
+    entt::entity createChunk(const glm::ivec3& chunkCoord);
+
+    /**
+     * OPTIMIZATION: Create multiple chunks in a single batch (1.5x speedup)
+     * Reduces lock overhead by creating all entities under one registry lock
+     * @param coords Vector of chunk coordinates to create
+     * @return Vector of created entities (same order as coords)
+     */
+    std::vector<entt::entity> createChunksBatch(const std::vector<glm::ivec3>& coords);
+
+    /**
+     * Find chunk entity by coordinate
+     * @return Entity handle (entt::null if not found)
+     */
+    entt::entity findChunk(const glm::ivec3& chunkCoord) const;
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet collectExistingChunksInRange(
+        const glm::ivec3& minChunk,
+        const glm::ivec3& maxChunk) const;
+
+    /**
+     * Get count of active chunks
+     */
+    size_t getChunkCount() const;
+
+    // Direct registry access for external systems
+    Registry& getRegistry() { return m_registry; }
+    const Registry& getRegistry() const { return m_registry; }
+    std::shared_mutex& registryMutex() const { return m_registryMutex; }
+
+    // C-nits 8: Job system and synchronization accessors
+    JobSystem& getJobSystem() { return m_jobSystem; }
+    PayloadPool& getPayloadPool() { return m_payloadPool; }
+    ChunkManager* getChunkManager() { return m_chunkManager.get(); }
+    
+    /**
+     * Pre-deserialize all collision shapes for instant runtime access
+     * MUST be called AFTER Jolt physics is initialized
+     */
+    void preDeserializeCollisionShapes();
+    
+    /**
+     * Chunk generation control
+     */
+    void resetChunkGeneration();
+    
+    /**
+     * Apply LOD parameter changes incrementally.
+     * Instead of destroying all chunks and rebuilding, this:
+     * 1. Compares each chunk's current LOD vs desired LOD under new thresholds
+     * 2. Only destroys+recreates chunks whose LOD actually changed
+     * 3. Creates new chunks for increased render distance / destroys for decreased
+     * 
+     * Much faster than resetChunkGeneration() for small parameter tweaks.
+     * @param newRenderDistance  The new total render distance in rings
+     */
+    void applyLODChangesIncrementally(int newRenderDistance);
+    
+    /**
+     * Release mesh data for all chunks at a specific LOD level
+     * Used when switching LOD from Mesh to SVO mode - frees VRAM without destroying chunks
+     * @param lodLevel The LOD level (0-4) to release meshes for
+     */
+    void releaseMeshesForLOD(int lodLevel);
+    
+    /**
+     * Queue mesh reload for all chunks at a specific LOD level
+     * Used when switching LOD from SVO back to Mesh mode
+     * @param lodLevel The LOD level (0-4) to reload meshes for
+     */
+    void reloadMeshesForLOD(int lodLevel);
+    
+    std::mutex& chunkVersionMutex() const { return m_chunkVersionMutex; }
+    std::unordered_map<entt::entity, std::shared_ptr<struct ChunkVersionState>, struct EntityHash>& 
+        getChunkVersionStates() { return m_chunkVersionStates; }
+
+    void transitionChunkState(entt::entity entity, ChunkState::State state);
+
+private:
+    /**
+     * Chunk loading system - creates/destroys/remeshes chunks in circular area
+     * @param deltaTime Frame time for speed-adaptive LOD
+     */
+    void updateChunkLoader(float deltaTime, const glm::vec3& cameraPos, float cameraYaw);
+
+    /**
+     * LOD transition scan + remesh drain (called from updateChunkLoader)
+     */
+    void updateLODTransitions(float deltaTime, bool centerChanged);
+
+    /**
+     * Mark newly generated chunks as dirty for meshing
+     */
+    void updateMarkDirtyOnGeneration();
+
+    /**
+     * Meshing system - kicks off mesh generation jobs for dirty chunks
+     */
+    void updateMeshingSystem();
+
+    /**
+     * Upload queue system - uploads finished meshes to GPU
+     * @return Number of meshes uploaded this frame
+     */
+    size_t updateUploadQueueSystem(BufferSuballocator* vbAllocator,
+                                  BufferSuballocator* ibAllocator,
+                                  UploadArena* uploadArena,
+                                  ResourceUploader* uploader,
+                                  uint64_t uploadReadyValue,
+                                  size_t maxUploadsOverride = 0,
+                                  bool terrainEditOnly = false);
+
+    /**
+     * Finalize queue - processes chunks after GPU upload completes
+     * @return Number of chunks finalized this frame
+     */
+    size_t processFinalizeQueue(size_t maxFinalizeCount = 0);
+    
+    /**
+     * Process LOD batch swaps - atomically swap PendingMeshHandle → MeshHandle
+     * for all chunks in a completed LOD transition batch.
+     * This eliminates visual holes at LOD boundaries.
+     * @return Number of chunks swapped this frame
+     */
+    size_t processLODSwaps(BufferSuballocator* vbAllocator,
+                           BufferSuballocator* ibAllocator,
+                           uint64_t deviceTimeline);
+
+    /**
+     * Old mesh buffers retired by LOD swaps. GPU culling slots are freed
+     * immediately; buffer allocator reclamation is deferred until the upload
+     * and swap path drains it.
+     */
+    void enqueueDeferredMeshBufferFree(const BufferSlice& vb, const BufferSlice& ib);
+    void processDeferredMeshBufferFrees(BufferSuballocator* vbAllocator,
+                                        BufferSuballocator* ibAllocator,
+                                        size_t maxFreeCount = 0);
+
+    /**
+     * Process solo edit swaps - swap PendingMeshHandle (batchId=0) → MeshHandle
+     * once deviceTimeline >= pending.handle.gpuReadyValue.
+     * Used for terrain edit remeshes where the old mesh must keep rendering
+     * until the GPU has finished reading the replacement upload.
+     * @return Number of chunks swapped this frame
+     */
+    size_t processSoloPendingSwaps(BufferSuballocator* vbAllocator,
+                                   BufferSuballocator* ibAllocator,
+                                   uint64_t deviceTimeline);
+    
+    /**
+     * Clean up orphaned PendingMeshHandles from cancelled LOD batches.
+     * Frees GPU resources (VB, IB, culling slots) and removes the component.
+     * Called when center changes and old batches are invalidated.
+     */
+    void cleanupStalePendingMeshHandles();
+    
+    // --- Pending LOD remesh queue ---
+    // LOD transition detection lives in World (not ChunkManager) because we
+    // need access to chunk.lodLevel (the ACTUAL mesh LOD, not the calculated one).
+    // On center change: scan all Ready chunks, find mismatches, populate queue.
+    // Drain it eagerly so movement can converge as quickly as the rest of the
+    // pipeline allows.
+    std::vector<ChunkManager::ChunkRemeshRequest> m_pendingLODRemeshes;
+    size_t m_lodScanCounter = 0;
+
+    // --- Burst recovery (explosion knockbacks, teleports) ---
+    // After a large center jump (moveDist > 5 chunks), accelerate LOD scans
+    // and skip upload throttling so the world fills in quickly.
+    int m_burstRecoveryFrames{0};
+
+    using PendingMeshBufferFree = WorldData::PendingMeshBufferFree;
+    std::deque<PendingMeshBufferFree> m_pendingMeshBufferFrees;
+    std::vector<BufferSlice> m_deferredFreeVbScratch;
+    std::vector<BufferSlice> m_deferredFreeIbScratch;
+
+    // --- Core ECS ---
+    Registry m_registry;
+
+    // --- Chunk loading ---
+    std::unique_ptr<ChunkManager> m_chunkManager;
+
+    // --- C-nits 8: Job system and synchronization (de-globalized) ---
+    JobSystem m_jobSystem;
+    PayloadPool m_payloadPool;  // Thread-safe pool for ChunkPipelinePayload
+    mutable std::mutex m_chunkVersionMutex;  // Protects m_chunkVersionStates
+    std::unordered_map<entt::entity, std::shared_ptr<struct ChunkVersionState>, struct EntityHash> m_chunkVersionStates;
+
+    // --- Streaming queues ---
+    mutable std::mutex m_pendingChunksMutex;  // Protects m_pendingChunks (accessed from main + lifecycle threads)
+    std::unordered_set<glm::ivec3, IVec3Hash> m_pendingChunks;
+    std::unordered_map<glm::ivec3, entt::entity, IVec3Hash> m_chunkEntityMap;
+    std::unordered_set<glm::ivec3, IVec3Hash> m_existingChunkSet;
+    std::unordered_set<glm::ivec3, IVec3Hash> m_readyChunkSet;
+    mutable std::shared_mutex m_chunkSetMutex;
+    // --- LOD system (extracted) ---
+    ChunkLODSystem m_lodSystem;
+    
+    // --- Lifecycle manager (extracted) ---
+    ChunkLifecycleManager m_lifecycleManager;
+    
+    // IChunkLifecycleCallback implementation
+    std::vector<entt::entity> createChunkEntities(const std::vector<glm::ivec3>& coords) override;
+    void scheduleChunkJobs(entt::entity entity, const glm::ivec3& coord, const glm::ivec3& playerChunk) override;
+    int destroyChunks(const std::vector<glm::ivec3>& coords) override;
+    glm::vec3 getCameraPosition() const override { return m_lastCameraPos; }
+    void cleanupStaleVersionStates() override;
+
+    // --- Upload system (extracted) ---
+    ChunkUploadSystem m_uploadSystem;
+    
+    // IUploadCallback implementation
+    void onMeshUploaded(
+        entt::entity entity,
+        const glm::ivec3& chunkCoord,
+        const std::vector<Vertex>& vertices,
+        const std::vector<uint16_t>& indices,
+        int lodLevel) override;
+    void onUploadPipelineEvent(
+        entt::entity entity,
+        const glm::ivec3* chunkCoord,
+        int lodLevel,
+        const char* stage,
+        const char* reason,
+        uint32_t batchId,
+        uint32_t expectedVersion,
+        uint32_t actualVersion,
+        const ChunkDebugAttribution* debugInfo = nullptr) override;
+    void onMeshHandleAdded(const MeshHandle& h) override { meshStatsAdd(h); }
+    void onMeshHandleRemoved(const MeshHandle& h) override { meshStatsSub(h); }
+    
+    // IBatchSignalCallback implementation
+    bool onBatchChunkReady(uint32_t batchId) override;
+    bool isBatchActive(uint32_t batchId) const override;
+
+    // --- Camera tracking for directional priority ---
+    glm::vec3 m_lastCameraPos{0.0f};
+    float m_lastCameraYaw{0.0f};  // For minimap view cone
+    glm::vec3 m_cameraVelocity{0.0f};
+
+    // --- Collision system (extracted) ---
+    ChunkCollisionSystem m_collisionSystem;
+    
+    // --- GPU buffer allocators (for cleanup) ---
+    BufferSuballocator* m_vbAllocator = nullptr;
+    BufferSuballocator* m_ibAllocator = nullptr;
+
+    // --- Chunk state tracking for worker threads ---
+    mutable std::shared_mutex m_chunkStateMutex;
+    std::unordered_map<glm::ivec3, ChunkState::State, IVec3Hash> m_chunkStateMap;
+
+    // --- Registry synchronization ---
+    mutable std::shared_mutex m_registryMutex;
+
+    // --- Helpers ---
+    void setChunkState(entt::entity entity, ChunkState::State state);
+    void setChunkState(const glm::ivec3& coord, ChunkState::State state);
+    void removeChunkState(const glm::ivec3& coord);
+    ChunkState::State getChunkStateSnapshot(const glm::ivec3& coord) const;
+    void markChunkPending(const glm::ivec3& coord);
+    void clearChunkPending(const glm::ivec3& coord);
+    bool isChunkPending(const glm::ivec3& coord) const;
+    bool tryDestroyChunk(const glm::ivec3& coord);
+    int tryDestroyChunksBatch(const std::vector<glm::ivec3>& coords);
+    int getDesiredLODForChunk(const glm::ivec3& coord) const;
+
+    // --- Debug metrics assembly (implementation in WorldDebugMetrics.cpp) ---
+    struct UpdateTimings {
+        std::chrono::high_resolution_clock::time_point startTime;
+        std::chrono::high_resolution_clock::time_point chunkLoadStart, chunkLoadEnd;
+        std::chrono::high_resolution_clock::time_point meshingStart, meshingEnd;
+        std::chrono::high_resolution_clock::time_point uploadStart, uploadEnd;
+        std::chrono::high_resolution_clock::time_point collisionStart, collisionEnd;
+        std::chrono::high_resolution_clock::time_point finalizeStart, finalizeEnd;
+        std::chrono::high_resolution_clock::time_point worldUpdateEnd;
+    };
+    void assembleDebugInfo(const UpdateTimings& timings,
+                           BufferSuballocator* vbAllocator,
+                           BufferSuballocator* ibAllocator,
+                           float cpuFrameMs,
+                           float gpuFrameMs);
+
+public:
+    // --- Streaming metrics ---
+    StreamingMetrics& getStreamingMetrics() { return m_streamingMetrics; }
+    const StreamingMetrics& getStreamingMetrics() const { return m_streamingMetrics; }
+
+    // Phase E1: expose passes this world contributes to (currently voxel opaque only)
+    std::vector<FramePassKind> enumerateFramePasses() const;
+
+private:
+    StreamingMetrics m_streamingMetrics;
+    std::unique_ptr<InGameDebug> m_inGameDebug;  // Debug overlay display
+    TerrainEdit::TerrainEditOverlayStore m_terrainEditOverlay; // Sparse mutable terrain edits
+    TextureOverlay::TextureOverlayStore m_textureMaterialStore; // Sparse voxel-face material edits
+    TerrainEdit::TerrainFieldSource m_terrainFieldSource;      // Merged base/edit terrain view
+    TerrainEdit::HeightmapBaseSampler m_heightmapSampler;      // Base heightmap for terrain edits
+    TerrainEdit::VoxelBaseSampler m_voxelBaseSampler;            // 3D voxel base for terrain edits
+    TerrainEdit::TerrainEditRemeshScheduler m_editRemeshScheduler; // Dirty-chunk re-mesh scheduler
+    std::vector<SnapshotInfo> m_snapshotInfos;
+    std::vector<TerrainBoxRecord> m_terrainBoxes;
+    uint64_t m_terrainBoxRevision{1};
+    int m_activeSnapshotIndex{0};
+    std::string m_snapshotRootDir;
+    std::string m_baseTerrainPath;
+    std::string m_baseCollisionPath;
+    std::unique_ptr<TerrainFileLoader> m_terrainLoader;      // Voxel terrain loader
+    std::unique_ptr<TerrainFileLoader> m_dccmTerrainLoader;  // DCCM terrain loader
+    std::array<TerrainType, MAX_LOD_LEVELS> m_terrainTypePerLOD{TerrainType::Voxel, TerrainType::Voxel, TerrainType::Voxel, TerrainType::Voxel, TerrainType::Voxel};
+    std::array<int, MAX_LOD_LEVELS> m_dataLODPerBand{0, 1, 2, 3, 4};  // Per-band data LOD override (Voxel only)
+    std::unique_ptr<Collision::CollisionCache> m_collisionCache;  // Precomputed collision data
+
+    bool m_snapshotDirty{false}; // Deferred save flag — set by edits, flushed on switch/save
+    std::string m_lastSnapshotStatusMessage;
+    bool m_lastSnapshotStatusIsError{false};
+    TerrainEditDiag m_lastEditDiag; // Last terrain edit timing diagnostics
+    TerrainEditStats m_editStats;   // Rolling history + averages
+    TerrainEditHistory m_editHistory; // Individual edit log entries
+    ChunkVisualHistory m_chunkVisualHistory; // End-to-end chunk upload/finalize history
+    ChunkVisualErrorHistory m_chunkVisualErrorHistory; // Upload/LOD/finalize error timeline
+
+    // Persisted edit collision map (saved/loaded with each snapshot)
+    std::unordered_map<glm::ivec3, EditCollisionEntry, IVec3Hash> m_editCollisionData;
+    mutable std::shared_mutex m_editArtifactCacheMutex;
+    std::unordered_map<EditArtifactKey, EditArtifact, EditArtifactKeyHash> m_editArtifactCache;
+    uint64_t m_editArtifactGenCounter{0};  // monotonic, bumped per storeEditArtifact
+    class Physics::PhysicsWorld* m_physics{nullptr};     // Physics world for collision (non-owning)
+    GPUCullingSystem* m_gpuCulling{nullptr};             // GPU culling system for persistent slots (non-owning)
+    CullingStats m_cullingStats;                          // Culling statistics from Engine
+    LastUpdateBreakdown m_lastUpdateBreakdown;            // Always-on timings for perf HUD / runtime metrics
+    
+    // Runtime voxel chunk tracking
+    mutable std::shared_mutex m_runtimeVoxelChunkMutex;
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet m_runtimeVoxelChunks;
+    std::atomic<uint64_t> m_meshTopologyVersion{0};  // Bumped when mesh topology changes
+    mutable std::mutex m_meshTopologyChangeMutex;
+    std::deque<MeshTopologyChange> m_meshTopologyChanges;
+    uint64_t m_meshTopologyOldestDroppedRevision{0};
+    ChunkHoleTracker m_chunkHoleTracker;              // Tracks chunk visual hole events
+    
+    // --- Render system (extracted) ---
+    ChunkRenderSystem m_renderSystem;
+    
+    // World metadata
+    std::string m_worldName;
+    std::string m_worldGenerationDate;
+    
+    // --- Atomic state counters for O(1) tracking instead of O(N) iteration ---
+    std::atomic<int> m_loadingCount{0};
+    std::atomic<int> m_meshingCount{0};
+    std::atomic<int> m_readyCount{0};
+    
+    // Track whether any uploads/copies were recorded this frame (for skipping empty submits)
+    bool m_hadUploadsThisFrame{false};
+    // Track whether any of those uploads were topology-changing replacements.
+    // Initial chunk loads and LOD batch swaps do NOT set this. Used to suppress
+    // temporal visibility reuse after frames that may have exposed previously
+    // occluded neighbor chunks, breaking the temporal occlusion death spiral on edits.
+    bool m_hadEditUploadsThisFrame{false};
+    // Cooldown frames remaining after the last edit/remesh upload. While > 0, the
+    // temporal-coherence shortcut is suppressed so chunks re-run Hi-Z depth tests
+    // instead of reusing potentially stale temporal visibility bits.
+    uint32_t m_hiZEditCooldown{0};
+    uint64_t m_nextTerrainEditId{1};
+
+    struct PendingEditVisualChunk {
+        uint64_t editId{0};
+        std::chrono::steady_clock::time_point startTime{};
+    };
+    struct PendingEditVisualAggregate {
+        std::chrono::steady_clock::time_point startTime{};
+        uint32_t totalChunks{0};
+        uint32_t readyChunks{0};
+        uint32_t supersededChunks{0};
+        float visualFirstChunkMs{0.0f};
+        float visualCompleteMs{0.0f};
+        uint64_t uploadBytes{0};
+        uint32_t artifactBuilds{0};
+        uint32_t artifactCacheHits{0};
+        uint32_t precomputedLoads{0};
+        uint32_t collisionBaseCache{0};
+        uint32_t collisionEditPacked{0};
+        uint32_t collisionArtifactRefresh{0};
+        uint32_t collisionExistingEdit{0};
+        uint32_t gpuResidentChunks{0};
+        uint32_t artifactResidentChunks{0};
+        uint32_t monolithicChunks{0};
+        uint32_t pagedChunks{0};
+        uint32_t dirtyPages{0};
+        uint32_t rebuiltPages{0};
+        uint32_t residentPages{0};
+        uint32_t evictedPages{0};
+    };
+    std::unordered_map<glm::ivec3, PendingEditVisualChunk, IVec3Hash> m_pendingEditVisualChunks;
+    std::unordered_map<uint64_t, PendingEditVisualAggregate> m_pendingEditVisuals;
+    std::unordered_map<glm::ivec3, ChunkCollisionSource, IVec3Hash> m_chunkCollisionSources;
+
+    // Edit→Load correlation tracker: counts consecutive [Load] entries per chunk
+    // since the last [Edit], propagating the editId to subsequent [Load] entries.
+    struct ChunkLoadTracker {
+        uint64_t editId{0};
+        uint32_t loadCount{0};
+    };
+    std::unordered_map<glm::ivec3, ChunkLoadTracker, IVec3Hash> m_chunkLoadTrackers;
+
+    // --- Finalize diagnostics ring buffer ---
+    std::vector<FinalizeDiagFrame> m_finalizeDiagHistory;
+    size_t m_finalizeDiagWriteIdx{0};
+    uint64_t m_finalizeDiagFrameCounter{0};
+    FinalizeDiagFrame m_currentFinalizeDiag;  // populated by processFinalizeQueue + processLODSwaps each frame
+    LODSwitchDiag m_lodSwitchDiag;
+
+    // Running subchunk stats (D3: avoid periodic full-entity scan)
+    std::atomic<uint32_t> m_statsChunksWithMesh{0};
+    std::atomic<uint32_t> m_statsTotalSubChunks{0};
+    std::atomic<uint32_t> m_statsSplitChunks{0};
+    std::atomic<uint32_t> m_statsSeamSubChunks{0};
+    void meshStatsAdd(const MeshHandle& h);
+    void meshStatsSub(const MeshHandle& h);
+    void refreshSnapshots();
+    void updateWorldIdentityFromActiveSnapshot();
+    bool ensureEditableSnapshot();
+    void beginTerrainEditVisualTracking(
+        uint64_t editId,
+        const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks,
+        const std::chrono::steady_clock::time_point& startTime);
+    void noteChunkVisualReady(
+        const glm::ivec3& coord,
+        const std::chrono::steady_clock::time_point& uploadEnqueueTime,
+        const std::chrono::steady_clock::time_point& finalizeTime,
+        int lodLevel,
+        uint64_t vramBytes,
+        uint32_t vertexCount,
+        uint32_t indexCount,
+        const ChunkDebugAttribution* debugInfo = nullptr);
+    void noteChunkVisualError(
+        const glm::ivec3* coord,
+        int lodLevel,
+        const char* stage,
+        const char* reason,
+        uint32_t batchId = 0,
+        uint32_t expectedVersion = 0,
+        uint32_t actualVersion = 0,
+        const ChunkDebugAttribution* debugInfo = nullptr);
+    void recordMeshTopologyChange(const glm::ivec3& coord);
+    void recordMeshTopologyChanges(const std::vector<glm::ivec3>& coords);
+    void recordGlobalMeshTopologyChange();
+
+    // --- Ghost-geometry detector ---
+    // Periodic scan that flags LOD-0 chunks with valid render meshes but no
+    // valid physics collider. The actual culprit (edit-collision drop, async
+    // BVH null, stale-version drop, missing collision cache, etc.) is logged
+    // into the chunk visual error history so VRAM panel inspection can show
+    // the cause directly per chunk.
+    void scanForGhostGeometry();
+    struct GhostGeometryState {
+        uint32_t consecutiveBrokenScans{0};
+        uint64_t lastReportedScanIndex{0};
+    };
+    std::unordered_map<glm::ivec3, GhostGeometryState, IVec3Hash> m_ghostGeometryState;
+    int m_ghostScanFrameCounter{0};
+    uint64_t m_ghostScanIndex{0};
+    void refreshEditedChunkCollisionFromArtifact(
+        entt::entity entity,
+        const glm::ivec3& chunkCoord,
+        int lodLevel);
+    TerrainEditHistoryEntry* findTerrainEditHistoryEntry(uint64_t editId);
+    void syncTerrainEditVisualState(uint64_t editId, bool eraseIfComplete);
+    
+public:
+    // VRAM budget control (delegated to ChunkRenderSystem)
+    void setVramBudgetMB(uint32_t megabytes) { 
+        m_renderSystem.setVramBudgetMB(megabytes);
+    }
+    uint64_t getVramBudgetBytes() const { 
+        return m_renderSystem.getVramBudgetBytes();
+    }
+    uint64_t getCurrentVramUsage() const { 
+        return m_renderSystem.getCurrentVramUsage();
+    }
+    void setEnableVramLimiting(bool enable) { 
+        m_renderSystem.setEnableVramLimiting(enable);
+    }
+    bool isVramLimitingEnabled() const { 
+        return m_renderSystem.isVramLimitingEnabled();
+    }
+    
+    // Query whether the most recent update() recorded any GPU copies
+    bool hadUploadsThisFrame() const { return m_hadUploadsThisFrame; }
+    // Query whether the most recent update() recorded any topology-changing
+    // replacement uploads (i.e., uploads that may have exposed previously
+    // occluded neighbor chunks).
+    // Returns true during edit upload frames AND for several frames afterward,
+    // suppressing temporal-visibility reuse while fresh depth settles.
+    bool hadEditUploadsThisFrame() const { return m_hadEditUploadsThisFrame || (m_hiZEditCooldown > 0); }
+    
+    // Per-chunk visibility control
+    void setChunkVisible(entt::entity entity, bool visible) {
+        if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
+            m_registry.get<Chunk>(entity).isVisible = visible;
+        }
+    }
+};

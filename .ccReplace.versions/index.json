@@ -996,7 +996,7 @@
                       "Path":  "include/world/World.h",
                       "FullPath":  "D:\\projects\\vulkanas\\include\\world\\World.h",
                       "Key":  "dde35833d8ad2bf6",
-                      "CurrentVersion":  2,
+                      "CurrentVersion":  3,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1009,6 +1009,12 @@
                                            "Timestamp":  "2026-05-07T17:58:57.5731893Z",
                                            "Snapshot":  "files\\dde35833d8ad2bf6\\v000002.snapshot",
                                            "Reason":  "applied insert_after_function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-08T12:31:25.0958063Z",
+                                           "Snapshot":  "files\\dde35833d8ad2bf6\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
                                        }
                                    ]
                   },
@@ -2630,6 +2636,62 @@
                                            "Version":  2,
                                            "Timestamp":  "2026-05-08T12:24:26.0380114Z",
                                            "Snapshot":  "files\\9f66abf0e1a39bf3\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/world/WorldSnapshotTypes.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\WorldSnapshotTypes.h",
+                      "Key":  "1d7db2d6a273ca4c",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:31:24.9737168Z",
+                                           "Snapshot":  "files\\1d7db2d6a273ca4c\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/world/WorldEditArtifactTypes.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\WorldEditArtifactTypes.h",
+                      "Key":  "d95a95291ced3cf4",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:31:24.9953051Z",
+                                           "Snapshot":  "files\\d95a95291ced3cf4\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/world/WorldTopologyTypes.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\WorldTopologyTypes.h",
+                      "Key":  "1b2b0da5eb44fda8",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:31:25.0411605Z",
+                                           "Snapshot":  "files\\1b2b0da5eb44fda8\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/world/WorldStreamingTypes.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\WorldStreamingTypes.h",
+                      "Key":  "ba0856a226465799",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:31:25.0672260Z",
+                                           "Snapshot":  "files\\ba0856a226465799\\v000001.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
