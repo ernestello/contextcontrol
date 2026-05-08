@@ -1,0 +1,1387 @@
+// WorldLODTransitions.cpp — LOD level changes, mesh release/reload, LOD swaps
+// Extracted from World.cpp to reduce god-file size without changing behavior.
+
+#include "world/World.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/config/WorldConfig.h"
+#include "world/chunks/core/ChunkJobs.h"
+#include "vulkan/BufferSuballocator.h"
+#include "rendering/culling/GPUCullingSystem.h"
+#include "physics/PhysicsWorld.h"
+#include <iostream>
+#include <algorithm>
+#include <chrono>
+#include <unordered_map>
+#include <string>
+#include <limits>
+
+void World::setTerrainTypeForLOD(int lodLevel, TerrainType type) {
+    if (lodLevel < 0 || lodLevel >= MAX_LOD_LEVELS) return;
+    TerrainType oldType = m_terrainTypePerLOD[lodLevel];
+    if (oldType == type) return;
+    
+    m_terrainTypePerLOD[lodLevel] = type;
+    std::cout << "[World] LOD " << lodLevel << " terrain type changed to: " 
+              << (type == TerrainType::DCCM ? "DCCM" : "Voxel") << std::endl;
+    
+    // ---------------------------------------------------------------
+    // FULL PIPELINE DRAIN before releasing/reloading meshes.
+    // Without this, in-flight uploads and LOD batches from the OLD
+    // terrain type can arrive AFTER releaseMeshesForLOD clears the
+    // handles, installing stale mesh data and leaking GPU culling
+    // slots.  This matches what applyLODChangesIncrementally does.
+    // ---------------------------------------------------------------
+    m_lifecycleManager.pauseAndDrain();
+    auto purgedCreates = m_lifecycleManager.purgeCreationQueue(
+        [](const glm::ivec3&) { return true; });
+    auto purgedDestroys = m_lifecycleManager.purgeDestructionQueue(
+        [](const glm::ivec3&) { return true; });
+    if (!purgedCreates.empty()) {
+        std::lock_guard lock(m_pendingChunksMutex);
+        for (const auto& coord : purgedCreates) {
+            m_pendingChunks.erase(coord);
+        }
+    }
+    if (!purgedCreates.empty()) {
+        m_chunkManager->cancelPendingCreates(purgedCreates);
+    }
+    if (!purgedDestroys.empty()) {
+        m_chunkManager->cancelPendingDestroys(purgedDestroys);
+    }
+    m_uploadSystem.clearQueue();
+    
+    // Cancel all in-flight LOD transition batches and clean up their
+    // PendingMeshHandle GPU resources (buffers + culling slots).
+    auto cancelledBatchIds = m_chunkManager->cancelAllBatches();
+    if (!cancelledBatchIds.empty()) {
+        std::string reason = "DataLodSwitchCancelledBatches count=" +
+            std::to_string(cancelledBatchIds.size());
+        noteChunkVisualError(
+            nullptr,
+            lodLevel,
+            "LODTransition",
+            reason.c_str(),
+            0,
+            static_cast<uint32_t>(cancelledBatchIds.size()),
+            0);
+        cleanupStalePendingMeshHandles();
+    }
+    // Drop stale remesh queue entries carrying cancelled batch IDs.
+    m_lodSystem.clearAllPending();
+    m_pendingLODRemeshes.clear();
+    
+    // Purge pending LOD remeshes for this LOD level so stale remesh
+    // requests don't re-queue jobs for the old terrain type.
+    m_pendingLODRemeshes.erase(
+        std::remove_if(m_pendingLODRemeshes.begin(), m_pendingLODRemeshes.end(),
+            [lodLevel](const ChunkManager::ChunkRemeshRequest& req) {
+                return req.newLOD == lodLevel;
+            }),
+        m_pendingLODRemeshes.end());
+    
+    // Regenerate chunks at this LOD level - release old meshes and reload with new terrain type
+    releaseMeshesForLOD(lodLevel);
+    reloadMeshesForLOD(lodLevel);
+    
+    // Resume background thread
+    m_lifecycleManager.resume();
+}
+
+void World::setTerrainTypesForStartup(const std::array<TerrainType, MAX_LOD_LEVELS>& types) {
+    m_terrainTypePerLOD = types;
+    std::cout << "[World] Startup terrain types:";
+    for (int lod = 0; lod < MAX_LOD_LEVELS; ++lod) {
+        std::cout << " LOD" << lod << "="
+                  << (m_terrainTypePerLOD[lod] == TerrainType::DCCM ? "DCCM" : "Voxel");
+    }
+    std::cout << std::endl;
+}
+
+void World::setDataLODForBand(int band, int dataLOD) {
+    if (band < 0 || band >= MAX_LOD_LEVELS) return;
+    if (dataLOD < 0 || dataLOD >= MAX_LOD_LEVELS) return;
+    int oldDataLOD = m_dataLODPerBand[band];
+    if (oldDataLOD == dataLOD) return;
+
+    m_dataLODPerBand[band] = dataLOD;
+    std::cout << "[World] Band " << band << " data LOD changed: "
+              << oldDataLOD << " -> " << dataLOD << std::endl;
+
+    // Only Voxel bands use data LOD override; DCCM always uses LOD 0
+    if (m_terrainTypePerLOD[band] == TerrainType::DCCM) return;
+
+    // Same drain/reload cycle as setTerrainTypeForLOD
+    m_lifecycleManager.pauseAndDrain();
+    auto purgedCreates = m_lifecycleManager.purgeCreationQueue(
+        [](const glm::ivec3&) { return true; });
+    auto purgedDestroys = m_lifecycleManager.purgeDestructionQueue(
+        [](const glm::ivec3&) { return true; });
+    if (!purgedCreates.empty()) {
+        std::lock_guard lock(m_pendingChunksMutex);
+        for (const auto& coord : purgedCreates) {
+            m_pendingChunks.erase(coord);
+        }
+    }
+    if (!purgedCreates.empty()) {
+        m_chunkManager->cancelPendingCreates(purgedCreates);
+    }
+    if (!purgedDestroys.empty()) {
+        m_chunkManager->cancelPendingDestroys(purgedDestroys);
+    }
+    m_uploadSystem.clearQueue();
+
+    auto cancelledBatchIds = m_chunkManager->cancelAllBatches();
+    if (!cancelledBatchIds.empty()) {
+        std::string reason = "TerrainTypeSwitchCancelledBatches count=" +
+            std::to_string(cancelledBatchIds.size());
+        noteChunkVisualError(
+            nullptr,
+            band,
+            "LODTransition",
+            reason.c_str(),
+            0,
+            static_cast<uint32_t>(cancelledBatchIds.size()),
+            0);
+        cleanupStalePendingMeshHandles();
+    }
+    m_lodSystem.clearAllPending();
+    m_pendingLODRemeshes.clear();
+
+    releaseMeshesForLOD(band);
+    reloadMeshesForLOD(band);
+
+    m_lifecycleManager.resume();
+}
+
+void World::applyLODChangesIncrementally(int newRenderDistance) {
+    // Pause the background thread so it doesn't interfere with scanning
+    m_lifecycleManager.pauseAndDrain();
+    
+    glm::ivec3 center = m_chunkManager->getCenterChunk();
+    
+    // Compute the full effective distance including extension rings.
+    // Extension chunks (at last LOD) must not be destroyed or purged.
+    int extensionRings = m_chunkManager->getExtensionRings();
+    int effectiveTarget = newRenderDistance + extensionRings;
+    
+    // SELECTIVE purge: only purge creates that are NOW out of range.
+    // In-range creates must stay in the lifecycle queue so the background
+    // thread can finish creating them after we resume.  Purging all creates
+    // (as was done before) kills mid-pipeline chunks whose uploads then get
+    // cleared, leaving grey/empty holes that are never recovered.
+    auto purgedCreates = m_lifecycleManager.purgeCreationQueue(
+        [&](const glm::ivec3& coord) {
+            int ring = m_chunkManager->calculateRingNumber(coord, center);
+            return ring >= effectiveTarget;
+        });
+    auto purgedDestroys = m_lifecycleManager.purgeDestructionQueue(
+        [](const glm::ivec3&) { return true; });
+    if (!purgedCreates.empty()) {
+        std::lock_guard lock(m_pendingChunksMutex);
+        for (const auto& coord : purgedCreates) {
+            m_pendingChunks.erase(coord);
+        }
+    }
+    if (!purgedCreates.empty()) {
+        m_chunkManager->cancelPendingCreates(purgedCreates);
+    }
+    if (!purgedDestroys.empty()) {
+        m_chunkManager->cancelPendingDestroys(purgedDestroys);
+    }
+    
+    // DO NOT clear the upload queue unconditionally.  Chunks that are in-range
+    // and mid-pipeline (mesh generated, waiting for upload) would lose their
+    // mesh data permanently — the entity exists so processRingConstruct won't
+    // re-emit a create, but the mesh is gone → grey/empty chunk forever.
+    // The version-checking system (stale version detection in LoadPrecomputedMeshJob
+    // and UploadJob) already handles stale uploads for destroyed/remeshed chunks.
+    
+    // Cancel all in-flight LOD transition batches and clean up their
+    // PendingMeshHandle GPU resources.  Without this, old batches from
+    // a previous slider change linger because version-stale jobs never
+    // signal signalBatchChunkReady.  processLODSwaps only runs when ALL
+    // entities in a batch are ready, so even one stale job permanently
+    // blocks the swap — chunks appear frozen until the next change.
+    auto cancelledBatchIds = m_chunkManager->cancelAllBatches();
+    if (!cancelledBatchIds.empty()) {
+        std::string reason = "RenderDistanceChangeCancelledBatches count=" +
+            std::to_string(cancelledBatchIds.size());
+        noteChunkVisualError(
+            nullptr,
+            -1,
+            "LODTransition",
+            reason.c_str(),
+            0,
+            static_cast<uint32_t>(cancelledBatchIds.size()),
+            0);
+        cleanupStalePendingMeshHandles();
+    }
+    
+    m_lodSystem.clearAllPending();
+    m_pendingLODRemeshes.clear();
+    
+    // Phase 1: Scan existing chunks for:
+    //   - out-of-range chunks (destroy)
+    //   - LOD mismatches (remesh)
+    //   - seam/casing topology mismatches at unchanged LOD (remesh)
+    // Also batch-update desired LODs for all in-range chunks so chunks that are
+    // currently Loading/Meshing converge to the new target without waiting for
+    // a later center-change scan.
+    std::vector<glm::ivec3> chunksToDestroy;     // Now out of range — need full destroy
+    struct RemeshCandidate {
+        entt::entity entity{entt::null};
+        glm::ivec3 coord{0, 0, 0};
+        int newLOD{0};
+        int ring{0};
+    };
+    std::vector<RemeshCandidate> chunksToRemesh;
+    std::vector<std::pair<glm::ivec3, int>> desiredLODUpdates;
+
+    auto computeDCCMCasingMask = [&](const glm::ivec3& pos,
+                                     const glm::ivec3& centerPos) -> uint8_t {
+        static const glm::ivec3 nOff[4] = {{-1,0,0},{1,0,0},{0,0,-1},{0,0,1}};
+        uint8_t mask = 0;
+        for (int e = 0; e < 4; ++e) {
+            glm::ivec3 nb = pos + nOff[e];
+            int nbRing = m_chunkManager->calculateRingNumber(nb, centerPos);
+            int nbLOD  = m_chunkManager->calculateLODFromRing(nbRing);
+            if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM) {
+                mask |= (1u << e);
+            }
+        }
+        return mask;
+    };
+    
+    {
+        std::shared_lock regLock(m_registryMutex);
+        auto view = m_registry.view<Chunk, ChunkCoord, ChunkState>();
+        desiredLODUpdates.reserve(view.size_hint());
+        chunksToDestroy.reserve(view.size_hint() / 4);
+        chunksToRemesh.reserve(view.size_hint() / 8);
+        
+        for (auto entity : view) {
+            auto& chunk = view.get<Chunk>(entity);
+            auto& coordComp = view.get<ChunkCoord>(entity);
+            auto& stateComp = view.get<ChunkState>(entity);
+            glm::ivec3 coord = coordComp.toVec3();
+            
+            int ring = m_chunkManager->calculateRingNumber(coord, center);
+            
+            if (ring >= effectiveTarget) {
+                chunksToDestroy.push_back(coord);
+                continue;
+            }
+            
+            int newLOD = m_chunkManager->calculateLODFromRing(ring);
+            desiredLODUpdates.push_back({coord, newLOD});
+
+            // For non-ready chunks, desired LOD update is enough; avoid enqueueing
+            // extra remesh work while initial generation is still in progress.
+            if (stateComp.state != ChunkState::State::Ready) {
+                continue;
+            }
+
+            if (newLOD != chunk.lodLevel) {
+                chunksToRemesh.push_back({entity, coord, newLOD, ring});
+                continue;
+            }
+
+            // LOD unchanged, but boundary topology may still need a remesh:
+            // voxel seam masks and DCCM casing masks change when thresholds move.
+            TerrainType thisType = getTerrainTypeForChunk(coord, chunk.lodLevel);
+            if (thisType == TerrainType::DCCM) {
+                uint8_t newMask = computeDCCMCasingMask(coord, center);
+                if (newMask != chunk.casingSeamMask) {
+                    chunksToRemesh.push_back({entity, coord, newLOD, ring});
+                }
+            } else {
+                uint8_t newMask = (newLOD > 0) ? m_chunkManager->getSeamEdgeMask(coord, center) : 0;
+                if (newMask != chunk.voxelSeamMask) {
+                    chunksToRemesh.push_back({entity, coord, newLOD, ring});
+                }
+            }
+        }
+    }
+
+    if (!desiredLODUpdates.empty()) {
+        m_lodSystem.setDesiredLODs(desiredLODUpdates);
+    }
+    
+    // Phase 2: Destroy only out-of-range chunks
+    if (!chunksToDestroy.empty()) {
+        // Invalidate version states so in-flight jobs are discarded
+        {
+            std::scoped_lock versionLock(m_chunkVersionMutex);
+            for (const auto& coord : chunksToDestroy) {
+                entt::entity entity = findChunk(coord);
+                if (entity != entt::null) {
+                    auto it = m_chunkVersionStates.find(entity);
+                    if (it != m_chunkVersionStates.end() && it->second) {
+                        it->second->version.fetch_add(1, std::memory_order_acq_rel);
+                        it->second->inFlight.store(false, std::memory_order_release);
+                        it->second->pending.store(false, std::memory_order_release);
+                    }
+                }
+            }
+        }
+        
+        tryDestroyChunksBatch(chunksToDestroy);
+    }
+    
+    // Phase 3: In-place remesh for LOD-changed chunks via the existing remesh pipeline
+    // Don't update chunk.lodLevel here — it will be updated when the mesh is actually
+    // swapped in processLODSwaps. Pass targetLOD through batch info.
+    if (!chunksToRemesh.empty()) {
+        // Prioritize near rings first for visual stability while transitioning.
+        std::sort(chunksToRemesh.begin(), chunksToRemesh.end(),
+                  [](const RemeshCandidate& a, const RemeshCandidate& b) {
+                      return a.ring < b.ring;
+                  });
+
+        // Group by target LOD but keep near-first order within each group.
+        std::unordered_map<int, std::vector<RemeshCandidate>> lodGroups;
+        lodGroups.reserve(4);
+        for (const auto& c : chunksToRemesh) {
+            lodGroups[c.newLOD].push_back(c);
+        }
+        
+        for (auto& [targetLOD, candidates] : lodGroups) {
+            // Split groups into moderate batches so swaps complete faster and
+            // reduce visible "stuck boundary" windows during rapid slider edits.
+            static constexpr size_t MAX_LOD_BATCH_SIZE = 128;
+            
+            for (size_t batchStart = 0; batchStart < candidates.size(); batchStart += MAX_LOD_BATCH_SIZE) {
+                size_t batchEnd = std::min(batchStart + MAX_LOD_BATCH_SIZE, candidates.size());
+                std::vector<entt::entity> subBatchEntities;
+                subBatchEntities.reserve(batchEnd - batchStart);
+                for (size_t i = batchStart; i < batchEnd; ++i) {
+                    subBatchEntities.push_back(candidates[i].entity);
+                }
+
+                uint32_t batchId = m_chunkManager->createLODTransitionBatch(targetLOD, subBatchEntities);
+            
+                for (size_t i = batchStart; i < batchEnd; ++i) {
+                    const auto& c = candidates[i];
+                    auto vs = ensureChunkVersionState(this, c.entity);
+                    if (vs) {
+                        vs->version.fetch_add(1, std::memory_order_acq_rel);
+                        // Reset inFlight so updateMeshingSystem can start a new pipeline.
+                        // Without this, stale jobs (which intentionally don't clear inFlight)
+                        // leave the flag set, causing updateMeshingSystem to requeue forever.
+                        vs->inFlight.store(false, std::memory_order_release);
+                        vs->pending.store(false, std::memory_order_release);
+                    }
+                    
+                    m_lodSystem.setDesiredLOD(c.coord, targetLOD);
+                    // Signal any superseded batch (unlikely after cancelAllBatches
+                    // above, but safe against future race conditions).
+                    uint32_t oldBatchId = m_lodSystem.enqueueLODRemesh(c.entity, true, batchId, targetLOD);
+                    if (oldBatchId != 0 && m_chunkManager->isBatchActive(oldBatchId)) {
+                        m_chunkManager->signalBatchChunkReady(oldBatchId);
+                    }
+                }
+            } // end sub-batch loop
+        }     // end target LOD loop
+    }
+    
+    // Phase 4: Update render distance and ring construction state.
+    //
+    // With selective purge (only out-of-range creates purged), the emission
+    // watermark (emittedUpToRing) is accurate for in-range rings:
+    //   - INCREASE: no in-range creates purged, emittedUpToRing stays valid,
+    //     processRingConstruct emits only the new rings above the old distance.
+    //   - DECREASE: out-of-range creates purged, clampRingProgress lowers
+    //     emittedUpToRing to newRenderDistance so we don't think we've emitted
+    //     rings that no longer exist.
+    //
+    // setEffectiveRenderDistance: overrides the budget-adaptive cap so the
+    // user's slider value takes effect immediately.
+    //
+    // resetAdaptWarmup: prevents adaptRenderDistance from immediately
+    // shrinking effectiveDist back down on the next frame.
+    m_chunkManager->setRenderDistanceRings(newRenderDistance);
+    // effectiveTarget (base + extension) was already computed at the top
+    m_chunkManager->setEffectiveRenderDistance(effectiveTarget);
+    m_chunkManager->clampRingProgress(effectiveTarget);
+    m_chunkManager->resetAdaptWarmup();
+    
+    // Resume background thread — in-range creates left in the lifecycle queue
+    // will continue processing now.
+    m_lifecycleManager.resume();
+    
+    // Debug: count existing chunks and report progress
+    int existingCount = 0;
+    int expectedCount = 0;
+    {
+        std::shared_lock setLock(m_chunkSetMutex);
+        existingCount = static_cast<int>(m_existingChunkSet.size());
+    }
+    for (int r = 1; r <= effectiveTarget; ++r) {
+        int chebyshevR = r - 1;
+        int chunksInRing = (r == 1) ? 1 : 8 * chebyshevR;
+        expectedCount += chunksInRing;
+    }
+    std::cout << "[World] Incremental update: destroyed " << chunksToDestroy.size()
+              << " out-of-range, remeshing " << chunksToRemesh.size()
+              << " affected, purged " << purgedCreates.size() << " OOR creates"
+              << ", existing=" << existingCount
+              << "/" << expectedCount << " expected at " << effectiveTarget
+              << " rings (base=" << newRenderDistance << " + ext=" << extensionRings << ")"
+              << std::endl;
+}
+
+void World::releaseMeshesForLOD(int lodLevel) {
+    if (lodLevel < 0 || lodLevel > 4) return;
+    
+    std::vector<entt::entity> chunksToRelease;
+    size_t totalVertices = 0;
+    size_t totalIndices = 0;
+    
+    // Find all chunks at this LOD level
+    {
+        std::shared_lock regLock(m_registryMutex);
+        auto view = m_registry.view<Chunk, MeshHandle>();
+        for (auto entity : view) {
+            auto& chunk = m_registry.get<Chunk>(entity);
+            if (chunk.lodLevel == lodLevel) {
+                auto& meshHandle = m_registry.get<MeshHandle>(entity);
+                if (meshHandle.vb.isValid() || meshHandle.ib.isValid()) {
+                    chunksToRelease.push_back(entity);
+                    totalVertices += meshHandle.vb.size;
+                    totalIndices += meshHandle.ib.size;
+                }
+            }
+        }
+    }
+    
+    if (chunksToRelease.empty()) {
+        return;
+    }
+    
+    // Release mesh handles — collect slices under single lock, batch-free outside lock
+    std::vector<BufferSlice> vbSlices;
+    std::vector<BufferSlice> ibSlices;
+    std::vector<uint32_t> cullingSlots;
+    vbSlices.reserve(chunksToRelease.size());
+    ibSlices.reserve(chunksToRelease.size());
+    cullingSlots.reserve(chunksToRelease.size());
+    {
+        std::unique_lock regLock(m_registryMutex);
+        for (entt::entity entity : chunksToRelease) {
+            if (!m_registry.valid(entity)) continue;
+
+            if (m_registry.all_of<MeshHandle>(entity)) {
+                auto& meshHandle = m_registry.get<MeshHandle>(entity);
+                meshStatsSub(meshHandle);
+                if (meshHandle.vb.isValid()) vbSlices.push_back(meshHandle.vb);
+                if (meshHandle.ib.isValid()) ibSlices.push_back(meshHandle.ib);
+                if (meshHandle.gpuCullingSlot != UINT32_MAX)
+                    cullingSlots.push_back(meshHandle.gpuCullingSlot);
+                meshHandle = MeshHandle{};
+            }
+
+            if (m_registry.all_of<Chunk>(entity)) {
+                m_registry.get<Chunk>(entity).isEmpty = true;
+            }
+        }
+    }
+    // Batch free outside registry lock
+    if (m_vbAllocator && !vbSlices.empty())
+        m_vbAllocator->freeBatch(vbSlices.data(), vbSlices.size());
+    if (m_ibAllocator && !ibSlices.empty())
+        m_ibAllocator->freeBatch(ibSlices.data(), ibSlices.size());
+    if (m_gpuCulling && !cullingSlots.empty())
+        m_gpuCulling->freeSlots(cullingSlots.data(), cullingSlots.size());
+    
+    std::cout << "[World] Released " << chunksToRelease.size() << " meshes for LOD " << lodLevel
+              << " (freed ~" << (totalVertices / 1024 / 1024) << "MB VB, ~" 
+              << (totalIndices / 1024 / 1024) << "MB IB)" << std::endl;
+}
+
+void World::reloadMeshesForLOD(int lodLevel) {
+    if (lodLevel < 0 || lodLevel > 4) return;
+    
+    std::vector<std::pair<entt::entity, glm::ivec3>> chunksToReload;
+    
+    // Find all chunks at this LOD level that need mesh data
+    {
+        std::shared_lock regLock(m_registryMutex);
+        auto view = m_registry.view<Chunk, ChunkCoord>();
+        for (auto entity : view) {
+            auto& chunk = m_registry.get<Chunk>(entity);
+            if (chunk.lodLevel == lodLevel && chunk.isEmpty) {
+                auto& coord = m_registry.get<ChunkCoord>(entity);
+                chunksToReload.push_back({entity, coord.toVec3()});
+            }
+        }
+    }
+    
+    if (chunksToReload.empty()) {
+        std::cout << "[World] No empty chunks to reload for LOD " << lodLevel << std::endl;
+        return;
+    }
+    
+    std::cout << "[World] Reloading " << chunksToReload.size() << " meshes for LOD " << lodLevel << std::endl;
+    
+    // Queue each chunk for mesh loading via the job system
+    for (const auto& [entity, coord] : chunksToReload) {
+        auto versionState = ensureChunkVersionState(this, entity);
+        if (!versionState) continue;
+        
+        // Increment version to invalidate any in-flight jobs
+        versionState->version.fetch_add(1, std::memory_order_acq_rel);
+        versionState->inFlight.store(true, std::memory_order_release);
+        versionState->pending.store(false, std::memory_order_release);
+        
+        // Mark chunk for reloading
+        {
+            std::unique_lock regLock(m_registryMutex);
+            if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
+                auto& chunk = m_registry.get<Chunk>(entity);
+                chunk.isEmpty = false;  // Will be set correctly by LoadPrecomputedMeshJob
+            }
+        }
+        
+        setChunkState(entity, ChunkState::State::Loading);
+        
+        // Get AABB
+        AABB aabb;
+        {
+            std::shared_lock regLock(m_registryMutex);
+            if (m_registry.all_of<AABB>(entity)) {
+                aabb = m_registry.get<AABB>(entity);
+            }
+        }
+        
+        // Create payload for job pipeline
+        auto* payload = new ChunkPipelinePayload();
+        payload->world = this;
+        payload->entity = entity;
+        payload->coord = ChunkCoord{coord.x, coord.y, coord.z};
+        payload->bounds = aabb;
+        payload->versionState = versionState;
+        payload->version = versionState->version.load(std::memory_order_acquire);
+        payload->distanceFromPlayer = 0;  // High priority for reload
+        payload->lodLevel = lodLevel;
+        payload->centerAtEnqueue = m_chunkManager ? m_chunkManager->getCenterChunk() : glm::ivec3(0, 0, 0);
+        
+        // Schedule jobs — use edit mesher for chunks with overlay edits
+        TerrainType chunkTerrainType = getTerrainTypeForChunk(coord, lodLevel);
+        const bool useEditMesher = chunkNeedsRuntimeVoxel(coord);
+        payload->fromTerrainEdit = useEditMesher && chunkTerrainType != TerrainType::DCCM;
+        auto loadJobFn = (useEditMesher && chunkTerrainType != TerrainType::DCCM)
+            ? LoadEditMeshJob
+            : LoadPrecomputedMeshJob;
+        JobHandle load = m_jobSystem.makeWithPriority(loadJobFn, payload, 0, 1000000);
+        JobHandle upload = m_jobSystem.makeWithPriority(UploadChunkJob, payload, 0, 1000000);
+        JobHandle finalize = m_jobSystem.makeWithPriority(FinalizeChunkJob, payload, 0, 1000000);
+        
+        m_jobSystem.addDependency(upload, load);
+        m_jobSystem.addDependency(finalize, upload);
+        
+        payload->jobHandles = {load, upload, finalize};
+        
+        m_jobSystem.schedule(load);
+        m_jobSystem.schedule(upload);
+        m_jobSystem.schedule(finalize);
+    }
+}
+
+void World::cleanupStalePendingMeshHandles() {
+    // Free GPU resources for ALL entities with a PendingMeshHandle.
+    // Called when LOD batches are cancelled (center changed, old batches stale).
+    size_t pendingCount = 0;
+    std::vector<BufferSlice> vbSlices;
+    std::vector<BufferSlice> ibSlices;
+    std::vector<uint32_t> cullingSlots;
+    {
+        std::unique_lock regLock(m_registryMutex);
+        auto view = m_registry.view<PendingMeshHandle>();
+        for (auto entity : view) {
+            ++pendingCount;
+            auto& pending = view.get<PendingMeshHandle>(entity);
+            if (pending.handle.vb.isValid()) vbSlices.push_back(pending.handle.vb);
+            if (pending.handle.ib.isValid()) ibSlices.push_back(pending.handle.ib);
+            if (pending.handle.gpuCullingSlot != UINT32_MAX)
+                cullingSlots.push_back(pending.handle.gpuCullingSlot);
+        }
+        // Remove all PendingMeshHandle components in one pass
+        m_registry.clear<PendingMeshHandle>();
+    }
+    if (m_vbAllocator && !vbSlices.empty()) {
+        m_vbAllocator->freeBatch(vbSlices.data(), vbSlices.size());
+    }
+    if (m_ibAllocator && !ibSlices.empty()) {
+        m_ibAllocator->freeBatch(ibSlices.data(), ibSlices.size());
+    }
+    if (m_gpuCulling && !cullingSlots.empty()) {
+        m_gpuCulling->freeSlots(cullingSlots.data(), cullingSlots.size());
+    }
+    if (pendingCount > 0) {
+        std::string reason = "CleanupStalePendingMeshes count=" + std::to_string(pendingCount);
+        noteChunkVisualError(
+            nullptr,
+            -1,
+            "LODCleanup",
+            reason.c_str(),
+            0,
+            static_cast<uint32_t>(pendingCount),
+            0);
+    }
+}
+
+bool World::onBatchChunkReady(uint32_t batchId) {
+    if (!m_chunkManager) return false;
+    return m_chunkManager->signalBatchChunkReady(batchId);
+}
+
+bool World::isBatchActive(uint32_t batchId) const {
+    return m_chunkManager && m_chunkManager->isBatchActive(batchId);
+}
+
+void World::enqueueDeferredMeshBufferFree(const BufferSlice& vb, const BufferSlice& ib) {
+    if (!vb.isValid() && !ib.isValid()) {
+        return;
+    }
+    m_pendingMeshBufferFrees.push_back(PendingMeshBufferFree{vb, ib});
+    ++m_currentFinalizeDiag.lodSwapFreeQueuedCount;
+    m_currentFinalizeDiag.lodSwapFreeBacklog =
+        static_cast<uint32_t>(std::min<size_t>(
+            m_pendingMeshBufferFrees.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+}
+
+void World::processDeferredMeshBufferFrees(BufferSuballocator* vbAllocator,
+                                           BufferSuballocator* ibAllocator,
+                                           size_t maxFreeCount) {
+    if (m_pendingMeshBufferFrees.empty() || (!vbAllocator && !ibAllocator)) {
+        return;
+    }
+
+    size_t budget = (maxFreeCount == 0)
+        ? m_pendingMeshBufferFrees.size()
+        : std::min(maxFreeCount, m_pendingMeshBufferFrees.size());
+    if (budget == 0) {
+        return;
+    }
+
+    using Clock = std::chrono::high_resolution_clock;
+    auto t = Clock::now();
+
+    m_deferredFreeVbScratch.clear();
+    m_deferredFreeIbScratch.clear();
+    m_deferredFreeVbScratch.reserve(budget);
+    m_deferredFreeIbScratch.reserve(budget);
+
+    for (size_t i = 0; i < budget; ++i) {
+        PendingMeshBufferFree pending = m_pendingMeshBufferFrees.front();
+        m_pendingMeshBufferFrees.pop_front();
+        if (pending.vb.isValid()) m_deferredFreeVbScratch.push_back(pending.vb);
+        if (pending.ib.isValid()) m_deferredFreeIbScratch.push_back(pending.ib);
+    }
+
+    if (vbAllocator && !m_deferredFreeVbScratch.empty()) {
+        vbAllocator->freeBatch(m_deferredFreeVbScratch.data(), m_deferredFreeVbScratch.size());
+    }
+    if (ibAllocator && !m_deferredFreeIbScratch.empty()) {
+        ibAllocator->freeBatch(m_deferredFreeIbScratch.data(), m_deferredFreeIbScratch.size());
+    }
+
+    m_currentFinalizeDiag.lodSwapFreeDrainedCount += static_cast<uint32_t>(
+        std::min<size_t>(budget, static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    m_currentFinalizeDiag.lodSwapFreeBacklog =
+        static_cast<uint32_t>(std::min<size_t>(
+            m_pendingMeshBufferFrees.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    m_currentFinalizeDiag.lodSwapFreeMs +=
+        std::chrono::duration<float, std::milli>(Clock::now() - t).count();
+}
+
+size_t World::processLODSwaps(BufferSuballocator* vbAllocator,
+                               BufferSuballocator* ibAllocator,
+                               uint64_t deviceTimeline) {
+    using Clock = std::chrono::high_resolution_clock;
+    auto& diag = m_currentFinalizeDiag;
+
+    processDeferredMeshBufferFrees(vbAllocator, ibAllocator);
+
+    if (!m_chunkManager) return 0;
+
+    size_t totalSwapped = 0;
+
+    struct DeferredFree {
+        BufferSlice vb;
+        BufferSlice ib;
+        uint32_t gpuCullingSlot{UINT32_MAX};
+    };
+    struct CollisionRefreshRequest {
+        entt::entity entity{entt::null};
+        glm::ivec3 coord{0};
+        int lodLevel{0};
+    };
+    struct ColliderRemoval {
+        uint32_t bodyIdIndex{0xFFFFFFFFu};
+        uint32_t bodyIdSequence{0};
+    };
+    struct SwapVisualReady {
+        glm::ivec3 coord{0};
+        std::chrono::steady_clock::time_point uploadEnqueueTime{};
+        int lodLevel{0};
+        uint64_t vramBytes{0};
+        uint32_t vertexCount{0};
+        uint32_t indexCount{0};
+        ChunkDebugAttribution debugInfo{};
+    };
+    std::vector<DeferredFree> deferredFrees;
+    std::vector<CollisionRefreshRequest> collisionRefreshes;
+    std::vector<ColliderRemoval> colliderRemovals;
+    std::vector<SwapVisualReady> visualReadyEntries;
+    std::vector<uint32_t> cullingSlotsToActivate;
+
+    // Drain every completed batch whose uploads are visible to the GPU.
+    while (LODTransitionBatch* batch = m_chunkManager->getCompletedBatch()) {
+        uint32_t batchId = batch->batchId;
+        size_t batchSwapped = 0;
+        size_t batchInvalidEntities = 0;
+        size_t batchMissingPending = 0;
+        size_t batchMismatchedPending = 0;
+
+        // A completed batch means every PendingMeshHandle has been uploaded
+        // into the staging component, not necessarily that the graphics queue
+        // can see those uploads yet. Keep the old visible MeshHandle until the
+        // upload timeline has crossed every pending handle to avoid
+        // LODN -> blank -> LODM frames.
+        bool batchGpuReady = true;
+        {
+            std::shared_lock regLock(m_registryMutex);
+            for (entt::entity entity : batch->entities) {
+                if (!m_registry.valid(entity) ||
+                    !m_registry.all_of<PendingMeshHandle>(entity)) {
+                    continue;
+                }
+                const auto& pending = m_registry.get<PendingMeshHandle>(entity);
+                if (pending.batchId == batchId &&
+                    pending.handle.gpuReadyValue > deviceTimeline) {
+                    batchGpuReady = false;
+                    break;
+                }
+            }
+        }
+        if (!batchGpuReady) {
+            break;
+        }
+
+        ++diag.lodSwapBatchCount;
+
+        // Phase 1: Under unique_lock — swap components only (no allocator calls)
+        {
+            auto lockWaitStart = Clock::now();
+            std::unique_lock regLock(m_registryMutex);
+            auto lockAcquired = Clock::now();
+            glm::ivec3 center = m_chunkManager ? m_chunkManager->getCenterChunk() : glm::ivec3(0, 0, 0);
+            for (entt::entity entity : batch->entities) {
+                if (!m_registry.valid(entity)) {
+                    ++batchInvalidEntities;
+                    continue;
+                }
+                if (!m_registry.all_of<PendingMeshHandle>(entity)) {
+                    ++batchMissingPending;
+                    continue;
+                }
+
+                auto& pending = m_registry.get<PendingMeshHandle>(entity);
+                const auto pendingUploadEnqueueTime = pending.uploadEnqueueTime;
+                const uint64_t pendingVramBytes = pending.handle.vb.size + pending.handle.ib.size;
+                const uint32_t pendingVertexCount = static_cast<uint32_t>(pending.handle.vb.size / sizeof(Vertex));
+                const uint32_t pendingIndexCount = pending.handle.getTotalIndexCount();
+                ChunkDebugAttribution pendingDebug = pending.debugInfo;
+                if (pendingDebug.uploadBytes == 0) {
+                    pendingDebug.uploadBytes = pendingVramBytes;
+                }
+                if (pendingDebug.subChunkCount == 0) {
+                    pendingDebug.subChunkCount = pending.handle.subChunkCount;
+                }
+                pendingDebug.residency = deriveChunkResidencyKind(
+                    /*gpuResident=*/true,
+                    pendingDebug.artifactCacheResident,
+                    /*pendingBatch=*/false);
+
+                // Only swap if this PendingMeshHandle belongs to THIS batch.
+                // If the entity was reassigned to a newer batch, its pending
+                // mesh belongs to that batch and must not be consumed here.
+                if (pending.batchId != batchId) {
+                    ++batchMismatchedPending;
+                    continue;
+                }
+
+                if (m_registry.all_of<MeshHandle>(entity)) {
+                    auto& oldHandle = m_registry.get<MeshHandle>(entity);
+                    meshStatsSub(oldHandle);
+                    DeferredFree df;
+                    df.vb = oldHandle.vb;
+                    df.ib = oldHandle.ib;
+                    df.gpuCullingSlot = oldHandle.gpuCullingSlot;
+                    deferredFrees.push_back(df);
+                }
+
+                const uint32_t pendingCullingSlot = pending.handle.gpuCullingSlot;
+                meshStatsAdd(pending.handle);
+                m_registry.emplace_or_replace<MeshHandle>(entity, pending.handle);
+                m_registry.remove<PendingMeshHandle>(entity);
+                if (pendingCullingSlot != UINT32_MAX) {
+                    cullingSlotsToActivate.push_back(pendingCullingSlot);
+                }
+
+                if (m_registry.all_of<Chunk>(entity)) {
+                    auto& chunk = m_registry.get<Chunk>(entity);
+                    chunk.lodLevel = batch->targetLOD;
+                    if (m_registry.all_of<ChunkCoord>(entity)) {
+                        glm::ivec3 coord = m_registry.get<ChunkCoord>(entity).toVec3();
+                        chunk.effectiveDataLod = static_cast<uint8_t>(
+                            std::clamp(getEffectiveLODForChunk(coord, batch->targetLOD), 0, 255));
+                        TerrainType chunkType = getTerrainTypeForChunk(coord, batch->targetLOD);
+                        if (chunkType == TerrainType::DCCM) {
+                            uint8_t casingMask = 0;
+                            static const glm::ivec3 nOff[4] = {{-1,0,0},{1,0,0},{0,0,-1},{0,0,1}};
+                            for (int e = 0; e < 4; ++e) {
+                                glm::ivec3 nb = coord + nOff[e];
+                                int nbRing = m_chunkManager->calculateRingNumber(nb, center);
+                                int nbLOD = m_chunkManager->calculateLODFromRing(nbRing);
+                                if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM) {
+                                    casingMask |= (1 << e);
+                                }
+                            }
+                            chunk.casingSeamMask = casingMask;
+                            chunk.voxelSeamMask = 0;
+                        } else {
+                            chunk.voxelSeamMask = (batch->targetLOD > 0)
+                                ? m_chunkManager->getSeamEdgeMask(coord, center)
+                                : 0;
+                            chunk.casingSeamMask = 0;
+                        }
+                    }
+                }
+
+                if (m_registry.all_of<ChunkCoord>(entity)) {
+                    const glm::ivec3 coord = m_registry.get<ChunkCoord>(entity).toVec3();
+                    collisionRefreshes.push_back({
+                        entity,
+                        coord,
+                        batch->targetLOD
+                    });
+                    visualReadyEntries.push_back({
+                        coord,
+                        pendingUploadEnqueueTime,
+                        batch->targetLOD,
+                        pendingVramBytes,
+                        pendingVertexCount,
+                        pendingIndexCount,
+                        pendingDebug
+                    });
+                }
+
+                // Physics colliders are tied to visible LOD 0, not chunk
+                // lifetime.  Moving across a LOD boundary must therefore add
+                // a collider when the LOD-0 mesh becomes visible and remove it
+                // when the chunk leaves LOD 0.
+                if (batch->targetLOD > 0 && m_registry.all_of<ChunkCollider>(entity)) {
+                    const ChunkCollider collider = m_registry.get<ChunkCollider>(entity);
+                    if (collider.isValid()) {
+                        colliderRemovals.push_back({
+                            collider.bodyIdIndex,
+                            collider.bodyIdSequence
+                        });
+                    }
+                    m_registry.remove<ChunkCollider>(entity);
+                }
+
+                ++batchSwapped;
+                ++totalSwapped;
+            }
+            auto lockDone = Clock::now();
+            diag.lodSwapLockWaitMs += std::chrono::duration<float, std::milli>(lockAcquired - lockWaitStart).count();
+            diag.lodSwapLockHeldMs += std::chrono::duration<float, std::milli>(lockDone - lockAcquired).count();
+        }
+
+        if (batchSwapped == 0 || batchInvalidEntities > 0 || batchMissingPending > 0 || batchMismatchedPending > 0) {
+            std::string reason = "BatchSwapSummary swapped=" + std::to_string(batchSwapped) +
+                                 " invalid=" + std::to_string(batchInvalidEntities) +
+                                 " missingPending=" + std::to_string(batchMissingPending) +
+                                 " mismatchedPending=" + std::to_string(batchMismatchedPending);
+            noteChunkVisualError(
+                nullptr,
+                batch->targetLOD,
+                "LODSwap",
+                reason.c_str(),
+                batchId,
+                static_cast<uint32_t>(batch->entities.size()),
+                static_cast<uint32_t>(batchSwapped));
+        }
+
+        m_chunkManager->removeCompletedBatch(batchId);
+    }
+
+    diag.lodSwapEntityCount += static_cast<uint32_t>(totalSwapped);
+    if (totalSwapped > 0) {
+        std::vector<glm::ivec3> changedCoords;
+        changedCoords.reserve(visualReadyEntries.size());
+        for (const auto& entry : visualReadyEntries) {
+            if (entry.debugInfo.affectsShadowGeometry) {
+                changedCoords.push_back(entry.coord);
+            }
+        }
+        if (!changedCoords.empty()) {
+            recordMeshTopologyChanges(changedCoords);
+        }
+    }
+
+    // Phase 2: Update GPU-culling slot visibility and retire old resources
+    // OUTSIDE the registry lock. VB/IB allocator frees are queued and then
+    // drained by the world update.
+    {
+        auto t = Clock::now();
+
+        std::vector<uint32_t> cullingSlots;
+        cullingSlots.reserve(deferredFrees.size());
+
+        uint32_t queuedBufferFrees = 0;
+        for (auto& df : deferredFrees) {
+            if (df.vb.isValid() || df.ib.isValid()) {
+                m_pendingMeshBufferFrees.push_back(PendingMeshBufferFree{df.vb, df.ib});
+                ++queuedBufferFrees;
+            }
+            if (df.gpuCullingSlot != UINT32_MAX) cullingSlots.push_back(df.gpuCullingSlot);
+        }
+        if (queuedBufferFrees > 0) {
+            diag.lodSwapFreeQueuedCount += queuedBufferFrees;
+            diag.lodSwapFreeBacklog =
+                static_cast<uint32_t>(std::min<size_t>(
+                    m_pendingMeshBufferFrees.size(),
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        }
+
+        // Single culling-list handoff: replacement slots become active at the
+        // same time old slots retire, so no LOD update frame can see both.
+        if (m_gpuCulling && (!cullingSlotsToActivate.empty() || !cullingSlots.empty())) {
+            m_gpuCulling->activateSlotsAndFreeSlots(
+                cullingSlotsToActivate.empty() ? nullptr : cullingSlotsToActivate.data(),
+                cullingSlotsToActivate.size(),
+                cullingSlots.empty() ? nullptr : cullingSlots.data(),
+                cullingSlots.size());
+        }
+
+        diag.lodSwapFreeMs += std::chrono::duration<float, std::milli>(Clock::now() - t).count();
+    }
+
+    for (const auto& request : collisionRefreshes) {
+        if (request.lodLevel != 0) {
+            continue;
+        }
+
+        const bool hasEditedCollision =
+            m_editCollisionData.find(request.coord) != m_editCollisionData.end();
+        const bool hasRuntimeEdit =
+            (request.coord.y != 0) ||
+            m_terrainEditOverlay.hasEditsInChunk(request.coord) ||
+            hasEditedCollision;
+
+        if (hasRuntimeEdit) {
+            refreshEditedChunkCollisionFromArtifact(
+                request.entity,
+                request.coord,
+                request.lodLevel);
+        } else {
+            static const std::vector<Vertex> emptyVertices;
+            static const std::vector<uint16_t> emptyIndices;
+            onMeshUploaded(
+                request.entity,
+                request.coord,
+                emptyVertices,
+                emptyIndices,
+                request.lodLevel);
+        }
+    }
+
+    if (m_physics) {
+        for (const auto& removal : colliderRemovals) {
+            m_physics->removeBodyByIndexSeq(
+                removal.bodyIdIndex,
+                static_cast<uint8_t>(removal.bodyIdSequence));
+        }
+    }
+
+    const auto finalizeTime = std::chrono::steady_clock::now();
+    for (const auto& entry : visualReadyEntries) {
+        noteChunkVisualReady(
+            entry.coord,
+            entry.uploadEnqueueTime,
+            finalizeTime,
+            entry.lodLevel,
+            entry.vramBytes,
+            entry.vertexCount,
+            entry.indexCount,
+            &entry.debugInfo);
+    }
+
+    return totalSwapped;
+}
+
+size_t World::processSoloPendingSwaps(BufferSuballocator* vbAllocator,
+                                       BufferSuballocator* ibAllocator,
+                                       uint64_t deviceTimeline) {
+    if (!vbAllocator || !ibAllocator) return 0;
+
+    // Phase 1 (shared lock): collect entities with solo PendingMeshHandles ready to swap.
+    // batchId == 0 is the solo-edit sentinel set by the NORMAL PATH in processUploads.
+    std::vector<entt::entity> toSwap;
+    {
+        std::shared_lock regLock(m_registryMutex);
+        auto view = m_registry.view<const PendingMeshHandle>();
+        for (auto entity : view) {
+            const auto& pending = view.get<const PendingMeshHandle>(entity);
+            if (pending.batchId == 0 && pending.handle.gpuReadyValue <= deviceTimeline) {
+                toSwap.push_back(entity);
+            }
+        }
+    }
+    if (toSwap.empty()) return 0;
+
+    struct DeferredFree {
+        std::vector<BufferSlice> vbs;
+        std::vector<BufferSlice> ibs;
+        uint32_t gpuCullingSlot{UINT32_MAX};
+    };
+    std::vector<DeferredFree> deferredFrees;
+    deferredFrees.reserve(toSwap.size());
+
+    struct SwapVisualReady {
+        glm::ivec3 coord{0};
+        std::chrono::steady_clock::time_point uploadEnqueueTime{};
+        int lodLevel{0};
+        uint64_t vramBytes{0};
+        uint32_t vertexCount{0};
+        uint32_t indexCount{0};
+        ChunkDebugAttribution debugInfo{};
+    };
+    std::vector<SwapVisualReady> visualReadyEntries;
+    visualReadyEntries.reserve(toSwap.size());
+
+    // Phase 2 (unique lock): swap components, collect old buffer slices for deferred free.
+    size_t swapped = 0;
+    const glm::ivec3 center = m_chunkManager
+        ? m_chunkManager->getCenterChunk()
+        : glm::ivec3(0, 0, 0);
+    {
+        std::unique_lock regLock(m_registryMutex);
+        for (auto entity : toSwap) {
+            if (!m_registry.valid(entity)) continue;
+            if (!m_registry.all_of<PendingMeshHandle>(entity)) continue;
+
+            auto& pending = m_registry.get<PendingMeshHandle>(entity);
+            // Re-validate: a newer upload may have changed batchId or gpuReadyValue.
+            if (pending.batchId != 0 || pending.handle.gpuReadyValue > deviceTimeline) continue;
+
+            if (m_registry.all_of<MeshHandle>(entity)) {
+                auto& oldHandle = m_registry.get<MeshHandle>(entity);
+                meshStatsSub(oldHandle);
+                DeferredFree df;
+                oldHandle.collectBufferSlices(df.vbs, df.ibs);
+                // Normal path typically reuses culling slot. Only free when slot changes.
+                if (oldHandle.gpuCullingSlot != UINT32_MAX &&
+                    oldHandle.gpuCullingSlot != pending.handle.gpuCullingSlot) {
+                    df.gpuCullingSlot = oldHandle.gpuCullingSlot;
+                }
+                deferredFrees.push_back(std::move(df));
+            }
+
+            meshStatsAdd(pending.handle);
+            // Capture visual-ready diagnostics before removing PendingMeshHandle.
+            if (m_registry.all_of<ChunkCoord>(entity)) {
+                SwapVisualReady vr;
+                vr.coord = m_registry.get<ChunkCoord>(entity).toVec3();
+                vr.uploadEnqueueTime = pending.uploadEnqueueTime;
+                vr.lodLevel = m_registry.all_of<Chunk>(entity)
+                    ? m_registry.get<Chunk>(entity).lodLevel
+                    : 0;
+                vr.vramBytes = pending.handle.getTotalVramBytes();
+                vr.vertexCount = pending.handle.getTotalVertexCount();
+                vr.indexCount = pending.handle.getTotalIndexCount();
+                vr.debugInfo = pending.debugInfo;
+                if (vr.debugInfo.uploadBytes == 0) {
+                    vr.debugInfo.uploadBytes = vr.vramBytes;
+                }
+                if (vr.debugInfo.subChunkCount == 0) {
+                    vr.debugInfo.subChunkCount = pending.handle.subChunkCount;
+                }
+                vr.debugInfo.residency = deriveChunkResidencyKind(
+                    /*gpuResident=*/true,
+                    vr.debugInfo.artifactCacheResident,
+                    /*pendingBatch=*/false);
+                visualReadyEntries.push_back(std::move(vr));
+            }
+
+            if (m_registry.all_of<Chunk, ChunkCoord>(entity)) {
+                auto& chunk = m_registry.get<Chunk>(entity);
+                const glm::ivec3 coord = m_registry.get<ChunkCoord>(entity).toVec3();
+                const int lodLevel = chunk.lodLevel;
+                chunk.effectiveDataLod = static_cast<uint8_t>(
+                    std::clamp(getEffectiveLODForChunk(coord, lodLevel), 0, 255));
+
+                const TerrainType chunkType = getTerrainTypeForChunk(coord, lodLevel);
+                if (chunkType == TerrainType::DCCM) {
+                    uint8_t casingMask = 0;
+                    if (m_chunkManager) {
+                        static const glm::ivec3 nOff[4] = {
+                            {-1, 0, 0}, {1, 0, 0}, {0, 0, -1}, {0, 0, 1}
+                        };
+                        for (int e = 0; e < 4; ++e) {
+                            const glm::ivec3 nb = coord + nOff[e];
+                            const int nbRing = m_chunkManager->calculateRingNumber(nb, center);
+                            const int nbLOD = m_chunkManager->calculateLODFromRing(nbRing);
+                            if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM) {
+                                casingMask |= (1 << e);
+                            }
+                        }
+                    }
+                    chunk.casingSeamMask = casingMask;
+                    chunk.voxelSeamMask = 0;
+                } else {
+                    chunk.voxelSeamMask = (lodLevel > 0 && m_chunkManager)
+                        ? m_chunkManager->getSeamEdgeMask(coord, center)
+                        : 0;
+                    chunk.casingSeamMask = 0;
+                }
+            }
+
+            m_registry.emplace_or_replace<MeshHandle>(entity, pending.handle);
+            m_registry.remove<PendingMeshHandle>(entity);
+            ++swapped;
+        }
+    }
+
+    if (swapped > 0) {
+        std::vector<glm::ivec3> changedCoords;
+        changedCoords.reserve(visualReadyEntries.size());
+        size_t shadowAffectingSwaps = 0;
+        for (const auto& entry : visualReadyEntries) {
+            if (entry.debugInfo.affectsShadowGeometry) {
+                ++shadowAffectingSwaps;
+                changedCoords.push_back(entry.coord);
+            }
+        }
+        if (shadowAffectingSwaps == 0) {
+            // Material-only mesh swaps keep the depth/shadow shape identical.
+        } else if (changedCoords.size() == shadowAffectingSwaps) {
+            recordMeshTopologyChanges(changedCoords);
+        } else {
+            recordGlobalMeshTopologyChange();
+        }
+    }
+
+    // Phase 3: retire old resources outside registry lock.
+    {
+        std::vector<uint32_t> cullingSlots;
+        cullingSlots.reserve(deferredFrees.size());
+        uint32_t queuedBufferFrees = 0;
+        for (auto& df : deferredFrees) {
+            const size_t freeCount = std::max(df.vbs.size(), df.ibs.size());
+            for (size_t i = 0; i < freeCount; ++i) {
+                BufferSlice vb = (i < df.vbs.size()) ? df.vbs[i] : BufferSlice{};
+                BufferSlice ib = (i < df.ibs.size()) ? df.ibs[i] : BufferSlice{};
+                if (vb.isValid() || ib.isValid()) {
+                    m_pendingMeshBufferFrees.push_back(PendingMeshBufferFree{vb, ib});
+                    ++queuedBufferFrees;
+                }
+            }
+            if (df.gpuCullingSlot != UINT32_MAX)
+                cullingSlots.push_back(df.gpuCullingSlot);
+        }
+        if (queuedBufferFrees > 0) {
+            m_currentFinalizeDiag.lodSwapFreeQueuedCount += queuedBufferFrees;
+            m_currentFinalizeDiag.lodSwapFreeBacklog =
+                static_cast<uint32_t>(std::min<size_t>(
+                    m_pendingMeshBufferFrees.size(),
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        }
+        if (m_gpuCulling && !cullingSlots.empty())
+            m_gpuCulling->freeSlots(cullingSlots.data(), cullingSlots.size());
+    }
+
+    // Phase 4: emit visual-ready logs (finalize path misses these while pending).
+    if (!visualReadyEntries.empty()) {
+        const auto finalizeTime = std::chrono::steady_clock::now();
+        for (const auto& entry : visualReadyEntries) {
+            noteChunkVisualReady(
+                entry.coord,
+                entry.uploadEnqueueTime,
+                finalizeTime,
+                entry.lodLevel,
+                entry.vramBytes,
+                entry.vertexCount,
+                entry.indexCount,
+                &entry.debugInfo);
+        }
+    }
+
+    return swapped;
+}
+
+void World::updateLODSwitchDiag() {
+    if (!m_lodSwitchDiag.active) return;
+
+    auto now = std::chrono::steady_clock::now();
+    if (m_lodSwitchDiag.completedMs == 0.0f) {
+        m_lodSwitchDiag.elapsedMs = std::chrono::duration<float, std::milli>(now - m_lodSwitchDiag.startTime).count();
+        m_lodSwitchDiag.lastFrameSwapped = m_currentFinalizeDiag.lodSwapEntityCount;
+        m_lodSwitchDiag.chunksSwappedTotal += m_currentFinalizeDiag.lodSwapEntityCount;
+
+        // Pipeline stage snapshot
+        m_lodSwitchDiag.activeBatches = static_cast<uint32_t>(
+            m_chunkManager ? m_chunkManager->getActiveBatchCount() : 0);
+        m_lodSwitchDiag.pendingRemeshes = static_cast<uint32_t>(m_pendingLODRemeshes.size());
+        m_lodSwitchDiag.lodRemeshQueueSize = static_cast<uint32_t>(m_lodSystem.getRemeshQueueSize());
+        m_lodSwitchDiag.uploadQueueSize = m_uploadSystem.getQueueSize();
+        m_lodSwitchDiag.finalizeQueueSize = static_cast<uint32_t>(m_uploadSystem.getFinalizeQueueSize());
+        m_lodSwitchDiag.peakActiveBatches = std::max(
+            m_lodSwitchDiag.peakActiveBatches, m_lodSwitchDiag.activeBatches);
+
+        // Sparkline: record swaps per frame
+        m_lodSwitchDiag.sparkline[m_lodSwitchDiag.sparklineIdx % LODSwitchDiag::SPARKLINE_SIZE] =
+            m_currentFinalizeDiag.lodSwapEntityCount;
+        m_lodSwitchDiag.sparklineIdx++;
+
+        // Mark complete when all batches and pipeline queues are drained
+        if (m_lodSwitchDiag.activeBatches == 0 &&
+            m_lodSwitchDiag.pendingRemeshes == 0 &&
+            m_lodSwitchDiag.lodRemeshQueueSize == 0) {
+            m_lodSwitchDiag.completedMs = m_lodSwitchDiag.elapsedMs;
+        }
+    }
+
+    // Post-completion audit: scan all chunks in the band to find any still stuck
+    if (m_lodSwitchDiag.completedMs > 0.0f && !m_lodSwitchDiag.auditDone) {
+        m_lodSwitchDiag.auditDone = true;
+        m_lodSwitchDiag.auditMs = m_lodSwitchDiag.elapsedMs;
+        uint32_t stuckReady = 0, stuckNotReady = 0;
+        {
+            std::shared_lock regLock(m_registryMutex);
+            auto view = m_registry.view<Chunk, ChunkCoord, ChunkState>();
+            for (auto entity : view) {
+                auto& chunk = view.get<Chunk>(entity);
+                if (chunk.lodLevel != m_lodSwitchDiag.band) continue;
+                const glm::ivec3 coord = view.get<ChunkCoord>(entity).toVec3();
+                if (getTerrainTypeForChunk(coord, m_lodSwitchDiag.band) == TerrainType::DCCM) continue;
+                int desired = getEffectiveLODForChunk(coord, m_lodSwitchDiag.band);
+                if (chunk.effectiveDataLod != static_cast<uint8_t>(std::clamp(desired, 0, 255))) {
+                    auto& state = view.get<ChunkState>(entity);
+                    if (state.state == ChunkState::State::Ready) {
+                        ++stuckReady;
+                    } else {
+                        ++stuckNotReady;
+                    }
+                }
+            }
+        }
+        m_lodSwitchDiag.auditStuckReady = stuckReady;
+        m_lodSwitchDiag.auditStuckNotReady = stuckNotReady;
+        m_lodSwitchDiag.auditStuckChunks = stuckReady + stuckNotReady;
+        if (m_lodSwitchDiag.auditStuckChunks > 0) {
+            std::cout << "[LOD-AUDIT] Band " << m_lodSwitchDiag.band
+                      << " switch reported complete but " << m_lodSwitchDiag.auditStuckChunks
+                      << " chunks stuck (ready=" << stuckReady
+                      << " notReady=" << stuckNotReady << ")" << std::endl;
+        }
+    }
+}
+
+std::string World::formatLODSwitchDiagReport() const {
+    const auto& d = m_lodSwitchDiag;
+    if (!d.active) return "No LOD switch active.\n";
+
+    const char* lodNames[] = { "Full", "1/2", "1/4", "1/8", "1/16" };
+    auto safeName = [&](int idx) { return lodNames[std::clamp(idx, 0, 4)]; };
+
+    std::string r;
+    r.reserve(2048);
+    r += "=== LOD Switch Diagnostics ===\n";
+    r += "Band " + std::to_string(d.band) + ": " + safeName(d.oldDataLOD) + " -> " + safeName(d.newDataLOD) + "\n";
+    r += "Status: " + std::string(d.completedMs > 0.0f ? "COMPLETE" : "IN PROGRESS") + "\n\n";
+
+    // Timing
+    float elapsed = d.completedMs > 0.0f ? d.completedMs : d.elapsedMs;
+    r += "--- Timing ---\n";
+    r += "Setup scan:    " + std::to_string(d.setupMs) + " ms\n";
+    if (elapsed < 1000.0f)
+        r += "Total elapsed: " + std::to_string(elapsed) + " ms\n";
+    else
+        r += "Total elapsed: " + std::to_string(elapsed / 1000.0f) + " s\n";
+
+    // Initial scan
+    r += "\n--- Initial Scan ---\n";
+    r += "Total chunks in band:   " + std::to_string(d.totalChunksInBand) + "\n";
+    r += "Queued for remesh:      " + std::to_string(d.totalChunksQueued) + "\n";
+    r += "Skipped (already OK):   " + std::to_string(d.skippedAlreadyCorrect) + "\n";
+    r += "Skipped (DCCM):         " + std::to_string(d.skippedDCCM) + "\n";
+    r += "Deferred (non-Ready):   " + std::to_string(d.deferredChunks) + "\n";
+    if (d.deferredChunks > 0) {
+        r += "  Loading: " + std::to_string(d.deferredLoading) +
+             "  Meshing: " + std::to_string(d.deferredMeshing) +
+             "  Other: " + std::to_string(d.deferredOther) + "\n";
+    }
+    r += "Cancelled old batches:  " + std::to_string(d.cancelledOldBatches) + "\n";
+    r += "Batches created:        " + std::to_string(d.batchesCreated) + "\n";
+
+    // Progress
+    r += "\n--- Progress ---\n";
+    r += "Chunks swapped: " + std::to_string(d.chunksSwappedTotal) + " / " + std::to_string(d.totalChunksQueued) + "\n";
+    r += "Active batches: " + std::to_string(d.activeBatches) + " (peak " + std::to_string(d.peakActiveBatches) + ")\n";
+    r += "Pending remeshes: " + std::to_string(d.pendingRemeshes) + "\n";
+    r += "LOD remesh queue: " + std::to_string(d.lodRemeshQueueSize) + "\n";
+    r += "Upload queue:     " + std::to_string(d.uploadQueueSize) + "\n";
+    r += "Finalize queue:   " + std::to_string(d.finalizeQueueSize) + "\n";
+
+    r += "\n--- Attribution ---\n";
+    r += "Visual entries:    " + std::to_string(d.readyVisualEntries) + "\n";
+    r += "Uploaded bytes:    " + std::to_string(d.uploadedBytesTotal) + "\n";
+    r += "Artifact builds:   " + std::to_string(d.artifactBuilds) + "\n";
+    r += "Artifact cache:    " + std::to_string(d.artifactCacheHits) + "\n";
+    r += "Precomputed:       " + std::to_string(d.precomputedLoads) + "\n";
+    r += "Collision base:    " + std::to_string(d.collisionBaseCache) + "\n";
+    r += "Collision edit:    " + std::to_string(d.collisionEditPacked) + "\n";
+    r += "Collision refresh: " + std::to_string(d.collisionArtifactRefresh) + "\n";
+    r += "Collision reused:  " + std::to_string(d.collisionExistingEdit) + "\n";
+    r += "GPU resident:      " + std::to_string(d.gpuResidentChunks) + "\n";
+    r += "Artifact resident: " + std::to_string(d.artifactResidentChunks) + "\n";
+    r += "Monolithic work:   " + std::to_string(d.monolithicChunks) + "\n";
+    r += "Paged work:        " + std::to_string(d.pagedChunks) + "\n";
+    r += "Dirty pages:       " + std::to_string(d.dirtyPages) + "\n";
+    r += "Rebuilt pages:     " + std::to_string(d.rebuiltPages) + "\n";
+    r += "Resident pages:    " + std::to_string(d.residentPages) + "\n";
+    r += "Evicted pages:     " + std::to_string(d.evictedPages) + "\n";
+
+    // Errors
+    uint32_t totalErr = d.errTotalFromSwaps + d.errFilteredByDrain;
+    r += "\n--- Errors ---\n";
+    r += "Total errors:          " + std::to_string(totalErr) + "\n";
+    if (d.errInvalidEntities > 0)
+        r += "  Invalid entities:    " + std::to_string(d.errInvalidEntities) + "\n";
+    if (d.errMissingPending > 0)
+        r += "  Missing pending:     " + std::to_string(d.errMissingPending) + "\n";
+    if (d.errMismatchedBatch > 0)
+        r += "  Mismatched batch:    " + std::to_string(d.errMismatchedBatch) + "\n";
+    if (d.errFilteredByDrain > 0)
+        r += "  Filtered by drain:   " + std::to_string(d.errFilteredByDrain) + "\n";
+
+    // Audit
+    if (d.auditDone) {
+        r += "\n--- Post-Completion Audit ---\n";
+        r += "Audit at: " + std::to_string(d.auditMs) + " ms\n";
+        r += "Stuck chunks: " + std::to_string(d.auditStuckChunks) + "\n";
+        if (d.auditStuckChunks > 0) {
+            r += "  Ready (should have been caught): " + std::to_string(d.auditStuckReady) + "\n";
+            r += "  Not-Ready (still in pipeline):   " + std::to_string(d.auditStuckNotReady) + "\n";
+        }
+    }
+
+    return r;
+}

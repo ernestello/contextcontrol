@@ -1,0 +1,874 @@
+// GPT-DESC: Owns World LOD transition scans, render-distance LOD updates, and remesh queue draining.
+#include "world/World.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/config/WorldConfig.h"
+#include "world/chunks/core/ChunkJobs.h"
+#include "world/ChunkHoleTracker.h"
+#include "vulkan/BufferSuballocator.h"
+#include "rendering/culling/GPUCullingSystem.h"
+#include "physics/PhysicsWorld.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+
+void World::applyLODChangesIncrementally(int newRenderDistance) {
+    // Pause the background thread so it doesn't interfere with scanning
+    m_lifecycleManager.pauseAndDrain();
+    
+    glm::ivec3 center = m_chunkManager->getCenterChunk();
+    
+    // Compute the full effective distance including extension rings.
+    // Extension chunks (at last LOD) must not be destroyed or purged.
+    int extensionRings = m_chunkManager->getExtensionRings();
+    int effectiveTarget = newRenderDistance + extensionRings;
+    
+    // SELECTIVE purge: only purge creates that are NOW out of range.
+    // In-range creates must stay in the lifecycle queue so the background
+    // thread can finish creating them after we resume.  Purging all creates
+    // (as was done before) kills mid-pipeline chunks whose uploads then get
+    // cleared, leaving grey/empty holes that are never recovered.
+    auto purgedCreates = m_lifecycleManager.purgeCreationQueue(
+        [&](const glm::ivec3& coord) {
+            int ring = m_chunkManager->calculateRingNumber(coord, center);
+            return ring >= effectiveTarget;
+        });
+    auto purgedDestroys = m_lifecycleManager.purgeDestructionQueue(
+        [](const glm::ivec3&) { return true; });
+    if (!purgedCreates.empty()) {
+        std::lock_guard lock(m_pendingChunksMutex);
+        for (const auto& coord : purgedCreates) {
+            m_pendingChunks.erase(coord);
+        }
+    }
+    if (!purgedCreates.empty()) {
+        m_chunkManager->cancelPendingCreates(purgedCreates);
+    }
+    if (!purgedDestroys.empty()) {
+        m_chunkManager->cancelPendingDestroys(purgedDestroys);
+    }
+    
+    // DO NOT clear the upload queue unconditionally.  Chunks that are in-range
+    // and mid-pipeline (mesh generated, waiting for upload) would lose their
+    // mesh data permanently — the entity exists so processRingConstruct won't
+    // re-emit a create, but the mesh is gone → grey/empty chunk forever.
+    // The version-checking system (stale version detection in LoadPrecomputedMeshJob
+    // and UploadJob) already handles stale uploads for destroyed/remeshed chunks.
+    
+    // Cancel all in-flight LOD transition batches and clean up their
+    // PendingMeshHandle GPU resources.  Without this, old batches from
+    // a previous slider change linger because version-stale jobs never
+    // signal signalBatchChunkReady.  processLODSwaps only runs when ALL
+    // entities in a batch are ready, so even one stale job permanently
+    // blocks the swap — chunks appear frozen until the next change.
+    auto cancelledBatchIds = m_chunkManager->cancelAllBatches();
+    if (!cancelledBatchIds.empty()) {
+        std::string reason = "RenderDistanceChangeCancelledBatches count=" +
+            std::to_string(cancelledBatchIds.size());
+        noteChunkVisualError(
+            nullptr,
+            -1,
+            "LODTransition",
+            reason.c_str(),
+            0,
+            static_cast<uint32_t>(cancelledBatchIds.size()),
+            0);
+        cleanupStalePendingMeshHandles();
+    }
+    
+    m_lodSystem.clearAllPending();
+    m_pendingLODRemeshes.clear();
+    
+    // Phase 1: Scan existing chunks for:
+    //   - out-of-range chunks (destroy)
+    //   - LOD mismatches (remesh)
+    //   - seam/casing topology mismatches at unchanged LOD (remesh)
+    // Also batch-update desired LODs for all in-range chunks so chunks that are
+    // currently Loading/Meshing converge to the new target without waiting for
+    // a later center-change scan.
+    std::vector<glm::ivec3> chunksToDestroy;     // Now out of range — need full destroy
+    struct RemeshCandidate {
+        entt::entity entity{entt::null};
+        glm::ivec3 coord{0, 0, 0};
+        int newLOD{0};
+        int ring{0};
+    };
+    std::vector<RemeshCandidate> chunksToRemesh;
+    std::vector<std::pair<glm::ivec3, int>> desiredLODUpdates;
+
+    auto computeDCCMCasingMask = [&](const glm::ivec3& pos,
+                                     const glm::ivec3& centerPos) -> uint8_t {
+        static const glm::ivec3 nOff[4] = {{-1,0,0},{1,0,0},{0,0,-1},{0,0,1}};
+        uint8_t mask = 0;
+        for (int e = 0; e < 4; ++e) {
+            glm::ivec3 nb = pos + nOff[e];
+            int nbRing = m_chunkManager->calculateRingNumber(nb, centerPos);
+            int nbLOD  = m_chunkManager->calculateLODFromRing(nbRing);
+            if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM) {
+                mask |= (1u << e);
+            }
+        }
+        return mask;
+    };
+    
+    {
+        std::shared_lock regLock(m_registryMutex);
+        auto view = m_registry.view<Chunk, ChunkCoord, ChunkState>();
+        desiredLODUpdates.reserve(view.size_hint());
+        chunksToDestroy.reserve(view.size_hint() / 4);
+        chunksToRemesh.reserve(view.size_hint() / 8);
+        
+        for (auto entity : view) {
+            auto& chunk = view.get<Chunk>(entity);
+            auto& coordComp = view.get<ChunkCoord>(entity);
+            auto& stateComp = view.get<ChunkState>(entity);
+            glm::ivec3 coord = coordComp.toVec3();
+            
+            int ring = m_chunkManager->calculateRingNumber(coord, center);
+            
+            if (ring >= effectiveTarget) {
+                chunksToDestroy.push_back(coord);
+                continue;
+            }
+            
+            int newLOD = m_chunkManager->calculateLODFromRing(ring);
+            desiredLODUpdates.push_back({coord, newLOD});
+
+            // For non-ready chunks, desired LOD update is enough; avoid enqueueing
+            // extra remesh work while initial generation is still in progress.
+            if (stateComp.state != ChunkState::State::Ready) {
+                continue;
+            }
+
+            if (newLOD != chunk.lodLevel) {
+                chunksToRemesh.push_back({entity, coord, newLOD, ring});
+                continue;
+            }
+
+            // LOD unchanged, but boundary topology may still need a remesh:
+            // voxel seam masks and DCCM casing masks change when thresholds move.
+            TerrainType thisType = getTerrainTypeForChunk(coord, chunk.lodLevel);
+            if (thisType == TerrainType::DCCM) {
+                uint8_t newMask = computeDCCMCasingMask(coord, center);
+                if (newMask != chunk.casingSeamMask) {
+                    chunksToRemesh.push_back({entity, coord, newLOD, ring});
+                }
+            } else {
+                uint8_t newMask = (newLOD > 0) ? m_chunkManager->getSeamEdgeMask(coord, center) : 0;
+                if (newMask != chunk.voxelSeamMask) {
+                    chunksToRemesh.push_back({entity, coord, newLOD, ring});
+                }
+            }
+        }
+    }
+
+    if (!desiredLODUpdates.empty()) {
+        m_lodSystem.setDesiredLODs(desiredLODUpdates);
+    }
+    
+    // Phase 2: Destroy only out-of-range chunks
+    if (!chunksToDestroy.empty()) {
+        // Invalidate version states so in-flight jobs are discarded
+        {
+            std::scoped_lock versionLock(m_chunkVersionMutex);
+            for (const auto& coord : chunksToDestroy) {
+                entt::entity entity = findChunk(coord);
+                if (entity != entt::null) {
+                    auto it = m_chunkVersionStates.find(entity);
+                    if (it != m_chunkVersionStates.end() && it->second) {
+                        it->second->version.fetch_add(1, std::memory_order_acq_rel);
+                        it->second->inFlight.store(false, std::memory_order_release);
+                        it->second->pending.store(false, std::memory_order_release);
+                    }
+                }
+            }
+        }
+        
+        tryDestroyChunksBatch(chunksToDestroy);
+    }
+    
+    // Phase 3: In-place remesh for LOD-changed chunks via the existing remesh pipeline
+    // Don't update chunk.lodLevel here — it will be updated when the mesh is actually
+    // swapped in processLODSwaps. Pass targetLOD through batch info.
+    if (!chunksToRemesh.empty()) {
+        // Prioritize near rings first for visual stability while transitioning.
+        std::sort(chunksToRemesh.begin(), chunksToRemesh.end(),
+                  [](const RemeshCandidate& a, const RemeshCandidate& b) {
+                      return a.ring < b.ring;
+                  });
+
+        // Group by target LOD but keep near-first order within each group.
+        std::unordered_map<int, std::vector<RemeshCandidate>> lodGroups;
+        lodGroups.reserve(4);
+        for (const auto& c : chunksToRemesh) {
+            lodGroups[c.newLOD].push_back(c);
+        }
+        
+        for (auto& [targetLOD, candidates] : lodGroups) {
+            // Split groups into moderate batches so swaps complete faster and
+            // reduce visible "stuck boundary" windows during rapid slider edits.
+            static constexpr size_t MAX_LOD_BATCH_SIZE = 128;
+            
+            for (size_t batchStart = 0; batchStart < candidates.size(); batchStart += MAX_LOD_BATCH_SIZE) {
+                size_t batchEnd = std::min(batchStart + MAX_LOD_BATCH_SIZE, candidates.size());
+                std::vector<entt::entity> subBatchEntities;
+                subBatchEntities.reserve(batchEnd - batchStart);
+                for (size_t i = batchStart; i < batchEnd; ++i) {
+                    subBatchEntities.push_back(candidates[i].entity);
+                }
+
+                uint32_t batchId = m_chunkManager->createLODTransitionBatch(targetLOD, subBatchEntities);
+            
+                for (size_t i = batchStart; i < batchEnd; ++i) {
+                    const auto& c = candidates[i];
+                    auto vs = ensureChunkVersionState(this, c.entity);
+                    if (vs) {
+                        vs->version.fetch_add(1, std::memory_order_acq_rel);
+                        // Reset inFlight so updateMeshingSystem can start a new pipeline.
+                        // Without this, stale jobs (which intentionally don't clear inFlight)
+                        // leave the flag set, causing updateMeshingSystem to requeue forever.
+                        vs->inFlight.store(false, std::memory_order_release);
+                        vs->pending.store(false, std::memory_order_release);
+                    }
+                    
+                    m_lodSystem.setDesiredLOD(c.coord, targetLOD);
+                    // Signal any superseded batch (unlikely after cancelAllBatches
+                    // above, but safe against future race conditions).
+                    uint32_t oldBatchId = m_lodSystem.enqueueLODRemesh(c.entity, true, batchId, targetLOD);
+                    if (oldBatchId != 0 && m_chunkManager->isBatchActive(oldBatchId)) {
+                        m_chunkManager->signalBatchChunkReady(oldBatchId);
+                    }
+                }
+            } // end sub-batch loop
+        }     // end target LOD loop
+    }
+    
+    // Phase 4: Update render distance and ring construction state.
+    //
+    // With selective purge (only out-of-range creates purged), the emission
+    // watermark (emittedUpToRing) is accurate for in-range rings:
+    //   - INCREASE: no in-range creates purged, emittedUpToRing stays valid,
+    //     processRingConstruct emits only the new rings above the old distance.
+    //   - DECREASE: out-of-range creates purged, clampRingProgress lowers
+    //     emittedUpToRing to newRenderDistance so we don't think we've emitted
+    //     rings that no longer exist.
+    //
+    // setEffectiveRenderDistance: overrides the budget-adaptive cap so the
+    // user's slider value takes effect immediately.
+    //
+    // resetAdaptWarmup: prevents adaptRenderDistance from immediately
+    // shrinking effectiveDist back down on the next frame.
+    m_chunkManager->setRenderDistanceRings(newRenderDistance);
+    // effectiveTarget (base + extension) was already computed at the top
+    m_chunkManager->setEffectiveRenderDistance(effectiveTarget);
+    m_chunkManager->clampRingProgress(effectiveTarget);
+    m_chunkManager->resetAdaptWarmup();
+    
+    // Resume background thread — in-range creates left in the lifecycle queue
+    // will continue processing now.
+    m_lifecycleManager.resume();
+    
+    // Debug: count existing chunks and report progress
+    int existingCount = 0;
+    int expectedCount = 0;
+    {
+        std::shared_lock setLock(m_chunkSetMutex);
+        existingCount = static_cast<int>(m_existingChunkSet.size());
+    }
+    for (int r = 1; r <= effectiveTarget; ++r) {
+        int chebyshevR = r - 1;
+        int chunksInRing = (r == 1) ? 1 : 8 * chebyshevR;
+        expectedCount += chunksInRing;
+    }
+    std::cout << "[World] Incremental update: destroyed " << chunksToDestroy.size()
+              << " out-of-range, remeshing " << chunksToRemesh.size()
+              << " affected, purged " << purgedCreates.size() << " OOR creates"
+              << ", existing=" << existingCount
+              << "/" << expectedCount << " expected at " << effectiveTarget
+              << " rings (base=" << newRenderDistance << " + ext=" << extensionRings << ")"
+              << std::endl;
+}
+
+
+void World::updateLODTransitions(float deltaTime, bool centerChanged) {
+    // ---------------------------------------------------------------
+    // LOD TRANSITION DETECTION (runs in World, not ChunkManager)
+    //
+    // On center change:
+    //   1. Cancel all in-flight LOD batches (stale transitions)
+    //   2. Clean up orphaned PendingMeshHandles (free GPU resources)
+    //   3. Scan ALL Ready chunks: compare chunk.lodLevel (actual mesh LOD)
+    //      vs desired LOD from ring position.  Queue mismatches.
+    //   4. Sort closest-first for visual priority.
+    //
+    // Every frame: drain the queue as fast as the rest of the pipeline allows.
+    //
+    // KEY INVARIANT: chunk.lodLevel is ONLY updated when the new mesh
+    // is actually swapped in (processLODSwaps), never when enqueued.
+    // This ensures the scan always sees the TRUE mesh LOD.
+    // ---------------------------------------------------------------
+    if (centerChanged) {
+        // Do NOT cancel LOD batches or clear the remesh queue on center change.
+        // Slider/UI-triggered LOD batches (from applyLODChangesIncrementally)
+        // must survive movement — they represent deliberate user changes.
+        // The version system + desiredLOD checks in updateMeshingSystem handle
+        // stale jobs gracefully: if a batch's targetLOD no longer matches the
+        // desired LOD (because the center moved), the entity is signaled and
+        // dropped, and the next LOD scan re-queues it with the correct target.
+
+        // Rate-limited diagnostic log (once per second)
+        static float s_lodDiagTimer = 0.0f;
+        s_lodDiagTimer += deltaTime;
+        if (s_lodDiagTimer >= 1.0f) {
+            s_lodDiagTimer = 0.0f;
+            int effDist = m_chunkManager->getEffectiveRenderDistance();
+            int baseDist = m_chunkManager->getRenderDistanceRings();
+            int extRings = m_chunkManager->getExtensionRings();
+            size_t lodQueueSize = m_lodSystem.getRemeshQueueSize();
+            size_t pendingRemeshes = m_pendingLODRemeshes.size();
+            std::cout << "[World] Center-change LOD: effectiveDist=" << effDist
+                      << " (base=" << baseDist << " + ext=" << extRings << ")"
+                      << ", lodQueue=" << lodQueueSize
+                      << ", pendingRemeshes=" << pendingRemeshes
+                      << ", bufPressure=" << (m_chunkManager->hasBufferPressure() ? "YES" : "no")
+                      << std::endl;
+        }
+    }
+    
+    // LOD mismatch scan: runs on center change AND periodically (every
+    // LOD_SCAN_INTERVAL frames) to catch chunks that reached Ready state
+    // after the last scan.  Instead of clearing the queue, we MERGE new
+    // mismatches so far-away chunks aren't perpetually evicted.
+    // During burst recovery, scan every frame to catch chunks that
+    // reach Ready state after a large teleport.
+    static constexpr size_t LOD_SCAN_INTERVAL = 60;
+    m_lodScanCounter++;
+    bool runLodScan = centerChanged || (m_lodScanCounter >= LOD_SCAN_INTERVAL)
+                      || (m_burstRecoveryFrames > 0);
+
+    // Tick down burst recovery counter (after using it for this frame's decisions)
+    if (m_burstRecoveryFrames > 0) {
+        m_burstRecoveryFrames--;
+    }
+    
+    if (runLodScan) {
+        m_lodScanCounter = 0;
+        glm::ivec3 newCenter = m_chunkManager->getCenterChunk();
+
+        // Build a map of pending entries for O(1) update/remove.
+        // Key = coord, Value = {desired LOD, isCasingUpdate}.
+        struct PendingLODInfo {
+            int newLOD{0};
+            bool isCasingUpdate{false};
+        };
+        std::unordered_map<glm::ivec3, PendingLODInfo, IVec3Hash> pendingMap;
+        pendingMap.reserve(m_pendingLODRemeshes.size());
+
+        auto lodThresholds = m_chunkManager->getLODThresholdRings();
+
+        // Helper: compute DCCM casing mask for a position relative to a center
+        auto computeDCCMCasingMask = [&](const glm::ivec3& pos,
+                                         const glm::ivec3& center) -> uint8_t {
+            static const glm::ivec3 nOff[4] = {{-1,0,0},{1,0,0},{0,0,-1},{0,0,1}};
+            uint8_t mask = 0;
+            for (int e = 0; e < 4; ++e) {
+                glm::ivec3 nb = pos + nOff[e];
+                int nbRing = m_chunkManager->calculateRingNumber(nb, center);
+                int nbLOD  = m_chunkManager->calculateLODFromRing(nbRing);
+                if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM)
+                    mask |= (1 << e);
+            }
+            return mask;
+        };
+
+        auto computeVoxelSeamMask = [&](const glm::ivec3& pos,
+                                        const glm::ivec3& center,
+                                        int lodLevel) -> uint8_t {
+            if (!m_chunkManager || lodLevel <= 0) return 0;
+            return m_chunkManager->getSeamEdgeMask(pos, center);
+        };
+
+        std::unordered_set<entt::entity> scanInFlightSet;
+        auto addAllInFlightEntities = [&]() {
+            std::scoped_lock vLock(m_chunkVersionMutex);
+            scanInFlightSet.reserve(m_chunkVersionStates.size());
+            for (const auto& [ent, vs] : m_chunkVersionStates) {
+                if (vs && vs->inFlight.load(std::memory_order_acquire)) {
+                    scanInFlightSet.insert(ent);
+                }
+            }
+        };
+        auto addCandidateInFlightEntities = [&](const std::vector<entt::entity>& entities) {
+            if (entities.empty()) return;
+            scanInFlightSet.reserve(entities.size());
+            std::scoped_lock vLock(m_chunkVersionMutex);
+            for (entt::entity ent : entities) {
+                auto it = m_chunkVersionStates.find(ent);
+                if (it != m_chunkVersionStates.end() && it->second &&
+                    it->second->inFlight.load(std::memory_order_acquire)) {
+                    scanInFlightSet.insert(ent);
+                }
+            }
+        };
+
+        if (centerChanged) {
+            // Center-change LOD scan: enumerate only the square-band cells
+            // whose classification can actually change.  For each true LOD
+            // boundary T, the changed set is the symmetric difference of the
+            // old/new Chebyshev squares of radius T, expanded by one cell so
+            // same-LOD seam/casing removals on the former boundary are seen.
+            glm::ivec3 prevCenter = m_chunkManager->getPreviousCenter();
+            int moveDist = std::max(std::abs(newCenter.x - prevCenter.x),
+                                    std::abs(newCenter.z - prevCenter.z));
+            int effectiveDist = m_chunkManager->getEffectiveRenderDistance();
+
+            // Lambda to check one coordinate position for LOD mismatch.
+            auto checkPos = [&](const glm::ivec3& pos) {
+                const int ring = m_chunkManager->calculateRingNumber(pos, newCenter);
+                if (ring >= effectiveDist) return;
+
+                auto entityIt = m_chunkEntityMap.find(pos);
+                if (entityIt == m_chunkEntityMap.end()) return;
+                entt::entity entity = entityIt->second;
+
+                if (!m_registry.valid(entity)) return;
+                if (!m_registry.all_of<Chunk, ChunkState>(entity)) return;
+                if (m_registry.get<ChunkState>(entity).state != ChunkState::State::Ready) return;
+
+                // Skip chunks whose new mesh is already uploaded and waiting for batch swap.
+                // Re-detecting them would create a duplicate batch that overwrites batch info,
+                // causing VersionMismatchDrop cascades and mismatched-batch errors.
+                if (m_registry.all_of<PendingMeshHandle>(entity)) return;
+
+                // Skip entities whose remesh pipeline is in-flight or queued.
+                if (scanInFlightSet.count(entity)) return;
+                if (m_lodSystem.isPending(entity)) return;
+
+                auto& chunk = m_registry.get<Chunk>(entity);
+                int desiredLOD = m_chunkManager->calculateLODFromRing(ring);
+                int currentLOD = chunk.lodLevel;
+
+                if (currentLOD != desiredLOD) {
+                    pendingMap[pos] = {desiredLOD, false};
+                } else {
+                    const int desiredEffectiveDataLod = getEffectiveLODForChunk(pos, currentLOD);
+                    if (chunk.effectiveDataLod != desiredEffectiveDataLod) {
+                        // During an active data-LOD switch, setDataLODForBand already
+                        // queued all chunks in this band.  Re-detecting them fills
+                        // m_pendingLODRemeshes with redundant entries that the drain
+                        // converts into duplicate batches — overwriting batch info,
+                        // causing VersionMismatchDrop and mismatched-batch errors.
+                        if (m_lodSwitchDiag.active && m_lodSwitchDiag.completedMs == 0.0f &&
+                            currentLOD == m_lodSwitchDiag.band) {
+                            return;
+                        }
+                        pendingMap[pos] = {currentLOD, false};
+                        return;
+                    }
+
+                    // LOD matches — check if seam/casing topology changed
+                    TerrainType thisType = getTerrainTypeForChunk(pos, currentLOD);
+                    if (thisType == TerrainType::DCCM) {
+                        uint8_t newMask = computeDCCMCasingMask(pos, newCenter);
+                        if (newMask != chunk.casingSeamMask) {
+                            pendingMap[pos] = {currentLOD, true};
+                        } else {
+                            pendingMap.erase(pos);
+                        }
+                    } else {
+                        uint8_t newMask = computeVoxelSeamMask(pos, newCenter, currentLOD);
+                        if (newMask != chunk.voxelSeamMask) {
+                            pendingMap[pos] = {currentLOD, true};
+                        } else {
+                            pendingMap.erase(pos);
+                        }
+                    }
+                }
+            };
+
+            struct Rect {
+                int minX;
+                int maxX;
+                int minZ;
+                int maxZ;
+            };
+
+            std::vector<glm::ivec3> candidates;
+            candidates.reserve(std::max<size_t>(128, lodThresholds.size() *
+                static_cast<size_t>(std::max(1, moveDist + 2)) * 256u));
+
+            auto addRect = [&](int minX, int maxX, int minZ, int maxZ, int expand) {
+                if (minX > maxX || minZ > maxZ) return;
+                minX -= expand;
+                maxX += expand;
+                minZ -= expand;
+                maxZ += expand;
+                for (int z = minZ; z <= maxZ; ++z) {
+                    for (int x = minX; x <= maxX; ++x) {
+                        candidates.push_back(glm::ivec3{x, 0, z});
+                    }
+                }
+            };
+
+            auto addRectDifference = [&](const Rect& a, const Rect& b, int expand) {
+                addRect(a.minX, std::min(a.maxX, b.minX - 1), a.minZ, a.maxZ, expand);
+                addRect(std::max(a.minX, b.maxX + 1), a.maxX, a.minZ, a.maxZ, expand);
+
+                const int overlapMinX = std::max(a.minX, b.minX);
+                const int overlapMaxX = std::min(a.maxX, b.maxX);
+                if (overlapMinX > overlapMaxX) return;
+
+                addRect(overlapMinX, overlapMaxX, a.minZ, std::min(a.maxZ, b.minZ - 1), expand);
+                addRect(overlapMinX, overlapMaxX, std::max(a.minZ, b.maxZ + 1), a.maxZ, expand);
+            };
+
+            auto addThresholdCandidates = [&](int threshold) {
+                if (threshold < 0 || threshold >= effectiveDist) return;
+                if (m_chunkManager->calculateLODFromRing(threshold) ==
+                    m_chunkManager->calculateLODFromRing(threshold + 1)) {
+                    return;
+                }
+
+                Rect oldRect{
+                    prevCenter.x - threshold,
+                    prevCenter.x + threshold,
+                    prevCenter.z - threshold,
+                    prevCenter.z + threshold
+                };
+                Rect newRect{
+                    newCenter.x - threshold,
+                    newCenter.x + threshold,
+                    newCenter.z - threshold,
+                    newCenter.z + threshold
+                };
+
+                addRectDifference(oldRect, newRect, 1);
+                addRectDifference(newRect, oldRect, 1);
+            };
+
+            for (int threshold : lodThresholds) {
+                addThresholdCandidates(threshold);
+            }
+
+            // Preserve already-deferred work, but re-validate it below so stale
+            // center-change entries don't keep cycling through the queue.
+            for (const auto& req : m_pendingLODRemeshes) {
+                candidates.push_back(req.coord);
+            }
+
+            std::sort(candidates.begin(), candidates.end(),
+                [](const glm::ivec3& a, const glm::ivec3& b) {
+                    if (a.x != b.x) return a.x < b.x;
+                    if (a.z != b.z) return a.z < b.z;
+                    return a.y < b.y;
+                });
+            candidates.erase(
+                std::unique(candidates.begin(), candidates.end(),
+                    [](const glm::ivec3& a, const glm::ivec3& b) {
+                        return a.x == b.x && a.y == b.y && a.z == b.z;
+                    }),
+                candidates.end());
+
+            // Build the in-flight snapshot only for differential candidates.
+            // A center change usually touches a few boundary strips; scanning
+            // every version state here was pure overhead during movement.
+            std::vector<entt::entity> candidateEntities;
+            candidateEntities.reserve(candidates.size());
+            {
+                std::shared_lock regLock(m_registryMutex);
+                for (const glm::ivec3& pos : candidates) {
+                    auto entityIt = m_chunkEntityMap.find(pos);
+                    if (entityIt != m_chunkEntityMap.end()) {
+                        candidateEntities.push_back(entityIt->second);
+                    }
+                }
+            }
+            addCandidateInFlightEntities(candidateEntities);
+
+            {
+                std::shared_lock csLock(m_chunkStateMutex);
+                std::shared_lock regLock(m_registryMutex);
+                for (const glm::ivec3& pos : candidates) {
+                    checkPos(pos);
+                }
+            }
+        } else {
+            // Full periodic scan: build a full in-flight snapshot once, then
+            // do O(1) membership checks while walking the ECS view.
+            addAllInFlightEntities();
+
+            for (const auto& req : m_pendingLODRemeshes)
+                pendingMap[req.coord] = {req.newLOD, req.isCasingUpdate};
+
+            // Periodic scan (every LOD_SCAN_INTERVAL frames): iterate full ECS view
+            // as TRUE catch-all for any mismatches missed by the differential scan.
+            // This must check ALL chunks, not just near-boundary ones, to catch
+            // interior chunks that have wrong LOD after ring allocation changes.
+
+            // Storm detection: log when a chunk keeps getting re-queued with the same mismatch
+            static std::unordered_map<glm::ivec3, uint32_t, IVec3Hash> s_remeshStormCounts;
+
+            {
+                std::shared_lock regLock(m_registryMutex);
+                auto view = m_registry.view<ChunkCoord, Chunk, ChunkState>();
+                for (auto entity : view) {
+                    auto& state = view.get<ChunkState>(entity);
+                    if (state.state != ChunkState::State::Ready) continue;
+
+                    // Skip chunks whose new mesh is already uploaded and waiting for batch swap.
+                    if (m_registry.all_of<PendingMeshHandle>(entity)) continue;
+
+                    // Skip entities whose remesh pipeline is in-flight or queued.
+                    if (scanInFlightSet.count(entity)) continue;
+                    if (m_lodSystem.isPending(entity)) continue;
+
+                    auto& coord = view.get<ChunkCoord>(entity);
+                    glm::ivec3 cv = coord.toVec3();
+                    int newRing = m_chunkManager->calculateRingNumber(cv, newCenter);
+
+                    auto& chunk = view.get<Chunk>(entity);
+                    int desiredLOD = m_chunkManager->calculateLODFromRing(newRing);
+
+                    if (chunk.lodLevel != desiredLOD) {
+                        pendingMap[cv] = {desiredLOD, false};
+                        if (++s_remeshStormCounts[cv] == 5) {
+                            std::cout << "[LOD-STORM] (" << cv.x << "," << cv.y << "," << cv.z << ")"
+                                      << " lodMismatch current=" << chunk.lodLevel
+                                      << " desired=" << desiredLOD << std::endl;
+                        }
+                    } else {
+                        const int desiredEffectiveDataLod = getEffectiveLODForChunk(cv, chunk.lodLevel);
+                        if (chunk.effectiveDataLod != desiredEffectiveDataLod) {
+                            // Suppress during active data-LOD switch (see center-change path).
+                            if (m_lodSwitchDiag.active && m_lodSwitchDiag.completedMs == 0.0f &&
+                                chunk.lodLevel == m_lodSwitchDiag.band) {
+                                continue;
+                            }
+                            pendingMap[cv] = {chunk.lodLevel, false};
+                            if (++s_remeshStormCounts[cv] == 5) {
+                                std::cout << "[LOD-STORM] (" << cv.x << "," << cv.y << "," << cv.z << ")"
+                                          << " dataLodMismatch current=" << (int)chunk.effectiveDataLod
+                                          << " desired=" << desiredEffectiveDataLod
+                                          << " lod=" << chunk.lodLevel << std::endl;
+                            }
+                            continue;
+                        }
+
+                        // LOD matches — check if seam/casing topology changed
+                        TerrainType thisType = getTerrainTypeForChunk(cv, chunk.lodLevel);
+                        if (thisType == TerrainType::DCCM) {
+                            uint8_t newMask = computeDCCMCasingMask(cv, newCenter);
+                            if (newMask != chunk.casingSeamMask) {
+                                pendingMap[cv] = {chunk.lodLevel, true};
+                                if (++s_remeshStormCounts[cv] == 5) {
+                                    std::cout << "[LOD-STORM] (" << cv.x << "," << cv.y << "," << cv.z << ")"
+                                              << " casingMismatch chunk=" << (int)chunk.casingSeamMask
+                                              << " computed=" << (int)newMask
+                                              << " lod=" << chunk.lodLevel << std::endl;
+                                }
+                            } else {
+                                pendingMap.erase(cv);
+                                s_remeshStormCounts.erase(cv);
+                            }
+                        } else {
+                            uint8_t newMask = computeVoxelSeamMask(cv, newCenter, chunk.lodLevel);
+                            if (newMask != chunk.voxelSeamMask) {
+                                pendingMap[cv] = {chunk.lodLevel, true};
+                                if (++s_remeshStormCounts[cv] == 5) {
+                                    std::cout << "[LOD-STORM] (" << cv.x << "," << cv.y << "," << cv.z << ")"
+                                              << " voxelSeamMismatch chunk=" << (int)chunk.voxelSeamMask
+                                              << " computed=" << (int)newMask
+                                              << " lod=" << chunk.lodLevel << std::endl;
+                                }
+                            } else {
+                                pendingMap.erase(cv);
+                                s_remeshStormCounts.erase(cv);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Rebuild vector from map
+        m_pendingLODRemeshes.clear();
+        m_pendingLODRemeshes.reserve(pendingMap.size());
+        for (const auto& [cv, info] : pendingMap)
+            m_pendingLODRemeshes.push_back({cv, info.newLOD, info.isCasingUpdate});
+
+        // Keep nearest work at the back so the per-frame drain can pop without
+        // shifting the remaining queue.
+        glm::ivec3 center = newCenter;
+        std::sort(m_pendingLODRemeshes.begin(), m_pendingLODRemeshes.end(),
+                  [&center](const ChunkManager::ChunkRemeshRequest& a,
+                            const ChunkManager::ChunkRemeshRequest& b) {
+                      int da = std::max(std::abs(a.coord.x - center.x),
+                                        std::abs(a.coord.z - center.z));
+                      int db = std::max(std::abs(b.coord.x - center.x),
+                                        std::abs(b.coord.z - center.z));
+                      return da > db;
+                  });
+
+        // Periodic LOD health diagnostic (rate-limited to once per second)
+        static float s_lodHealthTimer = 0.0f;
+        s_lodHealthTimer += deltaTime;
+        if (s_lodHealthTimer >= 1.0f) {
+            s_lodHealthTimer = 0.0f;
+            size_t lodQueueSize = m_lodSystem.getRemeshQueueSize();
+            if (!m_pendingLODRemeshes.empty() || lodQueueSize > 0) {
+                std::cout << "[LOD-diag] pendingRemeshes=" << m_pendingLODRemeshes.size()
+                          << " lodQueue=" << lodQueueSize
+                          << " activeBatches=" << m_chunkManager->getActiveBatchCount()
+                          << std::endl;
+            }
+        }
+    }
+    
+    // --- Drain pending LOD remesh queue ---
+    // Process the whole queue so movement doesn't leave remesh work parked
+    // behind arbitrary per-frame caps.
+    // Each drained chunk: resolve entity, verify still needs remesh,
+    // create batch, enqueue meshing job with targetLOD in batch info.
+    // chunk.lodLevel is NOT updated here — only in processLODSwaps.
+    {
+        size_t budget = m_pendingLODRemeshes.size();
+        if (budget > 0) {
+            // Extract this frame's nearest work from the back of the queue.
+            std::vector<ChunkManager::ChunkRemeshRequest> frameBatch;
+            frameBatch.reserve(budget);
+            for (size_t i = 0; i < budget; ++i) {
+                frameBatch.push_back(m_pendingLODRemeshes.back());
+                m_pendingLODRemeshes.pop_back();
+            }
+            
+            // Resolve entities and filter stale/no-op entries
+            struct ResolvedRemesh {
+                entt::entity entity;
+                glm::ivec3   coord;
+                int          newLOD;
+                bool         isCasingUpdate{false};
+            };
+            std::vector<ResolvedRemesh> resolved;
+            resolved.reserve(frameBatch.size());
+            {
+                std::shared_lock csLock(m_chunkStateMutex);
+                for (const auto& req : frameBatch) {
+                    auto it = m_chunkEntityMap.find(req.coord);
+                    if (it != m_chunkEntityMap.end())
+                        resolved.push_back({it->second, req.coord, req.newLOD, req.isCasingUpdate});
+                }
+            }
+
+            // Filter: skip entities that are gone or already at desired state.
+            // Same-LOD topology updates (voxel seam mask / DCCM casing mask)
+            // bypass the LOD equality check.
+            {
+                std::shared_lock regLock(m_registryMutex);
+                resolved.erase(
+                    std::remove_if(resolved.begin(), resolved.end(),
+                        [this](const ResolvedRemesh& r) {
+                            if (!m_registry.valid(r.entity) || !m_registry.all_of<Chunk>(r.entity))
+                                return true;
+                            // Skip entities whose new mesh is already waiting for batch swap.
+                            // Creating another batch would overwrite batch info, causing
+                            // mismatched-batch errors in processLODSwaps.
+                            if (m_registry.all_of<PendingMeshHandle>(r.entity))
+                                return true;
+                            if (r.isCasingUpdate) return false; // Always process casing updates
+                            auto& chunk = m_registry.get<Chunk>(r.entity);
+                            if (chunk.lodLevel != r.newLOD) return false; // LOD mismatch — needs remesh
+                            // LOD level matches — also check effectiveDataLod.
+                            // Data LOD switches keep lodLevel the same but change
+                            // the effective data LOD. Without this check, chunks
+                            // detected by the periodic scan as data-LOD-mismatched
+                            // were silently discarded here.
+                            int desiredDataLod = getEffectiveLODForChunk(r.coord, r.newLOD);
+                            return chunk.effectiveDataLod == static_cast<uint8_t>(
+                                std::clamp(desiredDataLod, 0, 255));
+                        }),
+                    resolved.end());
+            }
+
+            // Filter entities whose remesh pipeline is already in-flight.
+            // Without this, the drain creates duplicate batches that overwrite
+            // existing batch info via enqueueLODRemesh, causing version-mismatch
+            // cascades (upload version differs from bumped version) and
+            // mismatched-batch errors in processLODSwaps.
+            {
+                std::scoped_lock versionLock(m_chunkVersionMutex);
+                resolved.erase(
+                    std::remove_if(resolved.begin(), resolved.end(),
+                        [this](const ResolvedRemesh& r) {
+                            auto it = m_chunkVersionStates.find(r.entity);
+                            return it != m_chunkVersionStates.end() && it->second &&
+                                   it->second->inFlight.load(std::memory_order_acquire);
+                        }),
+                    resolved.end());
+            }
+
+            // Filter entities still queued for remesh (not yet dispatched).
+            // isPending is true between enqueueLODRemesh and dispatch in
+            // updateMeshingSystem — these entities' batches are already correct.
+            resolved.erase(
+                std::remove_if(resolved.begin(), resolved.end(),
+                    [this](const ResolvedRemesh& r) {
+                        return m_lodSystem.isPending(r.entity);
+                    }),
+                resolved.end());
+            
+            // Group by target LOD and create batches
+            if (!resolved.empty()) {
+                std::unordered_map<int, std::vector<ResolvedRemesh*>> lodGroups;
+                for (auto& r : resolved)
+                    lodGroups[r.newLOD].push_back(&r);
+                
+                for (auto& [targetLOD, group] : lodGroups) {
+                    static constexpr size_t MAX_LOD_BATCH_SIZE = 128;
+
+                    for (size_t batchStart = 0; batchStart < group.size(); batchStart += MAX_LOD_BATCH_SIZE) {
+                        const size_t batchEnd = std::min(batchStart + MAX_LOD_BATCH_SIZE, group.size());
+
+                        std::vector<entt::entity> batchEntities;
+                        batchEntities.reserve(batchEnd - batchStart);
+                        for (size_t i = batchStart; i < batchEnd; ++i) {
+                            batchEntities.push_back(group[i]->entity);
+                        }
+
+                        uint32_t batchId = m_chunkManager->createLODTransitionBatch(targetLOD, batchEntities);
+
+                        for (size_t i = batchStart; i < batchEnd; ++i) {
+                            auto* r = group[i];
+                            // Do not bump version here. If a mesh job is in-flight, let it finish;
+                            // updateMeshingSystem will schedule the remesh once inFlight clears.
+                            m_lodSystem.setDesiredLOD(r->coord, targetLOD);
+                            // Pass targetLOD through batch info — NOT via chunk.lodLevel.
+                            // If the entity was already pending with a different batch,
+                            // signal the old batch so it doesn't get permanently stuck.
+                            uint32_t oldBatchId = m_lodSystem.enqueueLODRemesh(r->entity, true, batchId, targetLOD);
+                            if (oldBatchId != 0 && m_chunkManager->isBatchActive(oldBatchId)) {
+                                m_chunkManager->signalBatchChunkReady(oldBatchId);
+                            }
+
+                            // ChunkHole tracking: record LOD remesh enqueue
+                            {
+                                ChunkHoleEvent ev{};
+                                ev.type = ChunkHoleEvent::Type::LODRemeshEnqueued;
+                                ev.timestampSec = ChunkHoleEvent::nowSec();
+                                ev.toLOD = targetLOD;
+                                ev.batchId = batchId;
+                                m_chunkHoleTracker.recordEvent(r->coord, std::move(ev));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

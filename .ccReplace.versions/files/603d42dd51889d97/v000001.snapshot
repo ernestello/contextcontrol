@@ -1,0 +1,7 @@
+#pragma once
+
+// GPT-DESC: Private shared helpers for World LOD split implementation files.
+//
+// Reserved for LOD-only helpers that need to be shared across WorldLODConfig,
+// WorldLODTransitions, WorldLODSwaps, and WorldLODDiagnostics. Keep public
+// World API declarations in include/world/World.h until a later header phase.

@@ -1,0 +1,8 @@
+// GPT-DESC: Legacy placeholder after moving World LOD implementation into src/world/lod/.
+#include "world/World.h"
+
+// World LOD implementation now lives in src/world/lod/:
+// - WorldLODConfig.cpp
+// - WorldLODTransitions.cpp
+// - WorldLODSwaps.cpp
+// - WorldLODDiagnostics.cpp

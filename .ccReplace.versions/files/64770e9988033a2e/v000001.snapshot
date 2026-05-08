@@ -1,0 +1,665 @@
+// GPT-DESC: Owns World pending LOD/edit mesh swaps and deferred GPU resource retirement.
+#include "world/World.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/config/WorldConfig.h"
+#include "world/chunks/core/ChunkJobs.h"
+#include "world/ChunkHoleTracker.h"
+#include "vulkan/BufferSuballocator.h"
+#include "rendering/culling/GPUCullingSystem.h"
+#include "physics/PhysicsWorld.h"
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+
+void World::cleanupStalePendingMeshHandles() {
+    // Free GPU resources for ALL entities with a PendingMeshHandle.
+    // Called when LOD batches are cancelled (center changed, old batches stale).
+    size_t pendingCount = 0;
+    std::vector<BufferSlice> vbSlices;
+    std::vector<BufferSlice> ibSlices;
+    std::vector<uint32_t> cullingSlots;
+    {
+        std::unique_lock regLock(m_registryMutex);
+        auto view = m_registry.view<PendingMeshHandle>();
+        for (auto entity : view) {
+            ++pendingCount;
+            auto& pending = view.get<PendingMeshHandle>(entity);
+            if (pending.handle.vb.isValid()) vbSlices.push_back(pending.handle.vb);
+            if (pending.handle.ib.isValid()) ibSlices.push_back(pending.handle.ib);
+            if (pending.handle.gpuCullingSlot != UINT32_MAX)
+                cullingSlots.push_back(pending.handle.gpuCullingSlot);
+        }
+        // Remove all PendingMeshHandle components in one pass
+        m_registry.clear<PendingMeshHandle>();
+    }
+    if (m_vbAllocator && !vbSlices.empty()) {
+        m_vbAllocator->freeBatch(vbSlices.data(), vbSlices.size());
+    }
+    if (m_ibAllocator && !ibSlices.empty()) {
+        m_ibAllocator->freeBatch(ibSlices.data(), ibSlices.size());
+    }
+    if (m_gpuCulling && !cullingSlots.empty()) {
+        m_gpuCulling->freeSlots(cullingSlots.data(), cullingSlots.size());
+    }
+    if (pendingCount > 0) {
+        std::string reason = "CleanupStalePendingMeshes count=" + std::to_string(pendingCount);
+        noteChunkVisualError(
+            nullptr,
+            -1,
+            "LODCleanup",
+            reason.c_str(),
+            0,
+            static_cast<uint32_t>(pendingCount),
+            0);
+    }
+}
+
+
+bool World::onBatchChunkReady(uint32_t batchId) {
+    if (!m_chunkManager) return false;
+    return m_chunkManager->signalBatchChunkReady(batchId);
+}
+
+
+bool World::isBatchActive(uint32_t batchId) const {
+    return m_chunkManager && m_chunkManager->isBatchActive(batchId);
+}
+
+
+void World::enqueueDeferredMeshBufferFree(const BufferSlice& vb, const BufferSlice& ib) {
+    if (!vb.isValid() && !ib.isValid()) {
+        return;
+    }
+    m_pendingMeshBufferFrees.push_back(PendingMeshBufferFree{vb, ib});
+    ++m_currentFinalizeDiag.lodSwapFreeQueuedCount;
+    m_currentFinalizeDiag.lodSwapFreeBacklog =
+        static_cast<uint32_t>(std::min<size_t>(
+            m_pendingMeshBufferFrees.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+}
+
+
+void World::processDeferredMeshBufferFrees(BufferSuballocator* vbAllocator,
+                                           BufferSuballocator* ibAllocator,
+                                           size_t maxFreeCount) {
+    if (m_pendingMeshBufferFrees.empty() || (!vbAllocator && !ibAllocator)) {
+        return;
+    }
+
+    size_t budget = (maxFreeCount == 0)
+        ? m_pendingMeshBufferFrees.size()
+        : std::min(maxFreeCount, m_pendingMeshBufferFrees.size());
+    if (budget == 0) {
+        return;
+    }
+
+    using Clock = std::chrono::high_resolution_clock;
+    auto t = Clock::now();
+
+    m_deferredFreeVbScratch.clear();
+    m_deferredFreeIbScratch.clear();
+    m_deferredFreeVbScratch.reserve(budget);
+    m_deferredFreeIbScratch.reserve(budget);
+
+    for (size_t i = 0; i < budget; ++i) {
+        PendingMeshBufferFree pending = m_pendingMeshBufferFrees.front();
+        m_pendingMeshBufferFrees.pop_front();
+        if (pending.vb.isValid()) m_deferredFreeVbScratch.push_back(pending.vb);
+        if (pending.ib.isValid()) m_deferredFreeIbScratch.push_back(pending.ib);
+    }
+
+    if (vbAllocator && !m_deferredFreeVbScratch.empty()) {
+        vbAllocator->freeBatch(m_deferredFreeVbScratch.data(), m_deferredFreeVbScratch.size());
+    }
+    if (ibAllocator && !m_deferredFreeIbScratch.empty()) {
+        ibAllocator->freeBatch(m_deferredFreeIbScratch.data(), m_deferredFreeIbScratch.size());
+    }
+
+    m_currentFinalizeDiag.lodSwapFreeDrainedCount += static_cast<uint32_t>(
+        std::min<size_t>(budget, static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    m_currentFinalizeDiag.lodSwapFreeBacklog =
+        static_cast<uint32_t>(std::min<size_t>(
+            m_pendingMeshBufferFrees.size(),
+            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+    m_currentFinalizeDiag.lodSwapFreeMs +=
+        std::chrono::duration<float, std::milli>(Clock::now() - t).count();
+}
+
+
+size_t World::processLODSwaps(BufferSuballocator* vbAllocator,
+                               BufferSuballocator* ibAllocator,
+                               uint64_t deviceTimeline) {
+    using Clock = std::chrono::high_resolution_clock;
+    auto& diag = m_currentFinalizeDiag;
+
+    processDeferredMeshBufferFrees(vbAllocator, ibAllocator);
+
+    if (!m_chunkManager) return 0;
+
+    size_t totalSwapped = 0;
+
+    struct DeferredFree {
+        BufferSlice vb;
+        BufferSlice ib;
+        uint32_t gpuCullingSlot{UINT32_MAX};
+    };
+    struct CollisionRefreshRequest {
+        entt::entity entity{entt::null};
+        glm::ivec3 coord{0};
+        int lodLevel{0};
+    };
+    struct ColliderRemoval {
+        uint32_t bodyIdIndex{0xFFFFFFFFu};
+        uint32_t bodyIdSequence{0};
+    };
+    struct SwapVisualReady {
+        glm::ivec3 coord{0};
+        std::chrono::steady_clock::time_point uploadEnqueueTime{};
+        int lodLevel{0};
+        uint64_t vramBytes{0};
+        uint32_t vertexCount{0};
+        uint32_t indexCount{0};
+        ChunkDebugAttribution debugInfo{};
+    };
+    std::vector<DeferredFree> deferredFrees;
+    std::vector<CollisionRefreshRequest> collisionRefreshes;
+    std::vector<ColliderRemoval> colliderRemovals;
+    std::vector<SwapVisualReady> visualReadyEntries;
+    std::vector<uint32_t> cullingSlotsToActivate;
+
+    // Drain every completed batch whose uploads are visible to the GPU.
+    while (LODTransitionBatch* batch = m_chunkManager->getCompletedBatch()) {
+        uint32_t batchId = batch->batchId;
+        size_t batchSwapped = 0;
+        size_t batchInvalidEntities = 0;
+        size_t batchMissingPending = 0;
+        size_t batchMismatchedPending = 0;
+
+        // A completed batch means every PendingMeshHandle has been uploaded
+        // into the staging component, not necessarily that the graphics queue
+        // can see those uploads yet. Keep the old visible MeshHandle until the
+        // upload timeline has crossed every pending handle to avoid
+        // LODN -> blank -> LODM frames.
+        bool batchGpuReady = true;
+        {
+            std::shared_lock regLock(m_registryMutex);
+            for (entt::entity entity : batch->entities) {
+                if (!m_registry.valid(entity) ||
+                    !m_registry.all_of<PendingMeshHandle>(entity)) {
+                    continue;
+                }
+                const auto& pending = m_registry.get<PendingMeshHandle>(entity);
+                if (pending.batchId == batchId &&
+                    pending.handle.gpuReadyValue > deviceTimeline) {
+                    batchGpuReady = false;
+                    break;
+                }
+            }
+        }
+        if (!batchGpuReady) {
+            break;
+        }
+
+        ++diag.lodSwapBatchCount;
+
+        // Phase 1: Under unique_lock — swap components only (no allocator calls)
+        {
+            auto lockWaitStart = Clock::now();
+            std::unique_lock regLock(m_registryMutex);
+            auto lockAcquired = Clock::now();
+            glm::ivec3 center = m_chunkManager ? m_chunkManager->getCenterChunk() : glm::ivec3(0, 0, 0);
+            for (entt::entity entity : batch->entities) {
+                if (!m_registry.valid(entity)) {
+                    ++batchInvalidEntities;
+                    continue;
+                }
+                if (!m_registry.all_of<PendingMeshHandle>(entity)) {
+                    ++batchMissingPending;
+                    continue;
+                }
+
+                auto& pending = m_registry.get<PendingMeshHandle>(entity);
+                const auto pendingUploadEnqueueTime = pending.uploadEnqueueTime;
+                const uint64_t pendingVramBytes = pending.handle.vb.size + pending.handle.ib.size;
+                const uint32_t pendingVertexCount = static_cast<uint32_t>(pending.handle.vb.size / sizeof(Vertex));
+                const uint32_t pendingIndexCount = pending.handle.getTotalIndexCount();
+                ChunkDebugAttribution pendingDebug = pending.debugInfo;
+                if (pendingDebug.uploadBytes == 0) {
+                    pendingDebug.uploadBytes = pendingVramBytes;
+                }
+                if (pendingDebug.subChunkCount == 0) {
+                    pendingDebug.subChunkCount = pending.handle.subChunkCount;
+                }
+                pendingDebug.residency = deriveChunkResidencyKind(
+                    /*gpuResident=*/true,
+                    pendingDebug.artifactCacheResident,
+                    /*pendingBatch=*/false);
+
+                // Only swap if this PendingMeshHandle belongs to THIS batch.
+                // If the entity was reassigned to a newer batch, its pending
+                // mesh belongs to that batch and must not be consumed here.
+                if (pending.batchId != batchId) {
+                    ++batchMismatchedPending;
+                    continue;
+                }
+
+                if (m_registry.all_of<MeshHandle>(entity)) {
+                    auto& oldHandle = m_registry.get<MeshHandle>(entity);
+                    meshStatsSub(oldHandle);
+                    DeferredFree df;
+                    df.vb = oldHandle.vb;
+                    df.ib = oldHandle.ib;
+                    df.gpuCullingSlot = oldHandle.gpuCullingSlot;
+                    deferredFrees.push_back(df);
+                }
+
+                const uint32_t pendingCullingSlot = pending.handle.gpuCullingSlot;
+                meshStatsAdd(pending.handle);
+                m_registry.emplace_or_replace<MeshHandle>(entity, pending.handle);
+                m_registry.remove<PendingMeshHandle>(entity);
+                if (pendingCullingSlot != UINT32_MAX) {
+                    cullingSlotsToActivate.push_back(pendingCullingSlot);
+                }
+
+                if (m_registry.all_of<Chunk>(entity)) {
+                    auto& chunk = m_registry.get<Chunk>(entity);
+                    chunk.lodLevel = batch->targetLOD;
+                    if (m_registry.all_of<ChunkCoord>(entity)) {
+                        glm::ivec3 coord = m_registry.get<ChunkCoord>(entity).toVec3();
+                        chunk.effectiveDataLod = static_cast<uint8_t>(
+                            std::clamp(getEffectiveLODForChunk(coord, batch->targetLOD), 0, 255));
+                        TerrainType chunkType = getTerrainTypeForChunk(coord, batch->targetLOD);
+                        if (chunkType == TerrainType::DCCM) {
+                            uint8_t casingMask = 0;
+                            static const glm::ivec3 nOff[4] = {{-1,0,0},{1,0,0},{0,0,-1},{0,0,1}};
+                            for (int e = 0; e < 4; ++e) {
+                                glm::ivec3 nb = coord + nOff[e];
+                                int nbRing = m_chunkManager->calculateRingNumber(nb, center);
+                                int nbLOD = m_chunkManager->calculateLODFromRing(nbRing);
+                                if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM) {
+                                    casingMask |= (1 << e);
+                                }
+                            }
+                            chunk.casingSeamMask = casingMask;
+                            chunk.voxelSeamMask = 0;
+                        } else {
+                            chunk.voxelSeamMask = (batch->targetLOD > 0)
+                                ? m_chunkManager->getSeamEdgeMask(coord, center)
+                                : 0;
+                            chunk.casingSeamMask = 0;
+                        }
+                    }
+                }
+
+                if (m_registry.all_of<ChunkCoord>(entity)) {
+                    const glm::ivec3 coord = m_registry.get<ChunkCoord>(entity).toVec3();
+                    collisionRefreshes.push_back({
+                        entity,
+                        coord,
+                        batch->targetLOD
+                    });
+                    visualReadyEntries.push_back({
+                        coord,
+                        pendingUploadEnqueueTime,
+                        batch->targetLOD,
+                        pendingVramBytes,
+                        pendingVertexCount,
+                        pendingIndexCount,
+                        pendingDebug
+                    });
+                }
+
+                // Physics colliders are tied to visible LOD 0, not chunk
+                // lifetime.  Moving across a LOD boundary must therefore add
+                // a collider when the LOD-0 mesh becomes visible and remove it
+                // when the chunk leaves LOD 0.
+                if (batch->targetLOD > 0 && m_registry.all_of<ChunkCollider>(entity)) {
+                    const ChunkCollider collider = m_registry.get<ChunkCollider>(entity);
+                    if (collider.isValid()) {
+                        colliderRemovals.push_back({
+                            collider.bodyIdIndex,
+                            collider.bodyIdSequence
+                        });
+                    }
+                    m_registry.remove<ChunkCollider>(entity);
+                }
+
+                ++batchSwapped;
+                ++totalSwapped;
+            }
+            auto lockDone = Clock::now();
+            diag.lodSwapLockWaitMs += std::chrono::duration<float, std::milli>(lockAcquired - lockWaitStart).count();
+            diag.lodSwapLockHeldMs += std::chrono::duration<float, std::milli>(lockDone - lockAcquired).count();
+        }
+
+        if (batchSwapped == 0 || batchInvalidEntities > 0 || batchMissingPending > 0 || batchMismatchedPending > 0) {
+            std::string reason = "BatchSwapSummary swapped=" + std::to_string(batchSwapped) +
+                                 " invalid=" + std::to_string(batchInvalidEntities) +
+                                 " missingPending=" + std::to_string(batchMissingPending) +
+                                 " mismatchedPending=" + std::to_string(batchMismatchedPending);
+            noteChunkVisualError(
+                nullptr,
+                batch->targetLOD,
+                "LODSwap",
+                reason.c_str(),
+                batchId,
+                static_cast<uint32_t>(batch->entities.size()),
+                static_cast<uint32_t>(batchSwapped));
+        }
+
+        m_chunkManager->removeCompletedBatch(batchId);
+    }
+
+    diag.lodSwapEntityCount += static_cast<uint32_t>(totalSwapped);
+    if (totalSwapped > 0) {
+        std::vector<glm::ivec3> changedCoords;
+        changedCoords.reserve(visualReadyEntries.size());
+        for (const auto& entry : visualReadyEntries) {
+            if (entry.debugInfo.affectsShadowGeometry) {
+                changedCoords.push_back(entry.coord);
+            }
+        }
+        if (!changedCoords.empty()) {
+            recordMeshTopologyChanges(changedCoords);
+        }
+    }
+
+    // Phase 2: Update GPU-culling slot visibility and retire old resources
+    // OUTSIDE the registry lock. VB/IB allocator frees are queued and then
+    // drained by the world update.
+    {
+        auto t = Clock::now();
+
+        std::vector<uint32_t> cullingSlots;
+        cullingSlots.reserve(deferredFrees.size());
+
+        uint32_t queuedBufferFrees = 0;
+        for (auto& df : deferredFrees) {
+            if (df.vb.isValid() || df.ib.isValid()) {
+                m_pendingMeshBufferFrees.push_back(PendingMeshBufferFree{df.vb, df.ib});
+                ++queuedBufferFrees;
+            }
+            if (df.gpuCullingSlot != UINT32_MAX) cullingSlots.push_back(df.gpuCullingSlot);
+        }
+        if (queuedBufferFrees > 0) {
+            diag.lodSwapFreeQueuedCount += queuedBufferFrees;
+            diag.lodSwapFreeBacklog =
+                static_cast<uint32_t>(std::min<size_t>(
+                    m_pendingMeshBufferFrees.size(),
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        }
+
+        // Single culling-list handoff: replacement slots become active at the
+        // same time old slots retire, so no LOD update frame can see both.
+        if (m_gpuCulling && (!cullingSlotsToActivate.empty() || !cullingSlots.empty())) {
+            m_gpuCulling->activateSlotsAndFreeSlots(
+                cullingSlotsToActivate.empty() ? nullptr : cullingSlotsToActivate.data(),
+                cullingSlotsToActivate.size(),
+                cullingSlots.empty() ? nullptr : cullingSlots.data(),
+                cullingSlots.size());
+        }
+
+        diag.lodSwapFreeMs += std::chrono::duration<float, std::milli>(Clock::now() - t).count();
+    }
+
+    for (const auto& request : collisionRefreshes) {
+        if (request.lodLevel != 0) {
+            continue;
+        }
+
+        const bool hasEditedCollision =
+            m_editCollisionData.find(request.coord) != m_editCollisionData.end();
+        const bool hasRuntimeEdit =
+            (request.coord.y != 0) ||
+            m_terrainEditOverlay.hasEditsInChunk(request.coord) ||
+            hasEditedCollision;
+
+        if (hasRuntimeEdit) {
+            refreshEditedChunkCollisionFromArtifact(
+                request.entity,
+                request.coord,
+                request.lodLevel);
+        } else {
+            static const std::vector<Vertex> emptyVertices;
+            static const std::vector<uint16_t> emptyIndices;
+            onMeshUploaded(
+                request.entity,
+                request.coord,
+                emptyVertices,
+                emptyIndices,
+                request.lodLevel);
+        }
+    }
+
+    if (m_physics) {
+        for (const auto& removal : colliderRemovals) {
+            m_physics->removeBodyByIndexSeq(
+                removal.bodyIdIndex,
+                static_cast<uint8_t>(removal.bodyIdSequence));
+        }
+    }
+
+    const auto finalizeTime = std::chrono::steady_clock::now();
+    for (const auto& entry : visualReadyEntries) {
+        noteChunkVisualReady(
+            entry.coord,
+            entry.uploadEnqueueTime,
+            finalizeTime,
+            entry.lodLevel,
+            entry.vramBytes,
+            entry.vertexCount,
+            entry.indexCount,
+            &entry.debugInfo);
+    }
+
+    return totalSwapped;
+}
+
+
+size_t World::processSoloPendingSwaps(BufferSuballocator* vbAllocator,
+                                       BufferSuballocator* ibAllocator,
+                                       uint64_t deviceTimeline) {
+    if (!vbAllocator || !ibAllocator) return 0;
+
+    // Phase 1 (shared lock): collect entities with solo PendingMeshHandles ready to swap.
+    // batchId == 0 is the solo-edit sentinel set by the NORMAL PATH in processUploads.
+    std::vector<entt::entity> toSwap;
+    {
+        std::shared_lock regLock(m_registryMutex);
+        auto view = m_registry.view<const PendingMeshHandle>();
+        for (auto entity : view) {
+            const auto& pending = view.get<const PendingMeshHandle>(entity);
+            if (pending.batchId == 0 && pending.handle.gpuReadyValue <= deviceTimeline) {
+                toSwap.push_back(entity);
+            }
+        }
+    }
+    if (toSwap.empty()) return 0;
+
+    struct DeferredFree {
+        std::vector<BufferSlice> vbs;
+        std::vector<BufferSlice> ibs;
+        uint32_t gpuCullingSlot{UINT32_MAX};
+    };
+    std::vector<DeferredFree> deferredFrees;
+    deferredFrees.reserve(toSwap.size());
+
+    struct SwapVisualReady {
+        glm::ivec3 coord{0};
+        std::chrono::steady_clock::time_point uploadEnqueueTime{};
+        int lodLevel{0};
+        uint64_t vramBytes{0};
+        uint32_t vertexCount{0};
+        uint32_t indexCount{0};
+        ChunkDebugAttribution debugInfo{};
+    };
+    std::vector<SwapVisualReady> visualReadyEntries;
+    visualReadyEntries.reserve(toSwap.size());
+
+    // Phase 2 (unique lock): swap components, collect old buffer slices for deferred free.
+    size_t swapped = 0;
+    const glm::ivec3 center = m_chunkManager
+        ? m_chunkManager->getCenterChunk()
+        : glm::ivec3(0, 0, 0);
+    {
+        std::unique_lock regLock(m_registryMutex);
+        for (auto entity : toSwap) {
+            if (!m_registry.valid(entity)) continue;
+            if (!m_registry.all_of<PendingMeshHandle>(entity)) continue;
+
+            auto& pending = m_registry.get<PendingMeshHandle>(entity);
+            // Re-validate: a newer upload may have changed batchId or gpuReadyValue.
+            if (pending.batchId != 0 || pending.handle.gpuReadyValue > deviceTimeline) continue;
+
+            if (m_registry.all_of<MeshHandle>(entity)) {
+                auto& oldHandle = m_registry.get<MeshHandle>(entity);
+                meshStatsSub(oldHandle);
+                DeferredFree df;
+                oldHandle.collectBufferSlices(df.vbs, df.ibs);
+                // Normal path typically reuses culling slot. Only free when slot changes.
+                if (oldHandle.gpuCullingSlot != UINT32_MAX &&
+                    oldHandle.gpuCullingSlot != pending.handle.gpuCullingSlot) {
+                    df.gpuCullingSlot = oldHandle.gpuCullingSlot;
+                }
+                deferredFrees.push_back(std::move(df));
+            }
+
+            meshStatsAdd(pending.handle);
+            // Capture visual-ready diagnostics before removing PendingMeshHandle.
+            if (m_registry.all_of<ChunkCoord>(entity)) {
+                SwapVisualReady vr;
+                vr.coord = m_registry.get<ChunkCoord>(entity).toVec3();
+                vr.uploadEnqueueTime = pending.uploadEnqueueTime;
+                vr.lodLevel = m_registry.all_of<Chunk>(entity)
+                    ? m_registry.get<Chunk>(entity).lodLevel
+                    : 0;
+                vr.vramBytes = pending.handle.getTotalVramBytes();
+                vr.vertexCount = pending.handle.getTotalVertexCount();
+                vr.indexCount = pending.handle.getTotalIndexCount();
+                vr.debugInfo = pending.debugInfo;
+                if (vr.debugInfo.uploadBytes == 0) {
+                    vr.debugInfo.uploadBytes = vr.vramBytes;
+                }
+                if (vr.debugInfo.subChunkCount == 0) {
+                    vr.debugInfo.subChunkCount = pending.handle.subChunkCount;
+                }
+                vr.debugInfo.residency = deriveChunkResidencyKind(
+                    /*gpuResident=*/true,
+                    vr.debugInfo.artifactCacheResident,
+                    /*pendingBatch=*/false);
+                visualReadyEntries.push_back(std::move(vr));
+            }
+
+            if (m_registry.all_of<Chunk, ChunkCoord>(entity)) {
+                auto& chunk = m_registry.get<Chunk>(entity);
+                const glm::ivec3 coord = m_registry.get<ChunkCoord>(entity).toVec3();
+                const int lodLevel = chunk.lodLevel;
+                chunk.effectiveDataLod = static_cast<uint8_t>(
+                    std::clamp(getEffectiveLODForChunk(coord, lodLevel), 0, 255));
+
+                const TerrainType chunkType = getTerrainTypeForChunk(coord, lodLevel);
+                if (chunkType == TerrainType::DCCM) {
+                    uint8_t casingMask = 0;
+                    if (m_chunkManager) {
+                        static const glm::ivec3 nOff[4] = {
+                            {-1, 0, 0}, {1, 0, 0}, {0, 0, -1}, {0, 0, 1}
+                        };
+                        for (int e = 0; e < 4; ++e) {
+                            const glm::ivec3 nb = coord + nOff[e];
+                            const int nbRing = m_chunkManager->calculateRingNumber(nb, center);
+                            const int nbLOD = m_chunkManager->calculateLODFromRing(nbRing);
+                            if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM) {
+                                casingMask |= (1 << e);
+                            }
+                        }
+                    }
+                    chunk.casingSeamMask = casingMask;
+                    chunk.voxelSeamMask = 0;
+                } else {
+                    chunk.voxelSeamMask = (lodLevel > 0 && m_chunkManager)
+                        ? m_chunkManager->getSeamEdgeMask(coord, center)
+                        : 0;
+                    chunk.casingSeamMask = 0;
+                }
+            }
+
+            m_registry.emplace_or_replace<MeshHandle>(entity, pending.handle);
+            m_registry.remove<PendingMeshHandle>(entity);
+            ++swapped;
+        }
+    }
+
+    if (swapped > 0) {
+        std::vector<glm::ivec3> changedCoords;
+        changedCoords.reserve(visualReadyEntries.size());
+        size_t shadowAffectingSwaps = 0;
+        for (const auto& entry : visualReadyEntries) {
+            if (entry.debugInfo.affectsShadowGeometry) {
+                ++shadowAffectingSwaps;
+                changedCoords.push_back(entry.coord);
+            }
+        }
+        if (shadowAffectingSwaps == 0) {
+            // Material-only mesh swaps keep the depth/shadow shape identical.
+        } else if (changedCoords.size() == shadowAffectingSwaps) {
+            recordMeshTopologyChanges(changedCoords);
+        } else {
+            recordGlobalMeshTopologyChange();
+        }
+    }
+
+    // Phase 3: retire old resources outside registry lock.
+    {
+        std::vector<uint32_t> cullingSlots;
+        cullingSlots.reserve(deferredFrees.size());
+        uint32_t queuedBufferFrees = 0;
+        for (auto& df : deferredFrees) {
+            const size_t freeCount = std::max(df.vbs.size(), df.ibs.size());
+            for (size_t i = 0; i < freeCount; ++i) {
+                BufferSlice vb = (i < df.vbs.size()) ? df.vbs[i] : BufferSlice{};
+                BufferSlice ib = (i < df.ibs.size()) ? df.ibs[i] : BufferSlice{};
+                if (vb.isValid() || ib.isValid()) {
+                    m_pendingMeshBufferFrees.push_back(PendingMeshBufferFree{vb, ib});
+                    ++queuedBufferFrees;
+                }
+            }
+            if (df.gpuCullingSlot != UINT32_MAX)
+                cullingSlots.push_back(df.gpuCullingSlot);
+        }
+        if (queuedBufferFrees > 0) {
+            m_currentFinalizeDiag.lodSwapFreeQueuedCount += queuedBufferFrees;
+            m_currentFinalizeDiag.lodSwapFreeBacklog =
+                static_cast<uint32_t>(std::min<size_t>(
+                    m_pendingMeshBufferFrees.size(),
+                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
+        }
+        if (m_gpuCulling && !cullingSlots.empty())
+            m_gpuCulling->freeSlots(cullingSlots.data(), cullingSlots.size());
+    }
+
+    // Phase 4: emit visual-ready logs (finalize path misses these while pending).
+    if (!visualReadyEntries.empty()) {
+        const auto finalizeTime = std::chrono::steady_clock::now();
+        for (const auto& entry : visualReadyEntries) {
+            noteChunkVisualReady(
+                entry.coord,
+                entry.uploadEnqueueTime,
+                finalizeTime,
+                entry.lodLevel,
+                entry.vramBytes,
+                entry.vertexCount,
+                entry.indexCount,
+                &entry.debugInfo);
+        }
+    }
+
+    return swapped;
+}

@@ -1146,7 +1146,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  11,
+                      "CurrentVersion":  12,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1212,6 +1212,12 @@
                                            "Version":  11,
                                            "Timestamp":  "2026-05-08T11:54:30.6599609Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000011.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  12,
+                                           "Timestamp":  "2026-05-08T12:10:14.9943764Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000012.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -2218,6 +2224,116 @@
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T11:54:30.6108156Z",
                                            "Snapshot":  "files\\326579d876aab8fe\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/lod/WorldLODConfig.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\lod\\WorldLODConfig.cpp",
+                      "Key":  "2449688021a19355",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:10:14.7594448Z",
+                                           "Snapshot":  "files\\2449688021a19355\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/lod/WorldLODTransitions.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\lod\\WorldLODTransitions.cpp",
+                      "Key":  "a08f6030a6dd3b5c",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:10:14.7865995Z",
+                                           "Snapshot":  "files\\a08f6030a6dd3b5c\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/lod/WorldLODSwaps.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\lod\\WorldLODSwaps.cpp",
+                      "Key":  "64770e9988033a2e",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:10:14.8144601Z",
+                                           "Snapshot":  "files\\64770e9988033a2e\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/lod/WorldLODDiagnostics.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\lod\\WorldLODDiagnostics.cpp",
+                      "Key":  "4fc8ec7e57336a41",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:10:14.8422598Z",
+                                           "Snapshot":  "files\\4fc8ec7e57336a41\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/lod/WorldLODInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\lod\\WorldLODInternal.h",
+                      "Key":  "603d42dd51889d97",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:10:14.8719521Z",
+                                           "Snapshot":  "files\\603d42dd51889d97\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/WorldLODTransitions.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\WorldLODTransitions.cpp",
+                      "Key":  "8b66a4ae3a48c149",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:10:14.9010785Z",
+                                           "Snapshot":  "files\\8b66a4ae3a48c149\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:10:14.9231842Z",
+                                           "Snapshot":  "files\\8b66a4ae3a48c149\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/WorldUpdateLODScan.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\WorldUpdateLODScan.cpp",
+                      "Key":  "616db278bfcf2491",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:10:14.9464699Z",
+                                           "Snapshot":  "files\\616db278bfcf2491\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:10:14.9671799Z",
+                                           "Snapshot":  "files\\616db278bfcf2491\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
