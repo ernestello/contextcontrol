@@ -1,0 +1,5 @@
+// GPT-DESC: Legacy placeholder for the World upload/finalize split.
+#include "world/World.h"
+
+// Upload callbacks, finalize queue, and topology tracking moved to
+// src/world/upload/ and src/world/finalize/.

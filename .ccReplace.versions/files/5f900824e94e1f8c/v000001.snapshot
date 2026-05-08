@@ -1,0 +1,146 @@
+// GPT-DESC: Updates chunk creation/destruction rings and forwards LOD transition scanning.
+#include "world/World.h"
+#include "world/chunks/core/Chunk.h"
+#include "vulkan/BufferSuballocator.h"
+#include <algorithm>
+#include <cmath>
+#include <vector>
+
+void World::updateChunkLoader(float deltaTime, const glm::vec3& cameraPos, float cameraYaw) {
+    // Update camera position for background thread
+    m_lastCameraPos = cameraPos;
+    m_lastCameraYaw = cameraYaw;  // For minimap view cone
+    
+    // Ring-based chunk management: get chunks to create/destroy
+    std::vector<ChunkManager::ChunkCreateRequest> chunksToCreate;
+    std::vector<glm::ivec3> chunksToDestroy;
+    
+    // Check buffer capacity to prevent crashes (cached — avoids per-frame mutex lock)
+    bool bufferLimitReached = false;
+    if (m_vbAllocator && m_ibAllocator) {
+        static int bufferCheckCounter = 0;
+        static float cachedVbUtil = 0.0f;
+        static float cachedIbUtil = 0.0f;
+        if (++bufferCheckCounter >= 10) { // Check every ~0.17s at 60fps
+            bufferCheckCounter = 0;
+            auto vbTotal = m_vbAllocator->getTotalCapacity();
+            auto ibTotal = m_ibAllocator->getTotalCapacity();
+            if (vbTotal > 0 && ibTotal > 0) {
+                cachedVbUtil = static_cast<float>(m_vbAllocator->getAllocatedBytes()) / vbTotal;
+                cachedIbUtil = static_cast<float>(m_ibAllocator->getAllocatedBytes()) / ibTotal;
+            }
+        }
+        if (cachedVbUtil > 0.80f || cachedIbUtil > 0.80f) {
+            bufferLimitReached = true;
+        }
+    }
+    
+    std::shared_lock setLock(m_chunkSetMutex);
+    m_chunkManager->update(deltaTime, cameraPos, m_readyChunkSet, m_existingChunkSet, chunksToCreate, chunksToDestroy, bufferLimitReached);
+    setLock.unlock();
+    
+    bool centerChanged = m_chunkManager->wasCenterChanged();
+
+    // Detect large teleport (explosion knockback, etc.)
+    // moveDist > 5 triggers burst recovery: accelerated LOD scans and
+    // full upload throughput so the world fills in as fast as possible.
+    int moveDist = 0;
+    if (centerChanged) {
+        glm::ivec3 newCenter = m_chunkManager->getCenterChunk();
+        glm::ivec3 prevCenter = m_chunkManager->getPreviousCenter();
+        moveDist = std::max(std::abs(newCenter.x - prevCenter.x),
+                            std::abs(newCenter.z - prevCenter.z));
+        if (moveDist > 5) {
+            m_burstRecoveryFrames = 10;
+        }
+    }
+
+    // Burst recovery still accelerates LOD scanning after teleports, but the
+    // upload/finalize path now always drains at full throughput.
+
+    // Queue destructions for background thread — BATCHED (single lock instead of per-coord)
+    if (!chunksToDestroy.empty()) {
+        m_lifecycleManager.queueDestructions(chunksToDestroy);
+        m_lodSystem.clearDesiredLODs(chunksToDestroy);
+    }
+
+    // On center change, purge any pending creations that are now out of range.
+    // Without this, chunks queued during forward movement stay in the lifecycle
+    // manager's creation queue even after the player reverses direction, and
+    // get created as orphans that never appear in a destroy sweep.
+    if (centerChanged) {
+        glm::ivec3 newCenter = m_chunkManager->getCenterChunk();
+        int renderDist = m_chunkManager->getEffectiveRenderDistance();
+        auto purgedCreates = m_lifecycleManager.purgeCreationQueue(
+            [&](const glm::ivec3& coord) {
+                int ring = m_chunkManager->calculateRingNumber(coord, newCenter);
+                return ring >= renderDist;
+            });
+        if (!purgedCreates.empty()) {
+            std::lock_guard lock(m_pendingChunksMutex);
+            for (const auto& coord : purgedCreates) {
+                m_pendingChunks.erase(coord);
+            }
+        }
+        if (!purgedCreates.empty()) {
+            m_chunkManager->cancelPendingCreates(purgedCreates);
+        }
+
+        // If center moved back toward previously-queued destroys, cancel those
+        // obsolete destruction requests before worker thread executes them.
+        auto purgedDestroys = m_lifecycleManager.purgeDestructionQueue(
+            [&](const glm::ivec3& coord) {
+                int ring = m_chunkManager->calculateRingNumber(coord, newCenter);
+                return ring < renderDist;
+            });
+        if (!purgedDestroys.empty()) {
+            m_chunkManager->cancelPendingDestroys(purgedDestroys);
+        }
+    }
+
+    // Out-of-range sweep: SKIPPED — ChunkManager::update already produced
+    // outChunksToDestroy via its trailing-edge pass, and the lifecycle
+    // manager purge above cleans stale creation queue entries.
+    // A second full O(N) scan of ~26K entries added ~0.9ms for no benefit.
+
+    // Queue creations — BATCHED (single lock each for pending check + LOD + lifecycle)
+    if (!chunksToCreate.empty()) {
+        // Batch LOD updates (1 lock instead of N)
+        std::vector<std::pair<glm::ivec3, int>> lodEntries;
+        lodEntries.reserve(chunksToCreate.size());
+        for (const auto& req : chunksToCreate) {
+            lodEntries.push_back({req.coord, req.lodLevel});
+        }
+        m_lodSystem.setDesiredLODs(lodEntries);
+
+        // Batch pending check + mark (1 lock instead of 2N)
+        std::vector<glm::ivec3> nonPendingCoords;
+        nonPendingCoords.reserve(chunksToCreate.size());
+        {
+            std::lock_guard lock(m_pendingChunksMutex);
+            for (const auto& req : chunksToCreate) {
+                if (m_pendingChunks.find(req.coord) == m_pendingChunks.end()) {
+                    nonPendingCoords.push_back(req.coord);
+                    m_pendingChunks.insert(req.coord);
+                }
+            }
+        }
+
+        // Batch lifecycle queue (1 lock instead of N)
+        if (!nonPendingCoords.empty()) {
+            m_lifecycleManager.queueCreations(nonPendingCoords);
+        }
+    }
+
+    updateLODTransitions(deltaTime, centerChanged);
+
+    // Wake up background thread if there's work
+    if (!chunksToCreate.empty() || !chunksToDestroy.empty()) {
+        m_lifecycleManager.wakeUp();
+    }
+}
+
+
+void World::updateMarkDirtyOnGeneration() {
+    // Job pipeline handles state transitions automatically via dependency chain
+}

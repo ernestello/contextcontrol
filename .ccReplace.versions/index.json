@@ -1066,7 +1066,7 @@
                       "Path":  "src/world/World.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\world\\World.cpp",
                       "Key":  "1fa53f96b5bd88f4",
-                      "CurrentVersion":  2,
+                      "CurrentVersion":  3,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1079,6 +1079,12 @@
                                            "Timestamp":  "2026-05-07T18:39:42.0169844Z",
                                            "Snapshot":  "files\\1fa53f96b5bd88f4\\v000002.snapshot",
                                            "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-08T12:24:26.0665726Z",
+                                           "Snapshot":  "files\\1fa53f96b5bd88f4\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
                                        }
                                    ]
                   },
@@ -1152,7 +1158,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  13,
+                      "CurrentVersion":  14,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1230,6 +1236,12 @@
                                            "Version":  13,
                                            "Timestamp":  "2026-05-08T12:14:20.2593696Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000013.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  14,
+                                           "Timestamp":  "2026-05-08T12:24:26.0912519Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000014.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -2460,6 +2472,164 @@
                                            "Version":  2,
                                            "Timestamp":  "2026-05-08T12:19:16.1667331Z",
                                            "Snapshot":  "files\\c906fe569d248af4\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/update/WorldUpdateLoop.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\update\\WorldUpdateLoop.cpp",
+                      "Key":  "a5adb9d9c2b48812",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:24:25.7785093Z",
+                                           "Snapshot":  "files\\a5adb9d9c2b48812\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/update/WorldChunkLoader.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\update\\WorldChunkLoader.cpp",
+                      "Key":  "5f900824e94e1f8c",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:24:25.7995333Z",
+                                           "Snapshot":  "files\\5f900824e94e1f8c\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/update/WorldMeshingDispatch.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\update\\WorldMeshingDispatch.cpp",
+                      "Key":  "9a6ad3dcdfec569c",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:24:25.8196028Z",
+                                           "Snapshot":  "files\\9a6ad3dcdfec569c\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/jobs/WorldChunkJobScheduling.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\jobs\\WorldChunkJobScheduling.cpp",
+                      "Key":  "7a50223479967043",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:24:25.8433861Z",
+                                           "Snapshot":  "files\\7a50223479967043\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/upload/WorldUploadQueue.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\upload\\WorldUploadQueue.cpp",
+                      "Key":  "7d04c7dec9ba3d24",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:24:25.8654512Z",
+                                           "Snapshot":  "files\\7d04c7dec9ba3d24\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/finalize/WorldFinalizeQueue.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\finalize\\WorldFinalizeQueue.cpp",
+                      "Key":  "3b511a54aa2ec1ae",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:24:25.8877930Z",
+                                           "Snapshot":  "files\\3b511a54aa2ec1ae\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/finalize/WorldTopologyChanges.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\finalize\\WorldTopologyChanges.cpp",
+                      "Key":  "bd94c058fe06e81e",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:24:25.9098763Z",
+                                           "Snapshot":  "files\\bd94c058fe06e81e\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/WorldUpdate.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\WorldUpdate.cpp",
+                      "Key":  "e7fa6b874bbb38a2",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:24:25.9340813Z",
+                                           "Snapshot":  "files\\e7fa6b874bbb38a2\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:24:25.9544674Z",
+                                           "Snapshot":  "files\\e7fa6b874bbb38a2\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/WorldUpdateMeshing.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\WorldUpdateMeshing.cpp",
+                      "Key":  "a769eb21933bcc5d",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:24:25.9765724Z",
+                                           "Snapshot":  "files\\a769eb21933bcc5d\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:24:25.9953478Z",
+                                           "Snapshot":  "files\\a769eb21933bcc5d\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/WorldUpdateFinalize.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\WorldUpdateFinalize.cpp",
+                      "Key":  "9f66abf0e1a39bf3",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:24:26.0184084Z",
+                                           "Snapshot":  "files\\9f66abf0e1a39bf3\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:24:26.0380114Z",
+                                           "Snapshot":  "files\\9f66abf0e1a39bf3\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]

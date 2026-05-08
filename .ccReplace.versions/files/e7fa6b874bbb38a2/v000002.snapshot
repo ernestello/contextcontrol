@@ -1,0 +1,5 @@
+// GPT-DESC: Legacy placeholder for the World update split; implementation lives in src/world/update/.
+#include "world/World.h"
+
+// World::update(), updateChunkLoader(), and updateMarkDirtyOnGeneration()
+// moved to src/world/update/.

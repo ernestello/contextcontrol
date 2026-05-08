@@ -246,6 +246,8 @@ vulkanas/
 │   │   └── snapshot.meta
 │   ├── snapshot_20260508_145702/
 │   │   └── snapshot.meta
+│   ├── snapshot_20260508_150335/
+│   │   └── snapshot.meta
 │   ├── heightmap.csv
 │   └── heightmap.hbin
 ├── shaders/
@@ -429,8 +431,7 @@ vulkanas/
 │   │   │   │   ├── ChunkVramWindow_Text.cpp
 │   │   │   │   ├── MinimapCullingReadback.cpp
 │   │   │   │   ├── ObjectManagerWindow.cpp
-│   │   │   │   ├── TerrainEditTool.cpp
-│   │   │   │   └── TexturePaintTool.cpp
+│   │   │   │   └── TerrainEditTool.cpp
 │   │   │   └── IconManagerForDebug.cpp
 │   │   ├── style/
 │   │   │   ├── EngineTheme.cpp
@@ -503,11 +504,22 @@ vulkanas/
 │   │   │   │   └── TextureOverlayStore.cpp
 │   │   │   ├── HeightmapBaseSampler.cpp
 │   │   │   ├── TerrainEditDCCMMesher.cpp
-│   │   │   ├── TerrainEditOverlayStore.cpp
 │   │   │   ├── TerrainEditOverlayStore_IO.cpp
 │   │   │   ├── TerrainFieldSource.cpp
-│   │   │   ├── TextureOverlayStore.cpp
 │   │   │   └── VoxelBaseSampler.cpp
+│   │   ├── lod/
+│   │   │   ├── WorldLODConfig.cpp
+│   │   │   ├── WorldLODDiagnostics.cpp
+│   │   │   ├── WorldLODInternal.h
+│   │   │   ├── WorldLODSwaps.cpp
+│   │   │   └── WorldLODTransitions.cpp
+│   │   ├── snapshot/
+│   │   │   ├── WorldSnapshotDelete.cpp
+│   │   │   ├── WorldSnapshotIdentity.cpp
+│   │   │   ├── WorldSnapshotInternal.h
+│   │   │   ├── WorldSnapshotLoad.cpp
+│   │   │   ├── WorldSnapshotSave.cpp
+│   │   │   └── WorldSnapshotStore.cpp
 │   │   ├── vxm/
 │   │   │   └── VxmImport.cpp
 │   │   ├── ChunkHoleTracker.cpp

@@ -1,0 +1,554 @@
+# GPT-DESC: Defines VulkanVX source targets and shader build helpers.
+cmake_minimum_required(VERSION 3.16)
+
+# Core engine files (minimal - just app lifecycle)
+set(CORE_SOURCES
+    # core/engine/ - Engine facade + domain-owned implementation files
+    core/engine/Engine.cpp
+    core/engine/lifecycle/EngineLifecycle.cpp
+    core/engine/lifecycle/EngineCleanup.cpp
+    core/engine/window/EngineWindow.cpp
+    core/engine/window/EngineWindowControls.cpp
+    core/engine/window/EngineGameplayWindow.cpp
+    core/engine/diagnostics/EnginePerfDiagnostics.cpp
+    core/engine/diagnostics/EngineGModeDiagnostics.cpp
+    core/engine/diagnostics/EngineGModeControls.cpp
+    core/engine/diagnostics/EngineTimestamps.cpp
+    core/engine/init/EngineVulkanInit.cpp
+    core/engine/init/EngineSubsystemInit.cpp
+    core/engine/init/EngineMaterialOverlay.cpp
+    core/engine/init/EngineRenderResources.cpp
+    core/engine/init/EngineDebugWiring.cpp
+    core/engine/init/EngineShaderHotReload.cpp
+    core/engine/init/EngineSettingsPersistence.cpp
+    core/engine/rendering/EngineRenderLoop.cpp
+    core/engine/rendering/EngineCommandBuffer.cpp
+    core/engine/rendering/EngineDepthPrePass.cpp
+    core/engine/rendering/EngineShadowPass.cpp
+    core/engine/rendering/EngineGameplayRendering.cpp
+    core/engine/rendering/EngineSwapchainLifecycle.cpp
+    # core/ - standalone core components
+    core/CodeRebuildService.cpp
+    core/EngineImGui.cpp
+    core/GameplayWindow.cpp
+    core/Jobs.cpp
+    core/TimeManager.cpp
+    core/WindowIcon.cpp
+)
+
+# Vulkan subsystem (GPU/rendering infrastructure)
+set(VULKAN_SOURCES
+    vulkan/VulkanContext.cpp
+    vulkan/Buffers.cpp
+    vulkan/Swapchain.cpp
+    vulkan/Pipeline.cpp
+    vulkan/Sync.cpp
+    vulkan/FrameGraph.cpp
+    vulkan/UploadArena.cpp
+    vulkan/BufferSuballocator.cpp
+)
+
+# Input subsystem
+set(INPUT_SOURCES
+    input/InputManager.cpp
+    input/CameraController.cpp
+)
+
+# Physics subsystem
+set(PHYSICS_SOURCES
+    physics/PhysicsWorld.cpp
+)
+
+# Player subsystem
+set(PLAYER_SOURCES
+    player/PlayerController.cpp
+    player/PlayerCamera.cpp
+)
+
+# Rendering subsystem (visual systems)
+set(RENDERING_SOURCES
+    # rendering/common/ - shared rendering utilities
+    rendering/common/Renderer.cpp
+    rendering/common/Mesh.cpp
+    rendering/common/VulkanHelpers.cpp
+    rendering/common/ParallelCommandRecorder.cpp
+    # rendering/hotreload/ - shader compilation & hot-reload
+    rendering/hotreload/ShaderCompiler.cpp
+    rendering/hotreload/ShaderHotReloadService.cpp
+    # rendering/postprocess/
+    rendering/postprocess/RetroPixelPassSystem.cpp
+    # rendering/tjunctionfix/
+    rendering/tjunctionfix/TJunctionFixSystem.cpp
+    # rendering/culling/
+    rendering/culling/GPUCullingSystem.cpp
+    rendering/culling/GPUCullingSlots.cpp
+    rendering/culling/GPUCullingReadback.cpp
+    rendering/culling/HiZPyramid.cpp
+    rendering/culling/HiZPyramidResources.cpp
+    rendering/culling/HiZPyramidDiagnostics.cpp
+    # rendering/lighting/
+    rendering/lighting/LightingSettings.cpp
+    rendering/lighting/LightGlowSystem.cpp
+    rendering/lighting/ShadowSystem.cpp
+    rendering/lighting/ShadowSystemUpdate.cpp
+    rendering/lighting/ShadowSystemResources.cpp
+    rendering/lighting/shadow/ShadowPass.cpp
+    rendering/lighting/shadow/ShadowSunCascades.cpp
+    rendering/lighting/shadow/sun/ShadowSunGather.cpp
+    rendering/lighting/shadow/sun/ShadowSunScroll.cpp
+    rendering/lighting/shadow/sun/ShadowSunRender.cpp
+    rendering/lighting/shadow/sun/ShadowSunDiagnostics.cpp
+    rendering/lighting/shadow/ShadowPointLights.cpp
+    rendering/lighting/shadow/ShadowCache.cpp
+    rendering/lighting/shadow/ShadowMatrices.cpp
+    rendering/lighting/ShadowDiagnostics.cpp
+    rendering/lighting/ClusteredLightingSystem.cpp
+    # rendering/sky/
+    rendering/sky/CloudSystem.cpp
+    rendering/sky/CloudWeather.cpp
+    rendering/sky/CloudFormation.cpp
+    rendering/sky/CloudAnimation.cpp
+    rendering/sky/CelestialSystem.cpp
+    rendering/sky/StarSystem.cpp
+    rendering/sky/SkySystem.cpp
+)
+
+# World subsystem (chunk management, streaming, world state, config)
+set(WORLD_SOURCES
+    world/World.cpp
+    world/update/WorldUpdateLoop.cpp
+    world/update/WorldChunkLoader.cpp
+    world/update/WorldMeshingDispatch.cpp
+    world/jobs/WorldChunkJobScheduling.cpp
+    world/upload/WorldUploadQueue.cpp
+    world/finalize/WorldFinalizeQueue.cpp
+    world/finalize/WorldTopologyChanges.cpp
+    world/WorldRendering.cpp
+    world/WorldDebugMetrics.cpp
+    world/WorldChunkCRUD.cpp
+    world/lod/WorldLODConfig.cpp
+    world/lod/WorldLODTransitions.cpp
+    world/lod/WorldLODSwaps.cpp
+    world/lod/WorldLODDiagnostics.cpp
+    world/snapshot/WorldSnapshotStore.cpp
+    world/snapshot/WorldSnapshotLoad.cpp
+    world/snapshot/WorldSnapshotSave.cpp
+    world/snapshot/WorldSnapshotDelete.cpp
+    world/snapshot/WorldSnapshotIdentity.cpp
+    world/WorldTerrainEditCollision.cpp
+    world/config/WorldConfig.cpp
+    world/TerrainFileLoader.cpp
+    world/edit/overlay/TerrainEditOverlayStore.cpp
+    world/edit/overlay/TerrainEditOverlayBrush.cpp
+    world/edit/overlay/TerrainEditOverlayDeferredFill.cpp
+    world/edit/overlay/TerrainEditOverlayQuery.cpp
+    world/edit/overlay/TerrainEditOverlaySolidCache.cpp
+    world/edit/TerrainEditOverlayStore_IO.cpp
+    world/edit/texture/TextureOverlayStore.cpp
+    world/edit/texture/TextureOverlayCells.cpp
+    world/edit/texture/TextureOverlayPaint.cpp
+    world/edit/texture/TextureOverlayStamps.cpp
+    world/edit/texture/TextureOverlayGPU.cpp
+    world/edit/texture/TextureOverlayIO.cpp
+    world/edit/texture/TextureBrushStyles.cpp
+    world/edit/TerrainFieldSource.cpp
+    world/edit/HeightmapBaseSampler.cpp
+    world/edit/VoxelBaseSampler.cpp
+    world/edit/meshing/TerrainEditMesher.cpp
+    world/edit/meshing/TerrainEditSolidCache.cpp
+    world/edit/meshing/TerrainEditMaterialResolve.cpp
+    world/edit/meshing/TerrainEditSubMeshSplit.cpp
+    world/edit/meshing/greedy/TerrainEditGreedyMesh.cpp
+    world/edit/meshing/greedy/TerrainEditGreedyCache.cpp
+    world/edit/meshing/greedy/TerrainEditGreedyRegions.cpp
+    world/edit/TerrainEditDCCMMesher.cpp
+    world/edit/remesh/RemeshScheduler.cpp
+    world/edit/remesh/RemeshSchedulerQueue.cpp
+    world/edit/remesh/RemeshSchedulerJobs.cpp
+    world/edit/remesh/RemeshSchedulerArtifacts.cpp
+    world/edit/remesh/RemeshSchedulerPagedRuntime.cpp
+    world/vxm/VxmImport.cpp
+    # chunks/core/ - universal chunk infrastructure
+    world/chunks/core/ChunkManager.cpp
+    world/chunks/core/ChunkManagerRings.cpp
+    world/chunks/core/ChunkManagerBatches.cpp
+    world/chunks/core/ChunkJobs.cpp
+    world/chunks/core/ChunkLifecycleManager.cpp
+    world/chunks/core/ChunkLODSystem.cpp
+    # chunks/streaming/ - GPU resource management
+    world/chunks/streaming/ChunkRenderSystem.cpp
+    world/chunks/streaming/ChunkUploadSystem.cpp
+    # chunks/physics/ - collision subsystem
+    world/chunks/physics/ChunkCollisionSystem.cpp
+    world/chunks/physics/CollisionCache.cpp
+    world/ChunkHoleTracker.cpp
+)
+
+# SVO (Sparse Voxel Octree) subsystem
+set(SVO_SOURCES
+    svo/SparseVoxelOctree.cpp
+    svo/SVOBuilder.cpp
+    svo/SVOSerializer.cpp
+)
+
+# UI subsystem
+set(UI_SOURCES
+    ui/InGameDebug.cpp
+    ui/EngineInterface.cpp
+    ui/EngineInterfaceGameplay.cpp
+    ui/EngineInterfaceLayout.cpp
+    # ui/cursor/ - OS cursor image loading and hotspot configuration
+    ui/cursor/CursorManager.cpp
+    # ui/debug_menu/ - shared debug UI infrastructure
+    ui/debug_menu/IconManagerForDebug.cpp
+    # debug_menu/profiling/ - performance & diagnostic windows
+    ui/debug_menu/profiling/DebugControlPanel.cpp
+    ui/debug_menu/profiling/FPSProfilerWindow.cpp
+    ui/debug_menu/profiling/TerminalOutputWindow.cpp
+    ui/debug_menu/profiling/WorkerThreadsWindow.cpp
+    # debug_menu/world/ - chunk, terrain & object debug windows
+    ui/debug_menu/world/ChunkDebugWindow.cpp
+    ui/debug_menu/world/ChunkMinimapWindow.cpp
+    ui/debug_menu/world/ChunkMinimapCullingOverlay.cpp
+    ui/debug_menu/world/ChunkVramWindow.cpp
+    ui/debug_menu/world/ChunkVramWindow_Text.cpp
+    ui/debug_menu/world/MinimapCullingReadback.cpp
+    ui/debug_menu/world/ObjectManagerWindow.cpp
+    ui/debug_menu/world/TerrainEditTool.cpp
+    ui/debug_menu/world/texture_paint/TexturePaintTool.cpp
+    ui/debug_menu/world/texture_paint/TexturePaintToolUI.cpp
+    ui/debug_menu/world/texture_paint/TexturePaintToolPreview.cpp
+    ui/debug_menu/world/texture_paint/TexturePaintToolExecution.cpp
+    ui/debug_menu/world/texture_paint/TexturePaintToolDiagnostics.cpp
+    # debug_menu/rendering/ - render settings & visual debug windows
+    ui/debug_menu/rendering/RenderSettingsWindow.cpp
+    ui/debug_menu/rendering/HiZDebugWindow.cpp
+    ui/debug_menu/rendering/AOSettingsWindow.cpp
+    ui/debug_menu/rendering/DCCMAOSettingsWindow.cpp
+    ui/debug_menu/rendering/LightingSettingsWindow.cpp
+    ui/debug_menu/rendering/CloudDebugWindow.cpp
+    ui/debug_menu/rendering/PixelPassWindow.cpp
+    ui/debug_menu/rendering/ShaderHotReloadWindow.cpp
+    ui/debug_menu/rendering/DirectionalShadowWindow.cpp
+    ui/debug_menu/rendering/SkyEnclosureWindow.cpp
+    # ui/widgets/ - reusable UI widgets
+    ui/widgets/CompassSphereWidget.cpp
+    # debug_menu/gameplay/ - player-facing tools & info
+    ui/debug_menu/gameplay/CursorPlaceTool.cpp
+    ui/debug_menu/gameplay/CursorSettingsWindow.cpp
+    ui/debug_menu/gameplay/ControlsWindow.cpp
+    ui/debug_menu/gameplay/TimeManagerWindow.cpp
+    # ui/style/ - centralized theme & animation
+    ui/style/EngineTheme.cpp
+    ui/style/UIAnimator.cpp
+)
+
+add_executable(VulkanVX
+    main.cpp
+    ${CORE_SOURCES}
+    ${VULKAN_SOURCES}
+    ${INPUT_SOURCES}
+    ${PHYSICS_SOURCES}
+    ${PLAYER_SOURCES}
+    ${RENDERING_SOURCES}
+    ${WORLD_SOURCES}
+    ${SVO_SOURCES}
+    ${UI_SOURCES}
+    $<$<PLATFORM_ID:Windows>:${CMAKE_CURRENT_BINARY_DIR}/VulkanVX.rc>
+)
+
+if(WIN32)
+    # Generate the .rc with an absolute icon path so the resource compiler can
+    # locate it regardless of build directory layout.
+    set(VULKANVX_ICON_PATH "${CMAKE_SOURCE_DIR}/assets/img/vulkanvx.ico")
+    # RC needs forward slashes or escaped backslashes.
+    string(REPLACE "\\" "/" VULKANVX_ICON_PATH "${VULKANVX_ICON_PATH}")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/VulkanVX.rc"
+        "1 ICON \"${VULKANVX_ICON_PATH}\"\n")
+
+    # Legacy cleanup: older builds produced `vulkan-engine.exe`.
+    # Remove it after linking so only VulkanVX.exe remains in Release/Debug.
+    add_custom_command(TARGET VulkanVX POST_BUILD
+        COMMAND powershell -NoProfile -ExecutionPolicy Bypass -Command
+            "if (Test-Path '$<TARGET_FILE_DIR:VulkanVX>/vulkan-engine.exe') { Remove-Item -Force -ErrorAction SilentlyContinue '$<TARGET_FILE_DIR:VulkanVX>/vulkan-engine.exe' }; exit 0"
+        COMMENT "Removing legacy vulkan-engine.exe (best effort)"
+    )
+endif()
+
+target_include_directories(VulkanVX PRIVATE 
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_SOURCE_DIR}/include/core
+    ${CMAKE_SOURCE_DIR}/include/core/engine
+    ${CMAKE_SOURCE_DIR}/include/vulkan
+    ${CMAKE_SOURCE_DIR}/include/input
+    ${CMAKE_SOURCE_DIR}/include/rendering
+    ${CMAKE_SOURCE_DIR}/include/rendering/common
+    ${CMAKE_SOURCE_DIR}/include/rendering/hotreload
+    ${CMAKE_SOURCE_DIR}/include/rendering/lighting
+    ${CMAKE_SOURCE_DIR}/include/rendering/postprocess
+    ${CMAKE_SOURCE_DIR}/include/rendering/sky
+    ${CMAKE_SOURCE_DIR}/include/rendering/svo
+    ${CMAKE_SOURCE_DIR}/include/rendering/culling
+    ${CMAKE_SOURCE_DIR}/include/rendering/tjunctionfix
+    ${CMAKE_SOURCE_DIR}/include/world
+    ${CMAKE_SOURCE_DIR}/include/world/config
+    ${CMAKE_SOURCE_DIR}/include/world/chunks/core
+    ${CMAKE_SOURCE_DIR}/include/world/chunks/streaming
+    ${CMAKE_SOURCE_DIR}/include/world/chunks/physics
+    ${CMAKE_SOURCE_DIR}/include/svo
+    ${CMAKE_SOURCE_DIR}/include/ui
+    ${CMAKE_SOURCE_DIR}/include/ui/debug_menu
+    ${CMAKE_SOURCE_DIR}/include/ui/debug_menu/base
+    ${CMAKE_SOURCE_DIR}/include/ui/debug_menu/world
+    ${CMAKE_SOURCE_DIR}/include/ui/debug_menu/rendering
+    ${CMAKE_SOURCE_DIR}/include/ui/debug_menu/gameplay
+    ${CMAKE_SOURCE_DIR}/include/ui/debug_menu/profiling
+    ${CMAKE_SOURCE_DIR}/include/ui/style
+    ${CMAKE_SOURCE_DIR}/include/physics
+    ${CMAKE_SOURCE_DIR}/include/player
+)
+
+target_compile_definitions(VulkanVX PRIVATE GLFW_INCLUDE_VULKAN)
+
+# Find and link EnTT
+find_package(EnTT CONFIG REQUIRED)
+
+# Find and link ImGui
+find_package(imgui CONFIG REQUIRED)
+
+# Find and link libpng for custom cursor PNG loading
+find_package(PNG REQUIRED)
+
+# Find and link Jolt Physics
+find_package(Jolt CONFIG REQUIRED)
+
+target_link_libraries(VulkanVX PRIVATE Vulkan::Vulkan glfw glm::glm EnTT::EnTT imgui::imgui PNG::PNG Jolt::Jolt)
+
+# Precompiled header — CMake injects /FI so no source files need modification.
+# All heavy external headers (vulkan, entt, glm, STL) are parsed once into a
+# .pch file and reused by all 116 translation units.
+target_precompile_headers(VulkanVX PRIVATE ${CMAKE_SOURCE_DIR}/include/pch.h)
+
+# MSVC: /MP enables within-project parallel compilation (one cl.exe thread per
+# logical core). Without this, cl.exe compiles 116 files sequentially even when
+# cmake -j is passed — because -j only parallelizes across .vcxproj projects.
+if(MSVC)
+    target_compile_options(VulkanVX PRIVATE /MP)
+    # Incremental linking for fast developer builds.
+    # /INCREMENTAL overrides CMake's default /INCREMENTAL:NO (last flag wins in MSVC).
+    # /OPT:NOREF,NOICF are required companions when /INCREMENTAL is used.
+    target_link_options(VulkanVX PRIVATE
+        $<$<CONFIG:Release>:/INCREMENTAL /OPT:NOREF /OPT:NOICF>
+    )
+endif()
+
+# Increase stack size to 8 MB — Engine object (containing World, Physics, GPU culling,
+# rendering subsystems) exceeds the default 1 MB Windows stack.
+if(MSVC)
+    target_link_options(VulkanVX PRIVATE /STACK:8388608)
+endif()
+
+# Shader compile step: try to find glslc; if not available, user must provide precompiled SPV
+find_program(GLSLC_EXECUTABLE glslc)
+if(GLSLC_EXECUTABLE)
+    message(STATUS "Found glslc: ${GLSLC_EXECUTABLE}")
+    set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)
+    
+    # Create shader output directories
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders/sky)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders/terrain)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders/lighting)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders/shadow)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders/svo)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders/culling)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders/pixelpass)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/shaders/tjunctionfix)
+    
+    # Collect shaders from subdirectories
+    file(GLOB SKY_SHADERS "${SHADER_DIR}/sky/*.vert" "${SHADER_DIR}/sky/*.frag")
+    file(GLOB TERRAIN_SHADERS "${SHADER_DIR}/terrain/*.vert" "${SHADER_DIR}/terrain/*.frag" "${SHADER_DIR}/terrain/*.comp")
+    file(GLOB LIGHTING_SHADERS "${SHADER_DIR}/lighting/*.vert" "${SHADER_DIR}/lighting/*.frag")
+    file(GLOB SHADOW_SHADERS "${SHADER_DIR}/shadow/*.vert" "${SHADER_DIR}/shadow/*.frag" "${SHADER_DIR}/shadow/*.comp")
+    file(GLOB SVO_SHADERS "${SHADER_DIR}/svo/*.comp")
+    file(GLOB CULLING_SHADERS CONFIGURE_DEPENDS "${SHADER_DIR}/culling/*.comp")
+    file(GLOB PIXELPASS_SHADERS "${SHADER_DIR}/pixelpass/*.vert" "${SHADER_DIR}/pixelpass/*.frag")
+    file(GLOB TJUNCTIONFIX_SHADERS "${SHADER_DIR}/tjunctionfix/*.vert" "${SHADER_DIR}/tjunctionfix/*.frag")
+    file(GLOB ROOT_COMPUTE_SHADERS "${SHADER_DIR}/*.comp")
+    
+    # Common shader includes (not compiled directly, but tracked as dependencies)
+    file(GLOB COMMON_SHADER_INCLUDES "${SHADER_DIR}/common/*.glsl")
+    
+    # Compile sky shaders
+    foreach(GLSL ${SKY_SHADERS})
+        get_filename_component(FNAME ${GLSL} NAME)
+        set(SPV ${CMAKE_BINARY_DIR}/shaders/sky/${FNAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPV}
+            COMMAND ${GLSLC_EXECUTABLE} -o ${SPV} ${GLSL}
+            DEPENDS ${GLSL}
+        )
+        list(APPEND SPV_OUTPUTS ${SPV})
+    endforeach()
+    
+    # Compile terrain shaders (depend on common includes for #include resolution)
+    foreach(GLSL ${TERRAIN_SHADERS})
+        get_filename_component(FNAME ${GLSL} NAME)
+        set(SPV ${CMAKE_BINARY_DIR}/shaders/terrain/${FNAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPV}
+            COMMAND ${GLSLC_EXECUTABLE} -o ${SPV} ${GLSL}
+            DEPENDS ${GLSL} ${COMMON_SHADER_INCLUDES}
+        )
+        list(APPEND SPV_OUTPUTS ${SPV})
+    endforeach()
+    
+    # Compile lighting shaders
+    foreach(GLSL ${LIGHTING_SHADERS})
+        get_filename_component(FNAME ${GLSL} NAME)
+        set(SPV ${CMAKE_BINARY_DIR}/shaders/lighting/${FNAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPV}
+            COMMAND ${GLSLC_EXECUTABLE} -o ${SPV} ${GLSL}
+            DEPENDS ${GLSL}
+        )
+        list(APPEND SPV_OUTPUTS ${SPV})
+    endforeach()
+
+    # Compile shadow shaders
+    foreach(GLSL ${SHADOW_SHADERS})
+        get_filename_component(FNAME ${GLSL} NAME)
+        set(SPV ${CMAKE_BINARY_DIR}/shaders/shadow/${FNAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPV}
+            COMMAND ${GLSLC_EXECUTABLE} -o ${SPV} ${GLSL}
+            DEPENDS ${GLSL}
+        )
+        list(APPEND SPV_OUTPUTS ${SPV})
+    endforeach()
+    
+    # Compile svo shaders (compute)
+    foreach(GLSL ${SVO_SHADERS})
+        get_filename_component(FNAME ${GLSL} NAME)
+        set(SPV ${CMAKE_BINARY_DIR}/shaders/svo/${FNAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPV}
+            COMMAND ${GLSLC_EXECUTABLE} -o ${SPV} ${GLSL}
+            DEPENDS ${GLSL}
+        )
+        list(APPEND SPV_OUTPUTS ${SPV})
+    endforeach()
+    
+    # Compile culling shaders
+    foreach(GLSL ${CULLING_SHADERS})
+        get_filename_component(FNAME ${GLSL} NAME)
+        set(SPV ${CMAKE_BINARY_DIR}/shaders/culling/${FNAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPV}
+            COMMAND ${GLSLC_EXECUTABLE} -o ${SPV} ${GLSL}
+            DEPENDS ${GLSL}
+        )
+        list(APPEND SPV_OUTPUTS ${SPV})
+    endforeach()
+
+    # Compile pixel pass shaders
+    foreach(GLSL ${PIXELPASS_SHADERS})
+        get_filename_component(FNAME ${GLSL} NAME)
+        set(SPV ${CMAKE_BINARY_DIR}/shaders/pixelpass/${FNAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPV}
+            COMMAND ${GLSLC_EXECUTABLE} -o ${SPV} ${GLSL}
+            DEPENDS ${GLSL}
+        )
+        list(APPEND SPV_OUTPUTS ${SPV})
+    endforeach()
+    
+    # Compile tjunctionfix shaders
+    foreach(GLSL ${TJUNCTIONFIX_SHADERS})
+        get_filename_component(FNAME ${GLSL} NAME)
+        set(SPV ${CMAKE_BINARY_DIR}/shaders/tjunctionfix/${FNAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPV}
+            COMMAND ${GLSLC_EXECUTABLE} -o ${SPV} ${GLSL}
+            DEPENDS ${GLSL}
+        )
+        list(APPEND SPV_OUTPUTS ${SPV})
+    endforeach()
+    
+    # Compile root compute shaders (voxel_mesh.comp, etc.)
+    foreach(GLSL ${ROOT_COMPUTE_SHADERS})
+        get_filename_component(FNAME ${GLSL} NAME)
+        set(SPV ${CMAKE_BINARY_DIR}/${FNAME}.spv)
+        add_custom_command(
+            OUTPUT ${SPV}
+            COMMAND ${GLSLC_EXECUTABLE} -o ${SPV} ${GLSL}
+            DEPENDS ${GLSL}
+        )
+        list(APPEND SPV_OUTPUTS ${SPV})
+    endforeach()
+    
+    add_custom_target(shaders ALL DEPENDS ${SPV_OUTPUTS})
+    add_dependencies(VulkanVX shaders)
+    
+    # Copy runtime DLLs next to the executable.
+    # Use copy_if_different (not copy_directory) so incremental builds don't
+    # try to overwrite in-use DLLs when VulkanVX is already running.
+    file(GLOB VCPKG_RUNTIME_DLLS
+        "${CMAKE_SOURCE_DIR}/vcpkg/installed/x64-windows/bin/*.dll")
+    add_custom_command(TARGET VulkanVX POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${VCPKG_RUNTIME_DLLS}
+            $<TARGET_FILE_DIR:VulkanVX>
+        COMMAND_EXPAND_LISTS
+        COMMENT "Copying vcpkg runtime DLLs"
+    )
+
+    # Copy shaders to exe directory maintaining folder structure
+    add_custom_command(TARGET VulkanVX POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:VulkanVX>/shaders/sky
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:VulkanVX>/shaders/terrain
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:VulkanVX>/shaders/lighting
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:VulkanVX>/shaders/shadow
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:VulkanVX>/shaders/svo
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:VulkanVX>/shaders/culling
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:VulkanVX>/shaders/pixelpass
+        COMMAND ${CMAKE_COMMAND} -E make_directory $<TARGET_FILE_DIR:VulkanVX>/shaders/tjunctionfix
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_BINARY_DIR}/shaders/sky
+            $<TARGET_FILE_DIR:VulkanVX>/shaders/sky
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_BINARY_DIR}/shaders/terrain
+            $<TARGET_FILE_DIR:VulkanVX>/shaders/terrain
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_BINARY_DIR}/shaders/lighting
+            $<TARGET_FILE_DIR:VulkanVX>/shaders/lighting
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_BINARY_DIR}/shaders/shadow
+            $<TARGET_FILE_DIR:VulkanVX>/shaders/shadow
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_BINARY_DIR}/shaders/svo
+            $<TARGET_FILE_DIR:VulkanVX>/shaders/svo
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_BINARY_DIR}/shaders/culling
+            $<TARGET_FILE_DIR:VulkanVX>/shaders/culling
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_BINARY_DIR}/shaders/pixelpass
+            $<TARGET_FILE_DIR:VulkanVX>/shaders/pixelpass
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+            ${CMAKE_BINARY_DIR}/shaders/tjunctionfix
+            $<TARGET_FILE_DIR:VulkanVX>/shaders/tjunctionfix
+        COMMENT "Copying shaders to executable directory"
+    )
+    
+    # Copy root-level compiled shaders (voxel_mesh.comp.spv, etc.)
+    foreach(GLSL ${ROOT_COMPUTE_SHADERS})
+        get_filename_component(FNAME ${GLSL} NAME)
+        add_custom_command(TARGET VulkanVX POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${CMAKE_BINARY_DIR}/${FNAME}.spv
+                $<TARGET_FILE_DIR:VulkanVX>/${FNAME}.spv
+            COMMENT "Copying ${FNAME}.spv to executable directory"
+        )
+    endforeach()
+else()
+    message(WARNING "glslc not found: shader compilation disabled. Provide precompiled .spv in build/shaders or install glslc.")
+endif()

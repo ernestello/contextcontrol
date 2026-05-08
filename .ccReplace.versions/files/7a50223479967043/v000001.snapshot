@@ -1,0 +1,105 @@
+// GPT-DESC: Implements World lifecycle callbacks that create, destroy, and schedule chunk jobs.
+#include "world/World.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/chunks/core/ChunkJobs.h"
+#include "world/config/WorldConfig.h"
+#include <algorithm>
+#include <atomic>
+#include <cmath>
+
+std::vector<entt::entity> World::createChunkEntities(const std::vector<glm::ivec3>& coords) {
+    return createChunksBatch(coords);
+}
+
+void World::scheduleChunkJobs(entt::entity entity, const glm::ivec3& coord, const glm::ivec3& playerChunk) {
+    if (entity == entt::null) return;
+    
+    markChunkPending(coord);
+
+    int desiredLod = getDesiredLODForChunk(coord);
+    {
+        std::unique_lock regLock(m_registryMutex);
+        if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
+            auto& chunk = m_registry.get<Chunk>(entity);
+            chunk.lodLevel = desiredLod;
+        }
+    }
+    
+    auto versionState = ensureChunkVersionState(this, entity);
+    if (!versionState) {
+        return;
+    }
+    
+    // Start pipeline
+    versionState->inFlight.store(true, std::memory_order_release);
+    versionState->pending.store(false, std::memory_order_release);
+    
+    setChunkState(entity, ChunkState::State::Loading);
+    
+    ChunkCoord chunkCoord;
+    AABB aabb;
+    {
+        std::shared_lock regLock(m_registryMutex);
+        if (!m_registry.valid(entity)) return;
+        chunkCoord = m_registry.get<ChunkCoord>(entity);
+        aabb = m_registry.get<AABB>(entity);
+    }
+    
+    // Ring-based priority
+    int dx = std::abs(coord.x - playerChunk.x);
+    int dz = std::abs(coord.z - playerChunk.z);
+    int ringNumber = std::max(dx, dz);
+    int distSq = dx * dx + dz * dz;
+    int priority = ringNumber * 1000000 + distSq;
+    
+    auto* payload = m_payloadPool.acquire();
+    payload->world = this;
+    payload->entity = entity;
+    payload->coord = chunkCoord;
+    payload->bounds = aabb;
+    payload->versionState = versionState;
+    payload->version = versionState->version.load(std::memory_order_acquire);
+    payload->distanceFromPlayer = priority;
+    payload->lodLevel = desiredLod;
+    payload->centerAtEnqueue = playerChunk;
+    
+    int chunkPriority = 1000000 - priority;
+    
+    // Choose mesh pipeline based on whether chunk has runtime voxel edits
+    const bool useRuntimeVoxel = chunkNeedsRuntimeVoxel(coord);
+    const TerrainType lodTerrainType = getTerrainTypeForChunk(coord, desiredLod);
+    const bool isDCCM = (lodTerrainType == TerrainType::DCCM) && m_heightmapSampler.isLoaded();
+    const bool useEditMesher = useRuntimeVoxel && !isDCCM;
+    payload->fromTerrainEdit = useEditMesher;
+    auto loadJobFn = useEditMesher ? LoadEditMeshJob : LoadPrecomputedMeshJob;
+    
+    JobHandle load = m_jobSystem.makeWithPriority(loadJobFn, payload, 0, chunkPriority);
+    JobHandle upload = m_jobSystem.makeWithPriority(UploadChunkJob, payload, 0, chunkPriority);
+    JobHandle finalize = m_jobSystem.makeWithPriority(FinalizeChunkJob, payload, 0, chunkPriority);
+    
+    m_jobSystem.addDependency(upload, load);
+    m_jobSystem.addDependency(finalize, upload);
+    
+    payload->jobHandles = {load, upload, finalize};
+    
+    m_jobSystem.schedule(load);
+    m_jobSystem.schedule(upload);
+    m_jobSystem.schedule(finalize);
+}
+
+int World::destroyChunks(const std::vector<glm::ivec3>& coords) {
+    return tryDestroyChunksBatch(coords);
+}
+
+void World::cleanupStaleVersionStates() {
+    std::shared_lock regLock(m_registryMutex);   // protect registry.valid()
+    std::scoped_lock versionLock(m_chunkVersionMutex);
+    auto& states = m_chunkVersionStates;
+    for (auto it = states.begin(); it != states.end(); ) {
+        if (!m_registry.valid(it->first)) {
+            it = states.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}

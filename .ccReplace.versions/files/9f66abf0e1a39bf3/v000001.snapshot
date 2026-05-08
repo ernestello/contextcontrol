@@ -1,0 +1,410 @@
+#include "world/World.h"
+#include "world/chunks/core/Chunk.h"
+#include "vulkan/BufferSuballocator.h"
+#include "vulkan/UploadArena.h"
+#include "rendering/common/Mesh.h"
+#include <chrono>
+#include <limits>
+
+// updateUploadQueueSystem(), onMeshUploaded(), processFinalizeQueue()
+// — extracted from WorldUpdate.cpp
+
+size_t World::updateUploadQueueSystem(BufferSuballocator* vbAllocator,
+                                     BufferSuballocator* ibAllocator,
+                                     UploadArena* uploadArena,
+                                     ResourceUploader* uploader,
+                                     uint64_t uploadReadyValue,
+                                     size_t maxUploadsOverride,
+                                     bool terrainEditOnly) {
+    // Store allocators for later cleanup
+    m_vbAllocator = vbAllocator;
+    m_ibAllocator = ibAllocator;
+    
+    // Set center for distance-sorted upload ordering
+    if (m_chunkManager) {
+        m_uploadSystem.setCenterChunk(m_chunkManager->getCenterChunk());
+    }
+    
+    // Delegate to ChunkUploadSystem
+    size_t processed = m_uploadSystem.processUploads(
+        m_registry,
+        m_registryMutex,
+        vbAllocator,
+        ibAllocator,
+        uploadArena,
+        uploader,
+        uploadReadyValue,
+        this,  // World implements IUploadCallback
+        maxUploadsOverride,
+        terrainEditOnly);
+    
+    // Update streaming metrics
+    m_streamingMetrics.uploadQueueSize = m_uploadSystem.getQueueSize();
+    m_streamingMetrics.currentUploadBudget = m_uploadSystem.getCurrentUploadBudget();
+    m_streamingMetrics.meshesUploaded.store(m_uploadSystem.getTotalUploaded(), std::memory_order_relaxed);
+    
+    return processed;
+}
+
+void World::onMeshUploaded(
+    entt::entity entity,
+    const glm::ivec3& chunkCoord,
+    const std::vector<Vertex>& vertices,
+    const std::vector<uint16_t>& indices,
+    int lodLevel)
+{
+    // Queue collision building for LOD 0 chunks ONLY
+    // Higher LODs are visual-only (distant terrain) - no physics needed
+    if (m_physics && lodLevel == 0) {
+        // If this chunk already has edit collision data (from a terrain edit),
+        // skip queueing from the stale base collision cache — the correct
+        // body was already created by enqueueEditCollision.
+        if (m_editCollisionData.count(chunkCoord)) {
+            m_chunkCollisionSources[chunkCoord] = ChunkCollisionSource::ExistingEditedCollision;
+            return;
+        }
+
+        PendingCollision pending;
+        pending.entity = entity;
+        pending.chunkCoord = chunkCoord;
+        pending.vertices = vertices;
+        pending.indices = indices;
+        m_chunkCollisionSources[chunkCoord] = ChunkCollisionSource::BaseCollisionCache;
+        m_collisionSystem.enqueueCollision(std::move(pending));
+    }
+}
+
+void World::onUploadPipelineEvent(
+    entt::entity /*entity*/,
+    const glm::ivec3* chunkCoord,
+    int lodLevel,
+    const char* stage,
+    const char* reason,
+    uint32_t batchId,
+    uint32_t expectedVersion,
+    uint32_t actualVersion,
+    const ChunkDebugAttribution* debugInfo)
+{
+    noteChunkVisualError(
+        chunkCoord,
+        lodLevel,
+        stage,
+        reason,
+        batchId,
+        expectedVersion,
+        actualVersion,
+        debugInfo);
+}
+
+void World::recordMeshTopologyChange(const glm::ivec3& coord) {
+    std::vector<glm::ivec3> coords;
+    coords.push_back(coord);
+    recordMeshTopologyChanges(coords);
+}
+
+void World::recordMeshTopologyChanges(const std::vector<glm::ivec3>& coords) {
+    if (coords.empty()) return;
+
+    const uint64_t revision =
+        m_meshTopologyVersion.fetch_add(1, std::memory_order_relaxed) + 1u;
+
+    std::lock_guard lock(m_meshTopologyChangeMutex);
+    for (const glm::ivec3& coord : coords) {
+        m_meshTopologyChanges.push_back(MeshTopologyChange{revision, coord});
+    }
+
+    constexpr size_t kMaxMeshTopologyChangeHistory = 65536u;
+    while (m_meshTopologyChanges.size() > kMaxMeshTopologyChangeHistory) {
+        m_meshTopologyOldestDroppedRevision =
+            std::max(m_meshTopologyOldestDroppedRevision,
+                     m_meshTopologyChanges.front().revision);
+        m_meshTopologyChanges.pop_front();
+    }
+}
+
+void World::recordGlobalMeshTopologyChange() {
+    const uint64_t revision =
+        m_meshTopologyVersion.fetch_add(1, std::memory_order_relaxed) + 1u;
+    std::lock_guard lock(m_meshTopologyChangeMutex);
+    m_meshTopologyChanges.clear();
+    m_meshTopologyOldestDroppedRevision = revision;
+}
+
+bool World::getMeshTopologyChangesSince(
+    uint64_t revision,
+    std::vector<MeshTopologyChange>& outChanges,
+    size_t maxChanges) const {
+    outChanges.clear();
+
+    const uint64_t currentRevision =
+        m_meshTopologyVersion.load(std::memory_order_relaxed);
+    if (revision == currentRevision) {
+        return true;
+    }
+
+    std::lock_guard lock(m_meshTopologyChangeMutex);
+    if (revision < m_meshTopologyOldestDroppedRevision) {
+        return false;
+    }
+    if (m_meshTopologyChanges.empty()) {
+        return false;
+    }
+
+    for (const MeshTopologyChange& change : m_meshTopologyChanges) {
+        if (change.revision <= revision) continue;
+        if (outChanges.size() >= maxChanges) {
+            outChanges.clear();
+            return false;
+        }
+        outChanges.push_back(change);
+    }
+    return true;
+}
+
+size_t World::processFinalizeQueue(size_t maxFinalizeCount) {
+    using Clock = std::chrono::high_resolution_clock;
+    auto& diag = m_currentFinalizeDiag;
+
+    // Step 1: Drain finalize queue without any locks (main-thread-only queue)
+    auto t0 = Clock::now();
+    std::vector<ChunkFinalizeRequest> toFinalize;
+    const size_t drainLimit = (maxFinalizeCount == 0u)
+        ? std::numeric_limits<size_t>::max()
+        : maxFinalizeCount;
+    m_uploadSystem.drainFinalizeQueue(toFinalize, drainLimit);
+    auto t1 = Clock::now();
+    diag.drainMs += std::chrono::duration<float, std::milli>(t1 - t0).count();
+    diag.finalizeCount += static_cast<uint32_t>(toFinalize.size());
+    if (toFinalize.empty()) return 0;
+
+    // Step 2: Validate entities + read coords + set ChunkState component (ONE unique_lock)
+    struct FinalizeEntry {
+        entt::entity entity;
+        glm::ivec3 coord;
+        ChunkState::State oldState{ChunkState::State::Unloaded};
+        std::chrono::steady_clock::time_point uploadEnqueueTime{};
+        int lodLevel{0};
+        uint8_t effectiveDataLod{0};
+        int desiredEffectiveDataLod{0};
+        bool dataLodMismatch{false};
+        bool hasPendingMeshHandle{false};
+        uint32_t pendingBatchId{0};
+        uint64_t vramBytes{0};
+        uint32_t vertexCount{0};
+        uint32_t indexCount{0};
+        std::shared_ptr<ChunkVersionState> versionState;
+        ChunkDebugAttribution debugInfo;
+    };
+    std::vector<FinalizeEntry> entries;
+    entries.reserve(toFinalize.size());
+    {
+        auto lockWaitStart = Clock::now();
+        std::unique_lock regLock(m_registryMutex);
+        auto lockAcquired = Clock::now();
+        for (const auto& req : toFinalize) {
+            const entt::entity entity = req.entity;
+            if (!m_registry.valid(entity) ||
+                !m_registry.all_of<ChunkState, ChunkCoord>(entity)) {
+                // Entity gone — clear inFlight so the edit scheduler doesn't deadlock
+                if (req.versionState) {
+                    req.versionState->inFlight.store(false, std::memory_order_release);
+                }
+                continue;
+            }
+            m_registry.get<ChunkState>(entity).state = ChunkState::State::Ready;
+
+            FinalizeEntry entry{};
+            entry.entity = entity;
+            entry.coord = m_registry.get<ChunkCoord>(entity).toVec3();
+            entry.uploadEnqueueTime = req.enqueueTime;
+            entry.versionState = req.versionState;
+            entry.debugInfo = req.debugInfo;
+
+            if (m_registry.all_of<Chunk>(entity)) {
+                const auto& chunk = m_registry.get<Chunk>(entity);
+                entry.lodLevel = chunk.lodLevel;
+                entry.effectiveDataLod = chunk.effectiveDataLod;
+                if (entry.debugInfo.meshMode == 0xFF) {
+                    entry.debugInfo.meshMode = static_cast<uint8_t>(chunk.meshMode);
+                }
+                entry.desiredEffectiveDataLod = getEffectiveLODForChunk(entry.coord, chunk.lodLevel);
+                entry.dataLodMismatch =
+                    static_cast<int>(chunk.effectiveDataLod) != entry.desiredEffectiveDataLod;
+                entry.hasPendingMeshHandle = m_registry.all_of<PendingMeshHandle>(entity);
+                if (entry.hasPendingMeshHandle) {
+                    entry.pendingBatchId = m_registry.get<PendingMeshHandle>(entity).batchId;
+                }
+            }
+            if (m_registry.all_of<MeshHandle>(entity)) {
+                const auto& mesh = m_registry.get<MeshHandle>(entity);
+                entry.vramBytes = mesh.getTotalVramBytes();
+                entry.vertexCount = mesh.getTotalVertexCount();
+                entry.indexCount = mesh.getTotalIndexCount();
+                if (entry.debugInfo.uploadBytes == 0) {
+                    entry.debugInfo.uploadBytes = entry.vramBytes;
+                }
+                if (entry.debugInfo.subChunkCount == 0) {
+                    entry.debugInfo.subChunkCount = mesh.subChunkCount;
+                }
+            }
+
+            entries.push_back(entry);
+        }
+        auto lockDone = Clock::now();
+        diag.regLockWaitMs += std::chrono::duration<float, std::milli>(lockAcquired - lockWaitStart).count();
+        diag.regLockHeldMs += std::chrono::duration<float, std::milli>(lockDone - lockAcquired).count();
+    }
+    if (entries.empty()) return 0;
+
+    // Step 3: Update state map (ONE unique_lock on m_chunkStateMutex)
+    {
+        auto t = Clock::now();
+        std::unique_lock lock(m_chunkStateMutex);
+        for (auto& entry : entries) {
+            auto it = m_chunkStateMap.find(entry.coord);
+            if (it != m_chunkStateMap.end()) {
+                entry.oldState = it->second;
+            }
+            m_chunkStateMap[entry.coord] = ChunkState::State::Ready;
+        }
+        diag.stateMapLockMs += std::chrono::duration<float, std::milli>(Clock::now() - t).count();
+    }
+
+    // Step 4: Adjust atomic counters (no lock needed)
+    for (auto& entry : entries) {
+        if (entry.oldState == ChunkState::State::Loading)
+            m_loadingCount.fetch_sub(1, std::memory_order_relaxed);
+        else if (entry.oldState == ChunkState::State::Meshing)
+            m_meshingCount.fetch_sub(1, std::memory_order_relaxed);
+        else if (entry.oldState == ChunkState::State::Ready)
+            m_readyCount.fetch_sub(1, std::memory_order_relaxed);
+        m_readyCount.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    // Step 5: Insert into readyChunkSet (ONE unique_lock on m_chunkSetMutex)
+    {
+        auto t = Clock::now();
+        std::unique_lock setLock(m_chunkSetMutex);
+        for (auto& entry : entries) {
+            m_readyChunkSet.insert(entry.coord);
+        }
+        diag.readySetLockMs += std::chrono::duration<float, std::milli>(Clock::now() - t).count();
+    }
+
+    // Step 6: Batch notify ChunkManager (ONE lock on m_pendingOpsMutex internally)
+    {
+        auto t = Clock::now();
+        std::vector<glm::ivec3> coords;
+        coords.reserve(entries.size());
+        for (auto& entry : entries) coords.push_back(entry.coord);
+        m_chunkManager->notifyChunksCreated(coords);
+        diag.notifyMs += std::chrono::duration<float, std::milli>(Clock::now() - t).count();
+    }
+
+    // Step 7: Clear pending chunks (ONE lock on m_pendingChunksMutex)
+    {
+        auto t = Clock::now();
+        std::lock_guard lock(m_pendingChunksMutex);
+        for (auto& entry : entries) {
+            m_pendingChunks.erase(entry.coord);
+        }
+        diag.clearPendingMs += std::chrono::duration<float, std::milli>(Clock::now() - t).count();
+    }
+
+    const auto finalizeTime = std::chrono::steady_clock::now();
+    bool shadowGeometryFinalized = false;
+    std::vector<glm::ivec3> shadowGeometryCoords;
+    for (const auto& entry : entries) {
+        // Batched LOD remesh uploads stage into PendingMeshHandle first and do
+        // not become visible until processLODSwaps() atomically swaps the whole
+        // batch. Logging them here floods history with fake "shown" events.
+        if (!entry.hasPendingMeshHandle) {
+            if (entry.debugInfo.affectsShadowGeometry) {
+                shadowGeometryFinalized = true;
+                shadowGeometryCoords.push_back(entry.coord);
+            }
+            auto tVisual = Clock::now();
+            noteChunkVisualReady(
+                entry.coord,
+                entry.uploadEnqueueTime,
+                finalizeTime,
+                entry.lodLevel,
+                entry.vramBytes,
+                entry.vertexCount,
+                entry.indexCount,
+                &entry.debugInfo);
+            diag.visualReadyMs += std::chrono::duration<float, std::milli>(Clock::now() - tVisual).count();
+        }
+
+        auto tMismatch = Clock::now();
+        if (entry.dataLodMismatch) {
+            if (entry.hasPendingMeshHandle) {
+                const bool pendingBatchActive =
+                    (entry.pendingBatchId != 0) && m_chunkManager && m_chunkManager->isBatchActive(entry.pendingBatchId);
+                if (!pendingBatchActive) {
+                    std::string reason = "FinalizeDataLodMismatchPendingInactiveBatch effective=" +
+                        std::to_string(entry.effectiveDataLod) +
+                        " desired=" + std::to_string(entry.desiredEffectiveDataLod) +
+                        " batch=" + std::to_string(entry.pendingBatchId);
+                    noteChunkVisualError(
+                        &entry.coord,
+                        entry.lodLevel,
+                        "Finalize",
+                        reason.c_str(),
+                        entry.pendingBatchId,
+                        entry.effectiveDataLod,
+                        static_cast<uint32_t>(entry.desiredEffectiveDataLod));
+                }
+            } else {
+                m_lodSystem.setDesiredLOD(entry.coord, entry.lodLevel);
+                m_lodSystem.enqueueLODRemesh(
+                    entry.entity,
+                    /*isRemesh=*/false,
+                    /*batchId=*/0,
+                    entry.lodLevel);
+                std::string reason = "FinalizeDataLodMismatchRequeued effective=" +
+                    std::to_string(entry.effectiveDataLod) +
+                    " desired=" + std::to_string(entry.desiredEffectiveDataLod);
+                noteChunkVisualError(
+                    &entry.coord,
+                    entry.lodLevel,
+                    "Finalize",
+                    reason.c_str(),
+                    0,
+                    entry.effectiveDataLod,
+                    static_cast<uint32_t>(entry.desiredEffectiveDataLod));
+            }
+        }
+        diag.lodMismatchMs += std::chrono::duration<float, std::milli>(Clock::now() - tMismatch).count();
+
+        auto tCollision = Clock::now();
+        refreshEditedChunkCollisionFromArtifact(entry.entity, entry.coord, entry.lodLevel);
+        diag.collisionRefreshMs += std::chrono::duration<float, std::milli>(Clock::now() - tCollision).count();
+    }
+
+    // Clear inFlight for entries that carry a versionState — this completes
+    // the dispatch→drain→upload→finalize pipeline and unlocks the entity for
+    // new edit / remesh dispatches.  Done AFTER all finalize work so no
+    // concurrent dispatch can race against partial state updates above.
+    {
+        auto t = Clock::now();
+        for (const auto& entry : entries) {
+            if (entry.versionState) {
+                entry.versionState->inFlight.store(false, std::memory_order_release);
+            }
+        }
+        diag.inFlightClearMs += std::chrono::duration<float, std::milli>(Clock::now() - t).count();
+    }
+
+    // New or replaced geometry is now eligible for rendering, so cached
+    // shadows must refresh on the next frame. Texture-only material remeshes
+    // keep the depth shape identical and must not invalidate shadow caches.
+    // Staged PendingMeshHandles bump this later, at the atomic swap point.
+    if (shadowGeometryFinalized) {
+        auto t = Clock::now();
+        recordMeshTopologyChanges(shadowGeometryCoords);
+        diag.topologyRecordMs += std::chrono::duration<float, std::milli>(Clock::now() - t).count();
+    }
+
+    return entries.size();
+}

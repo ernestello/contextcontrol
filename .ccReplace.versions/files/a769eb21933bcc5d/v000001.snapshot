@@ -1,0 +1,188 @@
+#include "world/World.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/chunks/core/ChunkJobs.h"
+#include "vulkan/BufferSuballocator.h"
+#include <iostream>
+#include <string>
+
+// updateMeshingSystem() — extracted from WorldUpdate.cpp
+
+void World::updateMeshingSystem() {
+    size_t iterations = m_lodSystem.getRemeshQueueSize();
+    while (iterations-- > 0) {
+        entt::entity entity = m_lodSystem.popRemeshQueue();
+        if (entity == entt::null) break;
+
+        // Get batch info EARLY so we can signal the batch if the entity gets dropped.
+        // Without this, dropped entities silently decrement the batch's effective count,
+        // and the batch never completes — freezing all chunks at old LOD.
+        auto batchInfo = m_lodSystem.getRemeshBatchInfo(entity);
+
+        auto versionState = ensureChunkVersionState(this, entity);
+        if (!versionState) {
+            if (batchInfo.isRemesh && m_chunkManager && m_chunkManager->isBatchActive(batchInfo.batchId))
+                m_chunkManager->signalBatchChunkReady(batchInfo.batchId);
+            if (batchInfo.isRemesh) {
+                noteChunkVisualError(
+                    nullptr,
+                    batchInfo.targetLOD,
+                    "LODQueue",
+                    "MissingVersionState",
+                    batchInfo.batchId,
+                    0,
+                    0);
+            }
+            m_lodSystem.clearPending(entity);
+            continue;
+        }
+
+        if (versionState->inFlight.load(std::memory_order_acquire)) {
+            m_lodSystem.requeue(entity);
+            continue;
+        }
+
+        ChunkCoord coordComponent;
+        Chunk chunkComponent;
+        AABB aabbComponent;
+        {
+            std::shared_lock regLock(m_registryMutex);
+            if (!m_registry.valid(entity) ||
+                !m_registry.all_of<ChunkCoord, ChunkState, Chunk, AABB>(entity)) {
+                if (batchInfo.isRemesh && m_chunkManager && m_chunkManager->isBatchActive(batchInfo.batchId))
+                    m_chunkManager->signalBatchChunkReady(batchInfo.batchId);
+                if (batchInfo.isRemesh) {
+                    noteChunkVisualError(
+                        nullptr,
+                        batchInfo.targetLOD,
+                        "LODQueue",
+                        "InvalidEntityOrMissingComponents",
+                        batchInfo.batchId,
+                        0,
+                        0);
+                }
+                m_lodSystem.clearPending(entity);
+                continue;
+            }
+
+            coordComponent = m_registry.get<ChunkCoord>(entity);
+            chunkComponent = m_registry.get<Chunk>(entity);
+            aabbComponent = m_registry.get<AABB>(entity);
+        }
+
+        glm::ivec3 coordVec = coordComponent.toVec3();
+        if (batchInfo.isRemesh) {
+            if (!m_chunkManager || !m_chunkManager->isBatchActive(batchInfo.batchId)) {
+                noteChunkVisualError(
+                    &coordVec,
+                    batchInfo.targetLOD,
+                    "LODQueue",
+                    "BatchInactiveBeforeDispatch",
+                    batchInfo.batchId,
+                    0,
+                    0);
+                m_lodSystem.clearPending(entity);
+                continue;
+            }
+
+            // Entry became stale (center moved and desired LOD changed) while waiting in queue.
+            int desiredLodNow = m_lodSystem.getDesiredLOD(coordVec);
+            if (batchInfo.targetLOD != desiredLodNow) {
+                m_chunkManager->signalBatchChunkReady(batchInfo.batchId);
+                std::string reason = "QueuedTargetLodStale target=" +
+                    std::to_string(batchInfo.targetLOD) +
+                    " desiredNow=" + std::to_string(desiredLodNow);
+                noteChunkVisualError(
+                    &coordVec,
+                    batchInfo.targetLOD,
+                    "LODQueue",
+                    reason.c_str(),
+                    batchInfo.batchId,
+                    static_cast<uint32_t>(batchInfo.targetLOD),
+                    static_cast<uint32_t>(desiredLodNow));
+                m_lodSystem.clearPending(entity);
+                continue;
+            }
+        }
+
+        // Start a new pipeline generation token now that we are actually scheduling.
+        versionState->version.fetch_add(1, std::memory_order_acq_rel);
+        versionState->inFlight.store(true, std::memory_order_release);
+        versionState->pending.store(false, std::memory_order_release);
+
+        // Clear from LOD system pending set now that dispatch is committed.
+        // This lets the LOD scan distinguish "in queue" (isPending=true) from
+        // "dispatched / in flight" (isPending=false, inFlight=true) so the
+        // drain doesn't create duplicate batches that overwrite batch info.
+        m_lodSystem.clearPending(entity);
+
+        // For LOD remeshes (chunk already Ready), keep old mesh visible
+        // until the new one is uploaded. Only set Loading for initial loads.
+        if (chunkComponent.lodLevel >= 0) {
+            // Check if this is a remesh (chunk already has a mesh / is Ready)
+            ChunkState::State currentState = ChunkState::State::Unloaded;
+            {
+                std::shared_lock regLock(m_registryMutex);
+                if (m_registry.valid(entity) && m_registry.all_of<ChunkState>(entity)) {
+                    currentState = m_registry.get<ChunkState>(entity).state;
+                }
+            }
+            // Only transition to Loading for initial chunk creation, not remeshes
+            if (currentState != ChunkState::State::Ready) {
+                setChunkState(entity, ChunkState::State::Loading);
+            }
+        }
+
+        auto* payload = m_payloadPool.acquire();
+        payload->world = this;
+        payload->entity = entity;
+        payload->coord = coordComponent;
+        payload->bounds = aabbComponent;
+        payload->versionState = versionState;
+        payload->version = versionState->version.load(std::memory_order_acquire);
+        
+        // Check if this is a batched LOD remesh
+        payload->isRemesh = batchInfo.isRemesh;
+        payload->batchId = batchInfo.batchId;
+        payload->affectsShadowGeometry = batchInfo.affectsShadowGeometry;
+        
+        // For remeshes, use the target LOD from batch info (chunk.lodLevel
+        // is NOT updated until the mesh is actually swapped in processLODSwaps).
+        // For initial loads, use chunk.lodLevel (set at creation time).
+        payload->lodLevel = batchInfo.isRemesh ? batchInfo.targetLOD : chunkComponent.lodLevel;
+
+        glm::ivec3 center = m_chunkManager ? m_chunkManager->getCenterChunk() : glm::ivec3(0, 0, 0);
+        payload->centerAtEnqueue = center;
+        int ringNumber = m_chunkManager ? m_chunkManager->calculateRingNumber(coordVec, center) : 0;
+        int dx = coordVec.x - center.x;
+        int dz = coordVec.z - center.z;
+        int distSq = dx * dx + dz * dz;
+        int priorityKey = ringNumber * 1000000 + distSq;
+        int jobPriority = 1000000 - priorityKey;
+        payload->distanceFromPlayer = priorityKey;
+
+        // Check if we should use precomputed meshes
+        // For chunks with terrain edits, use the edit mesher instead of loading from terrain.bin.
+        // DCCM terrain is not affected by edits — always use precomputed path.
+        const bool useRuntimeVoxel = chunkNeedsRuntimeVoxel(coordVec);
+        const TerrainType lodTerrainType = getTerrainTypeForChunk(coordVec, payload->lodLevel);
+        const bool isDCCM = (lodTerrainType == TerrainType::DCCM) && m_heightmapSampler.isLoaded();
+        const bool useEditMesher = useRuntimeVoxel;
+        payload->fromTerrainEdit = useEditMesher && !isDCCM;
+        auto loadJobFn = (useEditMesher && !isDCCM) ? LoadEditMeshJob : LoadPrecomputedMeshJob;
+
+        JobHandle load = m_jobSystem.makeWithPriority(loadJobFn, payload, 0, jobPriority);
+        JobHandle upload = m_jobSystem.makeWithPriority(UploadChunkJob, payload, 0, jobPriority);
+        JobHandle finalize = m_jobSystem.makeWithPriority(FinalizeChunkJob, payload, 0, jobPriority);
+
+        m_jobSystem.addDependency(upload, load);
+        m_jobSystem.addDependency(finalize, upload);
+
+        payload->jobHandles = {load, upload, finalize};
+
+        m_jobSystem.schedule(load);
+        m_jobSystem.schedule(upload);
+        m_jobSystem.schedule(finalize);
+
+        m_lodSystem.clearPending(entity);
+    }
+}
