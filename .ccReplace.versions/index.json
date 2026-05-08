@@ -258,7 +258,7 @@
                       "Path":  "src/world/edit/TextureOverlayStore.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\TextureOverlayStore.cpp",
                       "Key":  "b7ce26efdbfc487f",
-                      "CurrentVersion":  8,
+                      "CurrentVersion":  12,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -306,6 +306,30 @@
                                            "Version":  8,
                                            "Timestamp":  "2026-05-07T18:48:15.6921327Z",
                                            "Snapshot":  "files\\b7ce26efdbfc487f\\v000008.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  9,
+                                           "Timestamp":  "2026-05-08T11:36:14.1097953Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000009.snapshot",
+                                           "Reason":  "applied insert_include"
+                                       },
+                                       {
+                                           "Version":  10,
+                                           "Timestamp":  "2026-05-08T11:36:14.1812679Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000010.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  11,
+                                           "Timestamp":  "2026-05-08T11:36:14.2866727Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000011.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  12,
+                                           "Timestamp":  "2026-05-08T11:36:14.3960287Z",
+                                           "Snapshot":  "files\\b7ce26efdbfc487f\\v000012.snapshot",
                                            "Reason":  "applied function"
                                        }
                                    ]
@@ -898,7 +922,7 @@
                       "Path":  "src/ui/debug_menu/world/TexturePaintTool.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\TexturePaintTool.cpp",
                       "Key":  "984185f35b3d3aa4",
-                      "CurrentVersion":  8,
+                      "CurrentVersion":  9,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -946,6 +970,12 @@
                                            "Version":  8,
                                            "Timestamp":  "2026-05-07T18:39:41.8521196Z",
                                            "Snapshot":  "files\\984185f35b3d3aa4\\v000008.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  9,
+                                           "Timestamp":  "2026-05-08T11:36:14.4842244Z",
+                                           "Snapshot":  "files\\984185f35b3d3aa4\\v000009.snapshot",
                                            "Reason":  "applied function"
                                        }
                                    ]
@@ -1104,7 +1134,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  7,
+                      "CurrentVersion":  8,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1146,6 +1176,12 @@
                                            "Version":  7,
                                            "Timestamp":  "2026-05-08T11:21:53.5223299Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000007.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  8,
+                                           "Timestamp":  "2026-05-08T11:36:14.5171727Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000008.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -1812,6 +1848,54 @@
                                            "Version":  2,
                                            "Timestamp":  "2026-05-08T11:21:53.5012343Z",
                                            "Snapshot":  "files\\fa4f0c7573b77ca9\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/world/edit/texture/TextureBrushStyles.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\edit\\texture\\TextureBrushStyles.h",
+                      "Key":  "2f984a6c13cb82a0",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:36:14.0403716Z",
+                                           "Snapshot":  "files\\2f984a6c13cb82a0\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/texture/TextureBrushStyles.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\texture\\TextureBrushStyles.cpp",
+                      "Key":  "bbfe990a6ca9567f",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:36:14.0658310Z",
+                                           "Snapshot":  "files\\bbfe990a6ca9567f\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/ui/debug_menu/world/TexturePaintTool.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\ui\\debug_menu\\world\\TexturePaintTool.h",
+                      "Key":  "33cf7e9c4689ad83",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T11:36:14.4231373Z",
+                                           "Snapshot":  "files\\33cf7e9c4689ad83\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T11:36:14.4474166Z",
+                                           "Snapshot":  "files\\33cf7e9c4689ad83\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]

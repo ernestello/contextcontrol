@@ -1,0 +1,48 @@
+#pragma once
+
+// GPT-DESC: Declares terrain texture brush material styles and blend policy.
+
+#include <cstdint>
+
+#include <glm/glm.hpp>
+
+namespace TextureOverlay {
+
+enum class TextureType : uint8_t;
+enum class TransitionEdgeStyle : uint8_t;
+
+struct TextureStylePreviewColors {
+    glm::vec3 base{1.0f};
+    glm::vec3 highlight{1.0f};
+    glm::vec3 shadow{0.0f};
+    glm::vec3 accent{1.0f};
+};
+
+struct TextureBrushStyle {
+    TextureType type;
+    const char* displayName;
+    TextureStylePreviewColors preview;
+    TransitionEdgeStyle defaultBlendEdge;
+    uint32_t variantSalt;
+};
+
+namespace TextureBrushStyles {
+
+const TextureBrushStyle& getStyle(TextureType type);
+const char* name(TextureType type);
+
+uint8_t computeVariant(const glm::ivec3& coord,
+                       uint8_t face,
+                       TextureType type,
+                       uint8_t seed);
+
+TransitionEdgeStyle classifyTransitionEdge(TextureType a,
+                                           TextureType b,
+                                           const glm::ivec3& lodCoord);
+
+TransitionEdgeStyle mergeEdgeStyle(TransitionEdgeStyle lhs,
+                                   TransitionEdgeStyle rhs);
+
+} // namespace TextureBrushStyles
+
+} // namespace TextureOverlay
