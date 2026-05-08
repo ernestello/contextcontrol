@@ -996,7 +996,7 @@
                       "Path":  "include/world/World.h",
                       "FullPath":  "D:\\projects\\vulkanas\\include\\world\\World.h",
                       "Key":  "dde35833d8ad2bf6",
-                      "CurrentVersion":  3,
+                      "CurrentVersion":  6,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1014,6 +1014,24 @@
                                            "Version":  3,
                                            "Timestamp":  "2026-05-08T12:31:25.0958063Z",
                                            "Snapshot":  "files\\dde35833d8ad2bf6\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-08T12:39:45.7376547Z",
+                                           "Snapshot":  "files\\dde35833d8ad2bf6\\v000004.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-08T12:44:01.1309508Z",
+                                           "Snapshot":  "files\\dde35833d8ad2bf6\\v000005.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-08T12:48:09.3227474Z",
+                                           "Snapshot":  "files\\dde35833d8ad2bf6\\v000006.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -1072,7 +1090,7 @@
                       "Path":  "src/world/World.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\world\\World.cpp",
                       "Key":  "1fa53f96b5bd88f4",
-                      "CurrentVersion":  3,
+                      "CurrentVersion":  4,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1091,6 +1109,12 @@
                                            "Timestamp":  "2026-05-08T12:24:26.0665726Z",
                                            "Snapshot":  "files\\1fa53f96b5bd88f4\\v000003.snapshot",
                                            "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-08T12:39:45.7647070Z",
+                                           "Snapshot":  "files\\1fa53f96b5bd88f4\\v000004.snapshot",
+                                           "Reason":  "applied append_to_file"
                                        }
                                    ]
                   },
@@ -2262,13 +2286,19 @@
                       "Path":  "src/world/lod/WorldLODConfig.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\world\\lod\\WorldLODConfig.cpp",
                       "Key":  "2449688021a19355",
-                      "CurrentVersion":  1,
+                      "CurrentVersion":  2,
                       "Versions":  [
                                        {
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T12:10:14.7594448Z",
                                            "Snapshot":  "files\\2449688021a19355\\v000001.snapshot",
                                            "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:39:45.8188962Z",
+                                           "Snapshot":  "files\\2449688021a19355\\v000002.snapshot",
+                                           "Reason":  "applied append_to_file"
                                        }
                                    ]
                   },
@@ -2466,7 +2496,7 @@
                       "Path":  "src/world/snapshot/WorldSnapshotIdentity.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\world\\snapshot\\WorldSnapshotIdentity.cpp",
                       "Key":  "c906fe569d248af4",
-                      "CurrentVersion":  2,
+                      "CurrentVersion":  3,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -2479,6 +2509,12 @@
                                            "Timestamp":  "2026-05-08T12:19:16.1667331Z",
                                            "Snapshot":  "files\\c906fe569d248af4\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-08T12:39:45.7912921Z",
+                                           "Snapshot":  "files\\c906fe569d248af4\\v000003.snapshot",
+                                           "Reason":  "applied append_to_file"
                                        }
                                    ]
                   },
@@ -2693,6 +2729,68 @@
                                            "Timestamp":  "2026-05-08T12:31:25.0672260Z",
                                            "Snapshot":  "files\\ba0856a226465799\\v000001.snapshot",
                                            "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/world/WorldRenderTypes.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\WorldRenderTypes.h",
+                      "Key":  "5ed63bf7a7875572",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:39:45.6651990Z",
+                                           "Snapshot":  "files\\5ed63bf7a7875572\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/world/WorldTerrainEditTypes.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\WorldTerrainEditTypes.h",
+                      "Key":  "963fe0858753cd3a",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:39:45.6862265Z",
+                                           "Snapshot":  "files\\963fe0858753cd3a\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/world/WorldUpdateTypes.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\WorldUpdateTypes.h",
+                      "Key":  "01f789d2185ead15",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:39:45.7099309Z",
+                                           "Snapshot":  "files\\01f789d2185ead15\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/WorldRendering.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\WorldRendering.cpp",
+                      "Key":  "b7b0f51f04cf58c5",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:39:45.8444492Z",
+                                           "Snapshot":  "files\\b7b0f51f04cf58c5\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:39:45.8665283Z",
+                                           "Snapshot":  "files\\b7b0f51f04cf58c5\\v000002.snapshot",
+                                           "Reason":  "applied append_to_file"
                                        }
                                    ]
                   }

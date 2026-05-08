@@ -1,0 +1,603 @@
+#include "world/World.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/config/WorldConfig.h"
+#include <iostream>
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <chrono>
+#include <limits>
+
+// gatherDrawCommands(), gatherDrawCommandsInSphere(),
+// enqueueMeshForUpload() extracted from World.cpp
+
+// Helper: Calculate chunk AABB from chunk coordinate
+static AABB calculateChunkAABB(const glm::ivec3& chunkCoord) {
+    glm::vec3 minWorld = WorldConfig::microVoxelToWorld(WorldConfig::chunkToMicroVoxel(chunkCoord));
+    glm::vec3 maxWorld = minWorld + glm::vec3(WorldConfig::CHUNK_SIZE_M, WorldConfig::CHUNK_HEIGHT_M, WorldConfig::CHUNK_SIZE_M);
+    return AABB{minWorld, maxWorld};
+}
+
+static bool sphereIntersectsAABB(const glm::vec3& center, float radiusSq, const AABB& aabb) {
+    const float cx = std::max(aabb.min.x, std::min(center.x, aabb.max.x));
+    const float cy = std::max(aabb.min.y, std::min(center.y, aabb.max.y));
+    const float cz = std::max(aabb.min.z, std::min(center.z, aabb.max.z));
+    const glm::vec3 d = center - glm::vec3(cx, cy, cz);
+    return glm::dot(d, d) <= radiusSq;
+}
+
+static uint32_t sunCascadeMaskForChunkCenter(const glm::vec3& centerWorld,
+                                             const glm::mat4* cascadeVPs,
+                                             uint32_t cascadeCount,
+                                             uint32_t* outInnerRejected = nullptr) {
+    constexpr float kHalfChunkX = WorldConfig::CHUNK_SIZE_M * 0.5f;
+    constexpr float kHalfChunkY = WorldConfig::CHUNK_HEIGHT_M * 0.5f;
+    constexpr float kHalfChunkZ = WorldConfig::CHUNK_SIZE_M * 0.5f;
+
+    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipCx{};
+    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipCy{};
+    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipCz{};
+    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipHx{};
+    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipHy{};
+    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipHz{};
+    const uint32_t evalCount = std::min<uint32_t>(
+        cascadeCount, World::SUN_GATHER_DIAG_MAX_CASCADES);
+    for (uint32_t c = 0; c < evalCount; ++c) {
+        const glm::mat4& vp = cascadeVPs[c];
+        clipCx[c] =
+            vp[0][0] * centerWorld.x + vp[1][0] * centerWorld.y +
+            vp[2][0] * centerWorld.z + vp[3][0];
+        clipCy[c] =
+            vp[0][1] * centerWorld.x + vp[1][1] * centerWorld.y +
+            vp[2][1] * centerWorld.z + vp[3][1];
+        clipCz[c] =
+            vp[0][2] * centerWorld.x + vp[1][2] * centerWorld.y +
+            vp[2][2] * centerWorld.z + vp[3][2];
+        clipHx[c] =
+            std::abs(vp[0][0]) * kHalfChunkX +
+            std::abs(vp[1][0]) * kHalfChunkY +
+            std::abs(vp[2][0]) * kHalfChunkZ;
+        clipHy[c] =
+            std::abs(vp[0][1]) * kHalfChunkX +
+            std::abs(vp[1][1]) * kHalfChunkY +
+            std::abs(vp[2][1]) * kHalfChunkZ;
+        clipHz[c] =
+            std::abs(vp[0][2]) * kHalfChunkX +
+            std::abs(vp[1][2]) * kHalfChunkY +
+            std::abs(vp[2][2]) * kHalfChunkZ;
+    }
+
+    uint32_t mask = 0u;
+    uint32_t innerRejected = 0u;
+    constexpr float kCascadeBlendFrac = 0.12f;
+    constexpr float kInnerCascadeScale = 1.0f - kCascadeBlendFrac;
+    for (uint32_t c = 0; c < evalCount; ++c) {
+        if ((clipCx[c] + clipHx[c]) < -1.0f || (clipCx[c] - clipHx[c]) > 1.0f) continue;
+        if ((clipCy[c] + clipHy[c]) < -1.0f || (clipCy[c] - clipHy[c]) > 1.0f) continue;
+        if ((clipCz[c] + clipHz[c]) <  0.0f || (clipCz[c] - clipHz[c]) > 1.0f) continue;
+
+        if (c > 0u) {
+            const uint32_t inner = c - 1u;
+            const bool fullyInsideInnerReceiverRegion =
+                (clipCx[inner] - clipHx[inner]) >= -kInnerCascadeScale &&
+                (clipCx[inner] + clipHx[inner]) <=  kInnerCascadeScale &&
+                (clipCy[inner] - clipHy[inner]) >= -kInnerCascadeScale &&
+                (clipCy[inner] + clipHy[inner]) <=  kInnerCascadeScale &&
+                (clipCz[inner] - clipHz[inner]) >=  0.0f &&
+                (clipCz[inner] + clipHz[inner]) <=  1.0f;
+            if (fullyInsideInnerReceiverRegion) {
+                ++innerRejected;
+                continue;
+            }
+        }
+        mask |= (1u << c);
+    }
+    if (outInnerRejected) {
+        *outInnerRejected += innerRejected;
+    }
+    return mask;
+}
+
+uint32_t World::gatherDrawCommands(const glm::mat4& viewProj,
+                                    VkDrawIndexedIndirectCommand* outCmds,
+                                    glm::vec4* outOrigins,
+                                    uint32_t maxDraws,
+                                    uint64_t deviceTimeline) {
+    // Delegate to ChunkRenderSystem
+    return m_renderSystem.gatherDrawCommands(
+        m_registry,
+        m_registryMutex,
+        viewProj,
+        outCmds,
+        outOrigins,
+        maxDraws,
+        deviceTimeline);
+}
+
+uint32_t World::gatherDrawCommandsInSphere(const glm::vec3& center,
+                                           float radius,
+                                           VkDrawIndexedIndirectCommand* outCmds,
+                                           glm::vec4* outOrigins,
+                                           uint32_t maxDraws,
+                                           uint64_t deviceTimeline) {
+    if (!outCmds || !outOrigins || maxDraws == 0u || radius <= 0.0f) {
+        return 0u;
+    }
+
+    // Build a tight chunk-coordinate range from the light sphere.
+    const glm::vec3 minWorld = center - glm::vec3(radius);
+    const glm::vec3 maxWorld = center + glm::vec3(radius);
+    const glm::ivec3 minChunk = WorldConfig::microVoxelToChunk(WorldConfig::worldToMicroVoxel(minWorld));
+    const glm::ivec3 maxChunk = WorldConfig::microVoxelToChunk(WorldConfig::worldToMicroVoxel(maxWorld));
+    const float radiusSq = radius * radius;
+
+    // Direct hashmap lookup over the chunk-coord bbox in deterministic
+    // (z, y, x) order. For a typical 5 m point-light radius the bbox is
+    // 1×1×1 chunks (chunks are 32 m × 128 m × 32 m), so this is ~1 lookup
+    // instead of iterating every loaded chunk in the world. The (z, y, x)
+    // walk order matches the prior sorted-candidate order exactly, so the
+    // downstream shadow-cache terrain hash is bit-identical to the prior
+    // implementation — no visual or cache-invalidation change.
+    //
+    // Locks are taken separately (chunkState first, released, then registry)
+    // to match the rest of the engine's lock-order discipline and avoid
+    // introducing a new nested-lock pair.
+    struct CandidateChunk {
+        entt::entity entity{entt::null};
+        glm::ivec3 coord{0};
+    };
+    // Stack-friendly small buffer; orb radii in this engine are small so the
+    // bbox is almost always 1-8 chunks. Falls back to heap if it grows.
+    constexpr size_t kInlineCap = 32;
+    std::array<CandidateChunk, kInlineCap> inlineCandidates{};
+    std::vector<CandidateChunk> overflowCandidates;
+    size_t candidateCount = 0;
+    auto pushCandidate = [&](entt::entity e, const glm::ivec3& c) {
+        if (candidateCount < kInlineCap) {
+            inlineCandidates[candidateCount] = CandidateChunk{e, c};
+        } else {
+            if (overflowCandidates.empty()) overflowCandidates.reserve(64);
+            overflowCandidates.push_back(CandidateChunk{e, c});
+        }
+        ++candidateCount;
+    };
+    auto getCandidate = [&](size_t i) -> const CandidateChunk& {
+        return (i < kInlineCap) ? inlineCandidates[i] : overflowCandidates[i - kInlineCap];
+    };
+
+    {
+        std::shared_lock stateLock(m_chunkStateMutex);
+        for (int z = minChunk.z; z <= maxChunk.z; ++z) {
+            for (int y = minChunk.y; y <= maxChunk.y; ++y) {
+                for (int x = minChunk.x; x <= maxChunk.x; ++x) {
+                    const glm::ivec3 coord(x, y, z);
+                    auto it = m_chunkEntityMap.find(coord);
+                    if (it == m_chunkEntityMap.end()) continue;
+                    pushCandidate(it->second, coord);
+                }
+            }
+        }
+    }
+
+    uint32_t drawCount = 0u;
+    bool truncated = false;
+    {
+        std::shared_lock regLock(m_registryMutex);
+        for (size_t ci = 0; ci < candidateCount; ++ci) {
+            if (drawCount >= maxDraws) {
+                truncated = true;
+                break;
+            }
+            const CandidateChunk& candidate = getCandidate(ci);
+            const entt::entity entity = candidate.entity;
+            if (!m_registry.valid(entity)) continue;
+            if (!m_registry.all_of<ChunkState, MeshHandle, Chunk>(entity)) continue;
+
+            const auto& state = m_registry.get<ChunkState>(entity);
+            const auto& mesh = m_registry.get<MeshHandle>(entity);
+            const auto& chunk = m_registry.get<Chunk>(entity);
+
+            if (!chunk.isVisible) continue;
+            if (state.state != ChunkState::State::Ready) continue;
+            if (!mesh.isValid()) continue;
+            if (mesh.getTotalIndexCount() == 0) continue;
+            if (mesh.gpuReadyValue > deviceTimeline) continue;
+
+            const AABB chunkBounds = calculateChunkAABB(candidate.coord);
+            if (!sphereIntersectsAABB(center, radiusSq, chunkBounds)) continue;
+
+            for (uint8_t sc = 0; sc < mesh.subChunkCount && drawCount < maxDraws; ++sc) {
+                const auto& subChunk = mesh.subChunks[sc];
+                if (subChunk.indexCount == 0) continue;
+
+                VkDrawIndexedIndirectCommand& cmd = outCmds[drawCount];
+                cmd.indexCount = subChunk.indexCount;
+                cmd.instanceCount = 1u;
+                cmd.firstIndex = subChunk.firstIndex;
+                cmd.vertexOffset = subChunk.vertexOffset;
+                cmd.firstInstance = 0u;
+
+                outOrigins[drawCount] = glm::vec4(
+                    static_cast<float>(candidate.coord.x),
+                    static_cast<float>(candidate.coord.y),
+                    static_cast<float>(candidate.coord.z),
+                    0.0f);
+                ++drawCount;
+            }
+        }
+    }
+
+    static bool warnedSphereTruncationOnce = false;
+    if (truncated && !warnedSphereTruncationOnce) {
+        std::cout << "[World] gatherDrawCommandsInSphere truncated at " << maxDraws
+                  << " draws; consider increasing shadow local draw capacity." << std::endl;
+        warnedSphereTruncationOnce = true;
+    }
+
+    return drawCount;
+}
+
+uint32_t World::gatherDrawCommandsForSunCascades(
+    const glm::vec3& cameraPos,
+    const glm::vec3& sunDir,
+    const glm::mat4* cascadeVPs,
+    const float* cascadeHalfExtents,
+    uint32_t cascadeCount,
+    VkDrawIndexedIndirectCommand* outCmds,
+    glm::vec4* outOrigins,
+    uint16_t* outCascadeMasks,
+    uint32_t maxDraws,
+    uint64_t deviceTimeline,
+    SunCascadeGatherDiagnostics* diagnostics,
+    int32_t extraChunkPadding,
+    bool includeZeroMaskCandidates) {
+    using Clock = std::chrono::high_resolution_clock;
+    const auto totalStart = Clock::now();
+
+    if (diagnostics) {
+        *diagnostics = SunCascadeGatherDiagnostics{};
+        diagnostics->cascadeCount = cascadeCount;
+        diagnostics->maxDraws = maxDraws;
+    }
+
+    auto finishDiagnostics = [&]() {
+        if (diagnostics) {
+            diagnostics->totalMs = std::chrono::duration<float, std::milli>(
+                Clock::now() - totalStart).count();
+        }
+    };
+
+    if (!outCmds || !outOrigins || !outCascadeMasks ||
+        !cascadeVPs || !cascadeHalfExtents ||
+        cascadeCount == 0u || maxDraws == 0u) {
+        finishDiagnostics();
+        return 0u;
+    }
+
+    // ── Walk bounding box ───────────────────────────────────────────
+    // The largest cascade's clip volume in world XZ is roughly
+    // [cameraXZ ± halfExtent] expanded by chunk-height * |shear|
+    // (caster reach along the sun direction). Walking only chunks
+    // inside that box eliminates the huge spherical scan that the
+    // old single-radius gather performed at km-scale cascades.
+    float maxHalfExtent = 0.0f;
+    for (uint32_t c = 0; c < cascadeCount; ++c) {
+        maxHalfExtent = std::max(maxHalfExtent, cascadeHalfExtents[c]);
+    }
+    const float sinEl = std::max(-sunDir.y, 0.05f);
+    const float invSin = 1.0f / sinEl;
+    const float shearX = std::abs(sunDir.x) * invSin;
+    const float shearZ = std::abs(sunDir.z) * invSin;
+    const float shearMax = std::max(shearX, shearZ);
+    // Cap caster reach so very low sun (long shears) doesn't blow up the
+    // walk bounding box past sane limits.
+    const float casterReach = std::min(
+        WorldConfig::CHUNK_HEIGHT_M * shearMax,
+        std::max(maxHalfExtent * 2.0f, 768.0f));
+    const float padding = WorldConfig::CHUNK_SIZE_M * 2.0f;
+    const float halfX = maxHalfExtent + casterReach + padding;
+    const float halfZ = maxHalfExtent + casterReach + padding;
+
+    const glm::vec3 minWorld(cameraPos.x - halfX, -10000.0f, cameraPos.z - halfZ);
+    const glm::vec3 maxWorld(cameraPos.x + halfX,  10000.0f, cameraPos.z + halfZ);
+    glm::ivec3 minChunk = WorldConfig::microVoxelToChunk(WorldConfig::worldToMicroVoxel(minWorld));
+    glm::ivec3 maxChunk = WorldConfig::microVoxelToChunk(WorldConfig::worldToMicroVoxel(maxWorld));
+    const int32_t padChunks = std::max<int32_t>(extraChunkPadding, 0);
+    minChunk.x -= padChunks;
+    minChunk.z -= padChunks;
+    maxChunk.x += padChunks;
+    maxChunk.z += padChunks;
+
+    if (diagnostics) {
+        diagnostics->minChunk = minChunk;
+        diagnostics->maxChunk = maxChunk;
+        diagnostics->maxHalfExtent = maxHalfExtent;
+        diagnostics->sinElevation = sinEl;
+        diagnostics->shearX = shearX;
+        diagnostics->shearZ = shearZ;
+        diagnostics->shearMax = shearMax;
+        diagnostics->casterReach = casterReach;
+        diagnostics->padding = padding;
+        diagnostics->halfX = halfX;
+        diagnostics->halfZ = halfZ;
+    }
+
+    struct CandidateChunk {
+        entt::entity entity{entt::null};
+        glm::ivec3 coord{0};
+    };
+    std::vector<CandidateChunk> candidates;
+    const auto stateScanStart = Clock::now();
+    {
+        std::shared_lock stateLock(m_chunkStateMutex);
+        if (diagnostics) {
+            diagnostics->loadedChunkMapSize = static_cast<uint32_t>(
+                std::min<size_t>(m_chunkEntityMap.size(), std::numeric_limits<uint32_t>::max()));
+        }
+        candidates.reserve(m_chunkEntityMap.size());
+        for (const auto& [coord, entity] : m_chunkEntityMap) {
+            if (coord.x < minChunk.x || coord.x > maxChunk.x ||
+                coord.z < minChunk.z || coord.z > maxChunk.z) {
+                continue;
+            }
+            candidates.push_back(CandidateChunk{entity, coord});
+        }
+    }
+    if (diagnostics) {
+        diagnostics->stateMapScanMs = std::chrono::duration<float, std::milli>(
+            Clock::now() - stateScanStart).count();
+        diagnostics->bboxCandidateChunks = static_cast<uint32_t>(
+            std::min<size_t>(candidates.size(), std::numeric_limits<uint32_t>::max()));
+    }
+    if (diagnostics) {
+        diagnostics->candidateSortMs = 0.0f;
+    }
+
+    uint32_t drawCount = 0u;
+    bool truncated = false;
+    const auto registryStart = Clock::now();
+    {
+        std::shared_lock regLock(m_registryMutex);
+        for (const CandidateChunk& candidate : candidates) {
+            if (drawCount >= maxDraws) { truncated = true; break; }
+            if (diagnostics) ++diagnostics->visitedCandidateChunks;
+
+            const entt::entity entity = candidate.entity;
+            if (!m_registry.valid(entity)) {
+                if (diagnostics) ++diagnostics->invalidEntityRejects;
+                continue;
+            }
+            if (!m_registry.all_of<ChunkState, MeshHandle, Chunk>(entity)) {
+                if (diagnostics) ++diagnostics->missingComponentRejects;
+                continue;
+            }
+
+            const auto& state = m_registry.get<ChunkState>(entity);
+            const auto& mesh = m_registry.get<MeshHandle>(entity);
+            const auto& chunk = m_registry.get<Chunk>(entity);
+            if (!chunk.isVisible) {
+                if (diagnostics) ++diagnostics->invisibleRejects;
+                continue;
+            }
+            if (state.state != ChunkState::State::Ready) {
+                if (diagnostics) ++diagnostics->notReadyRejects;
+                continue;
+            }
+            if (!mesh.isValid()) {
+                if (diagnostics) ++diagnostics->invalidMeshRejects;
+                continue;
+            }
+            if (mesh.getTotalIndexCount() == 0) {
+                if (diagnostics) ++diagnostics->emptyMeshRejects;
+                continue;
+            }
+            if (mesh.gpuReadyValue > deviceTimeline) {
+                if (diagnostics) ++diagnostics->uploadPendingRejects;
+                continue;
+            }
+
+            const glm::vec3 centerWorld(
+                (candidate.coord.x + 0.5f) * WorldConfig::CHUNK_SIZE_M,
+                (candidate.coord.y + 0.5f) * WorldConfig::CHUNK_HEIGHT_M,
+                (candidate.coord.z + 0.5f) * WorldConfig::CHUNK_SIZE_M);
+            const uint32_t mask = sunCascadeMaskForChunkCenter(
+                centerWorld,
+                cascadeVPs,
+                cascadeCount,
+                diagnostics ? &diagnostics->cascadeInnerCullRejects : nullptr);
+            if (mask == 0u) {
+                if (diagnostics) ++diagnostics->cascadeCullRejects;
+                if (!includeZeroMaskCandidates) {
+                    continue;
+                }
+            }
+            if (diagnostics && mask != 0u) {
+                ++diagnostics->acceptedChunks;
+                const uint32_t diagCascadeCount = std::min<uint32_t>(
+                    cascadeCount, SUN_GATHER_DIAG_MAX_CASCADES);
+                for (uint32_t c = 0; c < diagCascadeCount; ++c) {
+                    if ((mask & (1u << c)) != 0u) {
+                        ++diagnostics->cascadeChunkHits[c];
+                    }
+                }
+            }
+
+            for (uint8_t sc = 0; sc < mesh.subChunkCount && drawCount < maxDraws; ++sc) {
+                const auto& subChunk = mesh.subChunks[sc];
+                if (subChunk.indexCount == 0) continue;
+
+                VkDrawIndexedIndirectCommand& cmd = outCmds[drawCount];
+                cmd.indexCount = subChunk.indexCount;
+                cmd.instanceCount = 1u;
+                cmd.firstIndex = subChunk.firstIndex;
+                cmd.vertexOffset = subChunk.vertexOffset;
+                cmd.firstInstance = 0u;
+                outOrigins[drawCount] = glm::vec4(
+                    static_cast<float>(candidate.coord.x),
+                    static_cast<float>(candidate.coord.y),
+                    static_cast<float>(candidate.coord.z),
+                    0.0f);
+                outCascadeMasks[drawCount] = static_cast<uint16_t>(mask);
+                if (diagnostics) {
+                    const uint32_t diagCascadeCount = std::min<uint32_t>(
+                        cascadeCount, SUN_GATHER_DIAG_MAX_CASCADES);
+                    for (uint32_t c = 0; c < diagCascadeCount; ++c) {
+                        if ((mask & (1u << c)) != 0u) {
+                            ++diagnostics->cascadeDrawHits[c];
+                        }
+                    }
+                }
+                ++drawCount;
+            }
+        }
+    }
+    if (diagnostics) {
+        diagnostics->registryWalkMs = std::chrono::duration<float, std::milli>(
+            Clock::now() - registryStart).count();
+        diagnostics->truncated = truncated;
+        diagnostics->emittedDraws = drawCount;
+    }
+
+    static bool warnedCascadeTruncationOnce = false;
+    if (truncated && !warnedCascadeTruncationOnce) {
+        std::cout << "[World] gatherDrawCommandsForSunCascades truncated at "
+                  << maxDraws << " draws." << std::endl;
+        warnedCascadeTruncationOnce = true;
+    }
+
+    finishDiagnostics();
+    return drawCount;
+}
+
+uint32_t World::gatherDrawCommandsForSunCascadeChunk(
+    const glm::ivec3& chunkCoord,
+    const glm::mat4* cascadeVPs,
+    uint32_t cascadeCount,
+    VkDrawIndexedIndirectCommand* outCmds,
+    glm::vec4* outOrigins,
+    uint16_t* outCascadeMasks,
+    uint32_t maxDraws,
+    uint64_t deviceTimeline,
+    bool includeZeroMaskCandidate) {
+    if (!outCmds || !outOrigins || !outCascadeMasks ||
+        !cascadeVPs || cascadeCount == 0u || maxDraws == 0u) {
+        return 0u;
+    }
+
+    entt::entity entity = entt::null;
+    {
+        std::shared_lock stateLock(m_chunkStateMutex);
+        auto it = m_chunkEntityMap.find(chunkCoord);
+        if (it == m_chunkEntityMap.end()) {
+            return 0u;
+        }
+        entity = it->second;
+    }
+
+    std::shared_lock regLock(m_registryMutex);
+    if (!m_registry.valid(entity)) return 0u;
+    if (!m_registry.all_of<ChunkState, MeshHandle, Chunk>(entity)) return 0u;
+
+    const auto& state = m_registry.get<ChunkState>(entity);
+    const auto& mesh = m_registry.get<MeshHandle>(entity);
+    const auto& chunk = m_registry.get<Chunk>(entity);
+    if (!chunk.isVisible) return 0u;
+    if (state.state != ChunkState::State::Ready) return 0u;
+    if (!mesh.isValid()) return 0u;
+    if (mesh.getTotalIndexCount() == 0) return 0u;
+    if (mesh.gpuReadyValue > deviceTimeline) return 0u;
+
+    const glm::vec3 centerWorld(
+        (chunkCoord.x + 0.5f) * WorldConfig::CHUNK_SIZE_M,
+        (chunkCoord.y + 0.5f) * WorldConfig::CHUNK_HEIGHT_M,
+        (chunkCoord.z + 0.5f) * WorldConfig::CHUNK_SIZE_M);
+    const uint32_t mask = sunCascadeMaskForChunkCenter(centerWorld, cascadeVPs, cascadeCount);
+    if (mask == 0u && !includeZeroMaskCandidate) {
+        return 0u;
+    }
+
+    uint32_t drawCount = 0u;
+    for (uint8_t sc = 0; sc < mesh.subChunkCount && drawCount < maxDraws; ++sc) {
+        const auto& subChunk = mesh.subChunks[sc];
+        if (subChunk.indexCount == 0) continue;
+
+        VkDrawIndexedIndirectCommand& cmd = outCmds[drawCount];
+        cmd.indexCount = subChunk.indexCount;
+        cmd.instanceCount = 1u;
+        cmd.firstIndex = subChunk.firstIndex;
+        cmd.vertexOffset = subChunk.vertexOffset;
+        cmd.firstInstance = 0u;
+        outOrigins[drawCount] = glm::vec4(
+            static_cast<float>(chunkCoord.x),
+            static_cast<float>(chunkCoord.y),
+            static_cast<float>(chunkCoord.z),
+            0.0f);
+        outCascadeMasks[drawCount] = static_cast<uint16_t>(mask);
+        ++drawCount;
+    }
+    return drawCount;
+}
+
+void World::enqueueMeshForUpload(entt::entity entity,
+                                  MeshData&& mesh,
+                                  bool fromTerrainEdit,
+                                  std::shared_ptr<ChunkVersionState> versionState,
+                                  uint32_t version,
+                                  ChunkDebugAttribution debugInfo) {
+    m_uploadSystem.enqueueMeshForUpload(entity, std::move(mesh), fromTerrainEdit, versionState, version,
+                                        std::chrono::steady_clock::time_point{}, debugInfo);
+}
+
+void World::enqueueMeshForUpload(entt::entity entity,
+                                  std::vector<MeshData>&& subChunks,
+                                  uint8_t mainSubChunkCount,
+                                  bool fromTerrainEdit,
+                                  std::shared_ptr<ChunkVersionState> versionState,
+                                  uint32_t version,
+                                  glm::vec3 tightMin,
+                                  glm::vec3 tightMax,
+                                  bool hasTight,
+                                  bool isRemesh,
+                                  uint32_t batchId,
+                                  ChunkDebugAttribution debugInfo) {
+    m_uploadSystem.enqueueMeshForUpload(entity, std::move(subChunks), mainSubChunkCount, fromTerrainEdit,
+                                        versionState, version, tightMin, tightMax, hasTight,
+                                        isRemesh, batchId, std::chrono::steady_clock::time_point{},
+                                        debugInfo);
+}
+
+// ---- Render facade definitions extracted from World.h ----
+
+void World::setVramBudgetMB(uint32_t megabytes) {
+    m_renderSystem.setVramBudgetMB(megabytes);
+}
+
+uint64_t World::getVramBudgetBytes() const {
+    return m_renderSystem.getVramBudgetBytes();
+}
+
+uint64_t World::getCurrentVramUsage() const {
+    return m_renderSystem.getCurrentVramUsage();
+}
+
+void World::setEnableVramLimiting(bool enable) {
+    m_renderSystem.setEnableVramLimiting(enable);
+}
+
+bool World::isVramLimitingEnabled() const {
+    return m_renderSystem.isVramLimitingEnabled();
+}
+
+bool World::hadUploadsThisFrame() const {
+    return m_hadUploadsThisFrame;
+}
+
+bool World::hadEditUploadsThisFrame() const {
+    return m_hadEditUploadsThisFrame || (m_hiZEditCooldown > 0);
+}
+
+void World::setChunkVisible(entt::entity entity, bool visible) {
+    if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
+        m_registry.get<Chunk>(entity).isVisible = visible;
+    }
+}

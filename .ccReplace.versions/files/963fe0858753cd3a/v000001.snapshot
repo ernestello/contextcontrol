@@ -1,0 +1,63 @@
+#pragma once
+
+// GPT-DESC: Defines World terrain-edit placement, visual tracking, and ghost-geometry helper types.
+#include <chrono>
+#include <cstdint>
+
+#include <glm/glm.hpp>
+
+#include "world/WorldTypes.h"
+#include "world/config/WorldConfig.h"
+
+namespace WorldData {
+
+struct TerrainEditPlacementContext {
+    bool valid{false};
+    glm::ivec3 chunkCoord{0, 0, 0};
+    int bandLodLevel{0};
+    int previewLodLevel{0};
+    TerrainType terrainType{TerrainType::Voxel};
+    float voxelSizeM{WorldConfig::VOXEL_SIZE_M};
+};
+
+struct PendingEditVisualChunk {
+    uint64_t editId{0};
+    std::chrono::steady_clock::time_point startTime{};
+};
+
+struct PendingEditVisualAggregate {
+    std::chrono::steady_clock::time_point startTime{};
+    uint32_t totalChunks{0};
+    uint32_t readyChunks{0};
+    uint32_t supersededChunks{0};
+    float visualFirstChunkMs{0.0f};
+    float visualCompleteMs{0.0f};
+    uint64_t uploadBytes{0};
+    uint32_t artifactBuilds{0};
+    uint32_t artifactCacheHits{0};
+    uint32_t precomputedLoads{0};
+    uint32_t collisionBaseCache{0};
+    uint32_t collisionEditPacked{0};
+    uint32_t collisionArtifactRefresh{0};
+    uint32_t collisionExistingEdit{0};
+    uint32_t gpuResidentChunks{0};
+    uint32_t artifactResidentChunks{0};
+    uint32_t monolithicChunks{0};
+    uint32_t pagedChunks{0};
+    uint32_t dirtyPages{0};
+    uint32_t rebuiltPages{0};
+    uint32_t residentPages{0};
+    uint32_t evictedPages{0};
+};
+
+struct ChunkLoadTracker {
+    uint64_t editId{0};
+    uint32_t loadCount{0};
+};
+
+struct GhostGeometryState {
+    uint32_t consecutiveBrokenScans{0};
+    uint64_t lastReportedScanIndex{0};
+};
+
+} // namespace WorldData
