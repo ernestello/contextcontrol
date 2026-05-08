@@ -1,0 +1,269 @@
+#include "../ShadowInternal.h"
+
+// GPT-DESC: Plans and records sun-cascade scroll reuse for directional shadow layers.
+
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+
+#include <array>
+#include <cmath>
+#include <cstdint>
+
+namespace ShadowSystemInternal {
+
+SunCascadeScrollPlan makeSunCascadeScrollPlan(
+    const glm::mat4& oldVP,
+    const glm::mat4& newVP,
+    uint32_t mapSize) {
+    SunCascadeScrollPlan plan{};
+    if (mapSize == 0u) {
+        return plan;
+    }
+
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            if (col == 3 && (row == 0 || row == 1)) {
+                continue;
+            }
+            if (floatToBits(oldVP[col][row]) != floatToBits(newVP[col][row])) {
+                return plan;
+            }
+        }
+    }
+
+    const float halfMap = static_cast<float>(mapSize) * 0.5f;
+    const float dxFloat = (newVP[3][0] - oldVP[3][0]) * halfMap;
+    const float dyFloat = (newVP[3][1] - oldVP[3][1]) * halfMap;
+    const int32_t dx = static_cast<int32_t>(std::lround(dxFloat));
+    const int32_t dy = static_cast<int32_t>(std::lround(dyFloat));
+    if (std::abs(dxFloat - static_cast<float>(dx)) > kSunScrollTexelEpsilon ||
+        std::abs(dyFloat - static_cast<float>(dy)) > kSunScrollTexelEpsilon) {
+        return plan;
+    }
+    if (dx == 0 && dy == 0) {
+        return plan;
+    }
+
+    const uint32_t absDx = static_cast<uint32_t>(std::abs(dx));
+    const uint32_t absDy = static_cast<uint32_t>(std::abs(dy));
+    if (absDx >= mapSize || absDy >= mapSize) {
+        return plan;
+    }
+
+    const uint64_t fullTexels =
+        static_cast<uint64_t>(mapSize) * static_cast<uint64_t>(mapSize);
+    const uint64_t copiedTexels =
+        static_cast<uint64_t>(mapSize - absDx) *
+        static_cast<uint64_t>(mapSize - absDy);
+    const uint64_t dirtyTexels = fullTexels - copiedTexels;
+    const float dirtyFraction =
+        static_cast<float>(static_cast<double>(dirtyTexels) /
+                           static_cast<double>(fullTexels));
+    if (dirtyFraction > kSunScrollMaxDirtyFraction) {
+        return plan;
+    }
+
+    plan.enabled = true;
+    plan.dxTexels = dx;
+    plan.dyTexels = dy;
+    plan.copiedTexels = copiedTexels;
+    plan.dirtyTexels = dirtyTexels;
+    return plan;
+}
+
+std::array<VkRect2D, 2> sunScrollDirtyRects(
+    uint32_t mapSize,
+    const SunCascadeScrollPlan& plan,
+    uint32_t& rectCountOut) {
+    std::array<VkRect2D, 2> rects{};
+    rectCountOut = 0u;
+    if (!plan.enabled || mapSize == 0u) {
+        return rects;
+    }
+
+    const int32_t map = static_cast<int32_t>(mapSize);
+    const int32_t dx = plan.dxTexels;
+    const int32_t dy = plan.dyTexels;
+    if (dx != 0) {
+        VkRect2D& r = rects[rectCountOut++];
+        r.offset.x = (dx > 0) ? 0 : (map + dx);
+        r.offset.y = 0;
+        r.extent.width = static_cast<uint32_t>(std::abs(dx));
+        r.extent.height = mapSize;
+    }
+    if (dy != 0) {
+        VkRect2D& r = rects[rectCountOut++];
+        r.offset.x = (dx > 0) ? std::abs(dx) : 0;
+        r.offset.y = (dy > 0) ? 0 : (map + dy);
+        r.extent.width = mapSize - static_cast<uint32_t>(std::abs(dx));
+        r.extent.height = static_cast<uint32_t>(std::abs(dy));
+    }
+    return rects;
+}
+
+} // namespace ShadowSystemInternal
+
+using namespace ShadowSystemInternal;
+
+void ShadowSystem::recordSunCascadeScrollCopy(
+    VkCommandBuffer cmd,
+    uint32_t cascade,
+    const SunCascadeScrollPlan& plan) {
+    if (!plan.enabled || m_sunShadowScrollScratchImage == VK_NULL_HANDLE) {
+        return;
+    }
+
+    const uint32_t mapSize = m_sunRuntimeConfig.mapSize;
+    const uint32_t absDx = static_cast<uint32_t>(std::abs(plan.dxTexels));
+    const uint32_t absDy = static_cast<uint32_t>(std::abs(plan.dyTexels));
+    const uint32_t copyWidth = mapSize - absDx;
+    const uint32_t copyHeight = mapSize - absDy;
+    if (copyWidth == 0u || copyHeight == 0u) {
+        return;
+    }
+
+    const int32_t srcX = (plan.dxTexels > 0) ? 0 : static_cast<int32_t>(absDx);
+    const int32_t srcY = (plan.dyTexels > 0) ? 0 : static_cast<int32_t>(absDy);
+    const int32_t dstX = (plan.dxTexels > 0) ? plan.dxTexels : 0;
+    const int32_t dstY = (plan.dyTexels > 0) ? plan.dyTexels : 0;
+
+    std::array<VkImageMemoryBarrier2, 2> toTransfer{};
+    toTransfer[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toTransfer[0].srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    toTransfer[0].srcAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    toTransfer[0].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    toTransfer[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    toTransfer[0].oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    toTransfer[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toTransfer[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer[0].image = m_sunShadowImage;
+    toTransfer[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    toTransfer[0].subresourceRange.baseMipLevel = 0;
+    toTransfer[0].subresourceRange.levelCount = 1;
+    toTransfer[0].subresourceRange.baseArrayLayer = cascade;
+    toTransfer[0].subresourceRange.layerCount = 1;
+
+    toTransfer[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toTransfer[1].srcStageMask =
+        (m_sunShadowScrollScratchLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+            ? VK_PIPELINE_STAGE_2_NONE
+            : VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    toTransfer[1].srcAccessMask =
+        (m_sunShadowScrollScratchLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+            ? VK_ACCESS_2_NONE
+            : VK_ACCESS_2_TRANSFER_READ_BIT;
+    toTransfer[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    toTransfer[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toTransfer[1].oldLayout = m_sunShadowScrollScratchLayout;
+    toTransfer[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransfer[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer[1].image = m_sunShadowScrollScratchImage;
+    toTransfer[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    toTransfer[1].subresourceRange.baseMipLevel = 0;
+    toTransfer[1].subresourceRange.levelCount = 1;
+    toTransfer[1].subresourceRange.baseArrayLayer = 0;
+    toTransfer[1].subresourceRange.layerCount = 1;
+
+    VkDependencyInfo toTransferDep{};
+    toTransferDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    toTransferDep.imageMemoryBarrierCount = static_cast<uint32_t>(toTransfer.size());
+    toTransferDep.pImageMemoryBarriers = toTransfer.data();
+    vkCmdPipelineBarrier2(cmd, &toTransferDep);
+    m_sunShadowScrollScratchLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+    VkImageCopy copyToScratch{};
+    copyToScratch.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    copyToScratch.srcSubresource.mipLevel = 0;
+    copyToScratch.srcSubresource.baseArrayLayer = cascade;
+    copyToScratch.srcSubresource.layerCount = 1;
+    copyToScratch.srcOffset = {srcX, srcY, 0};
+    copyToScratch.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    copyToScratch.dstSubresource.mipLevel = 0;
+    copyToScratch.dstSubresource.baseArrayLayer = 0;
+    copyToScratch.dstSubresource.layerCount = 1;
+    copyToScratch.dstOffset = {0, 0, 0};
+    copyToScratch.extent = {copyWidth, copyHeight, 1};
+    vkCmdCopyImage(
+        cmd,
+        m_sunShadowImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        m_sunShadowScrollScratchImage,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copyToScratch);
+
+    std::array<VkImageMemoryBarrier2, 2> toCopyBack{};
+    toCopyBack[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toCopyBack[0].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    toCopyBack[0].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toCopyBack[0].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    toCopyBack[0].dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    toCopyBack[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toCopyBack[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toCopyBack[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toCopyBack[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toCopyBack[0].image = m_sunShadowScrollScratchImage;
+    toCopyBack[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    toCopyBack[0].subresourceRange.baseMipLevel = 0;
+    toCopyBack[0].subresourceRange.levelCount = 1;
+    toCopyBack[0].subresourceRange.baseArrayLayer = 0;
+    toCopyBack[0].subresourceRange.layerCount = 1;
+
+    toCopyBack[1] = toTransfer[0];
+    toCopyBack[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    toCopyBack[1].srcAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+    toCopyBack[1].dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    toCopyBack[1].dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toCopyBack[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toCopyBack[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+
+    VkDependencyInfo toCopyBackDep{};
+    toCopyBackDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    toCopyBackDep.imageMemoryBarrierCount = static_cast<uint32_t>(toCopyBack.size());
+    toCopyBackDep.pImageMemoryBarriers = toCopyBack.data();
+    vkCmdPipelineBarrier2(cmd, &toCopyBackDep);
+    m_sunShadowScrollScratchLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
+    VkImageCopy copyBack = copyToScratch;
+    copyBack.srcSubresource.baseArrayLayer = 0;
+    copyBack.srcOffset = {0, 0, 0};
+    copyBack.dstSubresource.baseArrayLayer = cascade;
+    copyBack.dstOffset = {dstX, dstY, 0};
+    vkCmdCopyImage(
+        cmd,
+        m_sunShadowScrollScratchImage,
+        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        m_sunShadowImage,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        1,
+        &copyBack);
+
+    VkImageMemoryBarrier2 toAttachment{};
+    toAttachment.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toAttachment.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+    toAttachment.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    toAttachment.dstStageMask =
+        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toAttachment.dstAccessMask =
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toAttachment.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toAttachment.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    toAttachment.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttachment.image = m_sunShadowImage;
+    toAttachment.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    toAttachment.subresourceRange.baseMipLevel = 0;
+    toAttachment.subresourceRange.levelCount = 1;
+    toAttachment.subresourceRange.baseArrayLayer = cascade;
+    toAttachment.subresourceRange.layerCount = 1;
+
+    VkDependencyInfo toAttachmentDep{};
+    toAttachmentDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    toAttachmentDep.imageMemoryBarrierCount = 1;
+    toAttachmentDep.pImageMemoryBarriers = &toAttachment;
+    vkCmdPipelineBarrier2(cmd, &toAttachmentDep);
+}

@@ -20,207 +20,32 @@ Minimal rules for this turn:
 Default CMake build, when applicable: cmake --build build --config Release -j
 
 
-## src\rendering\lighting\ShadowMapRendering.cpp
+## src\rendering\lighting\shadow\ShadowSunCascades.cpp
 
 Description: No CC-DESC found.
 
 ````cpp
-#include "rendering/lighting/ShadowSystem.h"
+#include "ShadowInternal.h"
 
 #include "world/World.h"
 #include "world/config/WorldConfig.h"
 
+// GPT-DESC: Implements sun-cascade helper math, gather bounds, scroll planning, and topology invalidation.
+
 #define GLM_FORCE_RADIANS
 #define GLM_FORCE_DEPTH_ZERO_TO_ONE
-#include <glm/gtc/matrix_transform.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <initializer_list>
 #include <limits>
-#include <type_traits>
 #include <vector>
 
-namespace {
-
-constexpr uint32_t kInvalidSourceIndex = std::numeric_limits<uint32_t>::max();
-constexpr uint32_t kPointShadowFacesPerLight = 6u;
-constexpr float kShadowCacheEpsilon = 0.0001f;
-constexpr int32_t kSunGatherCachePaddingChunks = 12;
-constexpr float kSunScrollTexelEpsilon = 0.01f;
-constexpr float kSunScrollMaxDirtyFraction = 0.08f;
-
-uint32_t floatToBits(float value) {
-    uint32_t bits = 0u;
-    std::memcpy(&bits, &value, sizeof(bits));
-    return bits;
-}
-
-void hashCombine64(uint64_t& hash, uint64_t v) {
-    hash ^= v + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
-}
-
-uint64_t rotl64(uint64_t v, uint32_t shift) {
-    return (v << shift) | (v >> (64u - shift));
-}
-
-bool nearlyEqual(float a, float b, float eps = kShadowCacheEpsilon) {
-    return std::abs(a - b) <= eps;
-}
-
-bool nearlyEqualVec3(const glm::vec3& a, const glm::vec3& b, float eps = kShadowCacheEpsilon) {
-    return nearlyEqual(a.x, b.x, eps) &&
-           nearlyEqual(a.y, b.y, eps) &&
-           nearlyEqual(a.z, b.z, eps);
-}
-
-bool sameBitsVec3(const glm::vec3& a, const glm::vec3& b) {
-    return floatToBits(a.x) == floatToBits(b.x) &&
-           floatToBits(a.y) == floatToBits(b.y) &&
-           floatToBits(a.z) == floatToBits(b.z);
-}
-
-uint64_t hashTerrainDrawContext(const ShadowSystem::DrawContext& ctx) {
-    auto handleToU64 = [](auto handle) -> uint64_t {
-        using T = decltype(handle);
-        if constexpr (std::is_pointer_v<T>) {
-            return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
-        } else {
-            return static_cast<uint64_t>(handle);
-        }
-    };
-
-    uint64_t h = 1469598103934665603ull;
-    hashCombine64(h, handleToU64(ctx.terrainVertexBuffer));
-    hashCombine64(h, handleToU64(ctx.terrainIndexBuffer));
-    hashCombine64(h, handleToU64(ctx.indirectBuffer));
-    hashCombine64(h, static_cast<uint64_t>(ctx.indirectDrawCount));
-    hashCombine64(h, static_cast<uint64_t>(ctx.useGPUCulling ? 1u : 0u));
-    hashCombine64(h, handleToU64(ctx.gpuVisibleDrawsBuffer));
-    hashCombine64(h, handleToU64(ctx.gpuDrawCountBuffer));
-    hashCombine64(h, static_cast<uint64_t>(ctx.gpuMaxDraws));
-    hashCombine64(h, ctx.terrainEditRevision);
-    hashCombine64(h, ctx.terrainMeshRevision);
-    return h;
-}
-
-uint64_t hashTerrainDrawKey(const VkDrawIndexedIndirectCommand& d, const glm::vec4& o) {
-    uint64_t h = 1469598103934665603ull;
-    hashCombine64(h, static_cast<uint64_t>(d.indexCount));
-    hashCombine64(h, static_cast<uint64_t>(d.firstIndex));
-    hashCombine64(h, static_cast<uint64_t>(static_cast<uint32_t>(d.vertexOffset)));
-    hashCombine64(h, static_cast<uint64_t>(floatToBits(o.x)));
-    hashCombine64(h, static_cast<uint64_t>(floatToBits(o.y)));
-    hashCombine64(h, static_cast<uint64_t>(floatToBits(o.z)));
-    return h;
-}
-
-void hashTerrainDrawSetAdd(uint64_t key,
-                           uint64_t& sumA,
-                           uint64_t& sumB,
-                           uint64_t& xorA) {
-    constexpr uint64_t kMulA = 0xbf58476d1ce4e5b9ull;
-    constexpr uint64_t kMulB = 0x94d049bb133111ebull;
-    sumA += key;
-    sumB += rotl64(key * kMulA, 23u) ^ (key * kMulB);
-    xorA ^= key + 0x9e3779b97f4a7c15ull;
-}
-
-uint64_t finishTerrainDrawSetHash(uint32_t count,
-                                  uint64_t sumA,
-                                  uint64_t sumB,
-                                  uint64_t xorA) {
-    uint64_t h = 1469598103934665603ull;
-    hashCombine64(h, static_cast<uint64_t>(count));
-    hashCombine64(h, sumA);
-    hashCombine64(h, sumB);
-    hashCombine64(h, xorA);
-    return h;
-}
-
-uint64_t hashLocalTerrainDraws(const std::vector<VkDrawIndexedIndirectCommand>& draws,
-                               const std::vector<glm::vec4>& origins,
-                               uint32_t count) {
-    uint64_t sumA = 0u;
-    uint64_t sumB = 0u;
-    uint64_t xorA = 0u;
-    for (uint32_t i = 0; i < count; ++i) {
-        hashTerrainDrawSetAdd(hashTerrainDrawKey(draws[i], origins[i]), sumA, sumB, xorA);
-    }
-    return finishTerrainDrawSetHash(count, sumA, sumB, xorA);
-}
-
-uint64_t hashSunCascadeVP(const std::array<glm::mat4, ShadowSystem::MAX_SUN_SHADOW_CASCADES>& vps,
-                          uint32_t cascadeCount) {
-    uint64_t h = 1469598103934665603ull;
-    hashCombine64(h, static_cast<uint64_t>(cascadeCount));
-    const uint32_t count = std::min<uint32_t>(cascadeCount, ShadowSystem::MAX_SUN_SHADOW_CASCADES);
-    for (uint32_t c = 0; c < count; ++c) {
-        const glm::mat4& m = vps[c];
-        for (int col = 0; col < 4; ++col) {
-            for (int row = 0; row < 4; ++row) {
-                hashCombine64(h, static_cast<uint64_t>(floatToBits(m[col][row])));
-            }
-        }
-    }
-    return h;
-}
-
-std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES>
-hashLocalTerrainDrawsPerCascade(
-    const std::vector<VkDrawIndexedIndirectCommand>& draws,
-    const std::vector<glm::vec4>& origins,
-    const std::vector<uint16_t>& cascadeMasks,
-    uint32_t count,
-    uint32_t cascadeCount) {
-    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> hashes{};
-    std::array<uint32_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> counts{};
-    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> sumA{};
-    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> sumB{};
-    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> xorA{};
-
-    const uint32_t evalCount =
-        std::min<uint32_t>(cascadeCount, ShadowSystem::MAX_SUN_SHADOW_CASCADES);
-    for (uint32_t i = 0; i < count; ++i) {
-        const auto& d = draws[i];
-        const auto& o = origins[i];
-        const uint16_t mask = cascadeMasks[i];
-        const uint64_t key = hashTerrainDrawKey(d, o);
-        for (uint32_t c = 0; c < evalCount; ++c) {
-            if ((mask & static_cast<uint16_t>(1u << c)) == 0u) {
-                continue;
-            }
-            ++counts[c];
-            hashTerrainDrawSetAdd(key, sumA[c], sumB[c], xorA[c]);
-        }
-    }
-
-    for (uint32_t c = 0; c < evalCount; ++c) {
-        hashes[c] = finishTerrainDrawSetHash(counts[c], sumA[c], sumB[c], xorA[c]);
-        hashCombine64(hashes[c], static_cast<uint64_t>(c));
-    }
-    return hashes;
-}
-
-uint64_t hashSunCascadeLayerVP(const glm::mat4& vp) {
-    uint64_t h = 1469598103934665603ull;
-    for (int col = 0; col < 4; ++col) {
-        for (int row = 0; row < 4; ++row) {
-            hashCombine64(h, static_cast<uint64_t>(floatToBits(vp[col][row])));
-        }
-    }
-    return h;
-}
-
-struct SunCascadeScrollPlan {
-    bool enabled{false};
-    int32_t dxTexels{0};
-    int32_t dyTexels{0};
-    uint64_t copiedTexels{0};
-    uint64_t dirtyTexels{0};
-};
+namespace ShadowSystemInternal {
 
 SunCascadeScrollPlan makeSunCascadeScrollPlan(
     const glm::mat4& oldVP,
@@ -312,71 +137,6 @@ std::array<VkRect2D, 2> sunScrollDirtyRects(
     return rects;
 }
 
-bool chunkIntersectsSunCascadeClip(const glm::mat4& vp, const glm::vec4& chunkCoord) {
-    constexpr float kHalfChunkX = WorldConfig::CHUNK_SIZE_M * 0.5f;
-    constexpr float kHalfChunkY = WorldConfig::CHUNK_HEIGHT_M * 0.5f;
-    constexpr float kHalfChunkZ = WorldConfig::CHUNK_SIZE_M * 0.5f;
-
-    const glm::vec3 centerWorld(
-        (chunkCoord.x + 0.5f) * WorldConfig::CHUNK_SIZE_M,
-        (chunkCoord.y + 0.5f) * WorldConfig::CHUNK_HEIGHT_M,
-        (chunkCoord.z + 0.5f) * WorldConfig::CHUNK_SIZE_M);
-
-    const float clipCenterX =
-        vp[0][0] * centerWorld.x +
-        vp[1][0] * centerWorld.y +
-        vp[2][0] * centerWorld.z +
-        vp[3][0];
-    const float clipCenterY =
-        vp[0][1] * centerWorld.x +
-        vp[1][1] * centerWorld.y +
-        vp[2][1] * centerWorld.z +
-        vp[3][1];
-    const float clipCenterZ =
-        vp[0][2] * centerWorld.x +
-        vp[1][2] * centerWorld.y +
-        vp[2][2] * centerWorld.z +
-        vp[3][2];
-
-    const float clipHalfX =
-        std::abs(vp[0][0]) * kHalfChunkX +
-        std::abs(vp[1][0]) * kHalfChunkY +
-        std::abs(vp[2][0]) * kHalfChunkZ;
-    const float clipHalfY =
-        std::abs(vp[0][1]) * kHalfChunkX +
-        std::abs(vp[1][1]) * kHalfChunkY +
-        std::abs(vp[2][1]) * kHalfChunkZ;
-    const float clipHalfZ =
-        std::abs(vp[0][2]) * kHalfChunkX +
-        std::abs(vp[1][2]) * kHalfChunkY +
-        std::abs(vp[2][2]) * kHalfChunkZ;
-
-    if ((clipCenterX + clipHalfX) < -1.0f || (clipCenterX - clipHalfX) > 1.0f) {
-        return false;
-    }
-    if ((clipCenterY + clipHalfY) < -1.0f || (clipCenterY - clipHalfY) > 1.0f) {
-        return false;
-    }
-    if ((clipCenterZ + clipHalfZ) < 0.0f || (clipCenterZ - clipHalfZ) > 1.0f) {
-        return false;
-    }
-    return true;
-}
-
-struct SunGatherBounds {
-    glm::ivec3 minChunk{0};
-    glm::ivec3 maxChunk{0};
-    float maxHalfExtent{0.0f};
-    float sinElevation{0.0f};
-    float shearX{0.0f};
-    float shearZ{0.0f};
-    float shearMax{0.0f};
-    float casterReach{0.0f};
-    float padding{0.0f};
-    float halfX{0.0f};
-    float halfZ{0.0f};
-};
-
 SunGatherBounds computeSunGatherBounds(
     const glm::vec3& cameraPos,
     const glm::vec3& sunDir,
@@ -409,7 +169,7 @@ uint16_t sunCascadeMaskForChunkCoord(
     const glm::vec4& chunkCoord,
     const std::array<glm::mat4, ShadowSystem::MAX_SUN_SHADOW_CASCADES>& cascadeVPs,
     uint32_t cascadeCount,
-    uint32_t* outInnerRejected = nullptr) {
+    uint32_t* outInnerRejected) {
     constexpr float kHalfChunkX = WorldConfig::CHUNK_SIZE_M * 0.5f;
     constexpr float kHalfChunkY = WorldConfig::CHUNK_HEIGHT_M * 0.5f;
     constexpr float kHalfChunkZ = WorldConfig::CHUNK_SIZE_M * 0.5f;
@@ -493,7 +253,7 @@ uint32_t meshTopologyChangeCascadeMask(
     uint64_t cachedRevision,
     const std::array<glm::mat4, ShadowSystem::MAX_SUN_SHADOW_CASCADES>& cascadeVPs,
     uint32_t cascadeCount,
-    bool* reliableOut = nullptr) {
+    bool* reliableOut) {
     if (reliableOut) *reliableOut = true;
     if (!ctx.world || cachedRevision == ctx.terrainMeshRevision) {
         return 0u;
@@ -521,28 +281,13 @@ uint32_t meshTopologyChangeCascadeMask(
     return mask & allMask;
 }
 
-} // namespace
+} // namespace ShadowSystemInternal
 
-void ShadowSystem::recordShadowPasses(VkCommandBuffer cmd,
-                                      uint32_t imageIndex,
-                                      const DrawContext& ctx) {
-    if (!m_initialized || imageIndex >= m_shadowDataBuffers.size()) {
-        return;
-    }
+using namespace ShadowSystemInternal;
 
-    const bool haveTimingQueries =
-        (m_lightTimingQueryPool != VK_NULL_HANDLE) &&
-        (imageIndex < m_lightTimingImageCount) &&
-        (imageIndex < m_querySourceByImage.size()) &&
-        (imageIndex < m_queryLightCountByImage.size());
-    const uint32_t queryBase = imageIndex * (MAX_POINT_SHADOW_LIGHTS * 2u);
-
-    if (haveTimingQueries) {
-        vkCmdResetQueryPool(cmd, m_lightTimingQueryPool, queryBase, MAX_POINT_SHADOW_LIGHTS * 2u);
-        m_queryLightCountByImage[imageIndex] = 0u;
-        m_querySourceByImage[imageIndex].fill(kInvalidSourceIndex);
-    }
-
+void ShadowSystem::recordSunShadowPasses(VkCommandBuffer cmd,
+                                        uint32_t imageIndex,
+                                        const DrawContext& ctx) {
     // ═══════════════════════════════════════════════════════════════════
     // Sun (directional) shadow pass
     // ═══════════════════════════════════════════════════════════════════
@@ -2003,265 +1748,345 @@ void ShadowSystem::recordShadowPasses(VkCommandBuffer cmd,
             m_sunCurrentFrame.cpuCommandRecordMs;
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Point light shadow passes
-    // ═══════════════════════════════════════════════════════════════════
 
-    if (m_activeLights.empty()) {
+}
+
+````
+
+## src\rendering\lighting\shadow\ShadowInternal.h
+
+Description: No CC-DESC found. C++ struct 'SunCascadeScrollPlan'.
+
+````cpp
+#pragma once
+
+// GPT-DESC: Shares private shadow-pass helper declarations across split ShadowSystem translation units.
+
+#include "rendering/lighting/ShadowSystem.h"
+
+#include <vulkan/vulkan.h>
+#include <glm/glm.hpp>
+
+#include <array>
+#include <cstdint>
+#include <limits>
+#include <vector>
+
+namespace ShadowSystemInternal {
+
+inline constexpr uint32_t kInvalidSourceIndex = std::numeric_limits<uint32_t>::max();
+inline constexpr uint32_t kPointShadowFacesPerLight = 6u;
+inline constexpr float kShadowCacheEpsilon = 0.0001f;
+inline constexpr int32_t kSunGatherCachePaddingChunks = 12;
+inline constexpr float kSunScrollTexelEpsilon = 0.01f;
+inline constexpr float kSunScrollMaxDirtyFraction = 0.08f;
+
+struct SunCascadeScrollPlan {
+    bool enabled{false};
+    int32_t dxTexels{0};
+    int32_t dyTexels{0};
+    uint64_t copiedTexels{0};
+    uint64_t dirtyTexels{0};
+};
+
+struct SunGatherBounds {
+    glm::ivec3 minChunk{0};
+    glm::ivec3 maxChunk{0};
+    float maxHalfExtent{0.0f};
+    float sinElevation{0.0f};
+    float shearX{0.0f};
+    float shearZ{0.0f};
+    float shearMax{0.0f};
+    float casterReach{0.0f};
+    float padding{0.0f};
+    float halfX{0.0f};
+    float halfZ{0.0f};
+};
+
+uint32_t floatToBits(float value);
+void hashCombine64(uint64_t& hash, uint64_t v);
+uint64_t rotl64(uint64_t v, uint32_t shift);
+
+bool nearlyEqual(float a, float b, float eps = kShadowCacheEpsilon);
+bool nearlyEqualVec3(const glm::vec3& a, const glm::vec3& b, float eps = kShadowCacheEpsilon);
+bool sameBitsVec3(const glm::vec3& a, const glm::vec3& b);
+
+uint64_t hashTerrainDrawContext(const ShadowSystem::DrawContext& ctx);
+uint64_t hashTerrainDrawKey(const VkDrawIndexedIndirectCommand& d, const glm::vec4& o);
+void hashTerrainDrawSetAdd(uint64_t key,
+                           uint64_t& sumA,
+                           uint64_t& sumB,
+                           uint64_t& xorA);
+uint64_t finishTerrainDrawSetHash(uint32_t count,
+                                  uint64_t sumA,
+                                  uint64_t sumB,
+                                  uint64_t xorA);
+uint64_t hashLocalTerrainDraws(const std::vector<VkDrawIndexedIndirectCommand>& draws,
+                               const std::vector<glm::vec4>& origins,
+                               uint32_t count);
+uint64_t hashSunCascadeVP(
+    const std::array<glm::mat4, ShadowSystem::MAX_SUN_SHADOW_CASCADES>& vps,
+    uint32_t cascadeCount);
+std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES>
+hashLocalTerrainDrawsPerCascade(
+    const std::vector<VkDrawIndexedIndirectCommand>& draws,
+    const std::vector<glm::vec4>& origins,
+    const std::vector<uint16_t>& cascadeMasks,
+    uint32_t count,
+    uint32_t cascadeCount);
+uint64_t hashSunCascadeLayerVP(const glm::mat4& vp);
+
+SunCascadeScrollPlan makeSunCascadeScrollPlan(
+    const glm::mat4& oldVP,
+    const glm::mat4& newVP,
+    uint32_t mapSize);
+std::array<VkRect2D, 2> sunScrollDirtyRects(
+    uint32_t mapSize,
+    const SunCascadeScrollPlan& plan,
+    uint32_t& rectCountOut);
+SunGatherBounds computeSunGatherBounds(
+    const glm::vec3& cameraPos,
+    const glm::vec3& sunDir,
+    const std::array<float, ShadowSystem::MAX_SUN_SHADOW_CASCADES>& cascadeHalfExtents,
+    uint32_t cascadeCount);
+uint16_t sunCascadeMaskForChunkCoord(
+    const glm::vec4& chunkCoord,
+    const std::array<glm::mat4, ShadowSystem::MAX_SUN_SHADOW_CASCADES>& cascadeVPs,
+    uint32_t cascadeCount,
+    uint32_t* outInnerRejected = nullptr);
+uint32_t allCascadeBits(uint32_t cascadeCount);
+uint32_t meshTopologyChangeCascadeMask(
+    const ShadowSystem::DrawContext& ctx,
+    uint64_t cachedRevision,
+    const std::array<glm::mat4, ShadowSystem::MAX_SUN_SHADOW_CASCADES>& cascadeVPs,
+    uint32_t cascadeCount,
+    bool* reliableOut = nullptr);
+
+} // namespace ShadowSystemInternal
+
+````
+
+## src\rendering\lighting\shadow\ShadowPass.cpp
+
+Description: No CC-DESC found.
+
+````cpp
+#include "rendering/lighting/ShadowSystem.h"
+
+// GPT-DESC: Coordinates shadow pass recording across sun and point-light domain implementations.
+
+void ShadowSystem::recordShadowPasses(VkCommandBuffer cmd,
+                                      uint32_t imageIndex,
+                                      const DrawContext& ctx) {
+    if (!m_initialized || imageIndex >= m_shadowDataBuffers.size()) {
         return;
     }
 
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(POINT_SHADOW_MAP_SIZE);
-    viewport.height = static_cast<float>(POINT_SHADOW_MAP_SIZE);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = {POINT_SHADOW_MAP_SIZE, POINT_SHADOW_MAP_SIZE};
-
-    VkClearValue clearValue{};
-    clearValue.depthStencil = {1.0f, 0};
-
-    VkDeviceSize zeroOffset = 0;
-
-    const uint32_t activeCount = std::min<uint32_t>(
-        static_cast<uint32_t>(m_activeLights.size()),
-        MAX_POINT_SHADOW_LIGHTS);
-    if (haveTimingQueries) {
-        m_queryLightCountByImage[imageIndex] = activeCount;
-    }
-    const uint64_t perLightShadowTexels =
-        static_cast<uint64_t>(kPointShadowFacesPerLight) *
-        static_cast<uint64_t>(POINT_SHADOW_MAP_SIZE) *
-        static_cast<uint64_t>(POINT_SHADOW_MAP_SIZE);
-    const uint64_t terrainSignature = hashTerrainDrawContext(ctx);
-    const bool useLocalSphereTerrain = (ctx.world != nullptr);
-    const uint32_t localDrawCapacity = useLocalSphereTerrain
-        ? std::max<uint32_t>(ctx.gpuMaxDraws, std::max<uint32_t>(ctx.indirectDrawCount, 65536u))
-        : 0u;
-    if (useLocalSphereTerrain) {
-        if (m_localTerrainDrawScratch.size() < localDrawCapacity) {
-            m_localTerrainDrawScratch.resize(localDrawCapacity);
-            m_localTerrainOriginScratch.resize(localDrawCapacity);
-        }
-    }
-    m_frameDiagnostics.totalRenderedFaces = 0u;
-    m_frameDiagnostics.totalShadowMapTexelsRendered = 0u;
-
-    for (uint32_t lightSlot = 0; lightSlot < activeCount; ++lightSlot) {
-        const ActiveLight& light = m_activeLights[lightSlot];
-        const auto lightCpuStart = Clock::now();
-        if (haveTimingQueries) {
-            m_querySourceByImage[imageIndex][lightSlot] = light.sourceIndex;
-            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_lightTimingQueryPool,
-                                queryBase + lightSlot * 2u);
-        }
-
-        std::vector<glm::vec4> nearbyCubes;
-        uint32_t localTerrainDrawCount = 0u;
-        float terrainGatherMs = 0.0f;
-        uint64_t lightTerrainSignature = terrainSignature;
-        bool reusedFromCache = false;
-        if (lightSlot < m_slotShadowCache.size()) {
-            const auto& cache = m_slotShadowCache[lightSlot];
-            const bool allowReuseThisFrame = (!ctx.useGPUCulling) || useLocalSphereTerrain;
-            reusedFromCache =
-                allowReuseThisFrame &&
-                cache.valid &&
-                cache.sourceIndex == light.sourceIndex &&
-                nearlyEqualVec3(cache.lightPosition, light.position) &&
-                nearlyEqual(cache.nearPlane, light.nearPlane) &&
-                nearlyEqual(cache.farPlane, light.farPlane) &&
-                cache.terrainSignature == lightTerrainSignature;
-        }
-        if (!reusedFromCache &&
-            useLocalSphereTerrain &&
-            !m_localTerrainDrawScratch.empty() &&
-            !m_localTerrainOriginScratch.empty()) {
-            const auto terrainGatherStart = Clock::now();
-            localTerrainDrawCount = ctx.world->gatherDrawCommandsInSphere(
-                light.position,
-                light.farPlane,
-                m_localTerrainDrawScratch.data(),
-                m_localTerrainOriginScratch.data(),
-                localDrawCapacity,
-                ctx.uploadTimelineValue);
-            terrainGatherMs = std::chrono::duration<float, std::milli>(
-                Clock::now() - terrainGatherStart).count();
-        }
-        if (light.sourceIndex < m_lightDiagnostics.size()) {
-            auto& diag = m_lightDiagnostics[light.sourceIndex];
-            diag.cpuTerrainGatherMs = terrainGatherMs;
-            diag.usedLocalTerrainCulling = useLocalSphereTerrain;
-            diag.localTerrainDrawCount = localTerrainDrawCount;
-            diag.localTerrainDrawCapacity = localDrawCapacity;
-        }
-        if (!reusedFromCache) {
-            const auto faceVP = buildPointLightFaceMatrices(light.position, light.nearPlane, light.farPlane);
-            for (uint32_t face = 0; face < kPointShadowFacesPerLight; ++face) {
-                const uint32_t layer = lightSlot * kPointShadowFacesPerLight + face;
-
-                VkRenderPassBeginInfo rpBegin{};
-                rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-                rpBegin.renderPass = m_shadowRenderPass;
-                rpBegin.framebuffer = m_shadowFramebuffers[layer];
-                rpBegin.renderArea.offset = {0, 0};
-                rpBegin.renderArea.extent = {POINT_SHADOW_MAP_SIZE, POINT_SHADOW_MAP_SIZE};
-                rpBegin.clearValueCount = 1;
-                rpBegin.pClearValues = &clearValue;
-
-                vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
-                vkCmdSetViewport(cmd, 0, 1, &viewport);
-                vkCmdSetScissor(cmd, 0, 1, &scissor);
-                vkCmdSetDepthBias(cmd, 1.35f, 0.0f, 1.75f);
-
-                ShadowPushConstants push{};
-                push.lightVP = faceVP[face];
-                push.lightPosFar = glm::vec4(light.position, light.farPlane);
-                push.terrainChunkCoordMode = glm::vec4(0.0f);
-
-                if (ctx.terrainDescriptorSet != VK_NULL_HANDLE &&
-                    ctx.terrainVertexBuffer != VK_NULL_HANDLE &&
-                    ctx.terrainIndexBuffer != VK_NULL_HANDLE) {
-
-                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_terrainShadowPipeline);
-                    vkCmdBindDescriptorSets(
-                        cmd,
-                        VK_PIPELINE_BIND_POINT_GRAPHICS,
-                        m_terrainShadowPipelineLayout,
-                        0,
-                        1,
-                        &ctx.terrainDescriptorSet,
-                        0,
-                        nullptr);
-
-                    vkCmdBindVertexBuffers(cmd, 0, 1, &ctx.terrainVertexBuffer, &zeroOffset);
-                    vkCmdBindIndexBuffer(cmd, ctx.terrainIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
-
-                    if (useLocalSphereTerrain) {
-                        for (uint32_t drawIndex = 0; drawIndex < localTerrainDrawCount; ++drawIndex) {
-                            const auto& terrainDraw = m_localTerrainDrawScratch[drawIndex];
-                            const glm::vec4& chunkOrigin = m_localTerrainOriginScratch[drawIndex];
-                            push.terrainChunkCoordMode = glm::vec4(
-                                chunkOrigin.x,
-                                chunkOrigin.y,
-                                chunkOrigin.z,
-                                1.0f);
-                            vkCmdPushConstants(
-                                cmd,
-                                m_terrainShadowPipelineLayout,
-                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                                0,
-                                sizeof(ShadowPushConstants),
-                                &push);
-                            vkCmdDrawIndexed(
-                                cmd,
-                                terrainDraw.indexCount,
-                                1u,
-                                terrainDraw.firstIndex,
-                                terrainDraw.vertexOffset,
-                                0u);
-                        }
-                    } else if (ctx.useGPUCulling &&
-                        ctx.gpuVisibleDrawsBuffer != VK_NULL_HANDLE &&
-                        ctx.gpuDrawCountBuffer != VK_NULL_HANDLE &&
-                        ctx.gpuMaxDraws > 0) {
-                        // Phase D: signal point_shadow_terrain.vert to read from
-                        // bindless ChunkOrigins[1] (GPU visible-origins) instead of slot 0.
-                        push.terrainChunkCoordMode = glm::vec4(0.0f, 0.0f, 0.0f, 2.0f);
-                        vkCmdPushConstants(
-                            cmd,
-                            m_terrainShadowPipelineLayout,
-                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                            0,
-                            sizeof(ShadowPushConstants),
-                            &push);
-                        vkCmdDrawIndexedIndirectCount(
-                            cmd,
-                            ctx.gpuVisibleDrawsBuffer,
-                            0,
-                            ctx.gpuDrawCountBuffer,
-                            0,
-                            ctx.gpuMaxDraws,
-                            sizeof(VkDrawIndexedIndirectCommand));
-                    } else if (ctx.indirectBuffer != VK_NULL_HANDLE && ctx.indirectDrawCount > 0) {
-                        vkCmdPushConstants(
-                            cmd,
-                            m_terrainShadowPipelineLayout,
-                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                            0,
-                            sizeof(ShadowPushConstants),
-                            &push);
-                        vkCmdDrawIndexedIndirect(
-                            cmd,
-                            ctx.indirectBuffer,
-                            0,
-                            ctx.indirectDrawCount,
-                            sizeof(VkDrawIndexedIndirectCommand));
-                    }
-                }
-
-                vkCmdEndRenderPass(cmd);
-            }
-
-            m_frameDiagnostics.totalRenderedFaces += kPointShadowFacesPerLight;
-            m_frameDiagnostics.totalShadowMapTexelsRendered += perLightShadowTexels;
-
-            if (lightSlot < m_slotShadowCache.size()) {
-                auto& cache = m_slotShadowCache[lightSlot];
-                cache.valid = true;
-                cache.sourceIndex = light.sourceIndex;
-                cache.lightPosition = light.position;
-                cache.nearPlane = light.nearPlane;
-                cache.farPlane = light.farPlane;
-                cache.terrainSignature = lightTerrainSignature;
-            }
-        }
-
-        if (haveTimingQueries) {
-            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_lightTimingQueryPool,
-                                queryBase + lightSlot * 2u + 1u);
-        }
-
-        const float lightCpuMs = std::chrono::duration<float, std::milli>(Clock::now() - lightCpuStart).count();
-        if (light.sourceIndex < m_lightDiagnostics.size()) {
-            auto& diag = m_lightDiagnostics[light.sourceIndex];
-            diag.reusedShadowCache = reusedFromCache;
-            diag.renderedFaces = reusedFromCache ? 0u : kPointShadowFacesPerLight;
-            diag.reusedFaces = reusedFromCache ? kPointShadowFacesPerLight : 0u;
-            diag.shadowMapTexelsRendered = reusedFromCache ? 0u : perLightShadowTexels;
-            diag.cpuCommandRecordMs = std::max(0.0f, lightCpuMs - terrainGatherMs);
-            diag.cpuTotalMs += diag.cpuTerrainGatherMs + diag.cpuCommandRecordMs;
-        }
-    }
-
-    VkImageMemoryBarrier2 barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-    barrier.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = m_pointShadowImage;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = MAX_POINT_SHADOW_LIGHTS * 6;
-
-    VkDependencyInfo depInfo{};
-    depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    depInfo.imageMemoryBarrierCount = 1;
-    depInfo.pImageMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
+    recordSunShadowPasses(cmd, imageIndex, ctx);
+    recordPointShadowPasses(cmd, imageIndex, ctx);
 }
+
+````
+
+## src\rendering\lighting\shadow\ShadowCache.cpp
+
+Description: No CC-DESC found.
+
+````cpp
+#include "ShadowInternal.h"
+
+// GPT-DESC: Implements shadow cache hashing and equality helpers shared by sun and point shadow passes.
+
+#include <algorithm>
+#include <cstring>
+#include <type_traits>
+
+namespace ShadowSystemInternal {
+
+uint32_t floatToBits(float value) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+void hashCombine64(uint64_t& hash, uint64_t v) {
+    hash ^= v + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+}
+
+uint64_t rotl64(uint64_t v, uint32_t shift) {
+    return (v << shift) | (v >> (64u - shift));
+}
+
+bool nearlyEqual(float a, float b, float eps) {
+    return std::abs(a - b) <= eps;
+}
+
+bool nearlyEqualVec3(const glm::vec3& a, const glm::vec3& b, float eps) {
+    return nearlyEqual(a.x, b.x, eps) &&
+           nearlyEqual(a.y, b.y, eps) &&
+           nearlyEqual(a.z, b.z, eps);
+}
+
+bool sameBitsVec3(const glm::vec3& a, const glm::vec3& b) {
+    return floatToBits(a.x) == floatToBits(b.x) &&
+           floatToBits(a.y) == floatToBits(b.y) &&
+           floatToBits(a.z) == floatToBits(b.z);
+}
+
+uint64_t hashTerrainDrawContext(const ShadowSystem::DrawContext& ctx) {
+    auto handleToU64 = [](auto handle) -> uint64_t {
+        using T = decltype(handle);
+        if constexpr (std::is_pointer_v<T>) {
+            return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
+        } else {
+            return static_cast<uint64_t>(handle);
+        }
+    };
+
+    uint64_t h = 1469598103934665603ull;
+    hashCombine64(h, handleToU64(ctx.terrainVertexBuffer));
+    hashCombine64(h, handleToU64(ctx.terrainIndexBuffer));
+    hashCombine64(h, handleToU64(ctx.indirectBuffer));
+    hashCombine64(h, static_cast<uint64_t>(ctx.indirectDrawCount));
+    hashCombine64(h, static_cast<uint64_t>(ctx.useGPUCulling ? 1u : 0u));
+    hashCombine64(h, handleToU64(ctx.gpuVisibleDrawsBuffer));
+    hashCombine64(h, handleToU64(ctx.gpuDrawCountBuffer));
+    hashCombine64(h, static_cast<uint64_t>(ctx.gpuMaxDraws));
+    hashCombine64(h, ctx.terrainEditRevision);
+    hashCombine64(h, ctx.terrainMeshRevision);
+    return h;
+}
+
+uint64_t hashTerrainDrawKey(const VkDrawIndexedIndirectCommand& d, const glm::vec4& o) {
+    uint64_t h = 1469598103934665603ull;
+    hashCombine64(h, static_cast<uint64_t>(d.indexCount));
+    hashCombine64(h, static_cast<uint64_t>(d.firstIndex));
+    hashCombine64(h, static_cast<uint64_t>(static_cast<uint32_t>(d.vertexOffset)));
+    hashCombine64(h, static_cast<uint64_t>(floatToBits(o.x)));
+    hashCombine64(h, static_cast<uint64_t>(floatToBits(o.y)));
+    hashCombine64(h, static_cast<uint64_t>(floatToBits(o.z)));
+    return h;
+}
+
+void hashTerrainDrawSetAdd(uint64_t key,
+                           uint64_t& sumA,
+                           uint64_t& sumB,
+                           uint64_t& xorA) {
+    constexpr uint64_t kMulA = 0xbf58476d1ce4e5b9ull;
+    constexpr uint64_t kMulB = 0x94d049bb133111ebull;
+    sumA += key;
+    sumB += rotl64(key * kMulA, 23u) ^ (key * kMulB);
+    xorA ^= key + 0x9e3779b97f4a7c15ull;
+}
+
+uint64_t finishTerrainDrawSetHash(uint32_t count,
+                                  uint64_t sumA,
+                                  uint64_t sumB,
+                                  uint64_t xorA) {
+    uint64_t h = 1469598103934665603ull;
+    hashCombine64(h, static_cast<uint64_t>(count));
+    hashCombine64(h, sumA);
+    hashCombine64(h, sumB);
+    hashCombine64(h, xorA);
+    return h;
+}
+
+uint64_t hashLocalTerrainDraws(const std::vector<VkDrawIndexedIndirectCommand>& draws,
+                               const std::vector<glm::vec4>& origins,
+                               uint32_t count) {
+    uint64_t sumA = 0u;
+    uint64_t sumB = 0u;
+    uint64_t xorA = 0u;
+    for (uint32_t i = 0; i < count; ++i) {
+        hashTerrainDrawSetAdd(hashTerrainDrawKey(draws[i], origins[i]), sumA, sumB, xorA);
+    }
+    return finishTerrainDrawSetHash(count, sumA, sumB, xorA);
+}
+
+uint64_t hashSunCascadeVP(const std::array<glm::mat4, ShadowSystem::MAX_SUN_SHADOW_CASCADES>& vps,
+                          uint32_t cascadeCount) {
+    uint64_t h = 1469598103934665603ull;
+    hashCombine64(h, static_cast<uint64_t>(cascadeCount));
+    const uint32_t count = std::min<uint32_t>(cascadeCount, ShadowSystem::MAX_SUN_SHADOW_CASCADES);
+    for (uint32_t c = 0; c < count; ++c) {
+        const glm::mat4& m = vps[c];
+        for (int col = 0; col < 4; ++col) {
+            for (int row = 0; row < 4; ++row) {
+                hashCombine64(h, static_cast<uint64_t>(floatToBits(m[col][row])));
+            }
+        }
+    }
+    return h;
+}
+
+std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES>
+hashLocalTerrainDrawsPerCascade(
+    const std::vector<VkDrawIndexedIndirectCommand>& draws,
+    const std::vector<glm::vec4>& origins,
+    const std::vector<uint16_t>& cascadeMasks,
+    uint32_t count,
+    uint32_t cascadeCount) {
+    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> hashes{};
+    std::array<uint32_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> counts{};
+    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> sumA{};
+    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> sumB{};
+    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> xorA{};
+
+    const uint32_t evalCount =
+        std::min<uint32_t>(cascadeCount, ShadowSystem::MAX_SUN_SHADOW_CASCADES);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& d = draws[i];
+        const auto& o = origins[i];
+        const uint16_t mask = cascadeMasks[i];
+        const uint64_t key = hashTerrainDrawKey(d, o);
+        for (uint32_t c = 0; c < evalCount; ++c) {
+            if ((mask & static_cast<uint16_t>(1u << c)) == 0u) {
+                continue;
+            }
+            ++counts[c];
+            hashTerrainDrawSetAdd(key, sumA[c], sumB[c], xorA[c]);
+        }
+    }
+
+    for (uint32_t c = 0; c < evalCount; ++c) {
+        hashes[c] = finishTerrainDrawSetHash(counts[c], sumA[c], sumB[c], xorA[c]);
+        hashCombine64(hashes[c], static_cast<uint64_t>(c));
+    }
+    return hashes;
+}
+
+uint64_t hashSunCascadeLayerVP(const glm::mat4& vp) {
+    uint64_t h = 1469598103934665603ull;
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            hashCombine64(h, static_cast<uint64_t>(floatToBits(vp[col][row])));
+        }
+    }
+    return h;
+}
+
+} // namespace ShadowSystemInternal
+
+````
+
+## src\rendering\lighting\shadow\ShadowMatrices.cpp
+
+Description: No CC-DESC found.
+
+````cpp
+#include "rendering/lighting/ShadowSystem.h"
+
+#include "world/config/WorldConfig.h"
+
+// GPT-DESC: Builds point-light cube face matrices and directional sun shadow VP matrices.
+
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
 
 std::array<glm::mat4, 6> ShadowSystem::buildPointLightFaceMatrices(const glm::vec3& lightPos,
                                                                     float nearPlane,
@@ -2513,12 +2338,317 @@ glm::mat4 ShadowSystem::buildSunLightVP(const glm::vec3& cameraPos,
 
 ````
 
+## src\rendering\lighting\shadow\ShadowPointLights.cpp
+
+Description: No CC-DESC found.
+
+````cpp
+#include "rendering/lighting/ShadowSystem.h"
+
+#include "ShadowInternal.h"
+#include "world/World.h"
+
+// GPT-DESC: Records point-light shadow cube-map passes and point-shadow cache reuse.
+
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+
+using namespace ShadowSystemInternal;
+
+void ShadowSystem::recordPointShadowPasses(VkCommandBuffer cmd,
+                                          uint32_t imageIndex,
+                                          const DrawContext& ctx) {
+    const bool haveTimingQueries =
+        (m_lightTimingQueryPool != VK_NULL_HANDLE) &&
+        (imageIndex < m_lightTimingImageCount) &&
+        (imageIndex < m_querySourceByImage.size()) &&
+        (imageIndex < m_queryLightCountByImage.size());
+    const uint32_t queryBase = imageIndex * (MAX_POINT_SHADOW_LIGHTS * 2u);
+
+    if (haveTimingQueries) {
+        vkCmdResetQueryPool(cmd, m_lightTimingQueryPool, queryBase, MAX_POINT_SHADOW_LIGHTS * 2u);
+        m_queryLightCountByImage[imageIndex] = 0u;
+        m_querySourceByImage[imageIndex].fill(kInvalidSourceIndex);
+    }
+
+
+    using Clock = std::chrono::high_resolution_clock;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Point light shadow passes
+    // ═══════════════════════════════════════════════════════════════════
+
+    if (m_activeLights.empty()) {
+        return;
+    }
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(POINT_SHADOW_MAP_SIZE);
+    viewport.height = static_cast<float>(POINT_SHADOW_MAP_SIZE);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = {POINT_SHADOW_MAP_SIZE, POINT_SHADOW_MAP_SIZE};
+
+    VkClearValue clearValue{};
+    clearValue.depthStencil = {1.0f, 0};
+
+    VkDeviceSize zeroOffset = 0;
+
+    const uint32_t activeCount = std::min<uint32_t>(
+        static_cast<uint32_t>(m_activeLights.size()),
+        MAX_POINT_SHADOW_LIGHTS);
+    if (haveTimingQueries) {
+        m_queryLightCountByImage[imageIndex] = activeCount;
+    }
+    const uint64_t perLightShadowTexels =
+        static_cast<uint64_t>(kPointShadowFacesPerLight) *
+        static_cast<uint64_t>(POINT_SHADOW_MAP_SIZE) *
+        static_cast<uint64_t>(POINT_SHADOW_MAP_SIZE);
+    const uint64_t terrainSignature = hashTerrainDrawContext(ctx);
+    const bool useLocalSphereTerrain = (ctx.world != nullptr);
+    const uint32_t localDrawCapacity = useLocalSphereTerrain
+        ? std::max<uint32_t>(ctx.gpuMaxDraws, std::max<uint32_t>(ctx.indirectDrawCount, 65536u))
+        : 0u;
+    if (useLocalSphereTerrain) {
+        if (m_localTerrainDrawScratch.size() < localDrawCapacity) {
+            m_localTerrainDrawScratch.resize(localDrawCapacity);
+            m_localTerrainOriginScratch.resize(localDrawCapacity);
+        }
+    }
+    m_frameDiagnostics.totalRenderedFaces = 0u;
+    m_frameDiagnostics.totalShadowMapTexelsRendered = 0u;
+
+    for (uint32_t lightSlot = 0; lightSlot < activeCount; ++lightSlot) {
+        const ActiveLight& light = m_activeLights[lightSlot];
+        const auto lightCpuStart = Clock::now();
+        if (haveTimingQueries) {
+            m_querySourceByImage[imageIndex][lightSlot] = light.sourceIndex;
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_lightTimingQueryPool,
+                                queryBase + lightSlot * 2u);
+        }
+
+        uint32_t localTerrainDrawCount = 0u;
+        float terrainGatherMs = 0.0f;
+        uint64_t lightTerrainSignature = terrainSignature;
+        bool reusedFromCache = false;
+        if (lightSlot < m_slotShadowCache.size()) {
+            const auto& cache = m_slotShadowCache[lightSlot];
+            const bool allowReuseThisFrame = (!ctx.useGPUCulling) || useLocalSphereTerrain;
+            reusedFromCache =
+                allowReuseThisFrame &&
+                cache.valid &&
+                cache.sourceIndex == light.sourceIndex &&
+                nearlyEqualVec3(cache.lightPosition, light.position) &&
+                nearlyEqual(cache.nearPlane, light.nearPlane) &&
+                nearlyEqual(cache.farPlane, light.farPlane) &&
+                cache.terrainSignature == lightTerrainSignature;
+        }
+        if (!reusedFromCache &&
+            useLocalSphereTerrain &&
+            !m_localTerrainDrawScratch.empty() &&
+            !m_localTerrainOriginScratch.empty()) {
+            const auto terrainGatherStart = Clock::now();
+            localTerrainDrawCount = ctx.world->gatherDrawCommandsInSphere(
+                light.position,
+                light.farPlane,
+                m_localTerrainDrawScratch.data(),
+                m_localTerrainOriginScratch.data(),
+                localDrawCapacity,
+                ctx.uploadTimelineValue);
+            terrainGatherMs = std::chrono::duration<float, std::milli>(
+                Clock::now() - terrainGatherStart).count();
+        }
+        if (light.sourceIndex < m_lightDiagnostics.size()) {
+            auto& diag = m_lightDiagnostics[light.sourceIndex];
+            diag.cpuTerrainGatherMs = terrainGatherMs;
+            diag.usedLocalTerrainCulling = useLocalSphereTerrain;
+            diag.localTerrainDrawCount = localTerrainDrawCount;
+            diag.localTerrainDrawCapacity = localDrawCapacity;
+        }
+        if (!reusedFromCache) {
+            const auto faceVP = buildPointLightFaceMatrices(light.position, light.nearPlane, light.farPlane);
+            for (uint32_t face = 0; face < kPointShadowFacesPerLight; ++face) {
+                const uint32_t layer = lightSlot * kPointShadowFacesPerLight + face;
+
+                VkRenderPassBeginInfo rpBegin{};
+                rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+                rpBegin.renderPass = m_shadowRenderPass;
+                rpBegin.framebuffer = m_shadowFramebuffers[layer];
+                rpBegin.renderArea.offset = {0, 0};
+                rpBegin.renderArea.extent = {POINT_SHADOW_MAP_SIZE, POINT_SHADOW_MAP_SIZE};
+                rpBegin.clearValueCount = 1;
+                rpBegin.pClearValues = &clearValue;
+
+                vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+                vkCmdSetViewport(cmd, 0, 1, &viewport);
+                vkCmdSetScissor(cmd, 0, 1, &scissor);
+                vkCmdSetDepthBias(cmd, 1.35f, 0.0f, 1.75f);
+
+                ShadowPushConstants push{};
+                push.lightVP = faceVP[face];
+                push.lightPosFar = glm::vec4(light.position, light.farPlane);
+                push.terrainChunkCoordMode = glm::vec4(0.0f);
+
+                if (ctx.terrainDescriptorSet != VK_NULL_HANDLE &&
+                    ctx.terrainVertexBuffer != VK_NULL_HANDLE &&
+                    ctx.terrainIndexBuffer != VK_NULL_HANDLE) {
+
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_terrainShadowPipeline);
+                    vkCmdBindDescriptorSets(
+                        cmd,
+                        VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        m_terrainShadowPipelineLayout,
+                        0,
+                        1,
+                        &ctx.terrainDescriptorSet,
+                        0,
+                        nullptr);
+
+                    vkCmdBindVertexBuffers(cmd, 0, 1, &ctx.terrainVertexBuffer, &zeroOffset);
+                    vkCmdBindIndexBuffer(cmd, ctx.terrainIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
+                    if (useLocalSphereTerrain) {
+                        for (uint32_t drawIndex = 0; drawIndex < localTerrainDrawCount; ++drawIndex) {
+                            const auto& terrainDraw = m_localTerrainDrawScratch[drawIndex];
+                            const glm::vec4& chunkOrigin = m_localTerrainOriginScratch[drawIndex];
+                            push.terrainChunkCoordMode = glm::vec4(
+                                chunkOrigin.x,
+                                chunkOrigin.y,
+                                chunkOrigin.z,
+                                1.0f);
+                            vkCmdPushConstants(
+                                cmd,
+                                m_terrainShadowPipelineLayout,
+                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                0,
+                                sizeof(ShadowPushConstants),
+                                &push);
+                            vkCmdDrawIndexed(
+                                cmd,
+                                terrainDraw.indexCount,
+                                1u,
+                                terrainDraw.firstIndex,
+                                terrainDraw.vertexOffset,
+                                0u);
+                        }
+                    } else if (ctx.useGPUCulling &&
+                        ctx.gpuVisibleDrawsBuffer != VK_NULL_HANDLE &&
+                        ctx.gpuDrawCountBuffer != VK_NULL_HANDLE &&
+                        ctx.gpuMaxDraws > 0) {
+                        // Phase D: signal point_shadow_terrain.vert to read from
+                        // bindless ChunkOrigins[1] (GPU visible-origins) instead of slot 0.
+                        push.terrainChunkCoordMode = glm::vec4(0.0f, 0.0f, 0.0f, 2.0f);
+                        vkCmdPushConstants(
+                            cmd,
+                            m_terrainShadowPipelineLayout,
+                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                            0,
+                            sizeof(ShadowPushConstants),
+                            &push);
+                        vkCmdDrawIndexedIndirectCount(
+                            cmd,
+                            ctx.gpuVisibleDrawsBuffer,
+                            0,
+                            ctx.gpuDrawCountBuffer,
+                            0,
+                            ctx.gpuMaxDraws,
+                            sizeof(VkDrawIndexedIndirectCommand));
+                    } else if (ctx.indirectBuffer != VK_NULL_HANDLE && ctx.indirectDrawCount > 0) {
+                        vkCmdPushConstants(
+                            cmd,
+                            m_terrainShadowPipelineLayout,
+                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                            0,
+                            sizeof(ShadowPushConstants),
+                            &push);
+                        vkCmdDrawIndexedIndirect(
+                            cmd,
+                            ctx.indirectBuffer,
+                            0,
+                            ctx.indirectDrawCount,
+                            sizeof(VkDrawIndexedIndirectCommand));
+                    }
+                }
+
+                vkCmdEndRenderPass(cmd);
+            }
+
+            m_frameDiagnostics.totalRenderedFaces += kPointShadowFacesPerLight;
+            m_frameDiagnostics.totalShadowMapTexelsRendered += perLightShadowTexels;
+
+            if (lightSlot < m_slotShadowCache.size()) {
+                auto& cache = m_slotShadowCache[lightSlot];
+                cache.valid = true;
+                cache.sourceIndex = light.sourceIndex;
+                cache.lightPosition = light.position;
+                cache.nearPlane = light.nearPlane;
+                cache.farPlane = light.farPlane;
+                cache.terrainSignature = lightTerrainSignature;
+            }
+        }
+
+        if (haveTimingQueries) {
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_lightTimingQueryPool,
+                                queryBase + lightSlot * 2u + 1u);
+        }
+
+        const float lightCpuMs = std::chrono::duration<float, std::milli>(Clock::now() - lightCpuStart).count();
+        if (light.sourceIndex < m_lightDiagnostics.size()) {
+            auto& diag = m_lightDiagnostics[light.sourceIndex];
+            diag.reusedShadowCache = reusedFromCache;
+            diag.renderedFaces = reusedFromCache ? 0u : kPointShadowFacesPerLight;
+            diag.reusedFaces = reusedFromCache ? kPointShadowFacesPerLight : 0u;
+            diag.shadowMapTexelsRendered = reusedFromCache ? 0u : perLightShadowTexels;
+            diag.cpuCommandRecordMs = std::max(0.0f, lightCpuMs - terrainGatherMs);
+            diag.cpuTotalMs += diag.cpuTerrainGatherMs + diag.cpuCommandRecordMs;
+        }
+    }
+
+    VkImageMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = m_pointShadowImage;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = MAX_POINT_SHADOW_LIGHTS * 6;
+
+    VkDependencyInfo depInfo{};
+    depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    depInfo.imageMemoryBarrierCount = 1;
+    depInfo.pImageMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+}
+
+````
+
 ## include\rendering\lighting\ShadowSystem.h
 
 Description: No CC-DESC found. C++ struct 'LightingSettings'.
 
 ````cpp
 #pragma once
+
+// GPT-DESC: Declares the ShadowSystem facade, diagnostics, resources, and private pass split points.
 
 #include <vulkan/vulkan.h>
 #include <glm/glm.hpp>
@@ -3207,6 +3337,13 @@ private:
         std::array<uint32_t, MAX_SUN_SHADOW_CASCADES> cascadeDrawHits{};
     };
 
+    void recordSunShadowPasses(VkCommandBuffer cmd,
+                               uint32_t imageIndex,
+                               const DrawContext& ctx);
+    void recordPointShadowPasses(VkCommandBuffer cmd,
+                                 uint32_t imageIndex,
+                                 const DrawContext& ctx);
+
     void createPerImageBuffers(uint32_t swapchainImageCount);
     void destroyPerImageBuffers();
 
@@ -3396,3658 +3533,12 @@ private:
 
 ````
 
-## src\rendering\lighting\ShadowSystem.cpp
-
-Description: No CC-DESC found.
-
-````cpp
-#include "rendering/lighting/ShadowSystem.h"
-
-#include "rendering/common/VulkanHelpers.h"
-#include "rendering/common/Mesh.h"
-#include "rendering/lighting/LightingSettings.h"
-#include "world/edit/HeightmapBaseSampler.h"
-#include "world/config/WorldConfig.h"
-
-#define GLM_FORCE_RADIANS
-#define GLM_FORCE_DEPTH_ZERO_TO_ONE
-
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <iostream>
-#include <limits>
-#include <stdexcept>
-#include <vector>
-
-// init(), cleanup(), recreatePerImageResources(), getSun/PointShadowDescriptor()
-// See also: ShadowSystemUpdate.cpp, ShadowSystemResources.cpp
-
-void ShadowSystem::init(VkDevice device,
-                        VkPhysicalDevice physicalDevice,
-                        VkDescriptorSetLayout mainDescriptorSetLayout,
-                        VkCommandPool commandPool,
-                        VkQueue graphicsQueue,
-                        uint32_t swapchainImageCount,
-                        bool enableGpuTiming) {
-    cleanup();
-
-    m_device = device;
-    m_physicalDevice = physicalDevice;
-    m_mainDescriptorSetLayout = mainDescriptorSetLayout;
-    m_commandPool = commandPool;
-    m_graphicsQueue = graphicsQueue;
-    m_gpuTimingEnabled = enableGpuTiming;
-    VkPhysicalDeviceProperties props{};
-    vkGetPhysicalDeviceProperties(m_physicalDevice, &props);
-    m_timestampPeriod = props.limits.timestampPeriod;
-    m_maxSunShadowMapDimension = props.limits.maxImageDimension2D;
-    applySunShadowProfile(true);
-
-    createPerImageBuffers(swapchainImageCount);
-    createShadowImages();
-    createShadowRenderPass();
-    createShadowFramebuffers();
-    createShadowPipelines();
-    transitionImagesToSampled(commandPool, graphicsQueue);
-
-    // Sky-vis static heightmap texture: created here zero-filled at the
-    // fixed SKY_HEIGHTMAP_DIM. uploadSkyHeightmap() fills the content
-    // later (after the world's HeightmapBaseSampler has loaded). The
-    // descriptor binding never needs to be re-written because the image
-    // handle is stable from this point on.
-    {
-        VkImageCreateInfo imgInfo{};
-        imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-        imgInfo.imageType = VK_IMAGE_TYPE_2D;
-        imgInfo.format = VK_FORMAT_R16_SFLOAT;
-        imgInfo.extent = { SKY_HEIGHTMAP_DIM, SKY_HEIGHTMAP_DIM, 1 };
-        imgInfo.mipLevels = 1;
-        imgInfo.arrayLayers = 1;
-        imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-        imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-        imgInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-        imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        if (vkCreateImage(m_device, &imgInfo, nullptr, &m_skyHeightmapImage) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create sky heightmap image");
-        }
-
-        VkMemoryRequirements memReqs{};
-        vkGetImageMemoryRequirements(m_device, m_skyHeightmapImage, &memReqs);
-        VkMemoryAllocateInfo memAlloc{};
-        memAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        memAlloc.allocationSize = memReqs.size;
-        memAlloc.memoryTypeIndex = VulkanHelpers::findMemoryType(
-            m_physicalDevice, memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        if (vkAllocateMemory(m_device, &memAlloc, nullptr, &m_skyHeightmapMemory) != VK_SUCCESS) {
-            throw std::runtime_error("failed to allocate sky heightmap memory");
-        }
-        vkBindImageMemory(m_device, m_skyHeightmapImage, m_skyHeightmapMemory, 0);
-
-        VkImageViewCreateInfo viewInfo{};
-        viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        viewInfo.image = m_skyHeightmapImage;
-        viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_R16_SFLOAT;
-        viewInfo.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        if (vkCreateImageView(m_device, &viewInfo, nullptr, &m_skyHeightmapView) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create sky heightmap view");
-        }
-
-        VkSamplerCreateInfo samplerInfo{};
-        samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-        samplerInfo.magFilter = VK_FILTER_NEAREST;
-        samplerInfo.minFilter = VK_FILTER_NEAREST;
-        samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        samplerInfo.compareEnable = VK_FALSE;
-        samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
-        if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_skyHeightmapSampler) != VK_SUCCESS) {
-            throw std::runtime_error("failed to create sky heightmap sampler");
-        }
-
-        // Transition UNDEFINED -> SHADER_READ_ONLY (zero content; safe to sample).
-        VkCommandBufferAllocateInfo cmdAlloc{};
-        cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-        cmdAlloc.commandPool = m_commandPool;
-        cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cmdAlloc.commandBufferCount = 1;
-        VkCommandBuffer cmd{VK_NULL_HANDLE};
-        vkAllocateCommandBuffers(m_device, &cmdAlloc, &cmd);
-        VkCommandBufferBeginInfo bi{};
-        bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        vkBeginCommandBuffer(cmd, &bi);
-        VkImageMemoryBarrier b{};
-        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        b.image = m_skyHeightmapImage;
-        b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-        b.srcAccessMask = 0;
-        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cmd,
-            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-            0, 0, nullptr, 0, nullptr, 1, &b);
-        vkEndCommandBuffer(cmd);
-        VkSubmitInfo si{};
-        si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-        si.commandBufferCount = 1;
-        si.pCommandBuffers = &cmd;
-        vkQueueSubmit(m_graphicsQueue, 1, &si, VK_NULL_HANDLE);
-        vkQueueWaitIdle(m_graphicsQueue);
-        vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
-    }
-    m_skyHeightmapInitialized = false; // becomes true once content is uploaded
-
-    m_initialized = true;
-    std::cout << "[ShadowSystem] Initialized (point shadow map: "
-              << POINT_SHADOW_MAP_SIZE << "x" << POINT_SHADOW_MAP_SIZE
-              << ", max lights: " << MAX_POINT_SHADOW_LIGHTS
-              << ", sun cascades: " << m_sunRuntimeConfig.cascadeCount
-              << " x " << m_sunRuntimeConfig.mapSize << "x" << m_sunRuntimeConfig.mapSize
-              << ", max cast radius: " << m_sunRuntimeConfig.maxCastRadiusMeters << "m"
-              << ", texels/voxel: " << m_sunRuntimeConfig.texelsPerVoxel
-              << ", mem: " << m_sunRuntimeConfig.actualMemoryMB << " MB)\n";
-
-    // Directional-shadow resources are ready; profile can be changed at runtime via applySunShadowProfile().
-}
-
-void ShadowSystem::cleanup() {
-    if (m_device == VK_NULL_HANDLE) {
-        return;
-    }
-
-    vkDeviceWaitIdle(m_device);
-
-    destroyPerImageBuffers();
-
-    if (m_terrainShadowPipeline) vkDestroyPipeline(m_device, m_terrainShadowPipeline, nullptr);
-    if (m_terrainShadowPipelineLayout) vkDestroyPipelineLayout(m_device, m_terrainShadowPipelineLayout, nullptr);
-    m_terrainShadowPipeline = VK_NULL_HANDLE;
-    m_terrainShadowPipelineLayout = VK_NULL_HANDLE;
-
-    if (m_sunShadowPipeline) vkDestroyPipeline(m_device, m_sunShadowPipeline, nullptr);
-    m_sunShadowPipeline = VK_NULL_HANDLE;
-
-    for (VkFramebuffer fb : m_shadowFramebuffers) {
-        vkDestroyFramebuffer(m_device, fb, nullptr);
-    }
-    m_shadowFramebuffers.clear();
-
-    for (VkFramebuffer fb : m_sunShadowFramebuffers) {
-        vkDestroyFramebuffer(m_device, fb, nullptr);
-    }
-    m_sunShadowFramebuffers.clear();
-    for (VkFramebuffer fb : m_sunShadowLoadFramebuffers) {
-        vkDestroyFramebuffer(m_device, fb, nullptr);
-    }
-    m_sunShadowLoadFramebuffers.clear();
-
-    if (m_shadowRenderPass) vkDestroyRenderPass(m_device, m_shadowRenderPass, nullptr);
-    m_shadowRenderPass = VK_NULL_HANDLE;
-    if (m_shadowLoadRenderPass) vkDestroyRenderPass(m_device, m_shadowLoadRenderPass, nullptr);
-    m_shadowLoadRenderPass = VK_NULL_HANDLE;
-
-    for (VkImageView layerView : m_pointShadowLayerViews) {
-        vkDestroyImageView(m_device, layerView, nullptr);
-    }
-    m_pointShadowLayerViews.clear();
-
-    if (m_pointShadowCubeArrayView) vkDestroyImageView(m_device, m_pointShadowCubeArrayView, nullptr);
-    if (m_pointShadowImage) vkDestroyImage(m_device, m_pointShadowImage, nullptr);
-    if (m_pointShadowMemory) vkFreeMemory(m_device, m_pointShadowMemory, nullptr);
-    m_pointShadowCubeArrayView = VK_NULL_HANDLE;
-    m_pointShadowImage = VK_NULL_HANDLE;
-    m_pointShadowMemory = VK_NULL_HANDLE;
-
-    for (VkImageView layerView : m_sunShadowLayerViews) {
-        vkDestroyImageView(m_device, layerView, nullptr);
-    }
-    m_sunShadowLayerViews.clear();
-    if (m_sunShadowArrayView) vkDestroyImageView(m_device, m_sunShadowArrayView, nullptr);
-    if (m_sunShadowImage) vkDestroyImage(m_device, m_sunShadowImage, nullptr);
-    if (m_sunShadowMemory) vkFreeMemory(m_device, m_sunShadowMemory, nullptr);
-    m_sunShadowArrayView = VK_NULL_HANDLE;
-    m_sunShadowImage = VK_NULL_HANDLE;
-    m_sunShadowMemory = VK_NULL_HANDLE;
-    destroySunShadowScrollScratch();
-
-    if (m_shadowSampler) vkDestroySampler(m_device, m_shadowSampler, nullptr);
-    m_shadowSampler = VK_NULL_HANDLE;
-
-    // Sky-vis heightmap texture
-    if (m_skyHeightmapSampler) vkDestroySampler(m_device, m_skyHeightmapSampler, nullptr);
-    if (m_skyHeightmapView)    vkDestroyImageView(m_device, m_skyHeightmapView, nullptr);
-    if (m_skyHeightmapImage)   vkDestroyImage(m_device, m_skyHeightmapImage, nullptr);
-    if (m_skyHeightmapMemory)  vkFreeMemory(m_device, m_skyHeightmapMemory, nullptr);
-    m_skyHeightmapSampler = VK_NULL_HANDLE;
-    m_skyHeightmapView = VK_NULL_HANDLE;
-    m_skyHeightmapImage = VK_NULL_HANDLE;
-    m_skyHeightmapMemory = VK_NULL_HANDLE;
-    m_skyHeightmapInfo = glm::vec4(0.0f);
-    m_skyHeightmapInitialized = false;
-
-    m_activeLights.clear();
-    m_activeLightRemap.clear();
-    m_slotShadowCache = {};
-    m_localTerrainDrawScratch.clear();
-    m_localTerrainOriginScratch.clear();
-    m_lightDiagnostics.clear();
-    m_timestampPeriod = 0.0f;
-    m_detailedDiagnosticsEnabled = false;
-    m_lastTerrainPassGpuMs = 0.0f;
-    m_frameDiagnostics = {};
-    m_sunShadowCache = {};
-    m_sunLightVP = glm::mat4(1.0f);
-    m_sunCascadeVP = {};
-    m_sunCascadeHalfExtents = {};
-    m_sunCascadeTexelMeters = {};
-    m_activeSunCascadeCount = 1u;
-    m_sunDir = glm::vec3(0.0f, -1.0f, 0.0f);
-    m_sunCameraPos = glm::vec3(0.0f);
-    m_prevQuantizedSunShearX = 0.0f;
-    m_prevQuantizedSunShearZ = 0.0f;
-    m_prevQuantizedSunShearValid = false;
-    m_prevQuantizedSunOriginClipX = 0.0f;
-    m_prevQuantizedSunOriginClipY = 0.0f;
-    m_prevQuantizedSunOriginValid = false;
-    m_prevActiveAzimuth = 225.0f;
-    m_prevActiveElevation = 45.0f;
-    m_prevSunAnglesValid = false;
-    m_sunAnglesMoving = false;
-    m_sunShadowActive = false;
-    m_commandPool = VK_NULL_HANDLE;
-    m_graphicsQueue = VK_NULL_HANDLE;
-    m_initialized = false;
-}
-
-void ShadowSystem::recreatePerImageResources(uint32_t swapchainImageCount) {
-    if (!m_device) {
-        return;
-    }
-    destroyPerImageBuffers();
-    createPerImageBuffers(swapchainImageCount);
-}
-
-VkDescriptorImageInfo ShadowSystem::getSunShadowDescriptor() const {
-    VkDescriptorImageInfo info{};
-    info.sampler = m_shadowSampler;
-    info.imageView = m_sunShadowArrayView;
-    info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    return info;
-}
-
-VkDescriptorImageInfo ShadowSystem::getPointShadowDescriptor() const {
-    VkDescriptorImageInfo info{};
-    info.sampler = m_shadowSampler;
-    info.imageView = m_pointShadowCubeArrayView;
-    info.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    return info;
-}
-
-VkDescriptorImageInfo ShadowSystem::getSkyHeightmapDescriptor() const {
-    VkDescriptorImageInfo info{};
-    info.sampler = m_skyHeightmapSampler;
-    info.imageView = m_skyHeightmapView;
-    info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    return info;
-}
-
-void ShadowSystem::uploadSkyHeightmap(
-    const TerrainEdit::HeightmapBaseSampler& sampler,
-    float voxelToMeter)
-{
-    if (!m_skyHeightmapImage || !sampler.isLoaded()) {
-        return;
-    }
-
-    const int srcW = sampler.getMapWidth();
-    const int srcH = sampler.getMapHeight();
-    const uint32_t dstDim = SKY_HEIGHTMAP_DIM;
-
-    // World-space bounds: heightmap covers world voxel grid (0,0)..(srcW-1, srcH-1).
-    // World meters per heightmap voxel = voxelToMeter (default 0.25 = 4 voxels/m).
-    const float worldSizeXMeters = static_cast<float>(srcW) * voxelToMeter;
-    const float worldSizeZMeters = static_cast<float>(srcH) * voxelToMeter;
-    const float metersPerTexel   = worldSizeXMeters / static_cast<float>(dstDim);
-
-    m_skyHeightmapInfo = glm::vec4(
-        0.0f,             // worldOriginXMeters
-        0.0f,             // worldOriginZMeters
-        metersPerTexel,   // assumes square coverage
-        voxelToMeter);    // value (voxels) → meters scale
-
-    // Downsample with conservative MAX (so we never miss tall features).
-    const size_t pixelCount = static_cast<size_t>(dstDim) * dstDim;
-    std::vector<uint16_t> halfData(pixelCount, 0);
-
-    auto floatToHalf = [](float f) -> uint16_t {
-        // Minimal IEEE-754 float32 → float16 (round toward zero, no NaN handling).
-        // Heightmap values are non-negative finite, so this is sufficient.
-        union { float f; uint32_t u; } v;
-        v.f = std::max(0.0f, f);
-        uint32_t e = (v.u >> 23) & 0xFFu;
-        uint32_t m = v.u & 0x7FFFFFu;
-        if (e == 0u) return 0u;
-        if (e >= 143u) return 0x7BFFu; // clamp to max half (~65504)
-        if (e <= 112u) return 0u;
-        uint32_t newE = e - 112u;
-        return static_cast<uint16_t>((newE << 10) | (m >> 13));
-    };
-
-    const float xStep = static_cast<float>(srcW) / static_cast<float>(dstDim);
-    const float zStep = static_cast<float>(srcH) / static_cast<float>(dstDim);
-    for (uint32_t pz = 0; pz < dstDim; ++pz) {
-        const int z0 = std::min(srcH - 1, static_cast<int>(pz       * zStep));
-        const int z1 = std::min(srcH - 1, static_cast<int>((pz + 1) * zStep));
-        for (uint32_t px = 0; px < dstDim; ++px) {
-            const int x0 = std::min(srcW - 1, static_cast<int>(px       * xStep));
-            const int x1 = std::min(srcW - 1, static_cast<int>((px + 1) * xStep));
-            // Average downsample. Using MAX caused per-texel inflation
-            // that LINEAR/NEAREST sampling turned into chaotic stripes
-            // around tall features. Averaging keeps flat ground flat in
-            // the texture; the small (~one source-cell) downsampling
-            // error is removed by the shader's dead-zone.
-            double hSum = 0.0;
-            int    hCount = 0;
-            for (int z = z0; z <= z1; ++z) {
-                for (int x = x0; x <= x1; ++x) {
-                    hSum += static_cast<double>(sampler.getHeightAtVoxelUnchecked(x, z));
-                    ++hCount;
-                }
-            }
-            const float hAvg = hCount > 0 ? static_cast<float>(hSum / hCount) : 0.0f;
-            halfData[static_cast<size_t>(pz) * dstDim + px] = floatToHalf(hAvg);
-        }
-    }
-
-    const VkDeviceSize byteSize = pixelCount * sizeof(uint16_t);
-
-    // Staging buffer
-    VkBufferCreateInfo bufInfo{};
-    bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufInfo.size = byteSize;
-    bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    VkBuffer staging{VK_NULL_HANDLE};
-    if (vkCreateBuffer(m_device, &bufInfo, nullptr, &staging) != VK_SUCCESS) {
-        std::cerr << "[ShadowSystem] uploadSkyHeightmap: staging buffer create failed\n";
-        return;
-    }
-    VkMemoryRequirements memReqs{};
-    vkGetBufferMemoryRequirements(m_device, staging, &memReqs);
-    VkMemoryAllocateInfo memAlloc{};
-    memAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    memAlloc.allocationSize = memReqs.size;
-    memAlloc.memoryTypeIndex = VulkanHelpers::findMemoryType(
-        m_physicalDevice, memReqs.memoryTypeBits,
-        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    VkDeviceMemory stagingMem{VK_NULL_HANDLE};
-    if (vkAllocateMemory(m_device, &memAlloc, nullptr, &stagingMem) != VK_SUCCESS) {
-        vkDestroyBuffer(m_device, staging, nullptr);
-        std::cerr << "[ShadowSystem] uploadSkyHeightmap: staging memory alloc failed\n";
-        return;
-    }
-    vkBindBufferMemory(m_device, staging, stagingMem, 0);
-    void* mapped = nullptr;
-    vkMapMemory(m_device, stagingMem, 0, byteSize, 0, &mapped);
-    std::memcpy(mapped, halfData.data(), byteSize);
-    vkUnmapMemory(m_device, stagingMem);
-
-    // One-shot command buffer: SHADER_READ_ONLY -> TRANSFER_DST -> copy -> SHADER_READ_ONLY
-    VkCommandBufferAllocateInfo cmdAlloc{};
-    cmdAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmdAlloc.commandPool = m_commandPool;
-    cmdAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmdAlloc.commandBufferCount = 1;
-    VkCommandBuffer cmd{VK_NULL_HANDLE};
-    vkAllocateCommandBuffers(m_device, &cmdAlloc, &cmd);
-    VkCommandBufferBeginInfo bi{};
-    bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &bi);
-
-    VkImageMemoryBarrier b{};
-    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    b.image = m_skyHeightmapImage;
-    b.subresourceRange = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1 };
-    b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &b);
-
-    VkBufferImageCopy region{};
-    region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
-    region.imageExtent = { dstDim, dstDim, 1 };
-    vkCmdCopyBufferToImage(cmd, staging, m_skyHeightmapImage,
-        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-    b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cmd,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-        0, 0, nullptr, 0, nullptr, 1, &b);
-
-    vkEndCommandBuffer(cmd);
-    VkSubmitInfo si{};
-    si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    si.commandBufferCount = 1;
-    si.pCommandBuffers = &cmd;
-    vkQueueSubmit(m_graphicsQueue, 1, &si, VK_NULL_HANDLE);
-    vkQueueWaitIdle(m_graphicsQueue);
-    vkFreeCommandBuffers(m_device, m_commandPool, 1, &cmd);
-
-    vkDestroyBuffer(m_device, staging, nullptr);
-    vkFreeMemory(m_device, stagingMem, nullptr);
-
-    m_skyHeightmapInitialized = true;
-    std::cout << "[ShadowSystem] Sky heightmap uploaded ("
-              << srcW << "x" << srcH << " -> " << dstDim << "x" << dstDim
-              << ", " << metersPerTexel << " m/texel, world span "
-              << worldSizeXMeters << "x" << worldSizeZMeters << " m)\n";
-}
-
-ShadowSystem::SunShadowRuntimeConfig ShadowSystem::estimateSunShadowRuntimeConfig(
-    float budgetMB,
-    float texelsPerVoxel,
-    uint32_t cascadeCount,
-    float cascadeScale,
-    float shadowAreaRadius) const {
-    SunShadowRuntimeConfig cfg{};
-    cfg.budgetMB = std::max(budgetMB, SUN_MIN_BUDGET_MB);
-    const float requestedTexelsPerVoxel =
-        std::clamp(texelsPerVoxel, SUN_MIN_TEXELS_PER_VOXEL, SUN_MAX_TEXELS_PER_VOXEL);
-    cfg.cascadeCount = std::clamp(cascadeCount, SUN_MIN_CASCADE_COUNT, SUN_MAX_CASCADE_COUNT);
-    cfg.cascadeScale = std::clamp(cascadeScale, SUN_MIN_CASCADE_SCALE, SUN_MAX_CASCADE_SCALE);
-    // Cascade 0 half-extent tracks the area radius down to a floor, capped
-    // at the legacy default. This is the HD ring: budget-derived map dims
-    // are sized to this extent at the requested texel density, so a smaller
-    // visible radius gives more pixels per metre rather than wasting them
-    // on a 64m ring the user can't see.
-    float dynHalf = SUN_DEFAULT_HALF_EXTENT_METERS;
-    if (shadowAreaRadius > 0.0f) {
-        dynHalf = std::clamp(shadowAreaRadius,
-                             SUN_MIN_HALF_EXTENT_METERS,
-                             SUN_DEFAULT_HALF_EXTENT_METERS);
-    }
-    cfg.halfExtentMeters = dynHalf;
-    cfg.texelMeters = SUN_VOXEL_SIZE_METERS / requestedTexelsPerVoxel;
-
-    const double budgetBytes = static_cast<double>(cfg.budgetMB) * 1024.0 * 1024.0;
-    const double perCascadeBytes = budgetBytes / static_cast<double>(cfg.cascadeCount);
-    const double maxDimFromBudget = std::sqrt(std::max(perCascadeBytes / 4.0, 1.0));
-    const double targetDimFromRequestedTexel =
-        (2.0 * static_cast<double>(cfg.halfExtentMeters)) / static_cast<double>(cfg.texelMeters);
-    uint32_t mapSize = static_cast<uint32_t>(std::floor(std::min(maxDimFromBudget, targetDimFromRequestedTexel)));
-    uint32_t maxDim = m_maxSunShadowMapDimension;
-    if (maxDim == 0u) {
-        maxDim = SUN_DEFAULT_MAP_SIZE;
-    }
-    mapSize = std::min(mapSize, maxDim);
-    mapSize = std::max<uint32_t>(mapSize, 256u);
-
-    // Keep dimensions coarse-aligned for predictable allocations on low-end GPUs.
-    mapSize = (mapSize / 256u) * 256u;
-    if (mapSize == 0u) {
-        mapSize = std::min<uint32_t>(maxDim, 256u);
-    }
-    if (mapSize > maxDim) {
-        mapSize = maxDim;
-    }
-
-    cfg.mapSize = mapSize;
-    // Keep the requested texel density (texelsPerVoxel) honored exactly:
-    // if the budget-derived map dimension is smaller than what's needed
-    // for the requested halfExtent at that density, SHRINK halfExtent to
-    // preserve the texel size rather than letting the texel grow (which
-    // would silently degrade the shadow grain from 16×16 to 8×8 etc.).
-    const float requestedTexelMeters = SUN_VOXEL_SIZE_METERS / requestedTexelsPerVoxel;
-    const float maxHalfExtentForTexel =
-        0.5f * static_cast<float>(cfg.mapSize) * requestedTexelMeters;
-    if (cfg.halfExtentMeters > maxHalfExtentForTexel) {
-        cfg.halfExtentMeters = std::max(maxHalfExtentForTexel, SUN_MIN_HALF_EXTENT_METERS);
-    }
-    cfg.texelMeters = (2.0f * cfg.halfExtentMeters) / static_cast<float>(cfg.mapSize);
-    cfg.texelsPerVoxel = SUN_VOXEL_SIZE_METERS / cfg.texelMeters;
-    cfg.maxCastRadiusMeters = cfg.halfExtentMeters *
-        std::pow(cfg.cascadeScale, static_cast<float>(cfg.cascadeCount - 1u));
-    cfg.perCascadeMemoryMB =
-        (static_cast<float>(cfg.mapSize) * static_cast<float>(cfg.mapSize) * 4.0f) /
-        (1024.0f * 1024.0f);
-    cfg.actualMemoryMB = cfg.perCascadeMemoryMB * static_cast<float>(cfg.cascadeCount);
-    return cfg;
-}
-
-bool ShadowSystem::applySunShadowProfile(bool forceRecreate) {
-    const SunShadowRuntimeConfig desired = estimateSunShadowRuntimeConfig(
-        m_sunShadowConfig.sunShadowBudgetMB,
-        m_sunShadowConfig.sunTexelsPerVoxel,
-        m_sunShadowConfig.sunCascadeCount,
-        m_sunShadowConfig.sunCascadeScale,
-        m_sunShadowConfig.shadowAreaRadius);
-    const bool profileChanged =
-        desired.mapSize != m_sunRuntimeConfig.mapSize ||
-        desired.cascadeCount != m_sunRuntimeConfig.cascadeCount ||
-        std::abs(desired.cascadeScale - m_sunRuntimeConfig.cascadeScale) > 1e-5f ||
-        std::abs(desired.texelMeters - m_sunRuntimeConfig.texelMeters) > 1e-6f ||
-        std::abs(desired.halfExtentMeters - m_sunRuntimeConfig.halfExtentMeters) > 1e-5f ||
-        std::abs(desired.maxCastRadiusMeters - m_sunRuntimeConfig.maxCastRadiusMeters) > 1e-4f;
-
-    m_sunRuntimeConfig = desired;
-    m_activeSunCascadeCount = m_sunRuntimeConfig.cascadeCount;
-
-    if (!m_initialized) {
-        return profileChanged || forceRecreate;
-    }
-    if (!profileChanged && !forceRecreate) {
-        return false;
-    }
-    if (m_device == VK_NULL_HANDLE || m_commandPool == VK_NULL_HANDLE || m_graphicsQueue == VK_NULL_HANDLE) {
-        return false;
-    }
-
-    vkDeviceWaitIdle(m_device);
-
-    for (VkFramebuffer fb : m_sunShadowFramebuffers) {
-        vkDestroyFramebuffer(m_device, fb, nullptr);
-    }
-    m_sunShadowFramebuffers.clear();
-    for (VkFramebuffer fb : m_sunShadowLoadFramebuffers) {
-        vkDestroyFramebuffer(m_device, fb, nullptr);
-    }
-    m_sunShadowLoadFramebuffers.clear();
-    for (VkImageView layerView : m_sunShadowLayerViews) {
-        vkDestroyImageView(m_device, layerView, nullptr);
-    }
-    m_sunShadowLayerViews.clear();
-    if (m_sunShadowArrayView != VK_NULL_HANDLE) {
-        vkDestroyImageView(m_device, m_sunShadowArrayView, nullptr);
-        m_sunShadowArrayView = VK_NULL_HANDLE;
-    }
-    if (m_sunShadowImage != VK_NULL_HANDLE) {
-        vkDestroyImage(m_device, m_sunShadowImage, nullptr);
-        m_sunShadowImage = VK_NULL_HANDLE;
-    }
-    if (m_sunShadowMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(m_device, m_sunShadowMemory, nullptr);
-        m_sunShadowMemory = VK_NULL_HANDLE;
-    }
-    destroySunShadowScrollScratch();
-
-    createSunShadowImageAndView();
-    createSunShadowFramebuffers();
-    transitionSunImageToSampled(m_commandPool, m_graphicsQueue);
-
-    m_sunShadowCache = {};
-    m_sunLightVP = glm::mat4(1.0f);
-    m_sunCascadeVP = {};
-    m_sunCascadeHalfExtents = {};
-    m_sunCascadeTexelMeters = {};
-    m_sunTexelLogPrevValid = false;
-
-    std::cout << "[ShadowSystem] Applied sun profile: cascades=" << m_sunRuntimeConfig.cascadeCount
-              << " map=" << m_sunRuntimeConfig.mapSize
-              << " texels/voxel=" << m_sunRuntimeConfig.texelsPerVoxel
-              << " nearHalfExtent=" << m_sunRuntimeConfig.halfExtentMeters << "m"
-              << " maxCast=" << m_sunRuntimeConfig.maxCastRadiusMeters << "m"
-              << " mem=" << m_sunRuntimeConfig.actualMemoryMB << "MB" << std::endl;
-    return true;
-}
-
-````
-
-## src\rendering\lighting\ShadowSystemResources.cpp
-
-Description: No CC-DESC found.
-
-````cpp
-#include "rendering/lighting/ShadowSystem.h"
-
-#include "rendering/common/VulkanHelpers.h"
-#include "rendering/common/Mesh.h"
-#include "rendering/lighting/LightingSettings.h"
-
-#define GLM_FORCE_RADIANS
-#define GLM_FORCE_DEPTH_ZERO_TO_ONE
-
-#include <algorithm>
-#include <array>
-#include <chrono>
-#include <cmath>
-#include <cstddef>
-#include <cstdint>
-#include <cstring>
-#include <iostream>
-#include <limits>
-#include <stdexcept>
-#include <vector>
-
-// Resource creation/destruction functions - extracted from ShadowSystem.cpp
-
-namespace {
-
-constexpr uint32_t kInvalidSourceIndex = std::numeric_limits<uint32_t>::max();
-
-void createBuffer(VkDevice device,
-                  VkPhysicalDevice physicalDevice,
-                  VkDeviceSize size,
-                  VkBufferUsageFlags usage,
-                  VkMemoryPropertyFlags properties,
-                  VkBuffer& outBuffer,
-                  VkDeviceMemory& outMemory) {
-    VkBufferCreateInfo bufferInfo{};
-    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    bufferInfo.size = size;
-    bufferInfo.usage = usage;
-    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-
-    if (vkCreateBuffer(device, &bufferInfo, nullptr, &outBuffer) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to create buffer");
-    }
-
-    VkMemoryRequirements memRequirements{};
-    vkGetBufferMemoryRequirements(device, outBuffer, &memRequirements);
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memRequirements.size;
-    allocInfo.memoryTypeIndex = VulkanHelpers::findMemoryType(
-        physicalDevice,
-        memRequirements.memoryTypeBits,
-        properties);
-
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &outMemory) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to allocate buffer memory");
-    }
-
-    vkBindBufferMemory(device, outBuffer, outMemory, 0);
-}
-
-void createImage(VkDevice device,
-                 VkPhysicalDevice physicalDevice,
-                 uint32_t width,
-                 uint32_t height,
-                 uint32_t layers,
-                 VkFormat format,
-                 VkImageUsageFlags usage,
-                 VkImageCreateFlags flags,
-                 VkImage& outImage,
-                 VkDeviceMemory& outMemory) {
-    VkImageCreateInfo imageInfo{};
-    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imageInfo.imageType = VK_IMAGE_TYPE_2D;
-    imageInfo.extent.width = width;
-    imageInfo.extent.height = height;
-    imageInfo.extent.depth = 1;
-    imageInfo.mipLevels = 1;
-    imageInfo.arrayLayers = layers;
-    imageInfo.format = format;
-    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    imageInfo.usage = usage;
-    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    imageInfo.flags = flags;
-
-    if (vkCreateImage(device, &imageInfo, nullptr, &outImage) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to create image");
-    }
-
-    VkMemoryRequirements memRequirements{};
-    vkGetImageMemoryRequirements(device, outImage, &memRequirements);
-
-    VkMemoryAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    allocInfo.allocationSize = memRequirements.size;
-    allocInfo.memoryTypeIndex = VulkanHelpers::findMemoryType(
-        physicalDevice,
-        memRequirements.memoryTypeBits,
-        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-    if (vkAllocateMemory(device, &allocInfo, nullptr, &outMemory) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to allocate image memory");
-    }
-
-    vkBindImageMemory(device, outImage, outMemory, 0);
-}
-
-} // namespace
-
-void ShadowSystem::createPerImageBuffers(uint32_t swapchainImageCount) {
-    m_shadowDataBuffers.resize(swapchainImageCount, VK_NULL_HANDLE);
-    m_shadowDataMemories.resize(swapchainImageCount, VK_NULL_HANDLE);
-    m_shadowDataMapped.resize(swapchainImageCount, nullptr);
-    m_sunLocalIndirectBuffers.resize(swapchainImageCount, VK_NULL_HANDLE);
-    m_sunLocalIndirectMemories.resize(swapchainImageCount, VK_NULL_HANDLE);
-    m_sunLocalOriginsBuffers.resize(swapchainImageCount, VK_NULL_HANDLE);
-    m_sunLocalOriginsMemories.resize(swapchainImageCount, VK_NULL_HANDLE);
-    m_sunLocalUploadBuffers.resize(swapchainImageCount, VK_NULL_HANDLE);
-    m_sunLocalUploadMemories.resize(swapchainImageCount, VK_NULL_HANDLE);
-    m_sunLocalUploadMapped.resize(swapchainImageCount, nullptr);
-
-    const VkDeviceSize dataSize = sizeof(ShadowGPUData);
-    const VkDeviceSize sunIndirectBytes =
-        sizeof(VkDrawIndexedIndirectCommand) * SUN_LOCAL_INDIRECT_TOTAL_DRAWS;
-    const VkDeviceSize sunOriginsBytes =
-        sizeof(glm::vec4) * SUN_LOCAL_INDIRECT_TOTAL_DRAWS;
-    const VkDeviceSize sunUploadBytes = sunIndirectBytes + sunOriginsBytes;
-    for (uint32_t i = 0; i < swapchainImageCount; ++i) {
-        createBuffer(
-            m_device,
-            m_physicalDevice,
-            dataSize,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            m_shadowDataBuffers[i],
-            m_shadowDataMemories[i]);
-
-        vkMapMemory(m_device, m_shadowDataMemories[i], 0, dataSize, 0, &m_shadowDataMapped[i]);
-        std::memset(m_shadowDataMapped[i], 0, static_cast<size_t>(dataSize));
-
-        createBuffer(
-            m_device,
-            m_physicalDevice,
-            sunIndirectBytes,
-            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            m_sunLocalIndirectBuffers[i],
-            m_sunLocalIndirectMemories[i]);
-        createBuffer(
-            m_device,
-            m_physicalDevice,
-            sunOriginsBytes,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            m_sunLocalOriginsBuffers[i],
-            m_sunLocalOriginsMemories[i]);
-        createBuffer(
-            m_device,
-            m_physicalDevice,
-            sunUploadBytes,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            m_sunLocalUploadBuffers[i],
-            m_sunLocalUploadMemories[i]);
-        vkMapMemory(
-            m_device,
-            m_sunLocalUploadMemories[i],
-            0,
-            sunUploadBytes,
-            0,
-            &m_sunLocalUploadMapped[i]);
-    }
-
-    m_lightTimingImageCount = swapchainImageCount;
-    m_querySourceByImage.resize(swapchainImageCount);
-    for (auto& perImageSources : m_querySourceByImage) {
-        perImageSources.fill(kInvalidSourceIndex);
-    }
-    m_queryLightCountByImage.assign(swapchainImageCount, 0u);
-
-    const uint32_t queryCount = swapchainImageCount * MAX_POINT_SHADOW_LIGHTS * 2u;
-    if (m_gpuTimingEnabled && queryCount > 0u) {
-        VkQueryPoolCreateInfo queryInfo{};
-        queryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-        queryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        queryInfo.queryCount = queryCount;
-        if (vkCreateQueryPool(m_device, &queryInfo, nullptr, &m_lightTimingQueryPool) != VK_SUCCESS) {
-            throw std::runtime_error("ShadowSystem: failed to create per-light timestamp query pool");
-        }
-    }
-
-    // Sun shadow GPU timing: 2 timestamps (begin/end) per swapchain image.
-    m_sunTimingImageCount = swapchainImageCount;
-    m_sunTimingWritten.assign(swapchainImageCount, false);
-    if (m_gpuTimingEnabled && swapchainImageCount > 0u) {
-        VkQueryPoolCreateInfo sunQueryInfo{};
-        sunQueryInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-        sunQueryInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
-        sunQueryInfo.queryCount = swapchainImageCount * 2u;
-        if (vkCreateQueryPool(m_device, &sunQueryInfo, nullptr, &m_sunTimingQueryPool) != VK_SUCCESS) {
-            throw std::runtime_error("ShadowSystem: failed to create sun timestamp query pool");
-        }
-    }
-}
-
-void ShadowSystem::destroyPerImageBuffers() {
-    if (m_sunTimingQueryPool != VK_NULL_HANDLE) {
-        vkDestroyQueryPool(m_device, m_sunTimingQueryPool, nullptr);
-        m_sunTimingQueryPool = VK_NULL_HANDLE;
-    }
-    m_sunTimingImageCount = 0u;
-    m_sunTimingWritten.clear();
-
-    if (m_lightTimingQueryPool != VK_NULL_HANDLE) {
-        vkDestroyQueryPool(m_device, m_lightTimingQueryPool, nullptr);
-        m_lightTimingQueryPool = VK_NULL_HANDLE;
-    }
-    m_lightTimingImageCount = 0u;
-    m_querySourceByImage.clear();
-    m_queryLightCountByImage.clear();
-
-    for (size_t i = 0; i < m_shadowDataBuffers.size(); ++i) {
-        if (i < m_sunLocalUploadMapped.size() && m_sunLocalUploadMapped[i]) {
-            vkUnmapMemory(m_device, m_sunLocalUploadMemories[i]);
-        }
-        if (i < m_sunLocalUploadBuffers.size() && m_sunLocalUploadBuffers[i]) {
-            vkDestroyBuffer(m_device, m_sunLocalUploadBuffers[i], nullptr);
-        }
-        if (i < m_sunLocalUploadMemories.size() && m_sunLocalUploadMemories[i]) {
-            vkFreeMemory(m_device, m_sunLocalUploadMemories[i], nullptr);
-        }
-        if (i < m_sunLocalOriginsBuffers.size() && m_sunLocalOriginsBuffers[i]) {
-            vkDestroyBuffer(m_device, m_sunLocalOriginsBuffers[i], nullptr);
-        }
-        if (i < m_sunLocalOriginsMemories.size() && m_sunLocalOriginsMemories[i]) {
-            vkFreeMemory(m_device, m_sunLocalOriginsMemories[i], nullptr);
-        }
-        if (i < m_sunLocalIndirectBuffers.size() && m_sunLocalIndirectBuffers[i]) {
-            vkDestroyBuffer(m_device, m_sunLocalIndirectBuffers[i], nullptr);
-        }
-        if (i < m_sunLocalIndirectMemories.size() && m_sunLocalIndirectMemories[i]) {
-            vkFreeMemory(m_device, m_sunLocalIndirectMemories[i], nullptr);
-        }
-        if (m_shadowDataMapped[i]) {
-            vkUnmapMemory(m_device, m_shadowDataMemories[i]);
-        }
-        if (m_shadowDataBuffers[i]) {
-            vkDestroyBuffer(m_device, m_shadowDataBuffers[i], nullptr);
-        }
-        if (m_shadowDataMemories[i]) {
-            vkFreeMemory(m_device, m_shadowDataMemories[i], nullptr);
-        }
-    }
-
-    m_shadowDataBuffers.clear();
-    m_shadowDataMemories.clear();
-    m_shadowDataMapped.clear();
-    m_sunLocalIndirectBuffers.clear();
-    m_sunLocalIndirectMemories.clear();
-    m_sunLocalOriginsBuffers.clear();
-    m_sunLocalOriginsMemories.clear();
-    m_sunLocalUploadBuffers.clear();
-    m_sunLocalUploadMemories.clear();
-    m_sunLocalUploadMapped.clear();
-}
-
-void ShadowSystem::createShadowImages() {
-    createImage(
-        m_device,
-        m_physicalDevice,
-        POINT_SHADOW_MAP_SIZE,
-        POINT_SHADOW_MAP_SIZE,
-        MAX_POINT_SHADOW_LIGHTS * 6,
-        VK_FORMAT_D32_SFLOAT,
-        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
-        VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT,
-        m_pointShadowImage,
-        m_pointShadowMemory);
-
-    VkImageViewCreateInfo cubeArrayViewInfo{};
-    cubeArrayViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    cubeArrayViewInfo.image = m_pointShadowImage;
-    cubeArrayViewInfo.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
-    cubeArrayViewInfo.format = VK_FORMAT_D32_SFLOAT;
-    cubeArrayViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    cubeArrayViewInfo.subresourceRange.baseMipLevel = 0;
-    cubeArrayViewInfo.subresourceRange.levelCount = 1;
-    cubeArrayViewInfo.subresourceRange.baseArrayLayer = 0;
-    cubeArrayViewInfo.subresourceRange.layerCount = MAX_POINT_SHADOW_LIGHTS * 6;
-    if (vkCreateImageView(m_device, &cubeArrayViewInfo, nullptr, &m_pointShadowCubeArrayView) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to create point shadow cube-array view");
-    }
-
-    m_pointShadowLayerViews.resize(MAX_POINT_SHADOW_LIGHTS * 6, VK_NULL_HANDLE);
-    for (uint32_t layer = 0; layer < MAX_POINT_SHADOW_LIGHTS * 6; ++layer) {
-        VkImageViewCreateInfo layerViewInfo{};
-        layerViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        layerViewInfo.image = m_pointShadowImage;
-        layerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        layerViewInfo.format = VK_FORMAT_D32_SFLOAT;
-        layerViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        layerViewInfo.subresourceRange.baseMipLevel = 0;
-        layerViewInfo.subresourceRange.levelCount = 1;
-        layerViewInfo.subresourceRange.baseArrayLayer = layer;
-        layerViewInfo.subresourceRange.layerCount = 1;
-        if (vkCreateImageView(m_device, &layerViewInfo, nullptr, &m_pointShadowLayerViews[layer]) != VK_SUCCESS) {
-            throw std::runtime_error("ShadowSystem: failed to create point shadow layer view");
-        }
-    }
-
-    createSunShadowImageAndView();
-
-    VkSamplerCreateInfo samplerInfo{};
-    samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-    samplerInfo.magFilter = VK_FILTER_NEAREST;
-    samplerInfo.minFilter = VK_FILTER_NEAREST;
-    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    samplerInfo.mipLodBias = 0.0f;
-    samplerInfo.anisotropyEnable = VK_FALSE;
-    samplerInfo.maxAnisotropy = 1.0f;
-    samplerInfo.compareEnable = VK_TRUE;
-    samplerInfo.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = 1.0f;
-    samplerInfo.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
-    samplerInfo.unnormalizedCoordinates = VK_FALSE;
-    if (vkCreateSampler(m_device, &samplerInfo, nullptr, &m_shadowSampler) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to create shadow sampler");
-    }
-}
-
-void ShadowSystem::createSunShadowImageAndView() {
-    createImage(
-        m_device,
-        m_physicalDevice,
-        m_sunRuntimeConfig.mapSize,
-        m_sunRuntimeConfig.mapSize,
-        m_sunRuntimeConfig.cascadeCount,
-        VK_FORMAT_D32_SFLOAT,
-        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-            VK_IMAGE_USAGE_SAMPLED_BIT |
-            VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-            VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        0,
-        m_sunShadowImage,
-        m_sunShadowMemory);
-
-    VkImageViewCreateInfo arrayViewInfo{};
-    arrayViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-    arrayViewInfo.image = m_sunShadowImage;
-    arrayViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-    arrayViewInfo.format = VK_FORMAT_D32_SFLOAT;
-    arrayViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    arrayViewInfo.subresourceRange.baseMipLevel = 0;
-    arrayViewInfo.subresourceRange.levelCount = 1;
-    arrayViewInfo.subresourceRange.baseArrayLayer = 0;
-    arrayViewInfo.subresourceRange.layerCount = m_sunRuntimeConfig.cascadeCount;
-    if (vkCreateImageView(m_device, &arrayViewInfo, nullptr, &m_sunShadowArrayView) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to create sun shadow array view");
-    }
-
-    m_sunShadowLayerViews.resize(m_sunRuntimeConfig.cascadeCount, VK_NULL_HANDLE);
-    for (uint32_t layer = 0; layer < m_sunRuntimeConfig.cascadeCount; ++layer) {
-        VkImageViewCreateInfo layerViewInfo{};
-        layerViewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        layerViewInfo.image = m_sunShadowImage;
-        layerViewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        layerViewInfo.format = VK_FORMAT_D32_SFLOAT;
-        layerViewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-        layerViewInfo.subresourceRange.baseMipLevel = 0;
-        layerViewInfo.subresourceRange.levelCount = 1;
-        layerViewInfo.subresourceRange.baseArrayLayer = layer;
-        layerViewInfo.subresourceRange.layerCount = 1;
-        if (vkCreateImageView(m_device, &layerViewInfo, nullptr, &m_sunShadowLayerViews[layer]) != VK_SUCCESS) {
-            throw std::runtime_error("ShadowSystem: failed to create sun shadow layer view");
-        }
-    }
-
-    createSunShadowScrollScratch();
-}
-
-void ShadowSystem::createShadowRenderPass() {
-    auto createDepthPass = [&](VkAttachmentLoadOp loadOp,
-                               VkImageLayout initialLayout,
-                               const char* label,
-                               VkRenderPass& outPass) {
-        VkAttachmentDescription depthAttachment{};
-        depthAttachment.format = VK_FORMAT_D32_SFLOAT;
-        depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-        depthAttachment.loadOp = loadOp;
-        depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-        depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-        depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-        depthAttachment.initialLayout = initialLayout;
-        depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-
-        VkAttachmentReference depthRef{};
-        depthRef.attachment = 0;
-        depthRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-
-        VkSubpassDescription subpass{};
-        subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-        subpass.colorAttachmentCount = 0;
-        subpass.pDepthStencilAttachment = &depthRef;
-
-        std::array<VkSubpassDependency, 2> deps{};
-        deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-        deps[0].dstSubpass = 0;
-        deps[0].srcStageMask =
-            (loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
-                ? (VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT)
-                : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        deps[0].srcAccessMask =
-            (loadOp == VK_ATTACHMENT_LOAD_OP_LOAD)
-                ? (VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT)
-                : VK_ACCESS_SHADER_READ_BIT;
-        deps[0].dstStageMask =
-            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        deps[0].dstAccessMask =
-            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-            VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-        deps[1].srcSubpass = 0;
-        deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-        deps[1].srcStageMask =
-            VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-            VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-        deps[1].srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-        deps[1].dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-        deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-
-        VkRenderPassCreateInfo rpInfo{};
-        rpInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-        rpInfo.attachmentCount = 1;
-        rpInfo.pAttachments = &depthAttachment;
-        rpInfo.subpassCount = 1;
-        rpInfo.pSubpasses = &subpass;
-        rpInfo.dependencyCount = static_cast<uint32_t>(deps.size());
-        rpInfo.pDependencies = deps.data();
-
-        if (vkCreateRenderPass(m_device, &rpInfo, nullptr, &outPass) != VK_SUCCESS) {
-            throw std::runtime_error(label);
-        }
-    };
-
-    createDepthPass(
-        VK_ATTACHMENT_LOAD_OP_CLEAR,
-        VK_IMAGE_LAYOUT_UNDEFINED,
-        "ShadowSystem: failed to create shadow render pass",
-        m_shadowRenderPass);
-    createDepthPass(
-        VK_ATTACHMENT_LOAD_OP_LOAD,
-        VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        "ShadowSystem: failed to create shadow load render pass",
-        m_shadowLoadRenderPass);
-}
-
-void ShadowSystem::createShadowFramebuffers() {
-    m_shadowFramebuffers.resize(MAX_POINT_SHADOW_LIGHTS * 6, VK_NULL_HANDLE);
-
-    for (uint32_t layer = 0; layer < MAX_POINT_SHADOW_LIGHTS * 6; ++layer) {
-        VkImageView attachment = m_pointShadowLayerViews[layer];
-
-        VkFramebufferCreateInfo fbInfo{};
-        fbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        fbInfo.renderPass = m_shadowRenderPass;
-        fbInfo.attachmentCount = 1;
-        fbInfo.pAttachments = &attachment;
-        fbInfo.width = POINT_SHADOW_MAP_SIZE;
-        fbInfo.height = POINT_SHADOW_MAP_SIZE;
-        fbInfo.layers = 1;
-
-        if (vkCreateFramebuffer(m_device, &fbInfo, nullptr, &m_shadowFramebuffers[layer]) != VK_SUCCESS) {
-            throw std::runtime_error("ShadowSystem: failed to create shadow framebuffer");
-        }
-    }
-
-    createSunShadowFramebuffers();
-}
-
-void ShadowSystem::createSunShadowFramebuffers() {
-    m_sunShadowFramebuffers.resize(m_sunRuntimeConfig.cascadeCount, VK_NULL_HANDLE);
-    m_sunShadowLoadFramebuffers.resize(m_sunRuntimeConfig.cascadeCount, VK_NULL_HANDLE);
-    for (uint32_t layer = 0; layer < m_sunRuntimeConfig.cascadeCount; ++layer) {
-        VkImageView sunAttachment = m_sunShadowLayerViews[layer];
-        VkFramebufferCreateInfo sunFbInfo{};
-        sunFbInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-        sunFbInfo.renderPass = m_shadowRenderPass;
-        sunFbInfo.attachmentCount = 1;
-        sunFbInfo.pAttachments = &sunAttachment;
-        sunFbInfo.width = m_sunRuntimeConfig.mapSize;
-        sunFbInfo.height = m_sunRuntimeConfig.mapSize;
-        sunFbInfo.layers = 1;
-        if (vkCreateFramebuffer(m_device, &sunFbInfo, nullptr, &m_sunShadowFramebuffers[layer]) != VK_SUCCESS) {
-            throw std::runtime_error("ShadowSystem: failed to create sun shadow framebuffer");
-        }
-
-        VkFramebufferCreateInfo sunLoadFbInfo = sunFbInfo;
-        sunLoadFbInfo.renderPass = m_shadowLoadRenderPass;
-        if (vkCreateFramebuffer(m_device, &sunLoadFbInfo, nullptr, &m_sunShadowLoadFramebuffers[layer]) != VK_SUCCESS) {
-            throw std::runtime_error("ShadowSystem: failed to create sun shadow load framebuffer");
-        }
-    }
-}
-
-void ShadowSystem::createSunShadowScrollScratch() {
-    destroySunShadowScrollScratch();
-    createImage(
-        m_device,
-        m_physicalDevice,
-        m_sunRuntimeConfig.mapSize,
-        m_sunRuntimeConfig.mapSize,
-        1u,
-        VK_FORMAT_D32_SFLOAT,
-        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-        0,
-        m_sunShadowScrollScratchImage,
-        m_sunShadowScrollScratchMemory);
-    m_sunShadowScrollScratchLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-}
-
-void ShadowSystem::destroySunShadowScrollScratch() {
-    if (m_sunShadowScrollScratchImage != VK_NULL_HANDLE) {
-        vkDestroyImage(m_device, m_sunShadowScrollScratchImage, nullptr);
-        m_sunShadowScrollScratchImage = VK_NULL_HANDLE;
-    }
-    if (m_sunShadowScrollScratchMemory != VK_NULL_HANDLE) {
-        vkFreeMemory(m_device, m_sunShadowScrollScratchMemory, nullptr);
-        m_sunShadowScrollScratchMemory = VK_NULL_HANDLE;
-    }
-    m_sunShadowScrollScratchLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-}
-
-void ShadowSystem::createShadowPipelines() {
-    const std::vector<char> terrainVertCode = VulkanHelpers::readFile("shaders/shadow/point_shadow_terrain.vert.spv");
-    const std::vector<char> fragCode = VulkanHelpers::readFile("shaders/shadow/point_shadow_depth.frag.spv");
-
-    VkShaderModule terrainVert = VulkanHelpers::createShaderModule(m_device, terrainVertCode);
-    VkShaderModule frag = VulkanHelpers::createShaderModule(m_device, fragCode);
-
-    VkPipelineShaderStageCreateInfo terrainStages[2]{};
-    terrainStages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    terrainStages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    terrainStages[0].module = terrainVert;
-    terrainStages[0].pName = "main";
-    terrainStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    terrainStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    terrainStages[1].module = frag;
-    terrainStages[1].pName = "main";
-
-    VkVertexInputBindingDescription binding{};
-    binding.binding = 0;
-    binding.stride = sizeof(Vertex);
-    binding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-    VkVertexInputAttributeDescription attr{};
-    attr.location = 0;
-    attr.binding = 0;
-    attr.format = VK_FORMAT_R32_UINT;
-    attr.offset = offsetof(Vertex, packed);
-
-    VkPipelineVertexInputStateCreateInfo vertexInput{};
-    vertexInput.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-    vertexInput.vertexBindingDescriptionCount = 1;
-    vertexInput.pVertexBindingDescriptions = &binding;
-    vertexInput.vertexAttributeDescriptionCount = 1;
-    vertexInput.pVertexAttributeDescriptions = &attr;
-
-    VkPipelineInputAssemblyStateCreateInfo inputAssembly{};
-    inputAssembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    inputAssembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    inputAssembly.primitiveRestartEnable = VK_FALSE;
-
-    VkViewport viewport{};
-    viewport.x = 0.0f;
-    viewport.y = 0.0f;
-    viewport.width = static_cast<float>(POINT_SHADOW_MAP_SIZE);
-    viewport.height = static_cast<float>(POINT_SHADOW_MAP_SIZE);
-    viewport.minDepth = 0.0f;
-    viewport.maxDepth = 1.0f;
-
-    VkRect2D scissor{};
-    scissor.offset = {0, 0};
-    scissor.extent = {POINT_SHADOW_MAP_SIZE, POINT_SHADOW_MAP_SIZE};
-
-    VkPipelineViewportStateCreateInfo viewportState{};
-    viewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewportState.viewportCount = 1;
-    viewportState.pViewports = &viewport;
-    viewportState.scissorCount = 1;
-    viewportState.pScissors = &scissor;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.depthClampEnable = VK_FALSE;
-    raster.rasterizerDiscardEnable = VK_FALSE;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    raster.depthBiasEnable = VK_TRUE;
-    raster.depthBiasConstantFactor = 1.35f;
-    raster.depthBiasSlopeFactor = 1.75f;
-    raster.lineWidth = 1.0f;
-
-    VkPipelineMultisampleStateCreateInfo msaa{};
-    msaa.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    msaa.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-    msaa.sampleShadingEnable = VK_FALSE;
-
-    VkPipelineDepthStencilStateCreateInfo depthStencil{};
-    depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    depthStencil.depthTestEnable = VK_TRUE;
-    depthStencil.depthWriteEnable = VK_TRUE;
-    depthStencil.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
-    depthStencil.depthBoundsTestEnable = VK_FALSE;
-    depthStencil.stencilTestEnable = VK_FALSE;
-
-    VkPipelineColorBlendStateCreateInfo blend{};
-    blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blend.logicOpEnable = VK_FALSE;
-    blend.attachmentCount = 0;
-    blend.pAttachments = nullptr;
-
-    const std::array<VkDynamicState, 3> dynamicStates = {
-        VK_DYNAMIC_STATE_VIEWPORT,
-        VK_DYNAMIC_STATE_SCISSOR,
-        VK_DYNAMIC_STATE_DEPTH_BIAS
-    };
-    VkPipelineDynamicStateCreateInfo dynamicInfo{};
-    dynamicInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamicInfo.dynamicStateCount = static_cast<uint32_t>(dynamicStates.size());
-    dynamicInfo.pDynamicStates = dynamicStates.data();
-
-    VkPushConstantRange pushRange{};
-    pushRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    pushRange.offset = 0;
-    pushRange.size = sizeof(ShadowPushConstants);
-
-    VkPipelineLayoutCreateInfo terrainLayoutInfo{};
-    terrainLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    terrainLayoutInfo.setLayoutCount = 1;
-    terrainLayoutInfo.pSetLayouts = &m_mainDescriptorSetLayout;
-    terrainLayoutInfo.pushConstantRangeCount = 1;
-    terrainLayoutInfo.pPushConstantRanges = &pushRange;
-    if (vkCreatePipelineLayout(m_device, &terrainLayoutInfo, nullptr, &m_terrainShadowPipelineLayout) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to create terrain shadow pipeline layout");
-    }
-
-    VkGraphicsPipelineCreateInfo terrainPipeInfo{};
-    terrainPipeInfo.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    terrainPipeInfo.stageCount = 2;
-    terrainPipeInfo.pStages = terrainStages;
-    terrainPipeInfo.pVertexInputState = &vertexInput;
-    terrainPipeInfo.pInputAssemblyState = &inputAssembly;
-    terrainPipeInfo.pViewportState = &viewportState;
-    terrainPipeInfo.pRasterizationState = &raster;
-    terrainPipeInfo.pMultisampleState = &msaa;
-    terrainPipeInfo.pDepthStencilState = &depthStencil;
-    terrainPipeInfo.pColorBlendState = &blend;
-    terrainPipeInfo.pDynamicState = &dynamicInfo;
-    terrainPipeInfo.layout = m_terrainShadowPipelineLayout;
-    terrainPipeInfo.renderPass = m_shadowRenderPass;
-    terrainPipeInfo.subpass = 0;
-
-    if (vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &terrainPipeInfo, nullptr, &m_terrainShadowPipeline) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to create terrain shadow pipeline");
-    }
-
-    // Sun shadow pipeline: same vertex shader, directional depth fragment, dynamic viewport/scissor
-    const std::vector<char> sunFragCode = VulkanHelpers::readFile("shaders/shadow/directional_shadow_depth.frag.spv");
-    VkShaderModule sunFrag = VulkanHelpers::createShaderModule(m_device, sunFragCode);
-
-    VkPipelineShaderStageCreateInfo sunStages[2]{};
-    sunStages[0] = terrainStages[0]; // same vertex shader
-    sunStages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    sunStages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    sunStages[1].module = sunFrag;
-    sunStages[1].pName = "main";
-
-    // Sun shadow uses runtime directional-map size viewport
-    VkViewport sunViewport{};
-    sunViewport.x = 0.0f;
-    sunViewport.y = 0.0f;
-    sunViewport.width = static_cast<float>(m_sunRuntimeConfig.mapSize);
-    sunViewport.height = static_cast<float>(m_sunRuntimeConfig.mapSize);
-    sunViewport.minDepth = 0.0f;
-    sunViewport.maxDepth = 1.0f;
-
-    VkRect2D sunScissor{};
-    sunScissor.offset = {0, 0};
-    sunScissor.extent = {m_sunRuntimeConfig.mapSize, m_sunRuntimeConfig.mapSize};
-
-    VkPipelineViewportStateCreateInfo sunViewportState{};
-    sunViewportState.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    sunViewportState.viewportCount = 1;
-    sunViewportState.pViewports = &sunViewport;
-    sunViewportState.scissorCount = 1;
-    sunViewportState.pScissors = &sunScissor;
-
-    VkGraphicsPipelineCreateInfo sunPipeInfo = terrainPipeInfo;
-    sunPipeInfo.pStages = sunStages;
-    sunPipeInfo.pViewportState = &sunViewportState;
-
-    if (vkCreateGraphicsPipelines(m_device, VK_NULL_HANDLE, 1, &sunPipeInfo, nullptr, &m_sunShadowPipeline) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to create sun shadow pipeline");
-    }
-
-    vkDestroyShaderModule(m_device, sunFrag, nullptr);
-
-    vkDestroyShaderModule(m_device, terrainVert, nullptr);
-    vkDestroyShaderModule(m_device, frag, nullptr);
-}
-
-void ShadowSystem::transitionImagesToSampled(VkCommandPool commandPool, VkQueue queue) {
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(m_device, &allocInfo, &cmd) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to allocate transition command buffer");
-    }
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-
-    std::array<VkImageMemoryBarrier2, 2> barriers{};
-    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    barriers[0].srcStageMask = VK_PIPELINE_STAGE_2_NONE;
-    barriers[0].srcAccessMask = VK_ACCESS_2_NONE;
-    barriers[0].dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    barriers[0].dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    barriers[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barriers[0].newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].image = m_pointShadowImage;
-    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    barriers[0].subresourceRange.baseMipLevel = 0;
-    barriers[0].subresourceRange.levelCount = 1;
-    barriers[0].subresourceRange.baseArrayLayer = 0;
-    barriers[0].subresourceRange.layerCount = MAX_POINT_SHADOW_LIGHTS * 6;
-
-    barriers[1] = barriers[0];
-    barriers[1].image = m_sunShadowImage;
-    barriers[1].subresourceRange.layerCount = m_sunRuntimeConfig.cascadeCount;
-
-    VkDependencyInfo depInfo{};
-    depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    depInfo.imageMemoryBarrierCount = static_cast<uint32_t>(barriers.size());
-    depInfo.pImageMemoryBarriers = barriers.data();
-    vkCmdPipelineBarrier2(cmd, &depInfo);
-
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
-
-    vkFreeCommandBuffers(m_device, commandPool, 1, &cmd);
-}
-
-void ShadowSystem::transitionSunImageToSampled(VkCommandPool commandPool, VkQueue queue) {
-    VkCommandBufferAllocateInfo allocInfo{};
-    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocInfo.commandPool = commandPool;
-    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocInfo.commandBufferCount = 1;
-
-    VkCommandBuffer cmd = VK_NULL_HANDLE;
-    if (vkAllocateCommandBuffers(m_device, &allocInfo, &cmd) != VK_SUCCESS) {
-        throw std::runtime_error("ShadowSystem: failed to allocate sun-transition command buffer");
-    }
-
-    VkCommandBufferBeginInfo beginInfo{};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cmd, &beginInfo);
-
-    VkImageMemoryBarrier2 barrier{};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-    barrier.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
-    barrier.srcAccessMask = VK_ACCESS_2_NONE;
-    barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
-    barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = m_sunShadowImage;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = m_sunRuntimeConfig.cascadeCount;
-
-    VkDependencyInfo depInfo{};
-    depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-    depInfo.imageMemoryBarrierCount = 1;
-    depInfo.pImageMemoryBarriers = &barrier;
-    vkCmdPipelineBarrier2(cmd, &depInfo);
-
-    vkEndCommandBuffer(cmd);
-
-    VkSubmitInfo submitInfo{};
-    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmd;
-    vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-    vkQueueWaitIdle(queue);
-
-    vkFreeCommandBuffers(m_device, commandPool, 1, &cmd);
-}
-
-````
-
-## src\rendering\lighting\ShadowDiagnostics.cpp
-
-Description: No CC-DESC found.
-
-````cpp
-#include "rendering/lighting/ShadowSystem.h"
-
-#include <algorithm>
-#include <chrono>
-#include <cstdint>
-#include <limits>
-#include <vector>
-
-namespace {
-
-constexpr uint32_t kInvalidSourceIndex = std::numeric_limits<uint32_t>::max();
-constexpr uint32_t kPointShadowDepthComparesPerSample = 25u; // 5 taps * 5 sub-samples
-
-} // namespace
-
-void ShadowSystem::collectGpuTimings(uint32_t imageIndex) {
-    // Always collect sun timing first (even if point lights are empty).
-    collectSunGpuTiming(imageIndex);
-
-    // Keep terrain pass cost fresh even when point-light timing is unavailable.
-    m_frameDiagnostics.terrainPassGpuMs = m_lastTerrainPassGpuMs;
-
-    if (!m_initialized ||
-        m_lightTimingQueryPool == VK_NULL_HANDLE ||
-        imageIndex >= m_lightTimingImageCount ||
-        imageIndex >= m_queryLightCountByImage.size() ||
-        imageIndex >= m_querySourceByImage.size()) {
-        return;
-    }
-
-    const uint32_t lightCount = m_queryLightCountByImage[imageIndex];
-    auto clearPointShadowFrameDiagnostics = [this]() {
-        m_frameDiagnostics.totalShadowGpuMs = 0.0f;
-        m_frameDiagnostics.avgShadowGpuMsPerLight = 0.0f;
-        m_frameDiagnostics.terrainMsPerMegaShadowSample = 0.0f;
-        m_frameDiagnostics.totalPointShadowSamples = 0u;
-        m_frameDiagnostics.totalPointLightEvaluations = 0u;
-        m_frameDiagnostics.totalPointShadowFullyOccluded = 0u;
-        m_frameDiagnostics.totalPointShadowLitContrib = 0u;
-        m_frameDiagnostics.totalEstimatedShadowDepthCompareOps = 0u;
-        m_frameDiagnostics.detailedCountersEnabled = m_detailedDiagnosticsEnabled;
-    };
-
-    if (lightCount == 0u) {
-        clearPointShadowFrameDiagnostics();
-        return;
-    }
-
-    // Do not ever let diagnostics become a hidden frame stall. The frame-image
-    // fence normally means these queries are ready, but WITH_AVAILABILITY makes
-    // the collector safe if it is called earlier during future refactors or in
-    // perf mode. If any timestamp pair is not ready, keep the last published
-    // diagnostics and try again on a later image reuse.
-    std::vector<uint64_t> queryData(lightCount * 2u * 2u, 0u);
-    const uint32_t queryBase = imageIndex * (MAX_POINT_SHADOW_LIGHTS * 2u);
-    VkResult res = vkGetQueryPoolResults(
-        m_device,
-        m_lightTimingQueryPool,
-        queryBase,
-        lightCount * 2u,
-        static_cast<VkDeviceSize>(queryData.size() * sizeof(uint64_t)),
-        queryData.data(),
-        sizeof(uint64_t) * 2u,
-        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-
-    if (res != VK_SUCCESS && res != VK_NOT_READY) {
-        return;
-    }
-
-    for (uint32_t query = 0; query < lightCount * 2u; ++query) {
-        if (queryData[query * 2u + 1u] == 0u) {
-            return;
-        }
-    }
-
-    clearPointShadowFrameDiagnostics();
-
-    const ShadowGPUData* shadowData = nullptr;
-    if (imageIndex < m_shadowDataMapped.size()) {
-        shadowData = reinterpret_cast<const ShadowGPUData*>(m_shadowDataMapped[imageIndex]);
-    }
-
-    uint32_t timedLights = 0u;
-    for (uint32_t slot = 0; slot < lightCount; ++slot) {
-        const uint32_t source = m_querySourceByImage[imageIndex][slot];
-        if (source == kInvalidSourceIndex || source >= m_lightDiagnostics.size()) {
-            continue;
-        }
-
-        const uint64_t start = queryData[(slot * 2u + 0u) * 2u];
-        const uint64_t end = queryData[(slot * 2u + 1u) * 2u];
-        float gpuMs = 0.0f;
-        if (end > start && m_timestampPeriod > 0.0f) {
-            gpuMs = static_cast<float>(
-                static_cast<double>(end - start) *
-                static_cast<double>(m_timestampPeriod) / 1'000'000.0);
-        }
-
-        auto& diag = m_lightDiagnostics[source];
-        ++timedLights;
-        m_frameDiagnostics.totalShadowGpuMs += gpuMs;
-        diag.gpuShadowMs = gpuMs;
-        if (diag.gpuShadowMsAvg <= 0.0001f) {
-            diag.gpuShadowMsAvg = gpuMs;
-        } else {
-            diag.gpuShadowMsAvg = diag.gpuShadowMsAvg * 0.85f + gpuMs * 0.15f;
-        }
-        diag.terrainPassGpuMs = m_lastTerrainPassGpuMs;
-
-        if (shadowData) {
-            const glm::uvec4 c = shadowData->pointShadowDiag[slot];
-            diag.pointShadowSamples = c.x;
-            diag.pointLightEvaluations = c.y;
-            diag.pointShadowFullyOccluded = c.z;
-            diag.pointShadowLitContrib = c.w;
-            m_frameDiagnostics.totalPointShadowSamples += c.x;
-            m_frameDiagnostics.totalPointLightEvaluations += c.y;
-            m_frameDiagnostics.totalPointShadowFullyOccluded += c.z;
-            m_frameDiagnostics.totalPointShadowLitContrib += c.w;
-        } else {
-            diag.pointShadowSamples = 0u;
-            diag.pointLightEvaluations = 0u;
-            diag.pointShadowFullyOccluded = 0u;
-            diag.pointShadowLitContrib = 0u;
-        }
-
-        diag.estShadowDepthCompareOps =
-            static_cast<uint64_t>(diag.pointShadowSamples) * kPointShadowDepthComparesPerSample;
-        m_frameDiagnostics.totalEstimatedShadowDepthCompareOps += diag.estShadowDepthCompareOps;
-
-        if (diag.pointShadowSamples > 0u) {
-            const float invSamples = 1.0f / static_cast<float>(diag.pointShadowSamples);
-            diag.shadowOccludedRatio = static_cast<float>(diag.pointShadowFullyOccluded) * invSamples;
-            diag.shadowLitRatio = static_cast<float>(diag.pointShadowLitContrib) * invSamples;
-            diag.evalToSampleRatio = static_cast<float>(diag.pointLightEvaluations) * invSamples;
-            diag.gpuMsPerMegaShadowSample =
-                gpuMs * 1'000'000.0f / static_cast<float>(diag.pointShadowSamples);
-        } else {
-            diag.shadowOccludedRatio = 0.0f;
-            diag.shadowLitRatio = 0.0f;
-            diag.evalToSampleRatio = 0.0f;
-            diag.gpuMsPerMegaShadowSample = 0.0f;
-        }
-    }
-
-    if (timedLights > 0u) {
-        m_frameDiagnostics.avgShadowGpuMsPerLight =
-            m_frameDiagnostics.totalShadowGpuMs / static_cast<float>(timedLights);
-    }
-
-    const float terrainPassMs = std::max(0.0f, m_lastTerrainPassGpuMs);
-    if (m_frameDiagnostics.totalPointShadowSamples > 0u) {
-        m_frameDiagnostics.terrainMsPerMegaShadowSample =
-            terrainPassMs * 1'000'000.0f /
-            static_cast<float>(m_frameDiagnostics.totalPointShadowSamples);
-    } else {
-        m_frameDiagnostics.terrainMsPerMegaShadowSample = 0.0f;
-    }
-    constexpr float kShadowSamplingWeight = 0.65f;
-    constexpr float kLightingEvalWeight = 0.35f;
-    const float totalSamples =
-        static_cast<float>(std::max<uint64_t>(m_frameDiagnostics.totalPointShadowSamples, 1u));
-    const float totalEvals =
-        static_cast<float>(std::max<uint64_t>(m_frameDiagnostics.totalPointLightEvaluations, 1u));
-
-    for (uint32_t slot = 0; slot < lightCount; ++slot) {
-        const uint32_t source = m_querySourceByImage[imageIndex][slot];
-        if (source == kInvalidSourceIndex || source >= m_lightDiagnostics.size()) {
-            continue;
-        }
-
-        auto& diag = m_lightDiagnostics[source];
-        const float sampleShare = static_cast<float>(diag.pointShadowSamples) / totalSamples;
-        const float evalShare = static_cast<float>(diag.pointLightEvaluations) / totalEvals;
-        const float weightedShare = sampleShare * kShadowSamplingWeight + evalShare * kLightingEvalWeight;
-
-        diag.estTerrainLightingShareMs = terrainPassMs * weightedShare;
-        diag.estShadowSamplingMs = terrainPassMs * sampleShare * kShadowSamplingWeight;
-        diag.estShadowOffDeltaMs = diag.gpuShadowMs + diag.estShadowSamplingMs;
-        diag.estLightOffDeltaMs = diag.estShadowOffDeltaMs +
-                                  diag.estTerrainLightingShareMs;
-    }
-}
-
-void ShadowSystem::setFrameGpuPassCosts(float terrainPassGpuMs) {
-    m_lastTerrainPassGpuMs = std::max(terrainPassGpuMs, 0.0f);
-    m_frameDiagnostics.terrainPassGpuMs = m_lastTerrainPassGpuMs;
-}
-
-const ShadowSystem::LightDiagnostics* ShadowSystem::getLightDiagnostics(uint32_t sourceLightIndex) const {
-    if (sourceLightIndex >= m_lightDiagnostics.size()) {
-        return nullptr;
-    }
-    return &m_lightDiagnostics[sourceLightIndex];
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Sun shadow diagnostics — GPU readback + rolling window
-// ═══════════════════════════════════════════════════════════════════════
-
-void ShadowSystem::collectSunGpuTiming(uint32_t imageIndex) {
-    // Read GPU timestamps for the sun shadow pass, then push the
-    // completed frame sample into the rolling history. Query reads must be
-    // availability-checked so a diagnostic sample never fabricates a 0.0ms
-    // shadow pass just because the timestamp pair was not ready yet.
-    float gpuMs = 0.0f;
-
-    if (m_sunTimingQueryPool != VK_NULL_HANDLE &&
-        imageIndex < m_sunTimingImageCount &&
-        imageIndex < m_sunTimingWritten.size() &&
-        m_sunTimingWritten[imageIndex]) {
-
-        uint64_t queryData[4] = {};
-        VkResult res = vkGetQueryPoolResults(
-            m_device,
-            m_sunTimingQueryPool,
-            imageIndex * 2u,
-            2u,
-            sizeof(queryData),
-            queryData,
-            sizeof(uint64_t) * 2u,
-            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
-
-        if (res != VK_SUCCESS && res != VK_NOT_READY) {
-            return;
-        }
-        if (queryData[1] == 0u || queryData[3] == 0u) {
-            return;
-        }
-
-        const uint64_t start = queryData[0];
-        const uint64_t end = queryData[2];
-        if (end > start && m_timestampPeriod > 0.0f) {
-            gpuMs = static_cast<float>(
-                static_cast<double>(end - start) *
-                static_cast<double>(m_timestampPeriod) / 1'000'000.0);
-        }
-    }
-
-    m_sunCurrentFrame.gpuRenderMs = gpuMs;
-    // VP compute was already filled in updateForFrame; terrain+record in recordShadowPasses.
-    // cpuTotalMs should include VP compute as well.
-    m_sunCurrentFrame.cpuTotalMs += m_sunCurrentFrame.cpuVpComputeMs;
-
-    pushSunSample(m_sunCurrentFrame);
-}
-
-void ShadowSystem::pushSunSample(const SunShadowFrameSample& sample) {
-    SunShadowTimedSample ts;
-    ts.timestamp = std::chrono::steady_clock::now();
-    ts.data = sample;
-    m_sunSampleHistory.push_back(ts);
-
-    // Evict samples older than the window
-    const auto cutoff = ts.timestamp -
-        std::chrono::milliseconds(static_cast<int64_t>(m_sunDiagnostics.windowSeconds * 1000.0f));
-    while (!m_sunSampleHistory.empty() && m_sunSampleHistory.front().timestamp < cutoff) {
-        m_sunSampleHistory.pop_front();
-    }
-
-    recomputeSunWindowStats();
-}
-
-void ShadowSystem::recomputeSunWindowStats() {
-    const uint32_t n = static_cast<uint32_t>(m_sunSampleHistory.size());
-    m_sunDiagnostics.sampleCount = n;
-
-    if (n == 0u) {
-        m_sunDiagnostics.latest = {};
-        m_sunDiagnostics.avgCpuVpComputeMs = 0.0f;
-        m_sunDiagnostics.avgCpuTerrainGatherMs = 0.0f;
-        m_sunDiagnostics.avgCpuWorldGatherMs = 0.0f;
-        m_sunDiagnostics.avgCpuTerrainHashMs = 0.0f;
-        m_sunDiagnostics.avgCpuCacheDecisionMs = 0.0f;
-        m_sunDiagnostics.avgCpuCommandRecordMs = 0.0f;
-        m_sunDiagnostics.avgCpuTotalMs = 0.0f;
-        m_sunDiagnostics.maxCpuVpComputeMs = 0.0f;
-        m_sunDiagnostics.maxCpuTerrainGatherMs = 0.0f;
-        m_sunDiagnostics.maxCpuWorldGatherMs = 0.0f;
-        m_sunDiagnostics.maxCpuTerrainHashMs = 0.0f;
-        m_sunDiagnostics.maxCpuCacheDecisionMs = 0.0f;
-        m_sunDiagnostics.maxCpuCommandRecordMs = 0.0f;
-        m_sunDiagnostics.maxCpuTotalMs = 0.0f;
-        m_sunDiagnostics.avgGpuRenderMs = 0.0f;
-        m_sunDiagnostics.maxGpuRenderMs = 0.0f;
-        m_sunDiagnostics.minGpuRenderMs = 0.0f;
-        m_sunDiagnostics.avgDrawCallCount = 0.0f;
-        m_sunDiagnostics.avgApiDrawCallCount = 0.0f;
-        m_sunDiagnostics.avgTerrainChunks = 0.0f;
-        m_sunDiagnostics.avgGatherCandidateChunks = 0.0f;
-        m_sunDiagnostics.avgAcceptedChunks = 0.0f;
-        m_sunDiagnostics.avgRenderedFrameDrawCalls = 0.0f;
-        m_sunDiagnostics.avgRenderedFrameApiDrawCalls = 0.0f;
-        m_sunDiagnostics.avgRenderedFrameGpuMs = 0.0f;
-        m_sunDiagnostics.avgCascadesRendered = 0.0f;
-        m_sunDiagnostics.avgCascadesReused = 0.0f;
-        m_sunDiagnostics.renderCachePrecheckHits = 0u;
-        m_sunDiagnostics.gatherCacheHits = 0u;
-        m_sunDiagnostics.gatherCacheMisses = 0u;
-        m_sunDiagnostics.reusedFrames = 0u;
-        m_sunDiagnostics.renderedFrames = 0u;
-        return;
-    }
-
-    m_sunDiagnostics.latest = m_sunSampleHistory.back().data;
-
-    float sumVp = 0.0f, sumGather = 0.0f, sumWorldGather = 0.0f;
-    float sumHash = 0.0f, sumCacheDecision = 0.0f;
-    float sumRecord = 0.0f, sumTotal = 0.0f;
-    float sumGpu = 0.0f;
-    float maxVp = 0.0f, maxGather = 0.0f, maxWorldGather = 0.0f;
-    float maxHash = 0.0f, maxCacheDecision = 0.0f;
-    float maxRecord = 0.0f, maxTotal = 0.0f;
-    float maxGpu = 0.0f;
-    float minGpu = std::numeric_limits<float>::max();
-    float sumDraws = 0.0f, sumApiDraws = 0.0f, sumChunks = 0.0f;
-    float sumCandidates = 0.0f, sumAccepted = 0.0f;
-    float sumRenderedDraws = 0.0f, sumRenderedApiDraws = 0.0f, sumRenderedGpu = 0.0f;
-    float sumCascadesRendered = 0.0f, sumCascadesReused = 0.0f;
-    uint32_t reused = 0u, rendered = 0u;
-    uint32_t precheckHits = 0u, gatherHits = 0u, gatherMisses = 0u;
-
-    for (const auto& s : m_sunSampleHistory) {
-        const auto& d = s.data;
-        sumVp += d.cpuVpComputeMs;
-        sumGather += d.cpuTerrainGatherMs;
-        sumWorldGather += d.cpuWorldGatherMs;
-        sumHash += d.cpuTerrainHashMs;
-        sumCacheDecision += d.cpuCacheDecisionMs;
-        sumRecord += d.cpuCommandRecordMs;
-        sumTotal += d.cpuTotalMs;
-        sumGpu += d.gpuRenderMs;
-        sumDraws += static_cast<float>(d.drawCallCount);
-        sumApiDraws += static_cast<float>(d.apiDrawCallCount);
-        sumChunks += static_cast<float>(d.terrainChunksGathered);
-        sumCandidates += static_cast<float>(d.bboxCandidateChunks);
-        sumAccepted += static_cast<float>(d.acceptedChunkCount);
-        sumCascadesRendered += static_cast<float>(d.cascadesRendered);
-        sumCascadesReused += static_cast<float>(d.cascadesReused);
-
-        maxVp = std::max(maxVp, d.cpuVpComputeMs);
-        maxGather = std::max(maxGather, d.cpuTerrainGatherMs);
-        maxWorldGather = std::max(maxWorldGather, d.cpuWorldGatherMs);
-        maxHash = std::max(maxHash, d.cpuTerrainHashMs);
-        maxCacheDecision = std::max(maxCacheDecision, d.cpuCacheDecisionMs);
-        maxRecord = std::max(maxRecord, d.cpuCommandRecordMs);
-        maxTotal = std::max(maxTotal, d.cpuTotalMs);
-        maxGpu = std::max(maxGpu, d.gpuRenderMs);
-        if (!d.wasReused) {
-            minGpu = std::min(minGpu, d.gpuRenderMs);
-            sumRenderedDraws += static_cast<float>(d.drawCallCount);
-            sumRenderedApiDraws += static_cast<float>(d.apiDrawCallCount);
-            sumRenderedGpu += d.gpuRenderMs;
-        }
-
-        if (d.wasReused) ++reused; else ++rendered;
-        if (d.renderCachePrecheckHit) ++precheckHits;
-        if (d.gatherCacheHit) ++gatherHits;
-        if (d.usedLocalTerrainGather && !d.renderCachePrecheckHit && !d.gatherCacheHit) ++gatherMisses;
-    }
-
-    const float inv = 1.0f / static_cast<float>(n);
-    m_sunDiagnostics.avgCpuVpComputeMs = sumVp * inv;
-    m_sunDiagnostics.avgCpuTerrainGatherMs = sumGather * inv;
-    m_sunDiagnostics.avgCpuWorldGatherMs = sumWorldGather * inv;
-    m_sunDiagnostics.avgCpuTerrainHashMs = sumHash * inv;
-    m_sunDiagnostics.avgCpuCacheDecisionMs = sumCacheDecision * inv;
-    m_sunDiagnostics.avgCpuCommandRecordMs = sumRecord * inv;
-    m_sunDiagnostics.avgCpuTotalMs = sumTotal * inv;
-    m_sunDiagnostics.avgGpuRenderMs = sumGpu * inv;
-    m_sunDiagnostics.maxGpuRenderMs = maxGpu;
-    m_sunDiagnostics.minGpuRenderMs = (minGpu < std::numeric_limits<float>::max()) ? minGpu : 0.0f;
-    m_sunDiagnostics.maxCpuVpComputeMs = maxVp;
-    m_sunDiagnostics.maxCpuTerrainGatherMs = maxGather;
-    m_sunDiagnostics.maxCpuWorldGatherMs = maxWorldGather;
-    m_sunDiagnostics.maxCpuTerrainHashMs = maxHash;
-    m_sunDiagnostics.maxCpuCacheDecisionMs = maxCacheDecision;
-    m_sunDiagnostics.maxCpuCommandRecordMs = maxRecord;
-    m_sunDiagnostics.maxCpuTotalMs = maxTotal;
-    m_sunDiagnostics.avgDrawCallCount = sumDraws * inv;
-    m_sunDiagnostics.avgApiDrawCallCount = sumApiDraws * inv;
-    m_sunDiagnostics.avgTerrainChunks = sumChunks * inv;
-    m_sunDiagnostics.avgGatherCandidateChunks = sumCandidates * inv;
-    m_sunDiagnostics.avgAcceptedChunks = sumAccepted * inv;
-    m_sunDiagnostics.avgRenderedFrameDrawCalls =
-        (rendered > 0u) ? (sumRenderedDraws / static_cast<float>(rendered)) : 0.0f;
-    m_sunDiagnostics.avgRenderedFrameApiDrawCalls =
-        (rendered > 0u) ? (sumRenderedApiDraws / static_cast<float>(rendered)) : 0.0f;
-    m_sunDiagnostics.avgRenderedFrameGpuMs =
-        (rendered > 0u) ? (sumRenderedGpu / static_cast<float>(rendered)) : 0.0f;
-    m_sunDiagnostics.avgCascadesRendered = sumCascadesRendered * inv;
-    m_sunDiagnostics.avgCascadesReused = sumCascadesReused * inv;
-    m_sunDiagnostics.renderCachePrecheckHits = precheckHits;
-    m_sunDiagnostics.gatherCacheHits = gatherHits;
-    m_sunDiagnostics.gatherCacheMisses = gatherMisses;
-    m_sunDiagnostics.reusedFrames = reused;
-    m_sunDiagnostics.renderedFrames = rendered;
-}
-
-````
-
-## src\world\WorldRendering.cpp
-
-Description: No CC-DESC found.
-
-````cpp
-#include "world/World.h"
-#include "world/chunks/core/Chunk.h"
-#include "world/config/WorldConfig.h"
-#include <iostream>
-#include <algorithm>
-#include <array>
-#include <cmath>
-#include <chrono>
-#include <limits>
-
-// gatherDrawCommands(), gatherDrawCommandsInSphere(),
-// enqueueMeshForUpload() extracted from World.cpp
-
-// Helper: Calculate chunk AABB from chunk coordinate
-static AABB calculateChunkAABB(const glm::ivec3& chunkCoord) {
-    glm::vec3 minWorld = WorldConfig::microVoxelToWorld(WorldConfig::chunkToMicroVoxel(chunkCoord));
-    glm::vec3 maxWorld = minWorld + glm::vec3(WorldConfig::CHUNK_SIZE_M, WorldConfig::CHUNK_HEIGHT_M, WorldConfig::CHUNK_SIZE_M);
-    return AABB{minWorld, maxWorld};
-}
-
-static bool sphereIntersectsAABB(const glm::vec3& center, float radiusSq, const AABB& aabb) {
-    const float cx = std::max(aabb.min.x, std::min(center.x, aabb.max.x));
-    const float cy = std::max(aabb.min.y, std::min(center.y, aabb.max.y));
-    const float cz = std::max(aabb.min.z, std::min(center.z, aabb.max.z));
-    const glm::vec3 d = center - glm::vec3(cx, cy, cz);
-    return glm::dot(d, d) <= radiusSq;
-}
-
-static uint32_t sunCascadeMaskForChunkCenter(const glm::vec3& centerWorld,
-                                             const glm::mat4* cascadeVPs,
-                                             uint32_t cascadeCount,
-                                             uint32_t* outInnerRejected = nullptr) {
-    constexpr float kHalfChunkX = WorldConfig::CHUNK_SIZE_M * 0.5f;
-    constexpr float kHalfChunkY = WorldConfig::CHUNK_HEIGHT_M * 0.5f;
-    constexpr float kHalfChunkZ = WorldConfig::CHUNK_SIZE_M * 0.5f;
-
-    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipCx{};
-    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipCy{};
-    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipCz{};
-    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipHx{};
-    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipHy{};
-    std::array<float, World::SUN_GATHER_DIAG_MAX_CASCADES> clipHz{};
-    const uint32_t evalCount = std::min<uint32_t>(
-        cascadeCount, World::SUN_GATHER_DIAG_MAX_CASCADES);
-    for (uint32_t c = 0; c < evalCount; ++c) {
-        const glm::mat4& vp = cascadeVPs[c];
-        clipCx[c] =
-            vp[0][0] * centerWorld.x + vp[1][0] * centerWorld.y +
-            vp[2][0] * centerWorld.z + vp[3][0];
-        clipCy[c] =
-            vp[0][1] * centerWorld.x + vp[1][1] * centerWorld.y +
-            vp[2][1] * centerWorld.z + vp[3][1];
-        clipCz[c] =
-            vp[0][2] * centerWorld.x + vp[1][2] * centerWorld.y +
-            vp[2][2] * centerWorld.z + vp[3][2];
-        clipHx[c] =
-            std::abs(vp[0][0]) * kHalfChunkX +
-            std::abs(vp[1][0]) * kHalfChunkY +
-            std::abs(vp[2][0]) * kHalfChunkZ;
-        clipHy[c] =
-            std::abs(vp[0][1]) * kHalfChunkX +
-            std::abs(vp[1][1]) * kHalfChunkY +
-            std::abs(vp[2][1]) * kHalfChunkZ;
-        clipHz[c] =
-            std::abs(vp[0][2]) * kHalfChunkX +
-            std::abs(vp[1][2]) * kHalfChunkY +
-            std::abs(vp[2][2]) * kHalfChunkZ;
-    }
-
-    uint32_t mask = 0u;
-    uint32_t innerRejected = 0u;
-    constexpr float kCascadeBlendFrac = 0.12f;
-    constexpr float kInnerCascadeScale = 1.0f - kCascadeBlendFrac;
-    for (uint32_t c = 0; c < evalCount; ++c) {
-        if ((clipCx[c] + clipHx[c]) < -1.0f || (clipCx[c] - clipHx[c]) > 1.0f) continue;
-        if ((clipCy[c] + clipHy[c]) < -1.0f || (clipCy[c] - clipHy[c]) > 1.0f) continue;
-        if ((clipCz[c] + clipHz[c]) <  0.0f || (clipCz[c] - clipHz[c]) > 1.0f) continue;
-
-        if (c > 0u) {
-            const uint32_t inner = c - 1u;
-            const bool fullyInsideInnerReceiverRegion =
-                (clipCx[inner] - clipHx[inner]) >= -kInnerCascadeScale &&
-                (clipCx[inner] + clipHx[inner]) <=  kInnerCascadeScale &&
-                (clipCy[inner] - clipHy[inner]) >= -kInnerCascadeScale &&
-                (clipCy[inner] + clipHy[inner]) <=  kInnerCascadeScale &&
-                (clipCz[inner] - clipHz[inner]) >=  0.0f &&
-                (clipCz[inner] + clipHz[inner]) <=  1.0f;
-            if (fullyInsideInnerReceiverRegion) {
-                ++innerRejected;
-                continue;
-            }
-        }
-        mask |= (1u << c);
-    }
-    if (outInnerRejected) {
-        *outInnerRejected += innerRejected;
-    }
-    return mask;
-}
-
-uint32_t World::gatherDrawCommands(const glm::mat4& viewProj,
-                                    VkDrawIndexedIndirectCommand* outCmds,
-                                    glm::vec4* outOrigins,
-                                    uint32_t maxDraws,
-                                    uint64_t deviceTimeline) {
-    // Delegate to ChunkRenderSystem
-    return m_renderSystem.gatherDrawCommands(
-        m_registry,
-        m_registryMutex,
-        viewProj,
-        outCmds,
-        outOrigins,
-        maxDraws,
-        deviceTimeline);
-}
-
-uint32_t World::gatherDrawCommandsInSphere(const glm::vec3& center,
-                                           float radius,
-                                           VkDrawIndexedIndirectCommand* outCmds,
-                                           glm::vec4* outOrigins,
-                                           uint32_t maxDraws,
-                                           uint64_t deviceTimeline) {
-    if (!outCmds || !outOrigins || maxDraws == 0u || radius <= 0.0f) {
-        return 0u;
-    }
-
-    // Build a tight chunk-coordinate range from the light sphere.
-    const glm::vec3 minWorld = center - glm::vec3(radius);
-    const glm::vec3 maxWorld = center + glm::vec3(radius);
-    const glm::ivec3 minChunk = WorldConfig::microVoxelToChunk(WorldConfig::worldToMicroVoxel(minWorld));
-    const glm::ivec3 maxChunk = WorldConfig::microVoxelToChunk(WorldConfig::worldToMicroVoxel(maxWorld));
-    const float radiusSq = radius * radius;
-
-    // Direct hashmap lookup over the chunk-coord bbox in deterministic
-    // (z, y, x) order. For a typical 5 m point-light radius the bbox is
-    // 1×1×1 chunks (chunks are 32 m × 128 m × 32 m), so this is ~1 lookup
-    // instead of iterating every loaded chunk in the world. The (z, y, x)
-    // walk order matches the prior sorted-candidate order exactly, so the
-    // downstream shadow-cache terrain hash is bit-identical to the prior
-    // implementation — no visual or cache-invalidation change.
-    //
-    // Locks are taken separately (chunkState first, released, then registry)
-    // to match the rest of the engine's lock-order discipline and avoid
-    // introducing a new nested-lock pair.
-    struct CandidateChunk {
-        entt::entity entity{entt::null};
-        glm::ivec3 coord{0};
-    };
-    // Stack-friendly small buffer; orb radii in this engine are small so the
-    // bbox is almost always 1-8 chunks. Falls back to heap if it grows.
-    constexpr size_t kInlineCap = 32;
-    std::array<CandidateChunk, kInlineCap> inlineCandidates{};
-    std::vector<CandidateChunk> overflowCandidates;
-    size_t candidateCount = 0;
-    auto pushCandidate = [&](entt::entity e, const glm::ivec3& c) {
-        if (candidateCount < kInlineCap) {
-            inlineCandidates[candidateCount] = CandidateChunk{e, c};
-        } else {
-            if (overflowCandidates.empty()) overflowCandidates.reserve(64);
-            overflowCandidates.push_back(CandidateChunk{e, c});
-        }
-        ++candidateCount;
-    };
-    auto getCandidate = [&](size_t i) -> const CandidateChunk& {
-        return (i < kInlineCap) ? inlineCandidates[i] : overflowCandidates[i - kInlineCap];
-    };
-
-    {
-        std::shared_lock stateLock(m_chunkStateMutex);
-        for (int z = minChunk.z; z <= maxChunk.z; ++z) {
-            for (int y = minChunk.y; y <= maxChunk.y; ++y) {
-                for (int x = minChunk.x; x <= maxChunk.x; ++x) {
-                    const glm::ivec3 coord(x, y, z);
-                    auto it = m_chunkEntityMap.find(coord);
-                    if (it == m_chunkEntityMap.end()) continue;
-                    pushCandidate(it->second, coord);
-                }
-            }
-        }
-    }
-
-    uint32_t drawCount = 0u;
-    bool truncated = false;
-    {
-        std::shared_lock regLock(m_registryMutex);
-        for (size_t ci = 0; ci < candidateCount; ++ci) {
-            if (drawCount >= maxDraws) {
-                truncated = true;
-                break;
-            }
-            const CandidateChunk& candidate = getCandidate(ci);
-            const entt::entity entity = candidate.entity;
-            if (!m_registry.valid(entity)) continue;
-            if (!m_registry.all_of<ChunkState, MeshHandle, Chunk>(entity)) continue;
-
-            const auto& state = m_registry.get<ChunkState>(entity);
-            const auto& mesh = m_registry.get<MeshHandle>(entity);
-            const auto& chunk = m_registry.get<Chunk>(entity);
-
-            if (!chunk.isVisible) continue;
-            if (state.state != ChunkState::State::Ready) continue;
-            if (!mesh.isValid()) continue;
-            if (mesh.getTotalIndexCount() == 0) continue;
-            if (mesh.gpuReadyValue > deviceTimeline) continue;
-
-            const AABB chunkBounds = calculateChunkAABB(candidate.coord);
-            if (!sphereIntersectsAABB(center, radiusSq, chunkBounds)) continue;
-
-            for (uint8_t sc = 0; sc < mesh.subChunkCount && drawCount < maxDraws; ++sc) {
-                const auto& subChunk = mesh.subChunks[sc];
-                if (subChunk.indexCount == 0) continue;
-
-                VkDrawIndexedIndirectCommand& cmd = outCmds[drawCount];
-                cmd.indexCount = subChunk.indexCount;
-                cmd.instanceCount = 1u;
-                cmd.firstIndex = subChunk.firstIndex;
-                cmd.vertexOffset = subChunk.vertexOffset;
-                cmd.firstInstance = 0u;
-
-                outOrigins[drawCount] = glm::vec4(
-                    static_cast<float>(candidate.coord.x),
-                    static_cast<float>(candidate.coord.y),
-                    static_cast<float>(candidate.coord.z),
-                    0.0f);
-                ++drawCount;
-            }
-        }
-    }
-
-    static bool warnedSphereTruncationOnce = false;
-    if (truncated && !warnedSphereTruncationOnce) {
-        std::cout << "[World] gatherDrawCommandsInSphere truncated at " << maxDraws
-                  << " draws; consider increasing shadow local draw capacity." << std::endl;
-        warnedSphereTruncationOnce = true;
-    }
-
-    return drawCount;
-}
-
-uint32_t World::gatherDrawCommandsForSunCascades(
-    const glm::vec3& cameraPos,
-    const glm::vec3& sunDir,
-    const glm::mat4* cascadeVPs,
-    const float* cascadeHalfExtents,
-    uint32_t cascadeCount,
-    VkDrawIndexedIndirectCommand* outCmds,
-    glm::vec4* outOrigins,
-    uint16_t* outCascadeMasks,
-    uint32_t maxDraws,
-    uint64_t deviceTimeline,
-    SunCascadeGatherDiagnostics* diagnostics,
-    int32_t extraChunkPadding,
-    bool includeZeroMaskCandidates) {
-    using Clock = std::chrono::high_resolution_clock;
-    const auto totalStart = Clock::now();
-
-    if (diagnostics) {
-        *diagnostics = SunCascadeGatherDiagnostics{};
-        diagnostics->cascadeCount = cascadeCount;
-        diagnostics->maxDraws = maxDraws;
-    }
-
-    auto finishDiagnostics = [&]() {
-        if (diagnostics) {
-            diagnostics->totalMs = std::chrono::duration<float, std::milli>(
-                Clock::now() - totalStart).count();
-        }
-    };
-
-    if (!outCmds || !outOrigins || !outCascadeMasks ||
-        !cascadeVPs || !cascadeHalfExtents ||
-        cascadeCount == 0u || maxDraws == 0u) {
-        finishDiagnostics();
-        return 0u;
-    }
-
-    // ── Walk bounding box ───────────────────────────────────────────
-    // The largest cascade's clip volume in world XZ is roughly
-    // [cameraXZ ± halfExtent] expanded by chunk-height * |shear|
-    // (caster reach along the sun direction). Walking only chunks
-    // inside that box eliminates the huge spherical scan that the
-    // old single-radius gather performed at km-scale cascades.
-    float maxHalfExtent = 0.0f;
-    for (uint32_t c = 0; c < cascadeCount; ++c) {
-        maxHalfExtent = std::max(maxHalfExtent, cascadeHalfExtents[c]);
-    }
-    const float sinEl = std::max(-sunDir.y, 0.05f);
-    const float invSin = 1.0f / sinEl;
-    const float shearX = std::abs(sunDir.x) * invSin;
-    const float shearZ = std::abs(sunDir.z) * invSin;
-    const float shearMax = std::max(shearX, shearZ);
-    // Cap caster reach so very low sun (long shears) doesn't blow up the
-    // walk bounding box past sane limits.
-    const float casterReach = std::min(
-        WorldConfig::CHUNK_HEIGHT_M * shearMax,
-        std::max(maxHalfExtent * 2.0f, 768.0f));
-    const float padding = WorldConfig::CHUNK_SIZE_M * 2.0f;
-    const float halfX = maxHalfExtent + casterReach + padding;
-    const float halfZ = maxHalfExtent + casterReach + padding;
-
-    const glm::vec3 minWorld(cameraPos.x - halfX, -10000.0f, cameraPos.z - halfZ);
-    const glm::vec3 maxWorld(cameraPos.x + halfX,  10000.0f, cameraPos.z + halfZ);
-    glm::ivec3 minChunk = WorldConfig::microVoxelToChunk(WorldConfig::worldToMicroVoxel(minWorld));
-    glm::ivec3 maxChunk = WorldConfig::microVoxelToChunk(WorldConfig::worldToMicroVoxel(maxWorld));
-    const int32_t padChunks = std::max<int32_t>(extraChunkPadding, 0);
-    minChunk.x -= padChunks;
-    minChunk.z -= padChunks;
-    maxChunk.x += padChunks;
-    maxChunk.z += padChunks;
-
-    if (diagnostics) {
-        diagnostics->minChunk = minChunk;
-        diagnostics->maxChunk = maxChunk;
-        diagnostics->maxHalfExtent = maxHalfExtent;
-        diagnostics->sinElevation = sinEl;
-        diagnostics->shearX = shearX;
-        diagnostics->shearZ = shearZ;
-        diagnostics->shearMax = shearMax;
-        diagnostics->casterReach = casterReach;
-        diagnostics->padding = padding;
-        diagnostics->halfX = halfX;
-        diagnostics->halfZ = halfZ;
-    }
-
-    struct CandidateChunk {
-        entt::entity entity{entt::null};
-        glm::ivec3 coord{0};
-    };
-    std::vector<CandidateChunk> candidates;
-    const auto stateScanStart = Clock::now();
-    {
-        std::shared_lock stateLock(m_chunkStateMutex);
-        if (diagnostics) {
-            diagnostics->loadedChunkMapSize = static_cast<uint32_t>(
-                std::min<size_t>(m_chunkEntityMap.size(), std::numeric_limits<uint32_t>::max()));
-        }
-        candidates.reserve(m_chunkEntityMap.size());
-        for (const auto& [coord, entity] : m_chunkEntityMap) {
-            if (coord.x < minChunk.x || coord.x > maxChunk.x ||
-                coord.z < minChunk.z || coord.z > maxChunk.z) {
-                continue;
-            }
-            candidates.push_back(CandidateChunk{entity, coord});
-        }
-    }
-    if (diagnostics) {
-        diagnostics->stateMapScanMs = std::chrono::duration<float, std::milli>(
-            Clock::now() - stateScanStart).count();
-        diagnostics->bboxCandidateChunks = static_cast<uint32_t>(
-            std::min<size_t>(candidates.size(), std::numeric_limits<uint32_t>::max()));
-    }
-    if (diagnostics) {
-        diagnostics->candidateSortMs = 0.0f;
-    }
-
-    uint32_t drawCount = 0u;
-    bool truncated = false;
-    const auto registryStart = Clock::now();
-    {
-        std::shared_lock regLock(m_registryMutex);
-        for (const CandidateChunk& candidate : candidates) {
-            if (drawCount >= maxDraws) { truncated = true; break; }
-            if (diagnostics) ++diagnostics->visitedCandidateChunks;
-
-            const entt::entity entity = candidate.entity;
-            if (!m_registry.valid(entity)) {
-                if (diagnostics) ++diagnostics->invalidEntityRejects;
-                continue;
-            }
-            if (!m_registry.all_of<ChunkState, MeshHandle, Chunk>(entity)) {
-                if (diagnostics) ++diagnostics->missingComponentRejects;
-                continue;
-            }
-
-            const auto& state = m_registry.get<ChunkState>(entity);
-            const auto& mesh = m_registry.get<MeshHandle>(entity);
-            const auto& chunk = m_registry.get<Chunk>(entity);
-            if (!chunk.isVisible) {
-                if (diagnostics) ++diagnostics->invisibleRejects;
-                continue;
-            }
-            if (state.state != ChunkState::State::Ready) {
-                if (diagnostics) ++diagnostics->notReadyRejects;
-                continue;
-            }
-            if (!mesh.isValid()) {
-                if (diagnostics) ++diagnostics->invalidMeshRejects;
-                continue;
-            }
-            if (mesh.getTotalIndexCount() == 0) {
-                if (diagnostics) ++diagnostics->emptyMeshRejects;
-                continue;
-            }
-            if (mesh.gpuReadyValue > deviceTimeline) {
-                if (diagnostics) ++diagnostics->uploadPendingRejects;
-                continue;
-            }
-
-            const glm::vec3 centerWorld(
-                (candidate.coord.x + 0.5f) * WorldConfig::CHUNK_SIZE_M,
-                (candidate.coord.y + 0.5f) * WorldConfig::CHUNK_HEIGHT_M,
-                (candidate.coord.z + 0.5f) * WorldConfig::CHUNK_SIZE_M);
-            const uint32_t mask = sunCascadeMaskForChunkCenter(
-                centerWorld,
-                cascadeVPs,
-                cascadeCount,
-                diagnostics ? &diagnostics->cascadeInnerCullRejects : nullptr);
-            if (mask == 0u) {
-                if (diagnostics) ++diagnostics->cascadeCullRejects;
-                if (!includeZeroMaskCandidates) {
-                    continue;
-                }
-            }
-            if (diagnostics && mask != 0u) {
-                ++diagnostics->acceptedChunks;
-                const uint32_t diagCascadeCount = std::min<uint32_t>(
-                    cascadeCount, SUN_GATHER_DIAG_MAX_CASCADES);
-                for (uint32_t c = 0; c < diagCascadeCount; ++c) {
-                    if ((mask & (1u << c)) != 0u) {
-                        ++diagnostics->cascadeChunkHits[c];
-                    }
-                }
-            }
-
-            for (uint8_t sc = 0; sc < mesh.subChunkCount && drawCount < maxDraws; ++sc) {
-                const auto& subChunk = mesh.subChunks[sc];
-                if (subChunk.indexCount == 0) continue;
-
-                VkDrawIndexedIndirectCommand& cmd = outCmds[drawCount];
-                cmd.indexCount = subChunk.indexCount;
-                cmd.instanceCount = 1u;
-                cmd.firstIndex = subChunk.firstIndex;
-                cmd.vertexOffset = subChunk.vertexOffset;
-                cmd.firstInstance = 0u;
-                outOrigins[drawCount] = glm::vec4(
-                    static_cast<float>(candidate.coord.x),
-                    static_cast<float>(candidate.coord.y),
-                    static_cast<float>(candidate.coord.z),
-                    0.0f);
-                outCascadeMasks[drawCount] = static_cast<uint16_t>(mask);
-                if (diagnostics) {
-                    const uint32_t diagCascadeCount = std::min<uint32_t>(
-                        cascadeCount, SUN_GATHER_DIAG_MAX_CASCADES);
-                    for (uint32_t c = 0; c < diagCascadeCount; ++c) {
-                        if ((mask & (1u << c)) != 0u) {
-                            ++diagnostics->cascadeDrawHits[c];
-                        }
-                    }
-                }
-                ++drawCount;
-            }
-        }
-    }
-    if (diagnostics) {
-        diagnostics->registryWalkMs = std::chrono::duration<float, std::milli>(
-            Clock::now() - registryStart).count();
-        diagnostics->truncated = truncated;
-        diagnostics->emittedDraws = drawCount;
-    }
-
-    static bool warnedCascadeTruncationOnce = false;
-    if (truncated && !warnedCascadeTruncationOnce) {
-        std::cout << "[World] gatherDrawCommandsForSunCascades truncated at "
-                  << maxDraws << " draws." << std::endl;
-        warnedCascadeTruncationOnce = true;
-    }
-
-    finishDiagnostics();
-    return drawCount;
-}
-
-uint32_t World::gatherDrawCommandsForSunCascadeChunk(
-    const glm::ivec3& chunkCoord,
-    const glm::mat4* cascadeVPs,
-    uint32_t cascadeCount,
-    VkDrawIndexedIndirectCommand* outCmds,
-    glm::vec4* outOrigins,
-    uint16_t* outCascadeMasks,
-    uint32_t maxDraws,
-    uint64_t deviceTimeline,
-    bool includeZeroMaskCandidate) {
-    if (!outCmds || !outOrigins || !outCascadeMasks ||
-        !cascadeVPs || cascadeCount == 0u || maxDraws == 0u) {
-        return 0u;
-    }
-
-    entt::entity entity = entt::null;
-    {
-        std::shared_lock stateLock(m_chunkStateMutex);
-        auto it = m_chunkEntityMap.find(chunkCoord);
-        if (it == m_chunkEntityMap.end()) {
-            return 0u;
-        }
-        entity = it->second;
-    }
-
-    std::shared_lock regLock(m_registryMutex);
-    if (!m_registry.valid(entity)) return 0u;
-    if (!m_registry.all_of<ChunkState, MeshHandle, Chunk>(entity)) return 0u;
-
-    const auto& state = m_registry.get<ChunkState>(entity);
-    const auto& mesh = m_registry.get<MeshHandle>(entity);
-    const auto& chunk = m_registry.get<Chunk>(entity);
-    if (!chunk.isVisible) return 0u;
-    if (state.state != ChunkState::State::Ready) return 0u;
-    if (!mesh.isValid()) return 0u;
-    if (mesh.getTotalIndexCount() == 0) return 0u;
-    if (mesh.gpuReadyValue > deviceTimeline) return 0u;
-
-    const glm::vec3 centerWorld(
-        (chunkCoord.x + 0.5f) * WorldConfig::CHUNK_SIZE_M,
-        (chunkCoord.y + 0.5f) * WorldConfig::CHUNK_HEIGHT_M,
-        (chunkCoord.z + 0.5f) * WorldConfig::CHUNK_SIZE_M);
-    const uint32_t mask = sunCascadeMaskForChunkCenter(centerWorld, cascadeVPs, cascadeCount);
-    if (mask == 0u && !includeZeroMaskCandidate) {
-        return 0u;
-    }
-
-    uint32_t drawCount = 0u;
-    for (uint8_t sc = 0; sc < mesh.subChunkCount && drawCount < maxDraws; ++sc) {
-        const auto& subChunk = mesh.subChunks[sc];
-        if (subChunk.indexCount == 0) continue;
-
-        VkDrawIndexedIndirectCommand& cmd = outCmds[drawCount];
-        cmd.indexCount = subChunk.indexCount;
-        cmd.instanceCount = 1u;
-        cmd.firstIndex = subChunk.firstIndex;
-        cmd.vertexOffset = subChunk.vertexOffset;
-        cmd.firstInstance = 0u;
-        outOrigins[drawCount] = glm::vec4(
-            static_cast<float>(chunkCoord.x),
-            static_cast<float>(chunkCoord.y),
-            static_cast<float>(chunkCoord.z),
-            0.0f);
-        outCascadeMasks[drawCount] = static_cast<uint16_t>(mask);
-        ++drawCount;
-    }
-    return drawCount;
-}
-
-void World::enqueueMeshForUpload(entt::entity entity,
-                                  MeshData&& mesh,
-                                  bool fromTerrainEdit,
-                                  std::shared_ptr<ChunkVersionState> versionState,
-                                  uint32_t version,
-                                  ChunkDebugAttribution debugInfo) {
-    m_uploadSystem.enqueueMeshForUpload(entity, std::move(mesh), fromTerrainEdit, versionState, version,
-                                        std::chrono::steady_clock::time_point{}, debugInfo);
-}
-
-void World::enqueueMeshForUpload(entt::entity entity,
-                                  std::vector<MeshData>&& subChunks,
-                                  uint8_t mainSubChunkCount,
-                                  bool fromTerrainEdit,
-                                  std::shared_ptr<ChunkVersionState> versionState,
-                                  uint32_t version,
-                                  glm::vec3 tightMin,
-                                  glm::vec3 tightMax,
-                                  bool hasTight,
-                                  bool isRemesh,
-                                  uint32_t batchId,
-                                  ChunkDebugAttribution debugInfo) {
-    m_uploadSystem.enqueueMeshForUpload(entity, std::move(subChunks), mainSubChunkCount, fromTerrainEdit,
-                                        versionState, version, tightMin, tightMax, hasTight,
-                                        isRemesh, batchId, std::chrono::steady_clock::time_point{},
-                                        debugInfo);
-}
-
-````
-
-## include\world\World.h
-
-Description: No CC-DESC found. C++ class 'BufferSuballocator'.
-
-````cpp
-#pragma once
-
-#include <entt/entt.hpp>
-#include <glm/glm.hpp>
-#include "vulkan/FramePassTypes.h"
-#include "world/WorldTypes.h"
-#include "world/chunks/core/Chunk.h"
-#include "world/chunks/core/ChunkManager.h"
-#include "world/config/WorldConfig.h"
-#include "world/chunks/core/ChunkJobs.h"
-#include "world/TerrainFileLoader.h"
-#include "world/edit/TerrainEditOverlayStore.h"
-#include "world/edit/TerrainFieldSource.h"
-#include "world/edit/TextureOverlayStore.h"
-#include "world/edit/HeightmapBaseSampler.h"
-#include "world/edit/VoxelBaseSampler.h"
-#include "world/edit/TerrainEditRemeshScheduler.h"
-#include "world/ChunkHoleTracker.h"
-#include "world/chunks/physics/CollisionCache.h"
-#include "world/chunks/streaming/ChunkRenderSystem.h"
-#include "world/chunks/streaming/ChunkUploadSystem.h"
-#include "world/chunks/physics/ChunkCollisionSystem.h"
-#include "world/chunks/core/ChunkLODSystem.h"
-#include "world/chunks/core/ChunkLifecycleManager.h"
-#include "world/WorldDiagnostics.h"
-#include "rendering/common/Mesh.h"
-#include "ui/InGameDebug.h"
-#include <array>
-#include <memory>
-#include <vector>
-#include <deque>
-#include <queue>
-#include <unordered_set>
-#include <unordered_map>
-#include <mutex>
-#include <shared_mutex>
-#include <atomic>
-#include <string>
-#include <thread>
-#include <condition_variable>
-#include <set>
-#include <chrono>
-#include <vulkan/vulkan.h>
-
-// Forward declarations
-class BufferSuballocator;
-class UploadArena;
-class ResourceUploader;
-class GPUCullingSystem;
-
-namespace Physics { class PhysicsWorld; }
-
-/**
- * World - Manages chunk entity lifecycle, terrain generation, and rendering
- * 
- * Full terrain system with:
- * - Chunk loading/unloading in circular area around camera
- * - Job-based terrain generation and meshing pipeline
- * - Upload queue system for GPU mesh data
- * - Multi-draw indirect (MDI) rendering with frustum culling
- */
-class World : public IUploadCallback, public IChunkLifecycleCallback, public IBatchSignalCallback {
-public:
-    using Registry = entt::registry;
-
-    // ---- Diagnostic / stats / history types live in WorldDiagnostics.h ----
-    // These using-aliases preserve the historical `World::*` qualified names
-    // used throughout the codebase.
-    using CullingStats              = WorldDiag::CullingStats;
-    using TerrainEditDiag           = WorldDiag::TerrainEditDiag;
-    using TerrainEditStats          = WorldDiag::TerrainEditStats;
-    using TerrainEditHistoryEntry   = WorldDiag::TerrainEditHistoryEntry;
-    using TerrainEditHistory        = WorldDiag::TerrainEditHistory;
-    using LoadManagementDiag        = WorldDiag::LoadManagementDiag;
-    using ChunkVisualHistoryEntry   = WorldDiag::ChunkVisualHistoryEntry;
-    using ChunkVisualHistory        = WorldDiag::ChunkVisualHistory;
-    using ChunkVisualErrorEntry     = WorldDiag::ChunkVisualErrorEntry;
-    using ChunkVisualErrorHistory   = WorldDiag::ChunkVisualErrorHistory;
-    using FinalizeDiagFrame         = WorldDiag::FinalizeDiagFrame;
-    using LODSwitchDiag             = WorldDiag::LODSwitchDiag;
-    using LastUpdateBreakdown       = WorldDiag::LastUpdateBreakdown;
-
-    // Per-snapshot edit collision data (world-space positions + indices per chunk)
-    struct EditCollisionEntry {
-        std::vector<uint32_t> packedVerts;   // Vertex::packed values
-        std::vector<uint32_t> indices;
-        glm::ivec3 chunkCoord{0};            // For reconstructing world positions
-        uint64_t collisionArtifactGen{0};    // last artifact generation synced to collision
-    };
-
-    // --- Terrain edit diagnostics: see WorldDiag::TerrainEditDiag / TerrainEditStats ---
-
-    const TerrainEditDiag& getLastEditDiag() const { return m_lastEditDiag; }
-    TerrainEditDiag& editDiagMut() { return m_lastEditDiag; }
-    const TerrainEditStats& getEditStats() const { return m_editStats; }
-    TerrainEditStats& editStatsMut() { return m_editStats; }
-
-    // --- Terrain edit history: see WorldDiag::TerrainEditHistoryEntry / TerrainEditHistory ---
-
-    const TerrainEditHistory& getEditHistory() const { return m_editHistory; }
-    TerrainEditHistory& editHistoryMut() { return m_editHistory; }
-
-    // --- Load management diagnostics: see WorldDiag::LoadManagementDiag ---
-    LoadManagementDiag getLoadManagementDiag() const;
-
-    // --- Chunk visual history: see WorldDiag::ChunkVisualHistoryEntry / ChunkVisualHistory ---
-
-    const ChunkVisualHistory& getChunkVisualHistory() const { return m_chunkVisualHistory; }
-
-    // --- Chunk visual error history: see WorldDiag::ChunkVisualErrorEntry / ChunkVisualErrorHistory ---
-
-    const ChunkVisualErrorHistory& getChunkVisualErrorHistory() const { return m_chunkVisualErrorHistory; }
-    void appendChunkVisualError(
-        const glm::ivec3* coord,
-        int lodLevel,
-        const char* stage,
-        const char* reason,
-        uint32_t batchId = 0,
-        uint32_t expectedVersion = 0,
-        uint32_t actualVersion = 0,
-        const ChunkDebugAttribution* debugInfo = nullptr)
-    {
-        noteChunkVisualError(
-            coord,
-            lodLevel,
-            stage,
-            reason,
-            batchId,
-            expectedVersion,
-            actualVersion,
-            debugInfo);
-    }
-
-    // --- Finalize diagnostics: see WorldDiag::FinalizeDiagFrame ---
-    static constexpr size_t FINALIZE_DIAG_CAPACITY = 1200; // 20 seconds at 60fps
-    const std::vector<FinalizeDiagFrame>& getFinalizeDiagHistory() const { return m_finalizeDiagHistory; }
-    size_t getFinalizeDiagWriteIndex() const { return m_finalizeDiagWriteIdx; }
-    std::string generateFinalizeDiagReport(float spikeThresholdMs = 2.0f) const;
-
-    // --- LOD Switch diagnostics: see WorldDiag::LODSwitchDiag ---
-
-    const LODSwitchDiag& getLODSwitchDiag() const { return m_lodSwitchDiag; }
-    void updateLODSwitchDiag();
-    std::string formatLODSwitchDiagReport() const;
-
-    explicit World();
-    ~World();
-
-    /**
-     * Update full terrain system
-     * @param deltaTime Frame time
-     * @param cameraPos World position of camera
-     * @param vbAllocator Vertex buffer allocator
-     * @param ibAllocator Index buffer allocator
-     * @param uploadArena Upload staging arena
-     * @param uploader Upload manager
-     * @param uploadReadyValue Timeline semaphore value for upload gating
-     */
-    void update(float deltaTime, 
-                const glm::vec3& cameraPos,
-                float cameraYaw,
-                BufferSuballocator* vbAllocator = nullptr,
-                BufferSuballocator* ibAllocator = nullptr,
-                UploadArena* uploadArena = nullptr,
-                ResourceUploader* uploader = nullptr,
-                uint64_t uploadReadyValue = 0,
-                float cpuFrameMs = 0.0f,
-                float gpuFrameMs = 0.0f,
-                uint64_t deviceTimeline = 0);
-
-    /**
-     * Gather draw commands for visible chunks
-     * @param viewProj View-projection matrix for frustum culling
-     * @param outCmds Output buffer for indirect draw commands
-     * @param outOrigins Output buffer for chunk origins (vec4)
-     * @param maxDraws Maximum number of draws
-     * @param deviceTimeline Current timeline value (for upload gating)
-     * @return Number of draw commands written
-     */
-    uint32_t gatherDrawCommands(const glm::mat4& viewProj,
-                                 VkDrawIndexedIndirectCommand* outCmds,
-                                 glm::vec4* outOrigins,
-                                 uint32_t maxDraws,
-                                 uint64_t deviceTimeline);
-
-    /**
-     * Gather draw commands for chunks intersecting a world-space sphere.
-     * Used by per-light point shadow rendering to avoid world-scale terrain draws.
-     */
-    uint32_t gatherDrawCommandsInSphere(const glm::vec3& center,
-                                        float radius,
-                                        VkDrawIndexedIndirectCommand* outCmds,
-                                        glm::vec4* outOrigins,
-                                        uint32_t maxDraws,
-                                        uint64_t deviceTimeline);
-
-    static constexpr uint32_t SUN_GATHER_DIAG_MAX_CASCADES = 6;
-
-    struct SunCascadeGatherDiagnostics {
-        float totalMs{0.0f};
-        float stateMapScanMs{0.0f};
-        float candidateSortMs{0.0f};
-        float registryWalkMs{0.0f};
-
-        uint32_t cascadeCount{0};
-        uint32_t maxDraws{0};
-        bool truncated{false};
-
-        glm::ivec3 minChunk{0};
-        glm::ivec3 maxChunk{0};
-        uint32_t loadedChunkMapSize{0};
-        uint32_t bboxCandidateChunks{0};
-        uint32_t visitedCandidateChunks{0};
-
-        uint32_t invalidEntityRejects{0};
-        uint32_t missingComponentRejects{0};
-        uint32_t invisibleRejects{0};
-        uint32_t notReadyRejects{0};
-        uint32_t invalidMeshRejects{0};
-        uint32_t emptyMeshRejects{0};
-        uint32_t uploadPendingRejects{0};
-        uint32_t cascadeCullRejects{0};
-        uint32_t cascadeInnerCullRejects{0};
-        uint32_t acceptedChunks{0};
-        uint32_t emittedDraws{0};
-
-        float maxHalfExtent{0.0f};
-        float sinElevation{0.0f};
-        float shearX{0.0f};
-        float shearZ{0.0f};
-        float shearMax{0.0f};
-        float casterReach{0.0f};
-        float padding{0.0f};
-        float halfX{0.0f};
-        float halfZ{0.0f};
-
-        std::array<uint32_t, SUN_GATHER_DIAG_MAX_CASCADES> cascadeChunkHits{};
-        std::array<uint32_t, SUN_GATHER_DIAG_MAX_CASCADES> cascadeDrawHits{};
-    };
-
-    /**
-     * Gather draw commands for the sun shadow cascades in a single walk.
-     *
-     * Walks chunks intersecting the UNION of per-cascade extruded XZ
-     * footprints (cascade footprint = halfExtent + chunkHeight * |shear|),
-     * then tests each candidate against every cascade clip-AABB. Returns
-     * a per-draw cascade bitmask (`outCascadeMasks[i]`, bit c = 1 means
-     * draw `i` is needed by cascade `c`). Skips chunks that don't
-     * intersect ANY cascade.
-     *
-     * This replaces the legacy "single huge sphere then per-cascade
-     * AABB cull" pipeline: the walk bounding box is shrunk to the
-     * actual visible cascade volume, and each chunk is tested once
-     * against all cascades instead of once per cascade per render.
-     *
-     * @param cameraPos  Camera world position.
-     * @param sunDir     Normalised sun direction (towards ground, y < 0).
-     * @param cascadeVPs Per-cascade view-projection matrices (length = cascadeCount).
-     * @param cascadeHalfExtents Per-cascade ortho half-extent in metres (length = cascadeCount).
-     * @param cascadeCount Number of cascades (1..MAX_SUN_SHADOW_CASCADES).
-     * @param outCmds   Output draw commands.
-     * @param outOrigins Output chunk origin in chunk coordinates.
-     * @param outCascadeMasks Output bitmask (bit c = needed by cascade c).
-     * @param maxDraws  Output capacity.
-     * @param deviceTimeline Upload timeline gate.
-     * @param diagnostics Optional detailed counters/timings for debug UI.
-     * @param extraChunkPadding Extra X/Z chunk padding for reusable gather supersets.
-     * @param includeZeroMaskCandidates Emit ready chunks even when they miss current cascades.
-     * @return Number of draws emitted.
-     */
-    uint32_t gatherDrawCommandsForSunCascades(const glm::vec3& cameraPos,
-                                              const glm::vec3& sunDir,
-                                              const glm::mat4* cascadeVPs,
-                                              const float* cascadeHalfExtents,
-                                              uint32_t cascadeCount,
-                                              VkDrawIndexedIndirectCommand* outCmds,
-                                              glm::vec4* outOrigins,
-                                              uint16_t* outCascadeMasks,
-                                              uint32_t maxDraws,
-                                              uint64_t deviceTimeline,
-                                              SunCascadeGatherDiagnostics* diagnostics = nullptr,
-                                              int32_t extraChunkPadding = 0,
-                                              bool includeZeroMaskCandidates = false);
-
-    uint32_t gatherDrawCommandsForSunCascadeChunk(const glm::ivec3& chunkCoord,
-                                                  const glm::mat4* cascadeVPs,
-                                                  uint32_t cascadeCount,
-                                                  VkDrawIndexedIndirectCommand* outCmds,
-                                                  glm::vec4* outOrigins,
-                                                  uint16_t* outCascadeMasks,
-                                                  uint32_t maxDraws,
-                                                  uint64_t deviceTimeline,
-                                                  bool includeZeroMaskCandidate = false);
-
-
-
-    /**
-     * Enqueue mesh for upload to GPU
-     * Called by job pipeline after meshing completes
-     */
-    void enqueueMeshForUpload(entt::entity entity,
-                              MeshData&& mesh,
-                              bool fromTerrainEdit,
-                              std::shared_ptr<struct ChunkVersionState> versionState,
-                              uint32_t version,
-                              ChunkDebugAttribution debugInfo = {});
-    
-    /**
-     * Enqueue multiple SubChunks for a single entity (v4 format)
-     * SubChunks are NEVER merged - each becomes a separate draw call
-     * @param mainSubChunkCount How many subChunks are main mesh (rest are seams)
-     * @param isRemesh If true, stages to PendingMeshHandle for batch swap
-     * @param batchId LOD transition batch ID (0 = none)
-     */
-    void enqueueMeshForUpload(entt::entity entity,
-                              std::vector<MeshData>&& subChunks,
-                              uint8_t mainSubChunkCount,
-                              bool fromTerrainEdit,
-                              std::shared_ptr<struct ChunkVersionState> versionState,
-                              uint32_t version,
-                              glm::vec3 tightMin = glm::vec3(1e10f),
-                              glm::vec3 tightMax = glm::vec3(-1e10f),
-                              bool hasTight = false,
-                              bool isRemesh = false,
-                              uint32_t batchId = 0,
-                              ChunkDebugAttribution debugInfo = {});
-
-    /**
-     * Access to debug overlay
-     */
-    InGameDebug& getDebugOverlay() { return *m_inGameDebug; }
-    const InGameDebug& getDebugOverlay() const { return *m_inGameDebug; }
-
-    /**
-     * Runtime voxel chunk tracking (chunks that need voxel meshing due to edits)
-     */
-    void markRuntimeVoxelChunks(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords);
-    void clearRuntimeVoxelChunks();
-    TerrainEdit::TerrainEditOverlayStore::ChunkSet getRuntimeVoxelChunkCoords() const;
-    bool chunkNeedsRuntimeVoxel(const glm::ivec3& chunkCoord) const;
-
-    /**
-     * Access to the sparse runtime terrain edit overlay.
-     * This is the new mutable terrain layer; untouched terrain still uses
-     * the precomputed mesh/collision fast path.
-     */
-    TerrainEdit::TerrainEditOverlayStore& getTerrainEditOverlay() { return m_terrainEditOverlay; }
-    const TerrainEdit::TerrainEditOverlayStore& getTerrainEditOverlay() const { return m_terrainEditOverlay; }
-
-    /// Sparse voxel-face material assignments authored by the texture brush.
-    TextureOverlay::TextureOverlayStore& getTextureMaterialStore() { return m_textureMaterialStore; }
-    const TextureOverlay::TextureOverlayStore& getTextureMaterialStore() const { return m_textureMaterialStore; }
-
-    /**
-     * Access to the merged terrain field source (base + edit overlay).
-     * The base sampler is not wired yet; this is the foundation for the
-     * editable terrain pipeline.
-     */
-    TerrainEdit::TerrainFieldSource& getTerrainFieldSource() { return m_terrainFieldSource; }
-    const TerrainEdit::TerrainFieldSource& getTerrainFieldSource() const { return m_terrainFieldSource; }
-
-    /// Access the heightmap base sampler (for height-range queries).
-    const TerrainEdit::HeightmapBaseSampler& getHeightmapSampler() const { return m_heightmapSampler; }
-
-    /// Access the voxel base sampler (for 3D voxel range queries).
-    const TerrainEdit::VoxelBaseSampler& getVoxelBaseSampler() const { return m_voxelBaseSampler; }
-
-    /// Access the chunk hole tracker (for diagnosing LOD swap visual holes).
-    ChunkHoleTracker& getChunkHoleTracker() { return m_chunkHoleTracker; }
-    const ChunkHoleTracker& getChunkHoleTracker() const { return m_chunkHoleTracker; }
-
-    /// Mark edited chunks dirty for remeshing.
-    void markEditsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks);
-    void markTextureMaterialsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks);
-
-    struct SnapshotInfo {
-        std::string id;
-        std::string displayName;
-        std::string createdAt;
-        bool isBase{false};
-        uint64_t editedCells{0};
-        uint64_t editedBricks{0};
-    };
-
-    struct TerrainBoxRecord {
-        glm::vec3 minCorner{0.0f};
-        glm::vec3 maxCorner{0.0f};
-    };
-
-    const std::vector<SnapshotInfo>& getSnapshotInfos() const { return m_snapshotInfos; }
-    const std::vector<TerrainBoxRecord>& getTerrainBoxes() const { return m_terrainBoxes; }
-    uint64_t getTerrainBoxRevision() const { return m_terrainBoxRevision; }
-    struct MeshTopologyChange {
-        uint64_t revision{0};
-        glm::ivec3 coord{0};
-    };
-    uint64_t getMeshTopologyVersion() const {
-        return m_meshTopologyVersion.load(std::memory_order_relaxed);
-    }
-    bool getMeshTopologyChangesSince(uint64_t revision,
-                                     std::vector<MeshTopologyChange>& outChanges,
-                                     size_t maxChanges = 8192) const;
-    int getActiveSnapshotIndex() const { return m_activeSnapshotIndex; }
-    std::string getActiveSnapshotName() const {
-        if (m_activeSnapshotIndex >= 0 &&
-            m_activeSnapshotIndex < static_cast<int>(m_snapshotInfos.size())) {
-            return m_snapshotInfos[static_cast<size_t>(m_activeSnapshotIndex)].displayName;
-        }
-        return m_worldName;
-    }
-    bool hasActiveEditableSnapshot() const {
-        return m_activeSnapshotIndex > 0 &&
-               m_activeSnapshotIndex < static_cast<int>(m_snapshotInfos.size());
-    }
-
-    void markSnapshotDirty() { m_snapshotDirty = true; }
-
-    const std::string& getLastSnapshotStatusMessage() const { return m_lastSnapshotStatusMessage; }
-    bool lastSnapshotStatusIsError() const { return m_lastSnapshotStatusIsError; }
-
-    bool createSnapshot(const std::string& desiredName = "");
-    bool selectSnapshotByIndex(int index);
-    bool saveActiveSnapshot();
-    bool deleteSnapshot(int index);
-    void deleteAllSnapshots();
-    void flushDirtySnapshot();
-
-    struct TerrainEditPlacementContext {
-        bool valid{false};
-        glm::ivec3 chunkCoord{0, 0, 0};
-        int bandLodLevel{0};
-        int previewLodLevel{0};
-        TerrainType terrainType{TerrainType::Voxel};
-        float voxelSizeM{WorldConfig::VOXEL_SIZE_M};
-    };
-
-    TerrainEditPlacementContext getTerrainEditPlacementContext(const glm::vec3& worldPos) const;
-
-    bool applyTerrainBoxEdit(const glm::vec3& minCorner,
-                             const glm::vec3& maxCorner,
-                             bool additive,
-                             float requestedStep,
-                             int brushShape = 0);
-
-    /**
-     * Store collision data for an edited chunk and enqueue a physics body.
-     * Called by TerrainEditRemeshScheduler after re-meshing.
-     */
-    void enqueueEditCollision(entt::entity entity,
-                              const glm::ivec3& chunkCoord,
-                              std::vector<Vertex>&& packedVerts,
-                              std::vector<uint32_t>&& indices32,
-                              std::shared_ptr<struct ChunkVersionState> versionState = {},
-                              uint32_t version = 0,
-                              ChunkCollisionSource source = ChunkCollisionSource::EditMeshPacked);
-
-    /**
-     * Immediately create physics bodies for all chunks in m_editCollisionData.
-     * Called after loading a snapshot's collision file.
-     */
-    void applyEditCollisionData();
-
-    struct EditArtifactKey {
-        glm::ivec3 chunkCoord{0, 0, 0};
-        TerrainType terrainType{TerrainType::Voxel};
-        int lodLevel{0};
-
-        bool operator==(const EditArtifactKey& other) const {
-            return chunkCoord == other.chunkCoord &&
-                   terrainType == other.terrainType &&
-                   lodLevel == other.lodLevel;
-        }
-    };
-
-    struct EditArtifactKeyHash {
-        size_t operator()(const EditArtifactKey& key) const noexcept {
-            size_t hash = IVec3Hash{}(key.chunkCoord);
-            hash ^= (static_cast<size_t>(key.lodLevel) + 0x9e3779b9u + (hash << 6) + (hash >> 2));
-            hash ^= (static_cast<size_t>(key.terrainType) + 0x9e3779b9u + (hash << 6) + (hash >> 2));
-            return hash;
-        }
-    };
-
-    struct EditArtifact {
-        TerrainType terrainType{TerrainType::Voxel};
-        int lodLevel{0};
-        bool isEmpty{true};
-        bool deferredBuild{false};
-        std::vector<Vertex> vertices;
-        std::vector<uint32_t> indices;
-        glm::vec3 aabbMin{1e10f};
-        glm::vec3 aabbMax{-1e10f};
-        uint64_t generation{0};  // bumped on every storeEditArtifact
-    };
-
-    void clearEditArtifactCache();
-    void invalidateEditArtifact(const glm::ivec3& chunkCoord);
-    void invalidateEditArtifacts(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords);
-    void storeEditArtifact(const glm::ivec3& chunkCoord,
-                           TerrainType terrainType,
-                           int lodLevel,
-                           std::vector<Vertex>&& vertices,
-                           std::vector<uint32_t>&& indices,
-                           glm::vec3 aabbMin,
-                           glm::vec3 aabbMax,
-                           bool isEmpty,
-                           bool deferredBuild = false);
-    bool tryGetEditArtifact(const glm::ivec3& chunkCoord,
-                            TerrainType terrainType,
-                            int lodLevel,
-                            EditArtifact& outArtifact) const;
-    uint64_t getEditArtifactGeneration(const glm::ivec3& chunkCoord,
-                                       TerrainType terrainType,
-                                       int lodLevel) const;
-    
-    /**
-     * Access to terrain file loader (for heightmap-based terrain)
-     */
-    TerrainFileLoader* getTerrainLoader() { return m_terrainLoader.get(); }
-    
-    /**
-     * Access to DCCM terrain file loader
-     */
-    TerrainFileLoader* getDCCMTerrainLoader() { return m_dccmTerrainLoader.get(); }
-    
-    /**
-     * Get the appropriate terrain loader for a given LOD level
-     * Returns DCCM or voxel loader based on per-LOD terrain type config
-     */
-    TerrainFileLoader* getTerrainLoaderForLOD(int lodLevel) {
-        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS &&
-            m_terrainTypePerLOD[lodLevel] == TerrainType::DCCM &&
-            m_dccmTerrainLoader && m_dccmTerrainLoader->isLoaded()) {
-            return m_dccmTerrainLoader.get();
-        }
-        return m_terrainLoader.get();
-    }
-    
-    /**
-     * Get the effective LOD level for mesh loading
-     * DCCM always uses LOD 0 regardless of actual LOD
-     */
-    int getEffectiveLOD(int lodLevel) const {
-        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS &&
-            m_terrainTypePerLOD[lodLevel] == TerrainType::DCCM) {
-            return 0; // DCCM always uses LOD 0
-        }
-        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS) {
-            return m_dataLODPerBand[lodLevel];
-        }
-        return lodLevel;
-    }
-    int getEffectiveLODForChunk(const glm::ivec3& chunkCoord, int lodLevel) const {
-        if (getTerrainTypeForChunk(chunkCoord, lodLevel) == TerrainType::DCCM) {
-            return 0;
-        }
-        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS) {
-            return m_dataLODPerBand[lodLevel];
-        }
-        return lodLevel;
-    }
-    
-    /**
-     * Per-LOD terrain type configuration
-     */
-    void setTerrainTypeForLOD(int lodLevel, TerrainType type);
-    void setDataLODForBand(int band, int dataLOD);
-    void setTerrainTypesForStartup(const std::array<TerrainType, MAX_LOD_LEVELS>& types);
-    TerrainType getTerrainTypeForLOD(int lodLevel) const {
-        if (lodLevel >= 0 && lodLevel < MAX_LOD_LEVELS) return m_terrainTypePerLOD[lodLevel];
-        return TerrainType::Voxel;
-    }
-    TerrainType getTerrainTypeForChunk(const glm::ivec3& chunkCoord, int lodLevel) const {
-        if (chunkCoord.y != 0 || m_terrainEditOverlay.hasEditsInChunk(chunkCoord)) {
-            return TerrainType::Voxel;
-        }
-        return getTerrainTypeForLOD(lodLevel);
-    }
-    const std::array<TerrainType, MAX_LOD_LEVELS>& getTerrainTypePerLOD() const { return m_terrainTypePerLOD; }
-    int getDataLODForBand(int band) const {
-        if (band >= 0 && band < MAX_LOD_LEVELS) return m_dataLODPerBand[band];
-        return band;
-    }
-    const std::array<int, MAX_LOD_LEVELS>& getDataLODPerBand() const { return m_dataLODPerBand; }
-    
-    /**
-     * Returns true when chunks are loading/meshing/uploading.
-     * Used to block terrain type changes that would corrupt GPU state.
-     */
-    bool isTerrainBusy() const {
-        return m_loadingCount.load(std::memory_order_relaxed) > 0
-            || m_meshingCount.load(std::memory_order_relaxed) > 0
-            || m_uploadSystem.getQueueSize() > 0;
-    }
-    
-    /**
-     * Check if any LOD uses a specific terrain type
-     */
-    bool anyLODUsesType(TerrainType type) const {
-        for (int i = 0; i < MAX_LOD_LEVELS; ++i) {
-            if (m_terrainTypePerLOD[i] == type) return true;
-        }
-        return false;
-    }
-    
-    /**
-     * Switch to a different terrain file (e.g. voxel <-> DCCM)
-     * Destroys all chunks, reloads the terrain file, and restarts generation.
-     * @param newTerrainPath Full path to the new terrain .bin file
-     */
-    void switchTerrainFile(const std::string& newTerrainPath);
-    const std::string& getBaseTerrainPath() const { return m_baseTerrainPath; }
-    
-    /**
-     * Get terrain dimensions in chunks (from loaded terrain.bin)
-     * Returns {chunksX, chunksZ, lodLevels} or {0,0,0} if not loaded
-     */
-    TerrainFileLoader::Dimensions getTerrainDimensions() const {
-        if (m_terrainLoader && m_terrainLoader->isLoaded()) {
-            return m_terrainLoader->getDimensions();
-        }
-        return {0, 0, 0};
-    }
-    
-    /**
-     * Get maximum render distance in rings based on terrain size
-     * This is the furthest ring that can contain any terrain data
-     */
-    int getMaxRenderDistanceRings() const {
-        auto dims = getTerrainDimensions();
-        if (dims.chunksX == 0 || dims.chunksZ == 0) return 500; // Default fallback
-        // Max ring = max distance from center to corner
-        // For NxN grid, center is at (N/2, N/2), corner is at (N-1, N-1)
-        // Max Chebyshev distance = max(N/2, N/2) = N/2 (roughly)
-        int maxDim = static_cast<int>(std::max(dims.chunksX, dims.chunksZ));
-        return (maxDim + 1) / 2 + 1;
-    }
-
-    /**
-     * Get the number of LOD levels available in the loaded terrain
-     * Returns terrain file's lodLevels (typically 5 for LOD 0-4), or 5 as default
-     */
-    int getAvailableLODLevels() const {
-        auto dims = getTerrainDimensions();
-        if (dims.lodLevels > 0) return static_cast<int>(dims.lodLevels);
-        return 5; // Default: LOD 0-4
-    }
-
-    /**
-     * Set physics world for collision generation
-     * Call after physics system is initialized
-     */
-    void setPhysicsWorld(class Physics::PhysicsWorld* physics) { 
-        m_physics = physics; 
-        m_collisionSystem.setPhysicsWorld(physics);
-        m_collisionSystem.setCollisionCache(m_collisionCache.get());
-    }
-    
-    /**
-     * Set GPU culling system for persistent slot allocation
-     * Call after GPUCullingSystem is initialized
-     */
-    void setGPUCullingSystem(GPUCullingSystem* gpuCulling) {
-        m_gpuCulling = gpuCulling;
-        m_uploadSystem.setGPUCullingSystem(gpuCulling);
-    }
-    
-    /**
-     * Set culling statistics for debug display
-     * Called from Engine after culling is complete
-     */
-    void setCullingStats(const CullingStats& stats) {
-        m_cullingStats = stats;
-    }
-
-    const LastUpdateBreakdown& getLastUpdateBreakdown() const { return m_lastUpdateBreakdown; }
-    int getLoadingCount() const { return m_loadingCount.load(std::memory_order_relaxed); }
-    int getMeshingCount() const { return m_meshingCount.load(std::memory_order_relaxed); }
-    int getReadyCount() const { return m_readyCount.load(std::memory_order_relaxed); }
-
-    /**
-     * Create a chunk entity at given chunk coordinates
-     * @return Entity handle (entt::null if failed)
-     */
-    entt::entity createChunk(const glm::ivec3& chunkCoord);
-
-    /**
-     * OPTIMIZATION: Create multiple chunks in a single batch (1.5x speedup)
-     * Reduces lock overhead by creating all entities under one registry lock
-     * @param coords Vector of chunk coordinates to create
-     * @return Vector of created entities (same order as coords)
-     */
-    std::vector<entt::entity> createChunksBatch(const std::vector<glm::ivec3>& coords);
-
-    /**
-     * Find chunk entity by coordinate
-     * @return Entity handle (entt::null if not found)
-     */
-    entt::entity findChunk(const glm::ivec3& chunkCoord) const;
-    TerrainEdit::TerrainEditOverlayStore::ChunkSet collectExistingChunksInRange(
-        const glm::ivec3& minChunk,
-        const glm::ivec3& maxChunk) const;
-
-    /**
-     * Get count of active chunks
-     */
-    size_t getChunkCount() const;
-
-    // Direct registry access for external systems
-    Registry& getRegistry() { return m_registry; }
-    const Registry& getRegistry() const { return m_registry; }
-    std::shared_mutex& registryMutex() const { return m_registryMutex; }
-
-    // C-nits 8: Job system and synchronization accessors
-    JobSystem& getJobSystem() { return m_jobSystem; }
-    PayloadPool& getPayloadPool() { return m_payloadPool; }
-    ChunkManager* getChunkManager() { return m_chunkManager.get(); }
-    
-    /**
-     * Pre-deserialize all collision shapes for instant runtime access
-     * MUST be called AFTER Jolt physics is initialized
-     */
-    void preDeserializeCollisionShapes();
-    
-    /**
-     * Chunk generation control
-     */
-    void resetChunkGeneration();
-    
-    /**
-     * Apply LOD parameter changes incrementally.
-     * Instead of destroying all chunks and rebuilding, this:
-     * 1. Compares each chunk's current LOD vs desired LOD under new thresholds
-     * 2. Only destroys+recreates chunks whose LOD actually changed
-     * 3. Creates new chunks for increased render distance / destroys for decreased
-     * 
-     * Much faster than resetChunkGeneration() for small parameter tweaks.
-     * @param newRenderDistance  The new total render distance in rings
-     */
-    void applyLODChangesIncrementally(int newRenderDistance);
-    
-    /**
-     * Release mesh data for all chunks at a specific LOD level
-     * Used when switching LOD from Mesh to SVO mode - frees VRAM without destroying chunks
-     * @param lodLevel The LOD level (0-4) to release meshes for
-     */
-    void releaseMeshesForLOD(int lodLevel);
-    
-    /**
-     * Queue mesh reload for all chunks at a specific LOD level
-     * Used when switching LOD from SVO back to Mesh mode
-     * @param lodLevel The LOD level (0-4) to reload meshes for
-     */
-    void reloadMeshesForLOD(int lodLevel);
-    
-    std::mutex& chunkVersionMutex() const { return m_chunkVersionMutex; }
-    std::unordered_map<entt::entity, std::shared_ptr<struct ChunkVersionState>, struct EntityHash>& 
-        getChunkVersionStates() { return m_chunkVersionStates; }
-
-    void transitionChunkState(entt::entity entity, ChunkState::State state);
-
-private:
-    /**
-     * Chunk loading system - creates/destroys/remeshes chunks in circular area
-     * @param deltaTime Frame time for speed-adaptive LOD
-     */
-    void updateChunkLoader(float deltaTime, const glm::vec3& cameraPos, float cameraYaw);
-
-    /**
-     * LOD transition scan + remesh drain (called from updateChunkLoader)
-     */
-    void updateLODTransitions(float deltaTime, bool centerChanged);
-
-    /**
-     * Mark newly generated chunks as dirty for meshing
-     */
-    void updateMarkDirtyOnGeneration();
-
-    /**
-     * Meshing system - kicks off mesh generation jobs for dirty chunks
-     */
-    void updateMeshingSystem();
-
-    /**
-     * Upload queue system - uploads finished meshes to GPU
-     * @return Number of meshes uploaded this frame
-     */
-    size_t updateUploadQueueSystem(BufferSuballocator* vbAllocator,
-                                  BufferSuballocator* ibAllocator,
-                                  UploadArena* uploadArena,
-                                  ResourceUploader* uploader,
-                                  uint64_t uploadReadyValue,
-                                  size_t maxUploadsOverride = 0,
-                                  bool terrainEditOnly = false);
-
-    /**
-     * Finalize queue - processes chunks after GPU upload completes
-     * @return Number of chunks finalized this frame
-     */
-    size_t processFinalizeQueue(size_t maxFinalizeCount = 0);
-    
-    /**
-     * Process LOD batch swaps - atomically swap PendingMeshHandle → MeshHandle
-     * for all chunks in a completed LOD transition batch.
-     * This eliminates visual holes at LOD boundaries.
-     * @return Number of chunks swapped this frame
-     */
-    size_t processLODSwaps(BufferSuballocator* vbAllocator,
-                           BufferSuballocator* ibAllocator,
-                           uint64_t deviceTimeline);
-
-    /**
-     * Old mesh buffers retired by LOD swaps. GPU culling slots are freed
-     * immediately; buffer allocator reclamation is deferred until the upload
-     * and swap path drains it.
-     */
-    void enqueueDeferredMeshBufferFree(const BufferSlice& vb, const BufferSlice& ib);
-    void processDeferredMeshBufferFrees(BufferSuballocator* vbAllocator,
-                                        BufferSuballocator* ibAllocator,
-                                        size_t maxFreeCount = 0);
-
-    /**
-     * Process solo edit swaps - swap PendingMeshHandle (batchId=0) → MeshHandle
-     * once deviceTimeline >= pending.handle.gpuReadyValue.
-     * Used for terrain edit remeshes where the old mesh must keep rendering
-     * until the GPU has finished reading the replacement upload.
-     * @return Number of chunks swapped this frame
-     */
-    size_t processSoloPendingSwaps(BufferSuballocator* vbAllocator,
-                                   BufferSuballocator* ibAllocator,
-                                   uint64_t deviceTimeline);
-    
-    /**
-     * Clean up orphaned PendingMeshHandles from cancelled LOD batches.
-     * Frees GPU resources (VB, IB, culling slots) and removes the component.
-     * Called when center changes and old batches are invalidated.
-     */
-    void cleanupStalePendingMeshHandles();
-    
-    // --- Pending LOD remesh queue ---
-    // LOD transition detection lives in World (not ChunkManager) because we
-    // need access to chunk.lodLevel (the ACTUAL mesh LOD, not the calculated one).
-    // On center change: scan all Ready chunks, find mismatches, populate queue.
-    // Drain it eagerly so movement can converge as quickly as the rest of the
-    // pipeline allows.
-    std::vector<ChunkManager::ChunkRemeshRequest> m_pendingLODRemeshes;
-    size_t m_lodScanCounter = 0;
-
-    // --- Burst recovery (explosion knockbacks, teleports) ---
-    // After a large center jump (moveDist > 5 chunks), accelerate LOD scans
-    // and skip upload throttling so the world fills in quickly.
-    int m_burstRecoveryFrames{0};
-
-    struct PendingMeshBufferFree {
-        BufferSlice vb;
-        BufferSlice ib;
-    };
-    std::deque<PendingMeshBufferFree> m_pendingMeshBufferFrees;
-    std::vector<BufferSlice> m_deferredFreeVbScratch;
-    std::vector<BufferSlice> m_deferredFreeIbScratch;
-
-    // --- Core ECS ---
-    Registry m_registry;
-
-    // --- Chunk loading ---
-    std::unique_ptr<ChunkManager> m_chunkManager;
-
-    // --- C-nits 8: Job system and synchronization (de-globalized) ---
-    JobSystem m_jobSystem;
-    PayloadPool m_payloadPool;  // Thread-safe pool for ChunkPipelinePayload
-    mutable std::mutex m_chunkVersionMutex;  // Protects m_chunkVersionStates
-    std::unordered_map<entt::entity, std::shared_ptr<struct ChunkVersionState>, struct EntityHash> m_chunkVersionStates;
-
-    // --- Streaming queues ---
-    mutable std::mutex m_pendingChunksMutex;  // Protects m_pendingChunks (accessed from main + lifecycle threads)
-    std::unordered_set<glm::ivec3, IVec3Hash> m_pendingChunks;
-    std::unordered_map<glm::ivec3, entt::entity, IVec3Hash> m_chunkEntityMap;
-    std::unordered_set<glm::ivec3, IVec3Hash> m_existingChunkSet;
-    std::unordered_set<glm::ivec3, IVec3Hash> m_readyChunkSet;
-    mutable std::shared_mutex m_chunkSetMutex;
-    // --- LOD system (extracted) ---
-    ChunkLODSystem m_lodSystem;
-    
-    // --- Lifecycle manager (extracted) ---
-    ChunkLifecycleManager m_lifecycleManager;
-    
-    // IChunkLifecycleCallback implementation
-    std::vector<entt::entity> createChunkEntities(const std::vector<glm::ivec3>& coords) override;
-    void scheduleChunkJobs(entt::entity entity, const glm::ivec3& coord, const glm::ivec3& playerChunk) override;
-    int destroyChunks(const std::vector<glm::ivec3>& coords) override;
-    glm::vec3 getCameraPosition() const override { return m_lastCameraPos; }
-    void cleanupStaleVersionStates() override;
-
-    // --- Upload system (extracted) ---
-    ChunkUploadSystem m_uploadSystem;
-    
-    // IUploadCallback implementation
-    void onMeshUploaded(
-        entt::entity entity,
-        const glm::ivec3& chunkCoord,
-        const std::vector<Vertex>& vertices,
-        const std::vector<uint16_t>& indices,
-        int lodLevel) override;
-    void onUploadPipelineEvent(
-        entt::entity entity,
-        const glm::ivec3* chunkCoord,
-        int lodLevel,
-        const char* stage,
-        const char* reason,
-        uint32_t batchId,
-        uint32_t expectedVersion,
-        uint32_t actualVersion,
-        const ChunkDebugAttribution* debugInfo = nullptr) override;
-    void onMeshHandleAdded(const MeshHandle& h) override { meshStatsAdd(h); }
-    void onMeshHandleRemoved(const MeshHandle& h) override { meshStatsSub(h); }
-    
-    // IBatchSignalCallback implementation
-    bool onBatchChunkReady(uint32_t batchId) override;
-    bool isBatchActive(uint32_t batchId) const override;
-
-    // --- Camera tracking for directional priority ---
-    glm::vec3 m_lastCameraPos{0.0f};
-    float m_lastCameraYaw{0.0f};  // For minimap view cone
-    glm::vec3 m_cameraVelocity{0.0f};
-
-    // --- Collision system (extracted) ---
-    ChunkCollisionSystem m_collisionSystem;
-    
-    // --- GPU buffer allocators (for cleanup) ---
-    BufferSuballocator* m_vbAllocator = nullptr;
-    BufferSuballocator* m_ibAllocator = nullptr;
-
-    // --- Chunk state tracking for worker threads ---
-    mutable std::shared_mutex m_chunkStateMutex;
-    std::unordered_map<glm::ivec3, ChunkState::State, IVec3Hash> m_chunkStateMap;
-
-    // --- Registry synchronization ---
-    mutable std::shared_mutex m_registryMutex;
-
-    // --- Helpers ---
-    void setChunkState(entt::entity entity, ChunkState::State state);
-    void setChunkState(const glm::ivec3& coord, ChunkState::State state);
-    void removeChunkState(const glm::ivec3& coord);
-    ChunkState::State getChunkStateSnapshot(const glm::ivec3& coord) const;
-    void markChunkPending(const glm::ivec3& coord);
-    void clearChunkPending(const glm::ivec3& coord);
-    bool isChunkPending(const glm::ivec3& coord) const;
-    bool tryDestroyChunk(const glm::ivec3& coord);
-    int tryDestroyChunksBatch(const std::vector<glm::ivec3>& coords);
-    int getDesiredLODForChunk(const glm::ivec3& coord) const;
-
-    // --- Debug metrics assembly (implementation in WorldDebugMetrics.cpp) ---
-    struct UpdateTimings {
-        std::chrono::high_resolution_clock::time_point startTime;
-        std::chrono::high_resolution_clock::time_point chunkLoadStart, chunkLoadEnd;
-        std::chrono::high_resolution_clock::time_point meshingStart, meshingEnd;
-        std::chrono::high_resolution_clock::time_point uploadStart, uploadEnd;
-        std::chrono::high_resolution_clock::time_point collisionStart, collisionEnd;
-        std::chrono::high_resolution_clock::time_point finalizeStart, finalizeEnd;
-        std::chrono::high_resolution_clock::time_point worldUpdateEnd;
-    };
-    void assembleDebugInfo(const UpdateTimings& timings,
-                           BufferSuballocator* vbAllocator,
-                           BufferSuballocator* ibAllocator,
-                           float cpuFrameMs,
-                           float gpuFrameMs);
-
-public:
-    // --- Streaming metrics ---
-    struct StreamingMetrics {
-        std::atomic<uint64_t> chunksCreatedTotal{0};
-        std::atomic<uint64_t> chunksDestroyedTotal{0};
-        std::atomic<uint64_t> meshesUploaded{0};
-        uint32_t creationQueueSize{0};
-        uint32_t uploadQueueSize{0};
-        uint32_t currentBurstSize{0};
-        uint32_t currentUploadBudget{0};
-        
-        void reset() {
-            chunksCreatedTotal.store(0, std::memory_order_relaxed);
-            chunksDestroyedTotal.store(0, std::memory_order_relaxed);
-            meshesUploaded.store(0, std::memory_order_relaxed);
-            creationQueueSize = 0;
-            uploadQueueSize = 0;
-            currentBurstSize = 0;
-            currentUploadBudget = 0;
-        }
-    };
-    
-    StreamingMetrics& getStreamingMetrics() { return m_streamingMetrics; }
-    const StreamingMetrics& getStreamingMetrics() const { return m_streamingMetrics; }
-
-    // Phase E1: expose passes this world contributes to (currently voxel opaque only)
-    std::vector<FramePassKind> enumerateFramePasses() const;
-
-private:
-    StreamingMetrics m_streamingMetrics;
-    std::unique_ptr<InGameDebug> m_inGameDebug;  // Debug overlay display
-    TerrainEdit::TerrainEditOverlayStore m_terrainEditOverlay; // Sparse mutable terrain edits
-    TextureOverlay::TextureOverlayStore m_textureMaterialStore; // Sparse voxel-face material edits
-    TerrainEdit::TerrainFieldSource m_terrainFieldSource;      // Merged base/edit terrain view
-    TerrainEdit::HeightmapBaseSampler m_heightmapSampler;      // Base heightmap for terrain edits
-    TerrainEdit::VoxelBaseSampler m_voxelBaseSampler;            // 3D voxel base for terrain edits
-    TerrainEdit::TerrainEditRemeshScheduler m_editRemeshScheduler; // Dirty-chunk re-mesh scheduler
-    std::vector<SnapshotInfo> m_snapshotInfos;
-    std::vector<TerrainBoxRecord> m_terrainBoxes;
-    uint64_t m_terrainBoxRevision{1};
-    int m_activeSnapshotIndex{0};
-    std::string m_snapshotRootDir;
-    std::string m_baseTerrainPath;
-    std::string m_baseCollisionPath;
-    std::unique_ptr<TerrainFileLoader> m_terrainLoader;      // Voxel terrain loader
-    std::unique_ptr<TerrainFileLoader> m_dccmTerrainLoader;  // DCCM terrain loader
-    std::array<TerrainType, MAX_LOD_LEVELS> m_terrainTypePerLOD{TerrainType::Voxel, TerrainType::Voxel, TerrainType::Voxel, TerrainType::Voxel, TerrainType::Voxel};
-    std::array<int, MAX_LOD_LEVELS> m_dataLODPerBand{0, 1, 2, 3, 4};  // Per-band data LOD override (Voxel only)
-    std::unique_ptr<Collision::CollisionCache> m_collisionCache;  // Precomputed collision data
-
-    bool m_snapshotDirty{false}; // Deferred save flag — set by edits, flushed on switch/save
-    std::string m_lastSnapshotStatusMessage;
-    bool m_lastSnapshotStatusIsError{false};
-    TerrainEditDiag m_lastEditDiag; // Last terrain edit timing diagnostics
-    TerrainEditStats m_editStats;   // Rolling history + averages
-    TerrainEditHistory m_editHistory; // Individual edit log entries
-    ChunkVisualHistory m_chunkVisualHistory; // End-to-end chunk upload/finalize history
-    ChunkVisualErrorHistory m_chunkVisualErrorHistory; // Upload/LOD/finalize error timeline
-
-    // Persisted edit collision map (saved/loaded with each snapshot)
-    std::unordered_map<glm::ivec3, EditCollisionEntry, IVec3Hash> m_editCollisionData;
-    mutable std::shared_mutex m_editArtifactCacheMutex;
-    std::unordered_map<EditArtifactKey, EditArtifact, EditArtifactKeyHash> m_editArtifactCache;
-    uint64_t m_editArtifactGenCounter{0};  // monotonic, bumped per storeEditArtifact
-    class Physics::PhysicsWorld* m_physics{nullptr};     // Physics world for collision (non-owning)
-    GPUCullingSystem* m_gpuCulling{nullptr};             // GPU culling system for persistent slots (non-owning)
-    CullingStats m_cullingStats;                          // Culling statistics from Engine
-    LastUpdateBreakdown m_lastUpdateBreakdown;            // Always-on timings for perf HUD / runtime metrics
-    
-    // Runtime voxel chunk tracking
-    mutable std::shared_mutex m_runtimeVoxelChunkMutex;
-    TerrainEdit::TerrainEditOverlayStore::ChunkSet m_runtimeVoxelChunks;
-    std::atomic<uint64_t> m_meshTopologyVersion{0};  // Bumped when mesh topology changes
-    mutable std::mutex m_meshTopologyChangeMutex;
-    std::deque<MeshTopologyChange> m_meshTopologyChanges;
-    uint64_t m_meshTopologyOldestDroppedRevision{0};
-    ChunkHoleTracker m_chunkHoleTracker;              // Tracks chunk visual hole events
-    
-    // --- Render system (extracted) ---
-    ChunkRenderSystem m_renderSystem;
-    
-    // World metadata
-    std::string m_worldName;
-    std::string m_worldGenerationDate;
-    
-    // --- Atomic state counters for O(1) tracking instead of O(N) iteration ---
-    std::atomic<int> m_loadingCount{0};
-    std::atomic<int> m_meshingCount{0};
-    std::atomic<int> m_readyCount{0};
-    
-    // Track whether any uploads/copies were recorded this frame (for skipping empty submits)
-    bool m_hadUploadsThisFrame{false};
-    // Track whether any of those uploads were topology-changing replacements.
-    // Initial chunk loads and LOD batch swaps do NOT set this. Used to suppress
-    // temporal visibility reuse after frames that may have exposed previously
-    // occluded neighbor chunks, breaking the temporal occlusion death spiral on edits.
-    bool m_hadEditUploadsThisFrame{false};
-    // Cooldown frames remaining after the last edit/remesh upload. While > 0, the
-    // temporal-coherence shortcut is suppressed so chunks re-run Hi-Z depth tests
-    // instead of reusing potentially stale temporal visibility bits.
-    uint32_t m_hiZEditCooldown{0};
-    uint64_t m_nextTerrainEditId{1};
-
-    struct PendingEditVisualChunk {
-        uint64_t editId{0};
-        std::chrono::steady_clock::time_point startTime{};
-    };
-    struct PendingEditVisualAggregate {
-        std::chrono::steady_clock::time_point startTime{};
-        uint32_t totalChunks{0};
-        uint32_t readyChunks{0};
-        uint32_t supersededChunks{0};
-        float visualFirstChunkMs{0.0f};
-        float visualCompleteMs{0.0f};
-        uint64_t uploadBytes{0};
-        uint32_t artifactBuilds{0};
-        uint32_t artifactCacheHits{0};
-        uint32_t precomputedLoads{0};
-        uint32_t collisionBaseCache{0};
-        uint32_t collisionEditPacked{0};
-        uint32_t collisionArtifactRefresh{0};
-        uint32_t collisionExistingEdit{0};
-        uint32_t gpuResidentChunks{0};
-        uint32_t artifactResidentChunks{0};
-        uint32_t monolithicChunks{0};
-        uint32_t pagedChunks{0};
-        uint32_t dirtyPages{0};
-        uint32_t rebuiltPages{0};
-        uint32_t residentPages{0};
-        uint32_t evictedPages{0};
-    };
-    std::unordered_map<glm::ivec3, PendingEditVisualChunk, IVec3Hash> m_pendingEditVisualChunks;
-    std::unordered_map<uint64_t, PendingEditVisualAggregate> m_pendingEditVisuals;
-    std::unordered_map<glm::ivec3, ChunkCollisionSource, IVec3Hash> m_chunkCollisionSources;
-
-    // Edit→Load correlation tracker: counts consecutive [Load] entries per chunk
-    // since the last [Edit], propagating the editId to subsequent [Load] entries.
-    struct ChunkLoadTracker {
-        uint64_t editId{0};
-        uint32_t loadCount{0};
-    };
-    std::unordered_map<glm::ivec3, ChunkLoadTracker, IVec3Hash> m_chunkLoadTrackers;
-
-    // --- Finalize diagnostics ring buffer ---
-    std::vector<FinalizeDiagFrame> m_finalizeDiagHistory;
-    size_t m_finalizeDiagWriteIdx{0};
-    uint64_t m_finalizeDiagFrameCounter{0};
-    FinalizeDiagFrame m_currentFinalizeDiag;  // populated by processFinalizeQueue + processLODSwaps each frame
-    LODSwitchDiag m_lodSwitchDiag;
-
-    // Running subchunk stats (D3: avoid periodic full-entity scan)
-    std::atomic<uint32_t> m_statsChunksWithMesh{0};
-    std::atomic<uint32_t> m_statsTotalSubChunks{0};
-    std::atomic<uint32_t> m_statsSplitChunks{0};
-    std::atomic<uint32_t> m_statsSeamSubChunks{0};
-    void meshStatsAdd(const MeshHandle& h);
-    void meshStatsSub(const MeshHandle& h);
-    void refreshSnapshots();
-    void updateWorldIdentityFromActiveSnapshot();
-    bool ensureEditableSnapshot();
-    void beginTerrainEditVisualTracking(
-        uint64_t editId,
-        const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks,
-        const std::chrono::steady_clock::time_point& startTime);
-    void noteChunkVisualReady(
-        const glm::ivec3& coord,
-        const std::chrono::steady_clock::time_point& uploadEnqueueTime,
-        const std::chrono::steady_clock::time_point& finalizeTime,
-        int lodLevel,
-        uint64_t vramBytes,
-        uint32_t vertexCount,
-        uint32_t indexCount,
-        const ChunkDebugAttribution* debugInfo = nullptr);
-    void noteChunkVisualError(
-        const glm::ivec3* coord,
-        int lodLevel,
-        const char* stage,
-        const char* reason,
-        uint32_t batchId = 0,
-        uint32_t expectedVersion = 0,
-        uint32_t actualVersion = 0,
-        const ChunkDebugAttribution* debugInfo = nullptr);
-    void recordMeshTopologyChange(const glm::ivec3& coord);
-    void recordMeshTopologyChanges(const std::vector<glm::ivec3>& coords);
-    void recordGlobalMeshTopologyChange();
-
-    // --- Ghost-geometry detector ---
-    // Periodic scan that flags LOD-0 chunks with valid render meshes but no
-    // valid physics collider. The actual culprit (edit-collision drop, async
-    // BVH null, stale-version drop, missing collision cache, etc.) is logged
-    // into the chunk visual error history so VRAM panel inspection can show
-    // the cause directly per chunk.
-    void scanForGhostGeometry();
-    struct GhostGeometryState {
-        uint32_t consecutiveBrokenScans{0};
-        uint64_t lastReportedScanIndex{0};
-    };
-    std::unordered_map<glm::ivec3, GhostGeometryState, IVec3Hash> m_ghostGeometryState;
-    int m_ghostScanFrameCounter{0};
-    uint64_t m_ghostScanIndex{0};
-    void refreshEditedChunkCollisionFromArtifact(
-        entt::entity entity,
-        const glm::ivec3& chunkCoord,
-        int lodLevel);
-    TerrainEditHistoryEntry* findTerrainEditHistoryEntry(uint64_t editId);
-    void syncTerrainEditVisualState(uint64_t editId, bool eraseIfComplete);
-    
-public:
-    // VRAM budget control (delegated to ChunkRenderSystem)
-    void setVramBudgetMB(uint32_t megabytes) { 
-        m_renderSystem.setVramBudgetMB(megabytes);
-    }
-    uint64_t getVramBudgetBytes() const { 
-        return m_renderSystem.getVramBudgetBytes();
-    }
-    uint64_t getCurrentVramUsage() const { 
-        return m_renderSystem.getCurrentVramUsage();
-    }
-    void setEnableVramLimiting(bool enable) { 
-        m_renderSystem.setEnableVramLimiting(enable);
-    }
-    bool isVramLimitingEnabled() const { 
-        return m_renderSystem.isVramLimitingEnabled();
-    }
-    
-    // Query whether the most recent update() recorded any GPU copies
-    bool hadUploadsThisFrame() const { return m_hadUploadsThisFrame; }
-    // Query whether the most recent update() recorded any topology-changing
-    // replacement uploads (i.e., uploads that may have exposed previously
-    // occluded neighbor chunks).
-    // Returns true during edit upload frames AND for several frames afterward,
-    // suppressing temporal-visibility reuse while fresh depth settles.
-    bool hadEditUploadsThisFrame() const { return m_hadEditUploadsThisFrame || (m_hiZEditCooldown > 0); }
-    
-    // Per-chunk visibility control
-    void setChunkVisible(entt::entity entity, bool visible) {
-        if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
-            m_registry.get<Chunk>(entity).isVisible = visible;
-        }
-    }
-};
-
-````
-
 ## src\CMakeLists.txt
 
 Description: No CC-DESC found.
 
 ````cmake
+# GPT-DESC: Defines VulkanVX source targets and shader build helpers.
 cmake_minimum_required(VERSION 3.16)
 
 # Core engine files (minimal - just app lifecycle)
@@ -7131,7 +3622,11 @@ set(RENDERING_SOURCES
     rendering/lighting/ShadowSystem.cpp
     rendering/lighting/ShadowSystemUpdate.cpp
     rendering/lighting/ShadowSystemResources.cpp
-    rendering/lighting/ShadowMapRendering.cpp
+    rendering/lighting/shadow/ShadowPass.cpp
+    rendering/lighting/shadow/ShadowSunCascades.cpp
+    rendering/lighting/shadow/ShadowPointLights.cpp
+    rendering/lighting/shadow/ShadowCache.cpp
+    rendering/lighting/shadow/ShadowMatrices.cpp
     rendering/lighting/ShadowDiagnostics.cpp
     rendering/lighting/ClusteredLightingSystem.cpp
     # rendering/sky/

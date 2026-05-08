@@ -1,0 +1,820 @@
+#include "ShadowInternal.h"
+
+#include "world/World.h"
+#include "world/config/WorldConfig.h"
+
+// GPT-DESC: Orchestrates directional sun shadow gather/cache/render decisions across split sun-shadow files.
+
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <initializer_list>
+#include <limits>
+#include <vector>
+
+using namespace ShadowSystemInternal;
+
+void ShadowSystem::recordSunShadowPasses(VkCommandBuffer cmd,
+                                        uint32_t imageIndex,
+                                        const DrawContext& ctx) {
+    // ═══════════════════════════════════════════════════════════════════
+    // Sun (directional) shadow pass
+    // ═══════════════════════════════════════════════════════════════════
+
+    using Clock = std::chrono::high_resolution_clock;
+
+    const bool haveSunTimingQueries =
+        (m_sunTimingQueryPool != VK_NULL_HANDLE) &&
+        (imageIndex < m_sunTimingImageCount);
+
+    if (haveSunTimingQueries) {
+        vkCmdResetQueryPool(cmd, m_sunTimingQueryPool, imageIndex * 2u, 2u);
+        m_sunTimingWritten[imageIndex] = false;
+    }
+
+    const uint32_t sunCascadeCount = std::min<uint32_t>(
+        m_activeSunCascadeCount,
+        std::min<uint32_t>(
+            m_sunRuntimeConfig.cascadeCount,
+            static_cast<uint32_t>(m_sunShadowFramebuffers.size())));
+    std::array<uint64_t, MAX_SUN_SHADOW_CASCADES> sunCascadeVpHashes{};
+    for (uint32_t c = 0; c < sunCascadeCount && c < MAX_SUN_SHADOW_CASCADES; ++c) {
+        sunCascadeVpHashes[c] = hashSunCascadeLayerVP(m_sunCascadeVP[c]);
+    }
+    const uint64_t sunVpHash = hashSunCascadeVP(m_sunCascadeVP, sunCascadeCount);
+    m_sunCurrentFrame.activeCascadeCount = sunCascadeCount;
+    m_sunCurrentFrame.configuredCascadeCount = m_sunRuntimeConfig.cascadeCount;
+    m_sunCurrentFrame.mapSize = m_sunRuntimeConfig.mapSize;
+    m_sunCurrentFrame.vpHash = sunVpHash;
+    m_sunCurrentFrame.uploadTimeline = ctx.uploadTimelineValue;
+    m_sunCurrentFrame.terrainMeshRevision = ctx.terrainMeshRevision;
+
+    if (m_sunShadowActive && sunCascadeCount > 0u) {
+        const auto sunTerrainGatherStart = Clock::now();
+
+        const uint64_t terrainSigForSun = hashTerrainDrawContext(ctx);
+        const bool useLocalForSun = (ctx.world != nullptr);
+        m_sunCurrentFrame.ctxHash = terrainSigForSun;
+        m_sunCurrentFrame.usedLocalTerrainGather = useLocalForSun;
+
+        uint32_t sunLocalDrawCount = 0u;
+        uint64_t sunTerrainSig = terrainSigForSun;
+        std::array<uint64_t, MAX_SUN_SHADOW_CASCADES> sunCascadeTerrainSigs{};
+
+        // ── Fast cache pre-check: skip terrain gather entirely ──────────
+        // The local gather walks ~700 chunks (~0.3 ms) every frame. If
+        // (ctx hash, sunDir, snapped VP origin) are all bit-identical to
+        // the previous cached state, the gather is guaranteed to produce
+        // the identical draw set so we can reuse the cached terrainSig
+        // without touching the world. Mesh-topology changes are checked
+        // locally against the cascade volumes below, so swaps outside the
+        // sun shadow footprint do not poison the cache.
+        bool sunPrechecked = false;
+        {
+            const auto& cache = m_sunShadowCache;
+            uint32_t precheckMissMask = 0u;
+            bool precheckTimelineSafe = true;
+            bool precheckMeshSafe = true;
+            if (!cache.valid) {
+                precheckMissMask |= SUN_CACHE_MISS_INVALID;
+            } else {
+                if (cache.terrainMeshRevision != ctx.terrainMeshRevision) {
+                    bool meshChangesReliable = true;
+                    const uint32_t meshChangeMask = meshTopologyChangeCascadeMask(
+                        ctx,
+                        cache.terrainMeshRevision,
+                        m_sunCascadeVP,
+                        sunCascadeCount,
+                        &meshChangesReliable);
+                    m_sunCurrentFrame.renderCachePrecheckMeshChangeMask = meshChangeMask;
+                    m_sunCurrentFrame.renderCachePrecheckMeshChangesReliable = meshChangesReliable;
+                    if (!meshChangesReliable || meshChangeMask != 0u) {
+                        precheckMissMask |= SUN_CACHE_MISS_MESH_REVISION;
+                        precheckMeshSafe = false;
+                    }
+                }
+                if (cache.uploadPendingRejects > 0u &&
+                    cache.uploadTimeline != ctx.uploadTimelineValue) {
+                    precheckMissMask |= SUN_CACHE_MISS_UPLOAD_TIMELINE;
+                    precheckTimelineSafe = false;
+                }
+                if (cache.ctxHash != terrainSigForSun)
+                    precheckMissMask |= SUN_CACHE_MISS_CONTEXT;
+                if (!sameBitsVec3(cache.renderedSunDir, m_sunDir))
+                    precheckMissMask |= SUN_CACHE_MISS_SUN_DIR;
+                if (cache.cascadeCount != sunCascadeCount)
+                    precheckMissMask |= SUN_CACHE_MISS_CASCADE_COUNT;
+                if (cache.vpHash != sunVpHash)
+                    precheckMissMask |= SUN_CACHE_MISS_VP_HASH;
+            }
+            m_sunCurrentFrame.renderCachePrecheckMissMask = precheckMissMask;
+            if (cache.valid &&
+                precheckTimelineSafe &&
+                precheckMeshSafe &&
+                cache.ctxHash == terrainSigForSun &&
+                sameBitsVec3(cache.renderedSunDir, m_sunDir) &&
+                cache.cascadeCount == sunCascadeCount &&
+                cache.vpHash == sunVpHash) {
+                sunTerrainSig = cache.terrainSignature;
+                sunCascadeTerrainSigs = cache.cascadeTerrainSignatures;
+                sunLocalDrawCount = cache.terrainDrawCount;
+                sunPrechecked = true;
+                m_sunCurrentFrame.loadedChunkMapSize = cache.loadedChunkMapSize;
+                m_sunCurrentFrame.bboxCandidateChunks = cache.bboxCandidateChunks;
+                m_sunCurrentFrame.visitedCandidateChunks = cache.visitedCandidateChunks;
+                m_sunCurrentFrame.acceptedChunkCount = cache.acceptedChunks;
+                m_sunCurrentFrame.cascadeInnerCullRejects = cache.cascadeInnerCullRejects;
+                m_sunCurrentFrame.uploadPendingRejects = cache.uploadPendingRejects;
+                m_sunCurrentFrame.gatherSinElevation = cache.sinElevation;
+                m_sunCurrentFrame.gatherShearX = cache.shearX;
+                m_sunCurrentFrame.gatherShearZ = cache.shearZ;
+                m_sunCurrentFrame.gatherShearMax = cache.shearMax;
+                m_sunCurrentFrame.gatherCasterReach = cache.casterReach;
+                m_sunCurrentFrame.gatherPadding = cache.padding;
+                m_sunCurrentFrame.gatherHalfX = cache.halfX;
+                m_sunCurrentFrame.gatherHalfZ = cache.halfZ;
+                m_sunCurrentFrame.cameraChunk = cache.cameraChunk;
+                m_sunCurrentFrame.gatherMinChunk = cache.gatherMinChunk;
+                m_sunCurrentFrame.gatherMaxChunk = cache.gatherMaxChunk;
+                m_sunCurrentFrame.cascadeGatherChunkHits = cache.cascadeChunkHits;
+                m_sunCurrentFrame.cascadeGatherDrawHits = cache.cascadeDrawHits;
+            }
+        }
+        m_sunCurrentFrame.renderCachePrecheckHit = sunPrechecked;
+
+        // ── Gather-cache pre-check (independent of render cache) ─────
+        // The gather output is invariant to sub-chunk camera motion.
+        // Cache it keyed on snapped camera + sun bits + ctx + cascade
+        // VPs so steady-state movement reuses the cached gather instead
+        // of re-walking thousands of chunks every frame.
+        const float chunkSizeXZ = WorldConfig::CHUNK_SIZE_M;
+        const float chunkSizeY  = WorldConfig::CHUNK_HEIGHT_M;
+        const glm::ivec3 sunCameraChunk(
+            static_cast<int>(std::floor(m_sunCameraPos.x / chunkSizeXZ)),
+            static_cast<int>(std::floor(m_sunCameraPos.y / chunkSizeY)),
+            static_cast<int>(std::floor(m_sunCameraPos.z / chunkSizeXZ)));
+        m_sunCurrentFrame.cameraChunk = sunCameraChunk;
+        const SunGatherBounds currentGatherBounds = computeSunGatherBounds(
+            m_sunCameraPos, m_sunDir, m_sunCascadeHalfExtents, sunCascadeCount);
+
+        bool gatherCacheHit = false;
+        if (!sunPrechecked && useLocalForSun) {
+            const auto& gc = m_sunGatherCache;
+            uint32_t gatherMissMask = 0u;
+            bool extentsMatch = true;
+            bool boundsMatch = false;
+            bool gatherTimelineSafe = true;
+            bool gatherMeshSafe = true;
+            bool gatherCanAdvanceMeshRevision = true;
+            if (!gc.valid) {
+                gatherMissMask |= SUN_CACHE_MISS_INVALID;
+                extentsMatch = false;
+            } else {
+                boundsMatch =
+                    gc.gatherMinChunk.x <= currentGatherBounds.minChunk.x &&
+                    gc.gatherMinChunk.y <= currentGatherBounds.minChunk.y &&
+                    gc.gatherMinChunk.z <= currentGatherBounds.minChunk.z &&
+                    gc.gatherMaxChunk.x >= currentGatherBounds.maxChunk.x &&
+                    gc.gatherMaxChunk.y >= currentGatherBounds.maxChunk.y &&
+                    gc.gatherMaxChunk.z >= currentGatherBounds.maxChunk.z;
+                if (!boundsMatch)
+                    gatherMissMask |= SUN_CACHE_MISS_CAMERA_CHUNK;
+                if (!sameBitsVec3(gc.sunDir, m_sunDir))
+                    gatherMissMask |= SUN_CACHE_MISS_SUN_DIR;
+                if (gc.terrainMeshRevision != ctx.terrainMeshRevision) {
+                    bool meshChangesReliable = true;
+                    std::vector<World::MeshTopologyChange> meshChanges;
+                    if (!ctx.world ||
+                        !ctx.world->getMeshTopologyChangesSince(
+                            gc.terrainMeshRevision, meshChanges)) {
+                        meshChangesReliable = false;
+                    }
+                    uint32_t meshChangeMask = 0u;
+                    std::vector<glm::ivec3> changedCoordsInCache;
+                    if (meshChangesReliable) {
+                        for (const auto& change : meshChanges) {
+                            const glm::vec4 chunkCoord(
+                                static_cast<float>(change.coord.x),
+                                static_cast<float>(change.coord.y),
+                                static_cast<float>(change.coord.z),
+                                0.0f);
+                            meshChangeMask |= sunCascadeMaskForChunkCoord(
+                                chunkCoord, m_sunCascadeVP, sunCascadeCount);
+                            const glm::ivec3& c = change.coord;
+                            if (c.x >= gc.gatherMinChunk.x && c.x <= gc.gatherMaxChunk.x &&
+                                c.y >= gc.gatherMinChunk.y && c.y <= gc.gatherMaxChunk.y &&
+                                c.z >= gc.gatherMinChunk.z && c.z <= gc.gatherMaxChunk.z) {
+                                changedCoordsInCache.push_back(c);
+                            }
+                        }
+                    }
+                    m_sunCurrentFrame.gatherCacheMeshChangeMask = meshChangeMask;
+                    m_sunCurrentFrame.gatherCacheMeshChangesReliable = meshChangesReliable;
+                    bool incrementalMeshUpdateOk = meshChangesReliable;
+                    if (incrementalMeshUpdateOk && !changedCoordsInCache.empty()) {
+                        auto coordLess = [](const glm::ivec3& a, const glm::ivec3& b) {
+                            if (a.x != b.x) return a.x < b.x;
+                            if (a.y != b.y) return a.y < b.y;
+                            return a.z < b.z;
+                        };
+                        auto coordEqual = [](const glm::ivec3& a, const glm::ivec3& b) {
+                            return a.x == b.x && a.y == b.y && a.z == b.z;
+                        };
+                        std::sort(changedCoordsInCache.begin(), changedCoordsInCache.end(), coordLess);
+                        changedCoordsInCache.erase(
+                            std::unique(changedCoordsInCache.begin(), changedCoordsInCache.end(), coordEqual),
+                            changedCoordsInCache.end());
+
+                        const uint32_t capacity = static_cast<uint32_t>(std::min<size_t>({
+                            m_sunLocalTerrainDrawScratch.size(),
+                            m_sunLocalTerrainOriginScratch.size(),
+                            m_sunLocalTerrainCascadeMaskScratch.size(),
+                            static_cast<size_t>(std::numeric_limits<uint32_t>::max())}));
+                        uint32_t writeIndex = 0u;
+                        const uint32_t cachedDrawCount = std::min(gc.drawCount, capacity);
+                        auto originIsChanged = [&](const glm::vec4& origin) {
+                            const glm::ivec3 coord(
+                                static_cast<int>(origin.x),
+                                static_cast<int>(origin.y),
+                                static_cast<int>(origin.z));
+                            return std::binary_search(
+                                changedCoordsInCache.begin(),
+                                changedCoordsInCache.end(),
+                                coord,
+                                coordLess);
+                        };
+                        for (uint32_t readIndex = 0; readIndex < cachedDrawCount; ++readIndex) {
+                            if (originIsChanged(m_sunLocalTerrainOriginScratch[readIndex])) {
+                                continue;
+                            }
+                            if (writeIndex != readIndex) {
+                                m_sunLocalTerrainDrawScratch[writeIndex] =
+                                    m_sunLocalTerrainDrawScratch[readIndex];
+                                m_sunLocalTerrainOriginScratch[writeIndex] =
+                                    m_sunLocalTerrainOriginScratch[readIndex];
+                                m_sunLocalTerrainCascadeMaskScratch[writeIndex] =
+                                    m_sunLocalTerrainCascadeMaskScratch[readIndex];
+                            }
+                            ++writeIndex;
+                        }
+
+                        for (const glm::ivec3& coord : changedCoordsInCache) {
+                            if (writeIndex >= capacity) {
+                                incrementalMeshUpdateOk = false;
+                                break;
+                            }
+                            const uint32_t appended =
+                                ctx.world->gatherDrawCommandsForSunCascadeChunk(
+                                    coord,
+                                    m_sunCascadeVP.data(),
+                                    sunCascadeCount,
+                                    m_sunLocalTerrainDrawScratch.data() + writeIndex,
+                                    m_sunLocalTerrainOriginScratch.data() + writeIndex,
+                                    m_sunLocalTerrainCascadeMaskScratch.data() + writeIndex,
+                                    capacity - writeIndex,
+                                    ctx.uploadTimelineValue,
+                                    true);
+                            writeIndex += appended;
+                        }
+                        if (incrementalMeshUpdateOk) {
+                            m_sunGatherCache.drawCount = writeIndex;
+                        }
+                    }
+                    if (incrementalMeshUpdateOk) {
+                        m_sunGatherCache.terrainMeshRevision = ctx.terrainMeshRevision;
+                    } else {
+                        gatherMissMask |= SUN_CACHE_MISS_MESH_REVISION;
+                        gatherMeshSafe = false;
+                    }
+                }
+                if (gc.uploadPendingRejects > 0u &&
+                    gc.uploadTimeline != ctx.uploadTimelineValue) {
+                    gatherMissMask |= SUN_CACHE_MISS_UPLOAD_TIMELINE;
+                    gatherTimelineSafe = false;
+                }
+                if (gc.ctxHash != terrainSigForSun)
+                    gatherMissMask |= SUN_CACHE_MISS_CONTEXT;
+                if (gc.cascadeCount != sunCascadeCount)
+                    gatherMissMask |= SUN_CACHE_MISS_CASCADE_COUNT;
+                for (uint32_t c = 0; c < sunCascadeCount; ++c) {
+                    if (floatToBits(gc.cascadeHalfExtents[c]) !=
+                        floatToBits(m_sunCascadeHalfExtents[c])) {
+                        extentsMatch = false;
+                        break;
+                    }
+                }
+                if (!extentsMatch)
+                    gatherMissMask |= SUN_CACHE_MISS_CASCADE_EXTENTS;
+            }
+            m_sunCurrentFrame.gatherCacheMissMask = gatherMissMask;
+            if (gc.valid &&
+                boundsMatch &&
+                gatherTimelineSafe &&
+                gatherMeshSafe &&
+                sameBitsVec3(gc.sunDir, m_sunDir) &&
+                gc.ctxHash == terrainSigForSun &&
+                gc.cascadeCount == sunCascadeCount) {
+                if (extentsMatch) {
+                    const auto remaskStart = Clock::now();
+                    sunLocalDrawCount = gc.drawCount;
+                    sunTerrainSig = terrainSigForSun;
+                    gatherCacheHit = true;
+                    m_sunCurrentFrame.loadedChunkMapSize = gc.loadedChunkMapSize;
+                    m_sunCurrentFrame.bboxCandidateChunks = gc.bboxCandidateChunks;
+                    m_sunCurrentFrame.visitedCandidateChunks = gc.visitedCandidateChunks;
+                    m_sunCurrentFrame.acceptedChunkCount = 0u;
+                    m_sunCurrentFrame.cascadeCullRejects = 0u;
+                    m_sunCurrentFrame.cascadeInnerCullRejects = 0u;
+                    m_sunCurrentFrame.uploadPendingRejects = gc.uploadPendingRejects;
+                    m_sunCurrentFrame.gatherSinElevation = gc.sinElevation;
+                    m_sunCurrentFrame.gatherShearX = gc.shearX;
+                    m_sunCurrentFrame.gatherShearZ = gc.shearZ;
+                    m_sunCurrentFrame.gatherShearMax = gc.shearMax;
+                    m_sunCurrentFrame.gatherCasterReach = gc.casterReach;
+                    m_sunCurrentFrame.gatherPadding = gc.padding;
+                    m_sunCurrentFrame.gatherHalfX = gc.halfX;
+                    m_sunCurrentFrame.gatherHalfZ = gc.halfZ;
+                    m_sunCurrentFrame.gatherMinChunk = currentGatherBounds.minChunk;
+                    m_sunCurrentFrame.gatherMaxChunk = currentGatherBounds.maxChunk;
+                    m_sunCurrentFrame.cascadeGatherChunkHits.fill(0u);
+                    m_sunCurrentFrame.cascadeGatherDrawHits.fill(0u);
+                    uint32_t remaskedInnerRejects = 0u;
+                    glm::vec4 prevOrigin(0.0f);
+                    bool havePrevOrigin = false;
+                    uint16_t currentChunkMask = 0u;
+                    auto flushChunkMask = [&]() {
+                        if (!havePrevOrigin) {
+                            return;
+                        }
+                        if (currentChunkMask == 0u) {
+                            ++m_sunCurrentFrame.cascadeCullRejects;
+                            return;
+                        }
+                        ++m_sunCurrentFrame.acceptedChunkCount;
+                        for (uint32_t c = 0; c < sunCascadeCount && c < MAX_SUN_SHADOW_CASCADES; ++c) {
+                            if ((currentChunkMask & static_cast<uint16_t>(1u << c)) != 0u) {
+                                ++m_sunCurrentFrame.cascadeGatherChunkHits[c];
+                            }
+                        }
+                    };
+                    for (uint32_t drawIndex = 0; drawIndex < sunLocalDrawCount; ++drawIndex) {
+                        const glm::vec4& origin = m_sunLocalTerrainOriginScratch[drawIndex];
+                        const uint16_t mask = sunCascadeMaskForChunkCoord(
+                            origin,
+                            m_sunCascadeVP,
+                            sunCascadeCount,
+                            &remaskedInnerRejects);
+                        m_sunLocalTerrainCascadeMaskScratch[drawIndex] = mask;
+                        const bool newChunk =
+                            !havePrevOrigin ||
+                            origin.x != prevOrigin.x ||
+                            origin.y != prevOrigin.y ||
+                            origin.z != prevOrigin.z;
+                        if (newChunk) {
+                            flushChunkMask();
+                            currentChunkMask = 0u;
+                        }
+                        currentChunkMask |= mask;
+                        for (uint32_t c = 0; c < sunCascadeCount && c < MAX_SUN_SHADOW_CASCADES; ++c) {
+                            if ((mask & static_cast<uint16_t>(1u << c)) != 0u) {
+                                ++m_sunCurrentFrame.cascadeGatherDrawHits[c];
+                            }
+                        }
+                        prevOrigin = origin;
+                        havePrevOrigin = true;
+                    }
+                    flushChunkMask();
+                    m_sunCurrentFrame.cascadeInnerCullRejects = remaskedInnerRejects;
+                    m_sunCurrentFrame.cpuWorldGatherMs = std::chrono::duration<float, std::milli>(
+                        Clock::now() - remaskStart).count();
+                    if (gatherCanAdvanceMeshRevision) {
+                        m_sunGatherCache.terrainMeshRevision = ctx.terrainMeshRevision;
+                    }
+                }
+            }
+        }
+        m_sunCurrentFrame.gatherCacheHit = gatherCacheHit;
+
+        const uint32_t sunLocalCap = (useLocalForSun && !sunPrechecked && !gatherCacheHit)
+            ? std::max<uint32_t>(ctx.gpuMaxDraws, std::max<uint32_t>(ctx.indirectDrawCount, 65536u))
+            : 0u;
+        m_sunCurrentFrame.localDrawCapacity = gatherCacheHit
+            ? static_cast<uint32_t>(std::min<size_t>(
+                m_sunLocalTerrainDrawScratch.size(),
+                std::numeric_limits<uint32_t>::max()))
+            : sunLocalCap;
+        if (useLocalForSun && sunLocalCap > 0u) {
+            if (m_sunLocalTerrainDrawScratch.size() < sunLocalCap) {
+                m_sunLocalTerrainDrawScratch.resize(sunLocalCap);
+                m_sunLocalTerrainOriginScratch.resize(sunLocalCap);
+                m_sunLocalTerrainCascadeMaskScratch.resize(sunLocalCap);
+            } else if (m_sunLocalTerrainCascadeMaskScratch.size() < sunLocalCap) {
+                m_sunLocalTerrainCascadeMaskScratch.resize(sunLocalCap);
+            }
+            World::SunCascadeGatherDiagnostics gatherDiag{};
+            sunLocalDrawCount = ctx.world->gatherDrawCommandsForSunCascades(
+                m_sunCameraPos,
+                m_sunDir,
+                m_sunCascadeVP.data(),
+                m_sunCascadeHalfExtents.data(),
+                sunCascadeCount,
+                m_sunLocalTerrainDrawScratch.data(),
+                m_sunLocalTerrainOriginScratch.data(),
+                m_sunLocalTerrainCascadeMaskScratch.data(),
+                sunLocalCap,
+                ctx.uploadTimelineValue,
+                &gatherDiag,
+                kSunGatherCachePaddingChunks,
+                true);
+            m_sunCurrentFrame.cpuWorldGatherMs = gatherDiag.totalMs;
+            m_sunCurrentFrame.cpuGatherStateScanMs = gatherDiag.stateMapScanMs;
+            m_sunCurrentFrame.cpuGatherSortMs = gatherDiag.candidateSortMs;
+            m_sunCurrentFrame.cpuGatherRegistryWalkMs = gatherDiag.registryWalkMs;
+            m_sunCurrentFrame.loadedChunkMapSize = gatherDiag.loadedChunkMapSize;
+            m_sunCurrentFrame.bboxCandidateChunks = gatherDiag.bboxCandidateChunks;
+            m_sunCurrentFrame.visitedCandidateChunks = gatherDiag.visitedCandidateChunks;
+            m_sunCurrentFrame.acceptedChunkCount = gatherDiag.acceptedChunks;
+            m_sunCurrentFrame.invalidEntityRejects = gatherDiag.invalidEntityRejects;
+            m_sunCurrentFrame.missingComponentRejects = gatherDiag.missingComponentRejects;
+            m_sunCurrentFrame.invisibleRejects = gatherDiag.invisibleRejects;
+            m_sunCurrentFrame.notReadyRejects = gatherDiag.notReadyRejects;
+            m_sunCurrentFrame.invalidMeshRejects = gatherDiag.invalidMeshRejects;
+            m_sunCurrentFrame.emptyMeshRejects = gatherDiag.emptyMeshRejects;
+            m_sunCurrentFrame.uploadPendingRejects = gatherDiag.uploadPendingRejects;
+            m_sunCurrentFrame.cascadeCullRejects = gatherDiag.cascadeCullRejects;
+            m_sunCurrentFrame.cascadeInnerCullRejects = gatherDiag.cascadeInnerCullRejects;
+            m_sunCurrentFrame.gatherTruncated = gatherDiag.truncated;
+            m_sunCurrentFrame.gatherMaxHalfExtent = gatherDiag.maxHalfExtent;
+            m_sunCurrentFrame.gatherSinElevation = gatherDiag.sinElevation;
+            m_sunCurrentFrame.gatherShearX = gatherDiag.shearX;
+            m_sunCurrentFrame.gatherShearZ = gatherDiag.shearZ;
+            m_sunCurrentFrame.gatherShearMax = gatherDiag.shearMax;
+            m_sunCurrentFrame.gatherCasterReach = gatherDiag.casterReach;
+            m_sunCurrentFrame.gatherPadding = gatherDiag.padding;
+            m_sunCurrentFrame.gatherHalfX = gatherDiag.halfX;
+            m_sunCurrentFrame.gatherHalfZ = gatherDiag.halfZ;
+            m_sunCurrentFrame.gatherMinChunk = gatherDiag.minChunk;
+            m_sunCurrentFrame.gatherMaxChunk = gatherDiag.maxChunk;
+            for (uint32_t c = 0; c < sunCascadeCount && c < MAX_SUN_SHADOW_CASCADES; ++c) {
+                m_sunCurrentFrame.cascadeGatherChunkHits[c] = gatherDiag.cascadeChunkHits[c];
+                m_sunCurrentFrame.cascadeGatherDrawHits[c] = gatherDiag.cascadeDrawHits[c];
+            }
+        }
+
+        m_sunCurrentFrame.terrainChunksGathered = sunLocalDrawCount;
+        m_sunCurrentFrame.terrainDrawsGathered = sunLocalDrawCount;
+
+        // Build the terrain signature for cache comparison (only when we
+        // actually re-gathered — pre-check / gather-cache paths already
+        // populated it).
+        if (!sunPrechecked && !gatherCacheHit && useLocalForSun && sunLocalDrawCount > 0u) {
+            const auto hashStart = Clock::now();
+            const uint64_t localHash = hashLocalTerrainDraws(
+                m_sunLocalTerrainDrawScratch, m_sunLocalTerrainOriginScratch, sunLocalDrawCount);
+            hashCombine64(sunTerrainSig, localHash);
+            sunCascadeTerrainSigs = hashLocalTerrainDrawsPerCascade(
+                m_sunLocalTerrainDrawScratch,
+                m_sunLocalTerrainOriginScratch,
+                m_sunLocalTerrainCascadeMaskScratch,
+                sunLocalDrawCount,
+                sunCascadeCount);
+            m_sunCurrentFrame.cpuTerrainHashMs = std::chrono::duration<float, std::milli>(
+                Clock::now() - hashStart).count();
+        } else if (!sunPrechecked && gatherCacheHit && useLocalForSun && sunLocalDrawCount > 0u) {
+            const auto hashStart = Clock::now();
+            const uint64_t localHash = hashLocalTerrainDraws(
+                m_sunLocalTerrainDrawScratch, m_sunLocalTerrainOriginScratch, sunLocalDrawCount);
+            hashCombine64(sunTerrainSig, localHash);
+            sunCascadeTerrainSigs = hashLocalTerrainDrawsPerCascade(
+                m_sunLocalTerrainDrawScratch,
+                m_sunLocalTerrainOriginScratch,
+                m_sunLocalTerrainCascadeMaskScratch,
+                sunLocalDrawCount,
+                sunCascadeCount);
+            m_sunGatherCache.terrainSig = sunTerrainSig;
+            m_sunCurrentFrame.cpuTerrainHashMs = std::chrono::duration<float, std::milli>(
+                Clock::now() - hashStart).count();
+        } else if (!sunPrechecked && gatherCacheHit && useLocalForSun) {
+            m_sunGatherCache.terrainSig = sunTerrainSig;
+        }
+        m_sunCurrentFrame.terrainSignature = sunTerrainSig;
+
+        // ── Persist gather cache on miss ─────────────────────────────
+        if (!sunPrechecked && !gatherCacheHit && useLocalForSun) {
+            m_sunGatherCache.valid = true;
+            m_sunGatherCache.cameraChunk = sunCameraChunk;
+            m_sunGatherCache.sunDir = m_sunDir;
+            m_sunGatherCache.ctxHash = terrainSigForSun;
+            m_sunGatherCache.terrainMeshRevision = ctx.terrainMeshRevision;
+            m_sunGatherCache.uploadTimeline = ctx.uploadTimelineValue;
+            m_sunGatherCache.uploadPendingRejects = m_sunCurrentFrame.uploadPendingRejects;
+            m_sunGatherCache.vpHash = sunVpHash;
+            m_sunGatherCache.cascadeCount = sunCascadeCount;
+            for (uint32_t c = 0; c < MAX_SUN_SHADOW_CASCADES; ++c) {
+                m_sunGatherCache.cascadeHalfExtents[c] =
+                    (c < sunCascadeCount) ? m_sunCascadeHalfExtents[c] : 0.0f;
+            }
+            m_sunGatherCache.drawCount = sunLocalDrawCount;
+            m_sunGatherCache.terrainSig = sunTerrainSig;
+            m_sunGatherCache.loadedChunkMapSize = m_sunCurrentFrame.loadedChunkMapSize;
+            m_sunGatherCache.bboxCandidateChunks = m_sunCurrentFrame.bboxCandidateChunks;
+            m_sunGatherCache.visitedCandidateChunks = m_sunCurrentFrame.visitedCandidateChunks;
+            m_sunGatherCache.acceptedChunks = m_sunCurrentFrame.acceptedChunkCount;
+            m_sunGatherCache.cascadeInnerCullRejects = m_sunCurrentFrame.cascadeInnerCullRejects;
+            m_sunGatherCache.sinElevation = m_sunCurrentFrame.gatherSinElevation;
+            m_sunGatherCache.shearX = m_sunCurrentFrame.gatherShearX;
+            m_sunGatherCache.shearZ = m_sunCurrentFrame.gatherShearZ;
+            m_sunGatherCache.shearMax = m_sunCurrentFrame.gatherShearMax;
+            m_sunGatherCache.casterReach = m_sunCurrentFrame.gatherCasterReach;
+            m_sunGatherCache.padding = m_sunCurrentFrame.gatherPadding;
+            m_sunGatherCache.halfX = m_sunCurrentFrame.gatherHalfX;
+            m_sunGatherCache.halfZ = m_sunCurrentFrame.gatherHalfZ;
+            m_sunGatherCache.gatherMinChunk = m_sunCurrentFrame.gatherMinChunk;
+            m_sunGatherCache.gatherMaxChunk = m_sunCurrentFrame.gatherMaxChunk;
+            m_sunGatherCache.cascadeChunkHits = m_sunCurrentFrame.cascadeGatherChunkHits;
+            m_sunGatherCache.cascadeDrawHits = m_sunCurrentFrame.cascadeGatherDrawHits;
+        }
+
+        // Check cache per cascade. A changed near-cascade VP no longer
+        // forces far layers to redraw if their own VP and terrain content
+        // are unchanged.
+        bool sunReused = false;
+        std::array<bool, MAX_SUN_SHADOW_CASCADES> sunCascadeNeedsRender{};
+        std::array<SunCascadeScrollPlan, MAX_SUN_SHADOW_CASCADES> sunCascadeScrollPlans{};
+        uint32_t sunCascadeRenderMask = 0u;
+        uint32_t sunCascadeReuseMask = 0u;
+        uint32_t sunCascadeFullRenderMask = 0u;
+        uint32_t sunCascadeScrollMask = 0u;
+        uint32_t sunCascadesRendered = 0u;
+        uint32_t sunCascadesReused = 0u;
+        uint32_t sunCascadesFullRendered = 0u;
+        uint32_t sunCascadesScrolled = 0u;
+        uint64_t sunScrollCopiedTexels = 0u;
+        uint64_t sunScrollDirtyTexels = 0u;
+        {
+            const auto cacheDecisionStart = Clock::now();
+            const auto& cache = m_sunShadowCache;
+            uint32_t renderMissMask = 0u;
+            bool renderTimelineSafe = true;
+            bool renderMeshChangesReliable = true;
+            uint32_t renderMeshChangeMask = 0u;
+            if (!cache.valid) {
+                renderMissMask |= SUN_CACHE_MISS_INVALID;
+            } else {
+                if (cache.terrainMeshRevision != ctx.terrainMeshRevision) {
+                    renderMeshChangeMask = meshTopologyChangeCascadeMask(
+                        ctx,
+                        cache.terrainMeshRevision,
+                        m_sunCascadeVP,
+                        sunCascadeCount,
+                        &renderMeshChangesReliable);
+                    if (!renderMeshChangesReliable || renderMeshChangeMask != 0u) {
+                        renderMissMask |= SUN_CACHE_MISS_MESH_REVISION;
+                    }
+                }
+                if (cache.uploadPendingRejects > 0u &&
+                    cache.uploadTimeline != ctx.uploadTimelineValue) {
+                    renderMissMask |= SUN_CACHE_MISS_UPLOAD_TIMELINE;
+                    renderTimelineSafe = false;
+                }
+                if (!sameBitsVec3(cache.renderedSunDir, m_sunDir))
+                    renderMissMask |= SUN_CACHE_MISS_SUN_DIR;
+                if (cache.terrainSignature != sunTerrainSig)
+                    renderMissMask |= SUN_CACHE_MISS_TERRAIN_SIG;
+                if (cache.cascadeCount != sunCascadeCount)
+                    renderMissMask |= SUN_CACHE_MISS_CASCADE_COUNT;
+                if (cache.vpHash != sunVpHash)
+                    renderMissMask |= SUN_CACHE_MISS_VP_HASH;
+            }
+            m_sunCurrentFrame.renderCacheMeshChangeMask = renderMeshChangeMask;
+            m_sunCurrentFrame.renderCacheMeshChangesReliable = renderMeshChangesReliable;
+            m_sunCurrentFrame.renderCacheMissMask = renderMissMask;
+
+            const bool renderBaseReusable =
+                cache.valid &&
+                renderTimelineSafe &&
+                sameBitsVec3(cache.renderedSunDir, m_sunDir) &&
+                cache.ctxHash == terrainSigForSun;
+
+            for (uint32_t c = 0; c < sunCascadeCount && c < MAX_SUN_SHADOW_CASCADES; ++c) {
+                const uint32_t currentCascadeDraws = m_sunCurrentFrame.cascadeGatherDrawHits[c];
+                const bool cascadeMeshReusable =
+                    renderMeshChangesReliable &&
+                    ((renderMeshChangeMask & (1u << c)) == 0u);
+                const bool cascadeTerrainReusable = useLocalForSun
+                    ? (cache.cascadeTerrainSignatures[c] == sunCascadeTerrainSigs[c])
+                    : (cache.terrainSignature == sunTerrainSig);
+                const bool emptyLayerReusable =
+                    cache.valid &&
+                    cache.cascadeValid[c] &&
+                    cache.cascadeDrawCounts[c] == 0u &&
+                    currentCascadeDraws == 0u;
+                const bool layerReusable =
+                    emptyLayerReusable ||
+                    (renderBaseReusable &&
+                     cascadeMeshReusable &&
+                     cascadeTerrainReusable &&
+                     cache.cascadeValid[c] &&
+                     cache.cascadeVpHashes[c] == sunCascadeVpHashes[c]);
+                if (layerReusable) {
+                    sunCascadeReuseMask |= (1u << c);
+                    ++sunCascadesReused;
+                } else {
+                    // Scrolling preserves a layer exactly and avoids the full
+                    // 4096^2 depth clear. The scroll planner rejects non-
+                    // integer shifts and large dirty areas, so this stays on
+                    // the tiny-strip path where it beats full-layer redraw.
+                    const bool scrollBaseReusable =
+                        renderBaseReusable &&
+                        cascadeMeshReusable &&
+                        cascadeTerrainReusable &&
+                        cache.cascadeValid[c] &&
+                        m_sunShadowScrollScratchImage != VK_NULL_HANDLE &&
+                        c < m_sunShadowLoadFramebuffers.size() &&
+                        m_sunShadowLoadFramebuffers[c] != VK_NULL_HANDLE &&
+                        c < cache.renderedCascadeVP.size();
+                    const SunCascadeScrollPlan scrollPlan = scrollBaseReusable
+                        ? makeSunCascadeScrollPlan(
+                            cache.renderedCascadeVP[c],
+                            m_sunCascadeVP[c],
+                            m_sunRuntimeConfig.mapSize)
+                        : SunCascadeScrollPlan{};
+                    sunCascadeNeedsRender[c] = true;
+                    sunCascadeRenderMask |= (1u << c);
+                    ++sunCascadesRendered;
+                    if (scrollPlan.enabled) {
+                        sunCascadeScrollPlans[c] = scrollPlan;
+                        m_sunCurrentFrame.cascadeScrollDxTexels[c] = scrollPlan.dxTexels;
+                        m_sunCurrentFrame.cascadeScrollDyTexels[c] = scrollPlan.dyTexels;
+                        m_sunCurrentFrame.cascadeScrollDirtyTexels[c] = scrollPlan.dirtyTexels;
+                        sunCascadeScrollMask |= (1u << c);
+                        ++sunCascadesScrolled;
+                        sunScrollCopiedTexels += scrollPlan.copiedTexels;
+                        sunScrollDirtyTexels += scrollPlan.dirtyTexels;
+                    } else {
+                        sunCascadeFullRenderMask |= (1u << c);
+                        ++sunCascadesFullRendered;
+                    }
+                }
+            }
+
+            sunReused = (sunCascadesRendered == 0u);
+            m_sunCurrentFrame.cpuCacheDecisionMs = std::chrono::duration<float, std::milli>(
+                Clock::now() - cacheDecisionStart).count();
+        }
+        m_sunCurrentFrame.renderCacheHit = sunReused;
+        m_sunCurrentFrame.cascadeRenderMask = sunCascadeRenderMask;
+        m_sunCurrentFrame.cascadeReuseMask = sunCascadeReuseMask;
+        m_sunCurrentFrame.cascadeFullRenderMask = sunCascadeFullRenderMask;
+        m_sunCurrentFrame.cascadeScrollMask = sunCascadeScrollMask;
+        m_sunCurrentFrame.cascadesRendered = sunCascadesRendered;
+        m_sunCurrentFrame.cascadesReused = sunCascadesReused;
+        m_sunCurrentFrame.cascadesFullRendered = sunCascadesFullRendered;
+        m_sunCurrentFrame.cascadesScrolled = sunCascadesScrolled;
+        m_sunCurrentFrame.scrollCopiedTexels = sunScrollCopiedTexels;
+        m_sunCurrentFrame.scrollDirtyTexels = sunScrollDirtyTexels;
+
+        m_sunCurrentFrame.cpuTerrainGatherMs = std::chrono::duration<float, std::milli>(
+            Clock::now() - sunTerrainGatherStart).count();
+
+        const uint64_t sunFrameNumber = m_sunFrameCounter++;
+
+        // ── In-game shadow texel-grid log ──────────────────────────────
+        // Record the actual rendered VP state per frame (cache hit/miss,
+        // VP origin in shadow-texel units, sun direction, raw vs snapped
+        // angles). One entry per actual VP change OR cache flip; this is
+        // the in-game equivalent of the patch simulator's shadow-tip log
+        // and reveals exactly what the visible shadow does on the texel
+        // grid frame-to-frame.
+        recordSunTexelEvent(sunFrameNumber, sunReused);
+
+        // Patch simulator: 13×13 voxel grid (each voxel = 16 light cells
+        // of 0.015625 m). A virtual 1-voxel cube sits at the centre; its
+        // top face shears onto the ground via the sun direction. The
+        // integer light-cell offset of that shadow stamp is the only
+        // thing that controls visible motion. We log a snapshot whenever
+        // that integer offset (or shadowActive) changes — one row per
+        // visible shadow step.
+        if (!sunReused) {
+            recordSunShadowRenderWork(
+                cmd,
+                imageIndex,
+                ctx,
+                sunCascadeCount,
+                useLocalForSun,
+                sunLocalDrawCount,
+                sunCascadeNeedsRender.data(),
+                sunCascadeScrollPlans.data(),
+                sunCascadeScrollMask,
+                haveSunTimingQueries);
+
+            recordSunDebugSnapshot(sunFrameNumber, true);
+
+            // Update cache with current state so next frame can skip.
+            m_sunShadowCache.valid = true;
+            m_sunShadowCache.cameraPos = m_sunCameraPos;
+            m_sunShadowCache.azimuth = m_activeAzimuth;
+            m_sunShadowCache.elevation = m_activeElevation;
+            m_sunShadowCache.terrainSignature = sunTerrainSig;
+            m_sunShadowCache.ctxHash = terrainSigForSun;
+            m_sunShadowCache.terrainMeshRevision = ctx.terrainMeshRevision;
+            m_sunShadowCache.uploadTimeline = ctx.uploadTimelineValue;
+            m_sunShadowCache.uploadPendingRejects = m_sunCurrentFrame.uploadPendingRejects;
+            m_sunShadowCache.terrainDrawCount = sunLocalDrawCount;
+            m_sunShadowCache.cascadeCount = sunCascadeCount;
+            m_sunShadowCache.vpHash = sunVpHash;
+            m_sunShadowCache.renderedVP = m_sunCascadeVP[0];
+            m_sunShadowCache.renderedCascadeVP = {};
+            m_sunShadowCache.cascadeValid.fill(false);
+            m_sunShadowCache.cascadeVpHashes.fill(0u);
+            m_sunShadowCache.cascadeTerrainSignatures.fill(0u);
+            m_sunShadowCache.cascadeDrawCounts.fill(0u);
+            for (uint32_t i = 0; i < sunCascadeCount; ++i) {
+                m_sunShadowCache.cascadeValid[i] = true;
+                m_sunShadowCache.cascadeVpHashes[i] = sunCascadeVpHashes[i];
+                m_sunShadowCache.cascadeTerrainSignatures[i] = sunCascadeTerrainSigs[i];
+                m_sunShadowCache.cascadeDrawCounts[i] = m_sunCurrentFrame.cascadeGatherDrawHits[i];
+                m_sunShadowCache.renderedCascadeVP[i] = m_sunCascadeVP[i];
+            }
+            m_sunShadowCache.renderedSunDir = m_sunDir;
+            m_sunShadowCache.loadedChunkMapSize = m_sunCurrentFrame.loadedChunkMapSize;
+            m_sunShadowCache.bboxCandidateChunks = m_sunCurrentFrame.bboxCandidateChunks;
+            m_sunShadowCache.visitedCandidateChunks = m_sunCurrentFrame.visitedCandidateChunks;
+            m_sunShadowCache.acceptedChunks = m_sunCurrentFrame.acceptedChunkCount;
+            m_sunShadowCache.cascadeInnerCullRejects = m_sunCurrentFrame.cascadeInnerCullRejects;
+            m_sunShadowCache.sinElevation = m_sunCurrentFrame.gatherSinElevation;
+            m_sunShadowCache.shearX = m_sunCurrentFrame.gatherShearX;
+            m_sunShadowCache.shearZ = m_sunCurrentFrame.gatherShearZ;
+            m_sunShadowCache.shearMax = m_sunCurrentFrame.gatherShearMax;
+            m_sunShadowCache.casterReach = m_sunCurrentFrame.gatherCasterReach;
+            m_sunShadowCache.padding = m_sunCurrentFrame.gatherPadding;
+            m_sunShadowCache.halfX = m_sunCurrentFrame.gatherHalfX;
+            m_sunShadowCache.halfZ = m_sunCurrentFrame.gatherHalfZ;
+            m_sunShadowCache.cameraChunk = sunCameraChunk;
+            m_sunShadowCache.gatherMinChunk = m_sunCurrentFrame.gatherMinChunk;
+            m_sunShadowCache.gatherMaxChunk = m_sunCurrentFrame.gatherMaxChunk;
+            m_sunShadowCache.cascadeChunkHits = m_sunCurrentFrame.cascadeGatherChunkHits;
+            m_sunShadowCache.cascadeDrawHits = m_sunCurrentFrame.cascadeGatherDrawHits;
+        } else {
+            // Cache hit — sun shadow reused.
+            // Patch the GPU SSBO to use the VP AND sunDir the shadow map
+            // was actually rendered with.  This ensures the depth encoding,
+            // push direction, and ndotl all match the shadow map content.
+            m_activeSunCascadeCount = std::min<uint32_t>(
+                sunCascadeCount,
+                MAX_SUN_SHADOW_CASCADES);
+            for (uint32_t i = 0; i < MAX_SUN_SHADOW_CASCADES; ++i) {
+                m_sunCascadeVP[i] = glm::mat4(1.0f);
+            }
+            for (uint32_t i = 0; i < m_activeSunCascadeCount && i < MAX_SUN_SHADOW_CASCADES; ++i) {
+                m_sunCascadeVP[i] = m_sunShadowCache.renderedCascadeVP[i];
+            }
+            m_sunLightVP = (m_activeSunCascadeCount > 0u)
+                ? m_sunCascadeVP[0]
+                : glm::mat4(1.0f);
+            m_sunDir = m_sunShadowCache.renderedSunDir;
+            m_sunShadowCache.cascadeCount = sunCascadeCount;
+            m_sunShadowCache.vpHash = sunVpHash;
+            m_sunShadowCache.terrainSignature = sunTerrainSig;
+            m_sunShadowCache.ctxHash = terrainSigForSun;
+            m_sunShadowCache.terrainMeshRevision = ctx.terrainMeshRevision;
+            m_sunShadowCache.uploadTimeline = ctx.uploadTimelineValue;
+            m_sunShadowCache.uploadPendingRejects = m_sunCurrentFrame.uploadPendingRejects;
+            m_sunShadowCache.terrainDrawCount = sunLocalDrawCount;
+            m_sunShadowCache.renderedVP = (sunCascadeCount > 0u)
+                ? m_sunCascadeVP[0]
+                : glm::mat4(1.0f);
+            for (uint32_t i = 0; i < sunCascadeCount && i < MAX_SUN_SHADOW_CASCADES; ++i) {
+                m_sunShadowCache.cascadeValid[i] = true;
+                m_sunShadowCache.cascadeVpHashes[i] = sunCascadeVpHashes[i];
+                m_sunShadowCache.cascadeTerrainSignatures[i] = sunCascadeTerrainSigs[i];
+                m_sunShadowCache.cascadeDrawCounts[i] = m_sunCurrentFrame.cascadeGatherDrawHits[i];
+                m_sunShadowCache.renderedCascadeVP[i] = m_sunCascadeVP[i];
+            }
+            if (imageIndex < m_shadowDataMapped.size() && m_shadowDataMapped[imageIndex]) {
+                auto* gpu = reinterpret_cast<ShadowGPUData*>(m_shadowDataMapped[imageIndex]);
+                for (uint32_t i = 0; i < MAX_SUN_SHADOW_CASCADES; ++i) {
+                    gpu->sunLightVP[i] = m_sunCascadeVP[i];
+                }
+                gpu->sunDirTexelSize = glm::vec4(
+                    m_sunShadowCache.renderedSunDir,
+                    gpu->sunDirTexelSize.w);  // keep texelWorld (constant)
+                gpu->shadowConfig2.x = static_cast<float>(m_activeSunCascadeCount);
+            }
+            m_sunCurrentFrame.wasReused = true;
+
+            recordSunDebugSnapshot(sunFrameNumber, m_sunShadowActive);
+        }
+
+        m_sunCurrentFrame.cpuTotalMs =
+            m_sunCurrentFrame.cpuTerrainGatherMs +
+            m_sunCurrentFrame.cpuCommandRecordMs;
+    }
+
+}

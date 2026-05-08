@@ -1,0 +1,424 @@
+#include "../ShadowInternal.h"
+
+// GPT-DESC: Records directional shadow cascade depth passes, local indirect uploads, scroll copies, and sampled barriers.
+
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+
+using namespace ShadowSystemInternal;
+
+void ShadowSystem::recordSunShadowRenderWork(
+    VkCommandBuffer cmd,
+    uint32_t imageIndex,
+    const DrawContext& ctx,
+    uint32_t sunCascadeCount,
+    bool useLocalForSun,
+    uint32_t sunLocalDrawCount,
+    const bool* sunCascadeNeedsRender,
+    const SunCascadeScrollPlan* sunCascadeScrollPlans,
+    uint32_t sunCascadeScrollMask,
+    bool haveSunTimingQueries) {
+    using Clock = std::chrono::high_resolution_clock;
+
+    const auto sunRecordStart = Clock::now();
+    VkClearValue sunClear{};
+    sunClear.depthStencil = {1.0f, 0};
+
+    VkViewport sunVp{};
+    sunVp.x = 0.0f;
+    sunVp.y = 0.0f;
+    sunVp.width = static_cast<float>(m_sunRuntimeConfig.mapSize);
+    sunVp.height = static_cast<float>(m_sunRuntimeConfig.mapSize);
+    sunVp.minDepth = 0.0f;
+    sunVp.maxDepth = 1.0f;
+
+    VkRect2D sunSc{};
+    sunSc.offset = {0, 0};
+    sunSc.extent = {m_sunRuntimeConfig.mapSize, m_sunRuntimeConfig.mapSize};
+
+    VkDeviceSize sunZero = 0;
+    m_sunLocalIndirectCounts.fill(0u);
+    const bool canUseSunLocalIndirect =
+        useLocalForSun &&
+        sunLocalDrawCount > 0u &&
+        imageIndex < m_sunLocalIndirectBuffers.size() &&
+        imageIndex < m_sunLocalOriginsBuffers.size() &&
+        imageIndex < m_sunLocalUploadBuffers.size() &&
+        imageIndex < m_sunLocalUploadMapped.size() &&
+        m_sunLocalIndirectBuffers[imageIndex] != VK_NULL_HANDLE &&
+        m_sunLocalOriginsBuffers[imageIndex] != VK_NULL_HANDLE &&
+        m_sunLocalUploadBuffers[imageIndex] != VK_NULL_HANDLE &&
+        m_sunLocalUploadMapped[imageIndex] != nullptr;
+
+    // GPU timestamp: begin sun shadow render
+    if (haveSunTimingQueries) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                           m_sunTimingQueryPool, imageIndex * 2u);
+    }
+
+    if (canUseSunLocalIndirect) {
+        const auto indirectBuildStart = Clock::now();
+        const VkDeviceSize indirectBytes =
+            sizeof(VkDrawIndexedIndirectCommand) * SUN_LOCAL_INDIRECT_TOTAL_DRAWS;
+        auto* uploadBase = static_cast<uint8_t*>(m_sunLocalUploadMapped[imageIndex]);
+        auto* uploadDraws = reinterpret_cast<VkDrawIndexedIndirectCommand*>(uploadBase);
+        auto* uploadOrigins = reinterpret_cast<glm::vec4*>(uploadBase + indirectBytes);
+
+        for (uint32_t drawIndex = 0; drawIndex < sunLocalDrawCount; ++drawIndex) {
+            const uint16_t mask = m_sunLocalTerrainCascadeMaskScratch[drawIndex];
+            for (uint32_t cascade = 0u; cascade < sunCascadeCount; ++cascade) {
+                if (!sunCascadeNeedsRender[cascade]) {
+                    continue;
+                }
+                if ((mask & static_cast<uint16_t>(1u << cascade)) == 0u) {
+                    continue;
+                }
+                const uint32_t inCascade = m_sunLocalIndirectCounts[cascade]++;
+                const uint32_t outIndex =
+                    cascade * SUN_LOCAL_INDIRECT_DRAWS_PER_CASCADE + inCascade;
+                VkDrawIndexedIndirectCommand packed = m_sunLocalTerrainDrawScratch[drawIndex];
+                packed.instanceCount = 1u;
+                packed.firstInstance = outIndex;
+                uploadDraws[outIndex] = packed;
+                uploadOrigins[outIndex] = m_sunLocalTerrainOriginScratch[drawIndex];
+            }
+        }
+        m_sunCurrentFrame.cpuIndirectBuildMs = std::chrono::duration<float, std::milli>(
+            Clock::now() - indirectBuildStart).count();
+
+        const auto uploadRecordStart = Clock::now();
+        std::array<VkBufferCopy, MAX_SUN_SHADOW_CASCADES> indirectCopies{};
+        std::array<VkBufferCopy, MAX_SUN_SHADOW_CASCADES> originCopies{};
+        uint32_t indirectCopyCount = 0u;
+        uint32_t originCopyCount = 0u;
+        for (uint32_t cascade = 0u; cascade < sunCascadeCount; ++cascade) {
+            if (!sunCascadeNeedsRender[cascade]) {
+                continue;
+            }
+            const uint32_t count = m_sunLocalIndirectCounts[cascade];
+            if (count == 0u) {
+                continue;
+            }
+            const VkDeviceSize drawOffset =
+                static_cast<VkDeviceSize>(cascade) *
+                SUN_LOCAL_INDIRECT_DRAWS_PER_CASCADE *
+                sizeof(VkDrawIndexedIndirectCommand);
+            const VkDeviceSize originOffset =
+                static_cast<VkDeviceSize>(cascade) *
+                SUN_LOCAL_INDIRECT_DRAWS_PER_CASCADE *
+                sizeof(glm::vec4);
+            indirectCopies[indirectCopyCount++] = VkBufferCopy{
+                drawOffset,
+                drawOffset,
+                static_cast<VkDeviceSize>(count) * sizeof(VkDrawIndexedIndirectCommand)};
+            originCopies[originCopyCount++] = VkBufferCopy{
+                indirectBytes + originOffset,
+                originOffset,
+                static_cast<VkDeviceSize>(count) * sizeof(glm::vec4)};
+        }
+        if (indirectCopyCount > 0u) {
+            vkCmdCopyBuffer(
+                cmd,
+                m_sunLocalUploadBuffers[imageIndex],
+                m_sunLocalIndirectBuffers[imageIndex],
+                indirectCopyCount,
+                indirectCopies.data());
+        }
+        if (originCopyCount > 0u) {
+            vkCmdCopyBuffer(
+                cmd,
+                m_sunLocalUploadBuffers[imageIndex],
+                m_sunLocalOriginsBuffers[imageIndex],
+                originCopyCount,
+                originCopies.data());
+        }
+        if (indirectCopyCount > 0u || originCopyCount > 0u) {
+            std::array<VkBufferMemoryBarrier2, 2> uploadBarriers{};
+            uploadBarriers[0].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+            uploadBarriers[0].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            uploadBarriers[0].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            uploadBarriers[0].dstStageMask = VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+            uploadBarriers[0].dstAccessMask = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT;
+            uploadBarriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            uploadBarriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            uploadBarriers[0].buffer = m_sunLocalIndirectBuffers[imageIndex];
+            uploadBarriers[0].offset = 0;
+            uploadBarriers[0].size = VK_WHOLE_SIZE;
+
+            uploadBarriers[1].sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+            uploadBarriers[1].srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+            uploadBarriers[1].srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            uploadBarriers[1].dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
+            uploadBarriers[1].dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+            uploadBarriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            uploadBarriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            uploadBarriers[1].buffer = m_sunLocalOriginsBuffers[imageIndex];
+            uploadBarriers[1].offset = 0;
+            uploadBarriers[1].size = VK_WHOLE_SIZE;
+
+            VkDependencyInfo uploadDep{};
+            uploadDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            uploadDep.bufferMemoryBarrierCount = static_cast<uint32_t>(uploadBarriers.size());
+            uploadDep.pBufferMemoryBarriers = uploadBarriers.data();
+            vkCmdPipelineBarrier2(cmd, &uploadDep);
+        }
+        m_sunCurrentFrame.cpuIndirectUploadRecordMs =
+            std::chrono::duration<float, std::milli>(
+                Clock::now() - uploadRecordStart).count();
+    }
+
+    uint32_t sunDrawCallCount = 0u;
+    uint32_t sunApiDrawCallCount = 0u;
+    for (uint32_t cascade = 0u; cascade < sunCascadeCount; ++cascade) {
+        if ((sunCascadeScrollMask & (1u << cascade)) == 0u) {
+            continue;
+        }
+        recordSunCascadeScrollCopy(cmd, cascade, sunCascadeScrollPlans[cascade]);
+    }
+
+    for (uint32_t cascade = 0u; cascade < sunCascadeCount; ++cascade) {
+        if (!sunCascadeNeedsRender[cascade]) {
+            continue;
+        }
+        const auto cascadeRecordStart = Clock::now();
+        const bool scrollUpdate = sunCascadeScrollPlans[cascade].enabled;
+        uint32_t drawRectCount = 0u;
+        std::array<VkRect2D, 2> drawRects{};
+        if (scrollUpdate) {
+            drawRects = sunScrollDirtyRects(
+                m_sunRuntimeConfig.mapSize,
+                sunCascadeScrollPlans[cascade],
+                drawRectCount);
+        } else {
+            drawRects[0] = sunSc;
+            drawRectCount = 1u;
+        }
+        if (drawRectCount == 0u) {
+            m_sunCurrentFrame.cascadeRecordMs[cascade] =
+                std::chrono::duration<float, std::milli>(
+                    Clock::now() - cascadeRecordStart).count();
+            continue;
+        }
+
+        VkRenderPassBeginInfo sunRpBegin{};
+        sunRpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        sunRpBegin.renderPass = scrollUpdate ? m_shadowLoadRenderPass : m_shadowRenderPass;
+        sunRpBegin.framebuffer = scrollUpdate
+            ? m_sunShadowLoadFramebuffers[cascade]
+            : m_sunShadowFramebuffers[cascade];
+        sunRpBegin.renderArea.offset = {0, 0};
+        sunRpBegin.renderArea.extent = {m_sunRuntimeConfig.mapSize, m_sunRuntimeConfig.mapSize};
+        sunRpBegin.clearValueCount = scrollUpdate ? 0u : 1u;
+        sunRpBegin.pClearValues = scrollUpdate ? nullptr : &sunClear;
+
+        vkCmdBeginRenderPass(cmd, &sunRpBegin, VK_SUBPASS_CONTENTS_INLINE);
+        vkCmdSetViewport(cmd, 0, 1, &sunVp);
+        if (scrollUpdate) {
+            VkClearAttachment stripClear{};
+            stripClear.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            stripClear.clearValue = sunClear;
+            std::array<VkClearRect, 2> clearRects{};
+            for (uint32_t i = 0; i < drawRectCount; ++i) {
+                clearRects[i].rect = drawRects[i];
+                clearRects[i].baseArrayLayer = 0u;
+                clearRects[i].layerCount = 1u;
+            }
+            vkCmdClearAttachments(
+                cmd,
+                1,
+                &stripClear,
+                drawRectCount,
+                clearRects.data());
+        }
+
+        // Depth bias: anchored to cascade 0's behaviour so far rings
+        // inherit the HD ring's resistance against missing-shadow
+        // peter-panning. Previous formula scaled by log2(texelRatio)
+        // AND by (1 + grazing*1.5) on the slope term — at low sun on
+        // far cascades that combined into a bias large enough to
+        // erase small casters' shadows. Keep a gentle per-cascade
+        // bump (sqrt instead of full log) and a mild grazing term.
+        const float nearTexel = std::max(m_sunRuntimeConfig.texelMeters, 1e-5f);
+        const float cascadeTexel = std::max(m_sunCascadeTexelMeters[cascade], nearTexel);
+        const float texelRatio = std::max(cascadeTexel / nearTexel, 1.0f);
+        // sqrt(ratio) capped at 2.0: a 16x cascade gets only 2x bias
+        // (vs 2.4x with log2*0.35) — small casters survive on far rings.
+        const float cascadeBiasScale = std::min(2.0f, std::sqrt(texelRatio));
+        const float sunGrazing = 1.0f - std::clamp(-m_sunDir.y, 0.0f, 1.0f);
+        const float depthBiasConstant =
+            1.0f * cascadeBiasScale * (1.0f + sunGrazing * 0.35f);
+        const float depthBiasSlope =
+            0.8f * cascadeBiasScale * (1.0f + sunGrazing * 0.60f);
+        vkCmdSetDepthBias(cmd, depthBiasConstant, 0.0f, depthBiasSlope);
+
+        ShadowPushConstants sunPush{};
+        sunPush.lightVP = m_sunCascadeVP[cascade];
+        sunPush.lightPosFar = glm::vec4(0.0f, 0.0f, 0.0f, 1.0f);
+        sunPush.terrainChunkCoordMode = glm::vec4(0.0f);
+
+        if (ctx.terrainDescriptorSet != VK_NULL_HANDLE &&
+            ctx.terrainVertexBuffer != VK_NULL_HANDLE &&
+            ctx.terrainIndexBuffer != VK_NULL_HANDLE) {
+
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_sunShadowPipeline);
+            vkCmdBindDescriptorSets(
+                cmd,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                m_terrainShadowPipelineLayout,
+                0, 1, &ctx.terrainDescriptorSet, 0, nullptr);
+            vkCmdBindVertexBuffers(cmd, 0, 1, &ctx.terrainVertexBuffer, &sunZero);
+            vkCmdBindIndexBuffer(cmd, ctx.terrainIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
+            uint32_t cascadeIssuedDraws = 0u;
+            uint32_t cascadeApiDraws = 0u;
+            for (uint32_t rectIndex = 0; rectIndex < drawRectCount; ++rectIndex) {
+                vkCmdSetScissor(cmd, 0, 1, &drawRects[rectIndex]);
+
+                if (canUseSunLocalIndirect) {
+                    const uint32_t cascadeLocalDraws = m_sunLocalIndirectCounts[cascade];
+                    if (cascadeLocalDraws > 0u) {
+                        sunPush.terrainChunkCoordMode = glm::vec4(0.0f, 0.0f, 0.0f, 3.0f);
+                        vkCmdPushConstants(cmd, m_terrainShadowPipelineLayout,
+                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                            0, sizeof(ShadowPushConstants), &sunPush);
+                        const VkDeviceSize drawOffset =
+                            static_cast<VkDeviceSize>(cascade) *
+                            SUN_LOCAL_INDIRECT_DRAWS_PER_CASCADE *
+                            sizeof(VkDrawIndexedIndirectCommand);
+                        vkCmdDrawIndexedIndirect(
+                            cmd,
+                            m_sunLocalIndirectBuffers[imageIndex],
+                            drawOffset,
+                            cascadeLocalDraws,
+                            sizeof(VkDrawIndexedIndirectCommand));
+                        sunDrawCallCount += cascadeLocalDraws;
+                        ++sunApiDrawCallCount;
+                        cascadeIssuedDraws += cascadeLocalDraws;
+                        ++cascadeApiDraws;
+                    }
+                } else if (useLocalForSun && sunLocalDrawCount > 0u) {
+                    const uint16_t cascadeBit = static_cast<uint16_t>(1u << cascade);
+                    uint32_t cascadeLocalDraws = 0u;
+                    for (uint32_t drawIndex = 0; drawIndex < sunLocalDrawCount; ++drawIndex) {
+                        // Per-cascade visibility was decided once during
+                        // gather (World::gatherDrawCommandsForSunCascades);
+                        // a single bit-test replaces the previous
+                        // per-cascade clip-AABB recomputation.
+                        if ((m_sunLocalTerrainCascadeMaskScratch[drawIndex] & cascadeBit) == 0u) {
+                            continue;
+                        }
+                        const auto& terrainDraw = m_sunLocalTerrainDrawScratch[drawIndex];
+                        const glm::vec4& chunkOrigin = m_sunLocalTerrainOriginScratch[drawIndex];
+                        sunPush.terrainChunkCoordMode = glm::vec4(
+                            chunkOrigin.x, chunkOrigin.y, chunkOrigin.z, 1.0f);
+                        vkCmdPushConstants(cmd, m_terrainShadowPipelineLayout,
+                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                            0, sizeof(ShadowPushConstants), &sunPush);
+                        vkCmdDrawIndexed(cmd,
+                            terrainDraw.indexCount, 1u,
+                            terrainDraw.firstIndex, terrainDraw.vertexOffset, 0u);
+                        ++cascadeLocalDraws;
+                        ++sunApiDrawCallCount;
+                    }
+                    sunDrawCallCount += cascadeLocalDraws;
+                    cascadeIssuedDraws += cascadeLocalDraws;
+                    cascadeApiDraws += cascadeLocalDraws;
+                } else if (ctx.useGPUCulling &&
+                    ctx.gpuVisibleDrawsBuffer != VK_NULL_HANDLE &&
+                    ctx.gpuDrawCountBuffer != VK_NULL_HANDLE &&
+                    ctx.gpuMaxDraws > 0) {
+                    sunPush.terrainChunkCoordMode = glm::vec4(0.0f, 0.0f, 0.0f, 2.0f);
+                    vkCmdPushConstants(cmd, m_terrainShadowPipelineLayout,
+                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                        0, sizeof(ShadowPushConstants), &sunPush);
+                    vkCmdDrawIndexedIndirectCount(cmd,
+                        ctx.gpuVisibleDrawsBuffer, 0,
+                        ctx.gpuDrawCountBuffer, 0,
+                        ctx.gpuMaxDraws,
+                        sizeof(VkDrawIndexedIndirectCommand));
+                    ++sunDrawCallCount;
+                    ++sunApiDrawCallCount;
+                    ++cascadeIssuedDraws;
+                    ++cascadeApiDraws;
+                } else if (ctx.indirectBuffer != VK_NULL_HANDLE && ctx.indirectDrawCount > 0) {
+                    vkCmdPushConstants(cmd, m_terrainShadowPipelineLayout,
+                        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                        0, sizeof(ShadowPushConstants), &sunPush);
+                    vkCmdDrawIndexedIndirect(cmd,
+                        ctx.indirectBuffer, 0,
+                        ctx.indirectDrawCount,
+                        sizeof(VkDrawIndexedIndirectCommand));
+                    ++sunDrawCallCount;
+                    ++sunApiDrawCallCount;
+                    ++cascadeIssuedDraws;
+                    ++cascadeApiDraws;
+                }
+            }
+            m_sunCurrentFrame.cascadeIssuedDrawCalls[cascade] = cascadeIssuedDraws;
+            m_sunCurrentFrame.cascadeApiDrawCalls[cascade] = cascadeApiDraws;
+        }
+
+        vkCmdEndRenderPass(cmd);
+        m_sunCurrentFrame.cascadeRecordMs[cascade] =
+            std::chrono::duration<float, std::milli>(
+                Clock::now() - cascadeRecordStart).count();
+    }
+    m_sunCurrentFrame.drawCallCount = sunDrawCallCount;
+    m_sunCurrentFrame.apiDrawCallCount = sunApiDrawCallCount;
+
+    // Barrier: sun shadow map depth write -> shader read
+    const auto barrierStart = Clock::now();
+    std::array<VkImageMemoryBarrier2, MAX_SUN_SHADOW_CASCADES> sunBarriers{};
+    uint32_t sunBarrierCount = 0u;
+    for (uint32_t cascade = 0u; cascade < sunCascadeCount; ++cascade) {
+        if (!sunCascadeNeedsRender[cascade]) {
+            continue;
+        }
+        VkImageMemoryBarrier2& sunBarrier = sunBarriers[sunBarrierCount++];
+        sunBarrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        sunBarrier.srcStageMask =
+            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+        sunBarrier.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        sunBarrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        sunBarrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+        sunBarrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        sunBarrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        sunBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        sunBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        sunBarrier.image = m_sunShadowImage;
+        sunBarrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        sunBarrier.subresourceRange.baseMipLevel = 0;
+        sunBarrier.subresourceRange.levelCount = 1;
+        sunBarrier.subresourceRange.baseArrayLayer = cascade;
+        sunBarrier.subresourceRange.layerCount = 1;
+    }
+
+    VkDependencyInfo sunDepInfo{};
+    sunDepInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    sunDepInfo.imageMemoryBarrierCount = sunBarrierCount;
+    sunDepInfo.pImageMemoryBarriers = sunBarriers.data();
+    if (sunBarrierCount > 0u) {
+        vkCmdPipelineBarrier2(cmd, &sunDepInfo);
+    }
+
+    // GPU timestamp: end sun shadow render (after barrier)
+    if (haveSunTimingQueries) {
+        vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                           m_sunTimingQueryPool, imageIndex * 2u + 1u);
+        m_sunTimingWritten[imageIndex] = true;
+    }
+    m_sunCurrentFrame.cpuBarrierMs = std::chrono::duration<float, std::milli>(
+        Clock::now() - barrierStart).count();
+
+    const float sunRecordMs = std::chrono::duration<float, std::milli>(
+        Clock::now() - sunRecordStart).count();
+    m_sunCurrentFrame.cpuCommandRecordMs = sunRecordMs;
+    m_sunCurrentFrame.wasReused = false;
+}
