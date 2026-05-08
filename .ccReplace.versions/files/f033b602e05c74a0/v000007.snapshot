@@ -1,0 +1,9 @@
+// GPT-DESC: Legacy placeholder after Phase 5B moved snapshot implementation into src/world/snapshot/.
+#include "world/World.h"
+
+// Snapshot implementation now lives in:
+//   src/world/snapshot/WorldSnapshotStore.cpp
+//   src/world/snapshot/WorldSnapshotLoad.cpp
+//   src/world/snapshot/WorldSnapshotSave.cpp
+//   src/world/snapshot/WorldSnapshotDelete.cpp
+//   src/world/snapshot/WorldSnapshotIdentity.cpp

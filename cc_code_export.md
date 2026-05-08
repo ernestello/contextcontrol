@@ -20,2669 +20,1164 @@ Minimal rules for this turn:
 Default CMake build, when applicable: cmake --build build --config Release -j
 
 
-## src\world\WorldLODTransitions.cpp
+## src\world\WorldSnapshots.cpp
 
 Description: No CC-DESC found.
 
 ````cpp
-// WorldLODTransitions.cpp — LOD level changes, mesh release/reload, LOD swaps
-// Extracted from World.cpp to reduce god-file size without changing behavior.
-
 #include "world/World.h"
-#include "world/chunks/core/Chunk.h"
-#include "world/config/WorldConfig.h"
-#include "world/chunks/core/ChunkJobs.h"
-#include "vulkan/BufferSuballocator.h"
-#include "rendering/culling/GPUCullingSystem.h"
-#include "physics/PhysicsWorld.h"
-#include <iostream>
-#include <algorithm>
-#include <chrono>
-#include <unordered_map>
-#include <string>
-#include <limits>
-
-void World::setTerrainTypeForLOD(int lodLevel, TerrainType type) {
-    if (lodLevel < 0 || lodLevel >= MAX_LOD_LEVELS) return;
-    TerrainType oldType = m_terrainTypePerLOD[lodLevel];
-    if (oldType == type) return;
-    
-    m_terrainTypePerLOD[lodLevel] = type;
-    std::cout << "[World] LOD " << lodLevel << " terrain type changed to: " 
-              << (type == TerrainType::DCCM ? "DCCM" : "Voxel") << std::endl;
-    
-    // ---------------------------------------------------------------
-    // FULL PIPELINE DRAIN before releasing/reloading meshes.
-    // Without this, in-flight uploads and LOD batches from the OLD
-    // terrain type can arrive AFTER releaseMeshesForLOD clears the
-    // handles, installing stale mesh data and leaking GPU culling
-    // slots.  This matches what applyLODChangesIncrementally does.
-    // ---------------------------------------------------------------
-    m_lifecycleManager.pauseAndDrain();
-    auto purgedCreates = m_lifecycleManager.purgeCreationQueue(
-        [](const glm::ivec3&) { return true; });
-    auto purgedDestroys = m_lifecycleManager.purgeDestructionQueue(
-        [](const glm::ivec3&) { return true; });
-    if (!purgedCreates.empty()) {
-        std::lock_guard lock(m_pendingChunksMutex);
-        for (const auto& coord : purgedCreates) {
-            m_pendingChunks.erase(coord);
-        }
-    }
-    if (!purgedCreates.empty()) {
-        m_chunkManager->cancelPendingCreates(purgedCreates);
-    }
-    if (!purgedDestroys.empty()) {
-        m_chunkManager->cancelPendingDestroys(purgedDestroys);
-    }
-    m_uploadSystem.clearQueue();
-    
-    // Cancel all in-flight LOD transition batches and clean up their
-    // PendingMeshHandle GPU resources (buffers + culling slots).
-    auto cancelledBatchIds = m_chunkManager->cancelAllBatches();
-    if (!cancelledBatchIds.empty()) {
-        std::string reason = "DataLodSwitchCancelledBatches count=" +
-            std::to_string(cancelledBatchIds.size());
-        noteChunkVisualError(
-            nullptr,
-            lodLevel,
-            "LODTransition",
-            reason.c_str(),
-            0,
-            static_cast<uint32_t>(cancelledBatchIds.size()),
-            0);
-        cleanupStalePendingMeshHandles();
-    }
-    // Drop stale remesh queue entries carrying cancelled batch IDs.
-    m_lodSystem.clearAllPending();
-    m_pendingLODRemeshes.clear();
-    
-    // Purge pending LOD remeshes for this LOD level so stale remesh
-    // requests don't re-queue jobs for the old terrain type.
-    m_pendingLODRemeshes.erase(
-        std::remove_if(m_pendingLODRemeshes.begin(), m_pendingLODRemeshes.end(),
-            [lodLevel](const ChunkManager::ChunkRemeshRequest& req) {
-                return req.newLOD == lodLevel;
-            }),
-        m_pendingLODRemeshes.end());
-    
-    // Regenerate chunks at this LOD level - release old meshes and reload with new terrain type
-    releaseMeshesForLOD(lodLevel);
-    reloadMeshesForLOD(lodLevel);
-    
-    // Resume background thread
-    m_lifecycleManager.resume();
-}
-
-void World::setTerrainTypesForStartup(const std::array<TerrainType, MAX_LOD_LEVELS>& types) {
-    m_terrainTypePerLOD = types;
-    std::cout << "[World] Startup terrain types:";
-    for (int lod = 0; lod < MAX_LOD_LEVELS; ++lod) {
-        std::cout << " LOD" << lod << "="
-                  << (m_terrainTypePerLOD[lod] == TerrainType::DCCM ? "DCCM" : "Voxel");
-    }
-    std::cout << std::endl;
-}
-
-void World::setDataLODForBand(int band, int dataLOD) {
-    if (band < 0 || band >= MAX_LOD_LEVELS) return;
-    if (dataLOD < 0 || dataLOD >= MAX_LOD_LEVELS) return;
-    int oldDataLOD = m_dataLODPerBand[band];
-    if (oldDataLOD == dataLOD) return;
-
-    m_dataLODPerBand[band] = dataLOD;
-    std::cout << "[World] Band " << band << " data LOD changed: "
-              << oldDataLOD << " -> " << dataLOD << std::endl;
-
-    // Only Voxel bands use data LOD override; DCCM always uses LOD 0
-    if (m_terrainTypePerLOD[band] == TerrainType::DCCM) return;
-
-    // Same drain/reload cycle as setTerrainTypeForLOD
-    m_lifecycleManager.pauseAndDrain();
-    auto purgedCreates = m_lifecycleManager.purgeCreationQueue(
-        [](const glm::ivec3&) { return true; });
-    auto purgedDestroys = m_lifecycleManager.purgeDestructionQueue(
-        [](const glm::ivec3&) { return true; });
-    if (!purgedCreates.empty()) {
-        std::lock_guard lock(m_pendingChunksMutex);
-        for (const auto& coord : purgedCreates) {
-            m_pendingChunks.erase(coord);
-        }
-    }
-    if (!purgedCreates.empty()) {
-        m_chunkManager->cancelPendingCreates(purgedCreates);
-    }
-    if (!purgedDestroys.empty()) {
-        m_chunkManager->cancelPendingDestroys(purgedDestroys);
-    }
-    m_uploadSystem.clearQueue();
-
-    auto cancelledBatchIds = m_chunkManager->cancelAllBatches();
-    if (!cancelledBatchIds.empty()) {
-        std::string reason = "TerrainTypeSwitchCancelledBatches count=" +
-            std::to_string(cancelledBatchIds.size());
-        noteChunkVisualError(
-            nullptr,
-            band,
-            "LODTransition",
-            reason.c_str(),
-            0,
-            static_cast<uint32_t>(cancelledBatchIds.size()),
-            0);
-        cleanupStalePendingMeshHandles();
-    }
-    m_lodSystem.clearAllPending();
-    m_pendingLODRemeshes.clear();
-
-    releaseMeshesForLOD(band);
-    reloadMeshesForLOD(band);
-
-    m_lifecycleManager.resume();
-}
-
-void World::applyLODChangesIncrementally(int newRenderDistance) {
-    // Pause the background thread so it doesn't interfere with scanning
-    m_lifecycleManager.pauseAndDrain();
-    
-    glm::ivec3 center = m_chunkManager->getCenterChunk();
-    
-    // Compute the full effective distance including extension rings.
-    // Extension chunks (at last LOD) must not be destroyed or purged.
-    int extensionRings = m_chunkManager->getExtensionRings();
-    int effectiveTarget = newRenderDistance + extensionRings;
-    
-    // SELECTIVE purge: only purge creates that are NOW out of range.
-    // In-range creates must stay in the lifecycle queue so the background
-    // thread can finish creating them after we resume.  Purging all creates
-    // (as was done before) kills mid-pipeline chunks whose uploads then get
-    // cleared, leaving grey/empty holes that are never recovered.
-    auto purgedCreates = m_lifecycleManager.purgeCreationQueue(
-        [&](const glm::ivec3& coord) {
-            int ring = m_chunkManager->calculateRingNumber(coord, center);
-            return ring >= effectiveTarget;
-        });
-    auto purgedDestroys = m_lifecycleManager.purgeDestructionQueue(
-        [](const glm::ivec3&) { return true; });
-    if (!purgedCreates.empty()) {
-        std::lock_guard lock(m_pendingChunksMutex);
-        for (const auto& coord : purgedCreates) {
-            m_pendingChunks.erase(coord);
-        }
-    }
-    if (!purgedCreates.empty()) {
-        m_chunkManager->cancelPendingCreates(purgedCreates);
-    }
-    if (!purgedDestroys.empty()) {
-        m_chunkManager->cancelPendingDestroys(purgedDestroys);
-    }
-    
-    // DO NOT clear the upload queue unconditionally.  Chunks that are in-range
-    // and mid-pipeline (mesh generated, waiting for upload) would lose their
-    // mesh data permanently — the entity exists so processRingConstruct won't
-    // re-emit a create, but the mesh is gone → grey/empty chunk forever.
-    // The version-checking system (stale version detection in LoadPrecomputedMeshJob
-    // and UploadJob) already handles stale uploads for destroyed/remeshed chunks.
-    
-    // Cancel all in-flight LOD transition batches and clean up their
-    // PendingMeshHandle GPU resources.  Without this, old batches from
-    // a previous slider change linger because version-stale jobs never
-    // signal signalBatchChunkReady.  processLODSwaps only runs when ALL
-    // entities in a batch are ready, so even one stale job permanently
-    // blocks the swap — chunks appear frozen until the next change.
-    auto cancelledBatchIds = m_chunkManager->cancelAllBatches();
-    if (!cancelledBatchIds.empty()) {
-        std::string reason = "RenderDistanceChangeCancelledBatches count=" +
-            std::to_string(cancelledBatchIds.size());
-        noteChunkVisualError(
-            nullptr,
-            -1,
-            "LODTransition",
-            reason.c_str(),
-            0,
-            static_cast<uint32_t>(cancelledBatchIds.size()),
-            0);
-        cleanupStalePendingMeshHandles();
-    }
-    
-    m_lodSystem.clearAllPending();
-    m_pendingLODRemeshes.clear();
-    
-    // Phase 1: Scan existing chunks for:
-    //   - out-of-range chunks (destroy)
-    //   - LOD mismatches (remesh)
-    //   - seam/casing topology mismatches at unchanged LOD (remesh)
-    // Also batch-update desired LODs for all in-range chunks so chunks that are
-    // currently Loading/Meshing converge to the new target without waiting for
-    // a later center-change scan.
-    std::vector<glm::ivec3> chunksToDestroy;     // Now out of range — need full destroy
-    struct RemeshCandidate {
-        entt::entity entity{entt::null};
-        glm::ivec3 coord{0, 0, 0};
-        int newLOD{0};
-        int ring{0};
-    };
-    std::vector<RemeshCandidate> chunksToRemesh;
-    std::vector<std::pair<glm::ivec3, int>> desiredLODUpdates;
-
-    auto computeDCCMCasingMask = [&](const glm::ivec3& pos,
-                                     const glm::ivec3& centerPos) -> uint8_t {
-        static const glm::ivec3 nOff[4] = {{-1,0,0},{1,0,0},{0,0,-1},{0,0,1}};
-        uint8_t mask = 0;
-        for (int e = 0; e < 4; ++e) {
-            glm::ivec3 nb = pos + nOff[e];
-            int nbRing = m_chunkManager->calculateRingNumber(nb, centerPos);
-            int nbLOD  = m_chunkManager->calculateLODFromRing(nbRing);
-            if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM) {
-                mask |= (1u << e);
-            }
-        }
-        return mask;
-    };
-    
-    {
-        std::shared_lock regLock(m_registryMutex);
-        auto view = m_registry.view<Chunk, ChunkCoord, ChunkState>();
-        desiredLODUpdates.reserve(view.size_hint());
-        chunksToDestroy.reserve(view.size_hint() / 4);
-        chunksToRemesh.reserve(view.size_hint() / 8);
-        
-        for (auto entity : view) {
-            auto& chunk = view.get<Chunk>(entity);
-            auto& coordComp = view.get<ChunkCoord>(entity);
-            auto& stateComp = view.get<ChunkState>(entity);
-            glm::ivec3 coord = coordComp.toVec3();
-            
-            int ring = m_chunkManager->calculateRingNumber(coord, center);
-            
-            if (ring >= effectiveTarget) {
-                chunksToDestroy.push_back(coord);
-                continue;
-            }
-            
-            int newLOD = m_chunkManager->calculateLODFromRing(ring);
-            desiredLODUpdates.push_back({coord, newLOD});
-
-            // For non-ready chunks, desired LOD update is enough; avoid enqueueing
-            // extra remesh work while initial generation is still in progress.
-            if (stateComp.state != ChunkState::State::Ready) {
-                continue;
-            }
-
-            if (newLOD != chunk.lodLevel) {
-                chunksToRemesh.push_back({entity, coord, newLOD, ring});
-                continue;
-            }
-
-            // LOD unchanged, but boundary topology may still need a remesh:
-            // voxel seam masks and DCCM casing masks change when thresholds move.
-            TerrainType thisType = getTerrainTypeForChunk(coord, chunk.lodLevel);
-            if (thisType == TerrainType::DCCM) {
-                uint8_t newMask = computeDCCMCasingMask(coord, center);
-                if (newMask != chunk.casingSeamMask) {
-                    chunksToRemesh.push_back({entity, coord, newLOD, ring});
-                }
-            } else {
-                uint8_t newMask = (newLOD > 0) ? m_chunkManager->getSeamEdgeMask(coord, center) : 0;
-                if (newMask != chunk.voxelSeamMask) {
-                    chunksToRemesh.push_back({entity, coord, newLOD, ring});
-                }
-            }
-        }
-    }
-
-    if (!desiredLODUpdates.empty()) {
-        m_lodSystem.setDesiredLODs(desiredLODUpdates);
-    }
-    
-    // Phase 2: Destroy only out-of-range chunks
-    if (!chunksToDestroy.empty()) {
-        // Invalidate version states so in-flight jobs are discarded
-        {
-            std::scoped_lock versionLock(m_chunkVersionMutex);
-            for (const auto& coord : chunksToDestroy) {
-                entt::entity entity = findChunk(coord);
-                if (entity != entt::null) {
-                    auto it = m_chunkVersionStates.find(entity);
-                    if (it != m_chunkVersionStates.end() && it->second) {
-                        it->second->version.fetch_add(1, std::memory_order_acq_rel);
-                        it->second->inFlight.store(false, std::memory_order_release);
-                        it->second->pending.store(false, std::memory_order_release);
-                    }
-                }
-            }
-        }
-        
-        tryDestroyChunksBatch(chunksToDestroy);
-    }
-    
-    // Phase 3: In-place remesh for LOD-changed chunks via the existing remesh pipeline
-    // Don't update chunk.lodLevel here — it will be updated when the mesh is actually
-    // swapped in processLODSwaps. Pass targetLOD through batch info.
-    if (!chunksToRemesh.empty()) {
-        // Prioritize near rings first for visual stability while transitioning.
-        std::sort(chunksToRemesh.begin(), chunksToRemesh.end(),
-                  [](const RemeshCandidate& a, const RemeshCandidate& b) {
-                      return a.ring < b.ring;
-                  });
-
-        // Group by target LOD but keep near-first order within each group.
-        std::unordered_map<int, std::vector<RemeshCandidate>> lodGroups;
-        lodGroups.reserve(4);
-        for (const auto& c : chunksToRemesh) {
-            lodGroups[c.newLOD].push_back(c);
-        }
-        
-        for (auto& [targetLOD, candidates] : lodGroups) {
-            // Split groups into moderate batches so swaps complete faster and
-            // reduce visible "stuck boundary" windows during rapid slider edits.
-            static constexpr size_t MAX_LOD_BATCH_SIZE = 128;
-            
-            for (size_t batchStart = 0; batchStart < candidates.size(); batchStart += MAX_LOD_BATCH_SIZE) {
-                size_t batchEnd = std::min(batchStart + MAX_LOD_BATCH_SIZE, candidates.size());
-                std::vector<entt::entity> subBatchEntities;
-                subBatchEntities.reserve(batchEnd - batchStart);
-                for (size_t i = batchStart; i < batchEnd; ++i) {
-                    subBatchEntities.push_back(candidates[i].entity);
-                }
-
-                uint32_t batchId = m_chunkManager->createLODTransitionBatch(targetLOD, subBatchEntities);
-            
-                for (size_t i = batchStart; i < batchEnd; ++i) {
-                    const auto& c = candidates[i];
-                    auto vs = ensureChunkVersionState(this, c.entity);
-                    if (vs) {
-                        vs->version.fetch_add(1, std::memory_order_acq_rel);
-                        // Reset inFlight so updateMeshingSystem can start a new pipeline.
-                        // Without this, stale jobs (which intentionally don't clear inFlight)
-                        // leave the flag set, causing updateMeshingSystem to requeue forever.
-                        vs->inFlight.store(false, std::memory_order_release);
-                        vs->pending.store(false, std::memory_order_release);
-                    }
-                    
-                    m_lodSystem.setDesiredLOD(c.coord, targetLOD);
-                    // Signal any superseded batch (unlikely after cancelAllBatches
-                    // above, but safe against future race conditions).
-                    uint32_t oldBatchId = m_lodSystem.enqueueLODRemesh(c.entity, true, batchId, targetLOD);
-                    if (oldBatchId != 0 && m_chunkManager->isBatchActive(oldBatchId)) {
-                        m_chunkManager->signalBatchChunkReady(oldBatchId);
-                    }
-                }
-            } // end sub-batch loop
-        }     // end target LOD loop
-    }
-    
-    // Phase 4: Update render distance and ring construction state.
-    //
-    // With selective purge (only out-of-range creates purged), the emission
-    // watermark (emittedUpToRing) is accurate for in-range rings:
-    //   - INCREASE: no in-range creates purged, emittedUpToRing stays valid,
-    //     processRingConstruct emits only the new rings above the old distance.
-    //   - DECREASE: out-of-range creates purged, clampRingProgress lowers
-    //     emittedUpToRing to newRenderDistance so we don't think we've emitted
-    //     rings that no longer exist.
-    //
-    // setEffectiveRenderDistance: overrides the budget-adaptive cap so the
-    // user's slider value takes effect immediately.
-    //
-    // resetAdaptWarmup: prevents adaptRenderDistance from immediately
-    // shrinking effectiveDist back down on the next frame.
-    m_chunkManager->setRenderDistanceRings(newRenderDistance);
-    // effectiveTarget (base + extension) was already computed at the top
-    m_chunkManager->setEffectiveRenderDistance(effectiveTarget);
-    m_chunkManager->clampRingProgress(effectiveTarget);
-    m_chunkManager->resetAdaptWarmup();
-    
-    // Resume background thread — in-range creates left in the lifecycle queue
-    // will continue processing now.
-    m_lifecycleManager.resume();
-    
-    // Debug: count existing chunks and report progress
-    int existingCount = 0;
-    int expectedCount = 0;
-    {
-        std::shared_lock setLock(m_chunkSetMutex);
-        existingCount = static_cast<int>(m_existingChunkSet.size());
-    }
-    for (int r = 1; r <= effectiveTarget; ++r) {
-        int chebyshevR = r - 1;
-        int chunksInRing = (r == 1) ? 1 : 8 * chebyshevR;
-        expectedCount += chunksInRing;
-    }
-    std::cout << "[World] Incremental update: destroyed " << chunksToDestroy.size()
-              << " out-of-range, remeshing " << chunksToRemesh.size()
-              << " affected, purged " << purgedCreates.size() << " OOR creates"
-              << ", existing=" << existingCount
-              << "/" << expectedCount << " expected at " << effectiveTarget
-              << " rings (base=" << newRenderDistance << " + ext=" << extensionRings << ")"
-              << std::endl;
-}
-
-void World::releaseMeshesForLOD(int lodLevel) {
-    if (lodLevel < 0 || lodLevel > 4) return;
-    
-    std::vector<entt::entity> chunksToRelease;
-    size_t totalVertices = 0;
-    size_t totalIndices = 0;
-    
-    // Find all chunks at this LOD level
-    {
-        std::shared_lock regLock(m_registryMutex);
-        auto view = m_registry.view<Chunk, MeshHandle>();
-        for (auto entity : view) {
-            auto& chunk = m_registry.get<Chunk>(entity);
-            if (chunk.lodLevel == lodLevel) {
-                auto& meshHandle = m_registry.get<MeshHandle>(entity);
-                if (meshHandle.vb.isValid() || meshHandle.ib.isValid()) {
-                    chunksToRelease.push_back(entity);
-                    totalVertices += meshHandle.vb.size;
-                    totalIndices += meshHandle.ib.size;
-                }
-            }
-        }
-    }
-    
-    if (chunksToRelease.empty()) {
-        return;
-    }
-    
-    // Release mesh handles — collect slices under single lock, batch-free outside lock
-    std::vector<BufferSlice> vbSlices;
-    std::vector<BufferSlice> ibSlices;
-    std::vector<uint32_t> cullingSlots;
-    vbSlices.reserve(chunksToRelease.size());
-    ibSlices.reserve(chunksToRelease.size());
-    cullingSlots.reserve(chunksToRelease.size());
-    {
-        std::unique_lock regLock(m_registryMutex);
-        for (entt::entity entity : chunksToRelease) {
-            if (!m_registry.valid(entity)) continue;
-
-            if (m_registry.all_of<MeshHandle>(entity)) {
-                auto& meshHandle = m_registry.get<MeshHandle>(entity);
-                meshStatsSub(meshHandle);
-                if (meshHandle.vb.isValid()) vbSlices.push_back(meshHandle.vb);
-                if (meshHandle.ib.isValid()) ibSlices.push_back(meshHandle.ib);
-                if (meshHandle.gpuCullingSlot != UINT32_MAX)
-                    cullingSlots.push_back(meshHandle.gpuCullingSlot);
-                meshHandle = MeshHandle{};
-            }
-
-            if (m_registry.all_of<Chunk>(entity)) {
-                m_registry.get<Chunk>(entity).isEmpty = true;
-            }
-        }
-    }
-    // Batch free outside registry lock
-    if (m_vbAllocator && !vbSlices.empty())
-        m_vbAllocator->freeBatch(vbSlices.data(), vbSlices.size());
-    if (m_ibAllocator && !ibSlices.empty())
-        m_ibAllocator->freeBatch(ibSlices.data(), ibSlices.size());
-    if (m_gpuCulling && !cullingSlots.empty())
-        m_gpuCulling->freeSlots(cullingSlots.data(), cullingSlots.size());
-    
-    std::cout << "[World] Released " << chunksToRelease.size() << " meshes for LOD " << lodLevel
-              << " (freed ~" << (totalVertices / 1024 / 1024) << "MB VB, ~" 
-              << (totalIndices / 1024 / 1024) << "MB IB)" << std::endl;
-}
-
-void World::reloadMeshesForLOD(int lodLevel) {
-    if (lodLevel < 0 || lodLevel > 4) return;
-    
-    std::vector<std::pair<entt::entity, glm::ivec3>> chunksToReload;
-    
-    // Find all chunks at this LOD level that need mesh data
-    {
-        std::shared_lock regLock(m_registryMutex);
-        auto view = m_registry.view<Chunk, ChunkCoord>();
-        for (auto entity : view) {
-            auto& chunk = m_registry.get<Chunk>(entity);
-            if (chunk.lodLevel == lodLevel && chunk.isEmpty) {
-                auto& coord = m_registry.get<ChunkCoord>(entity);
-                chunksToReload.push_back({entity, coord.toVec3()});
-            }
-        }
-    }
-    
-    if (chunksToReload.empty()) {
-        std::cout << "[World] No empty chunks to reload for LOD " << lodLevel << std::endl;
-        return;
-    }
-    
-    std::cout << "[World] Reloading " << chunksToReload.size() << " meshes for LOD " << lodLevel << std::endl;
-    
-    // Queue each chunk for mesh loading via the job system
-    for (const auto& [entity, coord] : chunksToReload) {
-        auto versionState = ensureChunkVersionState(this, entity);
-        if (!versionState) continue;
-        
-        // Increment version to invalidate any in-flight jobs
-        versionState->version.fetch_add(1, std::memory_order_acq_rel);
-        versionState->inFlight.store(true, std::memory_order_release);
-        versionState->pending.store(false, std::memory_order_release);
-        
-        // Mark chunk for reloading
-        {
-            std::unique_lock regLock(m_registryMutex);
-            if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
-                auto& chunk = m_registry.get<Chunk>(entity);
-                chunk.isEmpty = false;  // Will be set correctly by LoadPrecomputedMeshJob
-            }
-        }
-        
-        setChunkState(entity, ChunkState::State::Loading);
-        
-        // Get AABB
-        AABB aabb;
-        {
-            std::shared_lock regLock(m_registryMutex);
-            if (m_registry.all_of<AABB>(entity)) {
-                aabb = m_registry.get<AABB>(entity);
-            }
-        }
-        
-        // Create payload for job pipeline
-        auto* payload = new ChunkPipelinePayload();
-        payload->world = this;
-        payload->entity = entity;
-        payload->coord = ChunkCoord{coord.x, coord.y, coord.z};
-        payload->bounds = aabb;
-        payload->versionState = versionState;
-        payload->version = versionState->version.load(std::memory_order_acquire);
-        payload->distanceFromPlayer = 0;  // High priority for reload
-        payload->lodLevel = lodLevel;
-        payload->centerAtEnqueue = m_chunkManager ? m_chunkManager->getCenterChunk() : glm::ivec3(0, 0, 0);
-        
-        // Schedule jobs — use edit mesher for chunks with overlay edits
-        TerrainType chunkTerrainType = getTerrainTypeForChunk(coord, lodLevel);
-        const bool useEditMesher = chunkNeedsRuntimeVoxel(coord);
-        payload->fromTerrainEdit = useEditMesher && chunkTerrainType != TerrainType::DCCM;
-        auto loadJobFn = (useEditMesher && chunkTerrainType != TerrainType::DCCM)
-            ? LoadEditMeshJob
-            : LoadPrecomputedMeshJob;
-        JobHandle load = m_jobSystem.makeWithPriority(loadJobFn, payload, 0, 1000000);
-        JobHandle upload = m_jobSystem.makeWithPriority(UploadChunkJob, payload, 0, 1000000);
-        JobHandle finalize = m_jobSystem.makeWithPriority(FinalizeChunkJob, payload, 0, 1000000);
-        
-        m_jobSystem.addDependency(upload, load);
-        m_jobSystem.addDependency(finalize, upload);
-        
-        payload->jobHandles = {load, upload, finalize};
-        
-        m_jobSystem.schedule(load);
-        m_jobSystem.schedule(upload);
-        m_jobSystem.schedule(finalize);
-    }
-}
-
-void World::cleanupStalePendingMeshHandles() {
-    // Free GPU resources for ALL entities with a PendingMeshHandle.
-    // Called when LOD batches are cancelled (center changed, old batches stale).
-    size_t pendingCount = 0;
-    std::vector<BufferSlice> vbSlices;
-    std::vector<BufferSlice> ibSlices;
-    std::vector<uint32_t> cullingSlots;
-    {
-        std::unique_lock regLock(m_registryMutex);
-        auto view = m_registry.view<PendingMeshHandle>();
-        for (auto entity : view) {
-            ++pendingCount;
-            auto& pending = view.get<PendingMeshHandle>(entity);
-            if (pending.handle.vb.isValid()) vbSlices.push_back(pending.handle.vb);
-            if (pending.handle.ib.isValid()) ibSlices.push_back(pending.handle.ib);
-            if (pending.handle.gpuCullingSlot != UINT32_MAX)
-                cullingSlots.push_back(pending.handle.gpuCullingSlot);
-        }
-        // Remove all PendingMeshHandle components in one pass
-        m_registry.clear<PendingMeshHandle>();
-    }
-    if (m_vbAllocator && !vbSlices.empty()) {
-        m_vbAllocator->freeBatch(vbSlices.data(), vbSlices.size());
-    }
-    if (m_ibAllocator && !ibSlices.empty()) {
-        m_ibAllocator->freeBatch(ibSlices.data(), ibSlices.size());
-    }
-    if (m_gpuCulling && !cullingSlots.empty()) {
-        m_gpuCulling->freeSlots(cullingSlots.data(), cullingSlots.size());
-    }
-    if (pendingCount > 0) {
-        std::string reason = "CleanupStalePendingMeshes count=" + std::to_string(pendingCount);
-        noteChunkVisualError(
-            nullptr,
-            -1,
-            "LODCleanup",
-            reason.c_str(),
-            0,
-            static_cast<uint32_t>(pendingCount),
-            0);
-    }
-}
-
-bool World::onBatchChunkReady(uint32_t batchId) {
-    if (!m_chunkManager) return false;
-    return m_chunkManager->signalBatchChunkReady(batchId);
-}
-
-bool World::isBatchActive(uint32_t batchId) const {
-    return m_chunkManager && m_chunkManager->isBatchActive(batchId);
-}
-
-void World::enqueueDeferredMeshBufferFree(const BufferSlice& vb, const BufferSlice& ib) {
-    if (!vb.isValid() && !ib.isValid()) {
-        return;
-    }
-    m_pendingMeshBufferFrees.push_back(PendingMeshBufferFree{vb, ib});
-    ++m_currentFinalizeDiag.lodSwapFreeQueuedCount;
-    m_currentFinalizeDiag.lodSwapFreeBacklog =
-        static_cast<uint32_t>(std::min<size_t>(
-            m_pendingMeshBufferFrees.size(),
-            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-}
-
-void World::processDeferredMeshBufferFrees(BufferSuballocator* vbAllocator,
-                                           BufferSuballocator* ibAllocator,
-                                           size_t maxFreeCount) {
-    if (m_pendingMeshBufferFrees.empty() || (!vbAllocator && !ibAllocator)) {
-        return;
-    }
-
-    size_t budget = (maxFreeCount == 0)
-        ? m_pendingMeshBufferFrees.size()
-        : std::min(maxFreeCount, m_pendingMeshBufferFrees.size());
-    if (budget == 0) {
-        return;
-    }
-
-    using Clock = std::chrono::high_resolution_clock;
-    auto t = Clock::now();
-
-    m_deferredFreeVbScratch.clear();
-    m_deferredFreeIbScratch.clear();
-    m_deferredFreeVbScratch.reserve(budget);
-    m_deferredFreeIbScratch.reserve(budget);
-
-    for (size_t i = 0; i < budget; ++i) {
-        PendingMeshBufferFree pending = m_pendingMeshBufferFrees.front();
-        m_pendingMeshBufferFrees.pop_front();
-        if (pending.vb.isValid()) m_deferredFreeVbScratch.push_back(pending.vb);
-        if (pending.ib.isValid()) m_deferredFreeIbScratch.push_back(pending.ib);
-    }
-
-    if (vbAllocator && !m_deferredFreeVbScratch.empty()) {
-        vbAllocator->freeBatch(m_deferredFreeVbScratch.data(), m_deferredFreeVbScratch.size());
-    }
-    if (ibAllocator && !m_deferredFreeIbScratch.empty()) {
-        ibAllocator->freeBatch(m_deferredFreeIbScratch.data(), m_deferredFreeIbScratch.size());
-    }
-
-    m_currentFinalizeDiag.lodSwapFreeDrainedCount += static_cast<uint32_t>(
-        std::min<size_t>(budget, static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-    m_currentFinalizeDiag.lodSwapFreeBacklog =
-        static_cast<uint32_t>(std::min<size_t>(
-            m_pendingMeshBufferFrees.size(),
-            static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-    m_currentFinalizeDiag.lodSwapFreeMs +=
-        std::chrono::duration<float, std::milli>(Clock::now() - t).count();
-}
-
-size_t World::processLODSwaps(BufferSuballocator* vbAllocator,
-                               BufferSuballocator* ibAllocator,
-                               uint64_t deviceTimeline) {
-    using Clock = std::chrono::high_resolution_clock;
-    auto& diag = m_currentFinalizeDiag;
-
-    processDeferredMeshBufferFrees(vbAllocator, ibAllocator);
-
-    if (!m_chunkManager) return 0;
-
-    size_t totalSwapped = 0;
-
-    struct DeferredFree {
-        BufferSlice vb;
-        BufferSlice ib;
-        uint32_t gpuCullingSlot{UINT32_MAX};
-    };
-    struct CollisionRefreshRequest {
-        entt::entity entity{entt::null};
-        glm::ivec3 coord{0};
-        int lodLevel{0};
-    };
-    struct ColliderRemoval {
-        uint32_t bodyIdIndex{0xFFFFFFFFu};
-        uint32_t bodyIdSequence{0};
-    };
-    struct SwapVisualReady {
-        glm::ivec3 coord{0};
-        std::chrono::steady_clock::time_point uploadEnqueueTime{};
-        int lodLevel{0};
-        uint64_t vramBytes{0};
-        uint32_t vertexCount{0};
-        uint32_t indexCount{0};
-        ChunkDebugAttribution debugInfo{};
-    };
-    std::vector<DeferredFree> deferredFrees;
-    std::vector<CollisionRefreshRequest> collisionRefreshes;
-    std::vector<ColliderRemoval> colliderRemovals;
-    std::vector<SwapVisualReady> visualReadyEntries;
-    std::vector<uint32_t> cullingSlotsToActivate;
-
-    // Drain every completed batch whose uploads are visible to the GPU.
-    while (LODTransitionBatch* batch = m_chunkManager->getCompletedBatch()) {
-        uint32_t batchId = batch->batchId;
-        size_t batchSwapped = 0;
-        size_t batchInvalidEntities = 0;
-        size_t batchMissingPending = 0;
-        size_t batchMismatchedPending = 0;
-
-        // A completed batch means every PendingMeshHandle has been uploaded
-        // into the staging component, not necessarily that the graphics queue
-        // can see those uploads yet. Keep the old visible MeshHandle until the
-        // upload timeline has crossed every pending handle to avoid
-        // LODN -> blank -> LODM frames.
-        bool batchGpuReady = true;
-        {
-            std::shared_lock regLock(m_registryMutex);
-            for (entt::entity entity : batch->entities) {
-                if (!m_registry.valid(entity) ||
-                    !m_registry.all_of<PendingMeshHandle>(entity)) {
-                    continue;
-                }
-                const auto& pending = m_registry.get<PendingMeshHandle>(entity);
-                if (pending.batchId == batchId &&
-                    pending.handle.gpuReadyValue > deviceTimeline) {
-                    batchGpuReady = false;
-                    break;
-                }
-            }
-        }
-        if (!batchGpuReady) {
-            break;
-        }
-
-        ++diag.lodSwapBatchCount;
-
-        // Phase 1: Under unique_lock — swap components only (no allocator calls)
-        {
-            auto lockWaitStart = Clock::now();
-            std::unique_lock regLock(m_registryMutex);
-            auto lockAcquired = Clock::now();
-            glm::ivec3 center = m_chunkManager ? m_chunkManager->getCenterChunk() : glm::ivec3(0, 0, 0);
-            for (entt::entity entity : batch->entities) {
-                if (!m_registry.valid(entity)) {
-                    ++batchInvalidEntities;
-                    continue;
-                }
-                if (!m_registry.all_of<PendingMeshHandle>(entity)) {
-                    ++batchMissingPending;
-                    continue;
-                }
-
-                auto& pending = m_registry.get<PendingMeshHandle>(entity);
-                const auto pendingUploadEnqueueTime = pending.uploadEnqueueTime;
-                const uint64_t pendingVramBytes = pending.handle.vb.size + pending.handle.ib.size;
-                const uint32_t pendingVertexCount = static_cast<uint32_t>(pending.handle.vb.size / sizeof(Vertex));
-                const uint32_t pendingIndexCount = pending.handle.getTotalIndexCount();
-                ChunkDebugAttribution pendingDebug = pending.debugInfo;
-                if (pendingDebug.uploadBytes == 0) {
-                    pendingDebug.uploadBytes = pendingVramBytes;
-                }
-                if (pendingDebug.subChunkCount == 0) {
-                    pendingDebug.subChunkCount = pending.handle.subChunkCount;
-                }
-                pendingDebug.residency = deriveChunkResidencyKind(
-                    /*gpuResident=*/true,
-                    pendingDebug.artifactCacheResident,
-                    /*pendingBatch=*/false);
-
-                // Only swap if this PendingMeshHandle belongs to THIS batch.
-                // If the entity was reassigned to a newer batch, its pending
-                // mesh belongs to that batch and must not be consumed here.
-                if (pending.batchId != batchId) {
-                    ++batchMismatchedPending;
-                    continue;
-                }
-
-                if (m_registry.all_of<MeshHandle>(entity)) {
-                    auto& oldHandle = m_registry.get<MeshHandle>(entity);
-                    meshStatsSub(oldHandle);
-                    DeferredFree df;
-                    df.vb = oldHandle.vb;
-                    df.ib = oldHandle.ib;
-                    df.gpuCullingSlot = oldHandle.gpuCullingSlot;
-                    deferredFrees.push_back(df);
-                }
-
-                const uint32_t pendingCullingSlot = pending.handle.gpuCullingSlot;
-                meshStatsAdd(pending.handle);
-                m_registry.emplace_or_replace<MeshHandle>(entity, pending.handle);
-                m_registry.remove<PendingMeshHandle>(entity);
-                if (pendingCullingSlot != UINT32_MAX) {
-                    cullingSlotsToActivate.push_back(pendingCullingSlot);
-                }
-
-                if (m_registry.all_of<Chunk>(entity)) {
-                    auto& chunk = m_registry.get<Chunk>(entity);
-                    chunk.lodLevel = batch->targetLOD;
-                    if (m_registry.all_of<ChunkCoord>(entity)) {
-                        glm::ivec3 coord = m_registry.get<ChunkCoord>(entity).toVec3();
-                        chunk.effectiveDataLod = static_cast<uint8_t>(
-                            std::clamp(getEffectiveLODForChunk(coord, batch->targetLOD), 0, 255));
-                        TerrainType chunkType = getTerrainTypeForChunk(coord, batch->targetLOD);
-                        if (chunkType == TerrainType::DCCM) {
-                            uint8_t casingMask = 0;
-                            static const glm::ivec3 nOff[4] = {{-1,0,0},{1,0,0},{0,0,-1},{0,0,1}};
-                            for (int e = 0; e < 4; ++e) {
-                                glm::ivec3 nb = coord + nOff[e];
-                                int nbRing = m_chunkManager->calculateRingNumber(nb, center);
-                                int nbLOD = m_chunkManager->calculateLODFromRing(nbRing);
-                                if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM) {
-                                    casingMask |= (1 << e);
-                                }
-                            }
-                            chunk.casingSeamMask = casingMask;
-                            chunk.voxelSeamMask = 0;
-                        } else {
-                            chunk.voxelSeamMask = (batch->targetLOD > 0)
-                                ? m_chunkManager->getSeamEdgeMask(coord, center)
-                                : 0;
-                            chunk.casingSeamMask = 0;
-                        }
-                    }
-                }
-
-                if (m_registry.all_of<ChunkCoord>(entity)) {
-                    const glm::ivec3 coord = m_registry.get<ChunkCoord>(entity).toVec3();
-                    collisionRefreshes.push_back({
-                        entity,
-                        coord,
-                        batch->targetLOD
-                    });
-                    visualReadyEntries.push_back({
-                        coord,
-                        pendingUploadEnqueueTime,
-                        batch->targetLOD,
-                        pendingVramBytes,
-                        pendingVertexCount,
-                        pendingIndexCount,
-                        pendingDebug
-                    });
-                }
-
-                // Physics colliders are tied to visible LOD 0, not chunk
-                // lifetime.  Moving across a LOD boundary must therefore add
-                // a collider when the LOD-0 mesh becomes visible and remove it
-                // when the chunk leaves LOD 0.
-                if (batch->targetLOD > 0 && m_registry.all_of<ChunkCollider>(entity)) {
-                    const ChunkCollider collider = m_registry.get<ChunkCollider>(entity);
-                    if (collider.isValid()) {
-                        colliderRemovals.push_back({
-                            collider.bodyIdIndex,
-                            collider.bodyIdSequence
-                        });
-                    }
-                    m_registry.remove<ChunkCollider>(entity);
-                }
-
-                ++batchSwapped;
-                ++totalSwapped;
-            }
-            auto lockDone = Clock::now();
-            diag.lodSwapLockWaitMs += std::chrono::duration<float, std::milli>(lockAcquired - lockWaitStart).count();
-            diag.lodSwapLockHeldMs += std::chrono::duration<float, std::milli>(lockDone - lockAcquired).count();
-        }
-
-        if (batchSwapped == 0 || batchInvalidEntities > 0 || batchMissingPending > 0 || batchMismatchedPending > 0) {
-            std::string reason = "BatchSwapSummary swapped=" + std::to_string(batchSwapped) +
-                                 " invalid=" + std::to_string(batchInvalidEntities) +
-                                 " missingPending=" + std::to_string(batchMissingPending) +
-                                 " mismatchedPending=" + std::to_string(batchMismatchedPending);
-            noteChunkVisualError(
-                nullptr,
-                batch->targetLOD,
-                "LODSwap",
-                reason.c_str(),
-                batchId,
-                static_cast<uint32_t>(batch->entities.size()),
-                static_cast<uint32_t>(batchSwapped));
-        }
-
-        m_chunkManager->removeCompletedBatch(batchId);
-    }
-
-    diag.lodSwapEntityCount += static_cast<uint32_t>(totalSwapped);
-    if (totalSwapped > 0) {
-        std::vector<glm::ivec3> changedCoords;
-        changedCoords.reserve(visualReadyEntries.size());
-        for (const auto& entry : visualReadyEntries) {
-            if (entry.debugInfo.affectsShadowGeometry) {
-                changedCoords.push_back(entry.coord);
-            }
-        }
-        if (!changedCoords.empty()) {
-            recordMeshTopologyChanges(changedCoords);
-        }
-    }
-
-    // Phase 2: Update GPU-culling slot visibility and retire old resources
-    // OUTSIDE the registry lock. VB/IB allocator frees are queued and then
-    // drained by the world update.
-    {
-        auto t = Clock::now();
-
-        std::vector<uint32_t> cullingSlots;
-        cullingSlots.reserve(deferredFrees.size());
-
-        uint32_t queuedBufferFrees = 0;
-        for (auto& df : deferredFrees) {
-            if (df.vb.isValid() || df.ib.isValid()) {
-                m_pendingMeshBufferFrees.push_back(PendingMeshBufferFree{df.vb, df.ib});
-                ++queuedBufferFrees;
-            }
-            if (df.gpuCullingSlot != UINT32_MAX) cullingSlots.push_back(df.gpuCullingSlot);
-        }
-        if (queuedBufferFrees > 0) {
-            diag.lodSwapFreeQueuedCount += queuedBufferFrees;
-            diag.lodSwapFreeBacklog =
-                static_cast<uint32_t>(std::min<size_t>(
-                    m_pendingMeshBufferFrees.size(),
-                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-        }
-
-        // Single culling-list handoff: replacement slots become active at the
-        // same time old slots retire, so no LOD update frame can see both.
-        if (m_gpuCulling && (!cullingSlotsToActivate.empty() || !cullingSlots.empty())) {
-            m_gpuCulling->activateSlotsAndFreeSlots(
-                cullingSlotsToActivate.empty() ? nullptr : cullingSlotsToActivate.data(),
-                cullingSlotsToActivate.size(),
-                cullingSlots.empty() ? nullptr : cullingSlots.data(),
-                cullingSlots.size());
-        }
-
-        diag.lodSwapFreeMs += std::chrono::duration<float, std::milli>(Clock::now() - t).count();
-    }
-
-    for (const auto& request : collisionRefreshes) {
-        if (request.lodLevel != 0) {
-            continue;
-        }
-
-        const bool hasEditedCollision =
-            m_editCollisionData.find(request.coord) != m_editCollisionData.end();
-        const bool hasRuntimeEdit =
-            (request.coord.y != 0) ||
-            m_terrainEditOverlay.hasEditsInChunk(request.coord) ||
-            hasEditedCollision;
-
-        if (hasRuntimeEdit) {
-            refreshEditedChunkCollisionFromArtifact(
-                request.entity,
-                request.coord,
-                request.lodLevel);
-        } else {
-            static const std::vector<Vertex> emptyVertices;
-            static const std::vector<uint16_t> emptyIndices;
-            onMeshUploaded(
-                request.entity,
-                request.coord,
-                emptyVertices,
-                emptyIndices,
-                request.lodLevel);
-        }
-    }
-
-    if (m_physics) {
-        for (const auto& removal : colliderRemovals) {
-            m_physics->removeBodyByIndexSeq(
-                removal.bodyIdIndex,
-                static_cast<uint8_t>(removal.bodyIdSequence));
-        }
-    }
-
-    const auto finalizeTime = std::chrono::steady_clock::now();
-    for (const auto& entry : visualReadyEntries) {
-        noteChunkVisualReady(
-            entry.coord,
-            entry.uploadEnqueueTime,
-            finalizeTime,
-            entry.lodLevel,
-            entry.vramBytes,
-            entry.vertexCount,
-            entry.indexCount,
-            &entry.debugInfo);
-    }
-
-    return totalSwapped;
-}
-
-size_t World::processSoloPendingSwaps(BufferSuballocator* vbAllocator,
-                                       BufferSuballocator* ibAllocator,
-                                       uint64_t deviceTimeline) {
-    if (!vbAllocator || !ibAllocator) return 0;
-
-    // Phase 1 (shared lock): collect entities with solo PendingMeshHandles ready to swap.
-    // batchId == 0 is the solo-edit sentinel set by the NORMAL PATH in processUploads.
-    std::vector<entt::entity> toSwap;
-    {
-        std::shared_lock regLock(m_registryMutex);
-        auto view = m_registry.view<const PendingMeshHandle>();
-        for (auto entity : view) {
-            const auto& pending = view.get<const PendingMeshHandle>(entity);
-            if (pending.batchId == 0 && pending.handle.gpuReadyValue <= deviceTimeline) {
-                toSwap.push_back(entity);
-            }
-        }
-    }
-    if (toSwap.empty()) return 0;
-
-    struct DeferredFree {
-        std::vector<BufferSlice> vbs;
-        std::vector<BufferSlice> ibs;
-        uint32_t gpuCullingSlot{UINT32_MAX};
-    };
-    std::vector<DeferredFree> deferredFrees;
-    deferredFrees.reserve(toSwap.size());
-
-    struct SwapVisualReady {
-        glm::ivec3 coord{0};
-        std::chrono::steady_clock::time_point uploadEnqueueTime{};
-        int lodLevel{0};
-        uint64_t vramBytes{0};
-        uint32_t vertexCount{0};
-        uint32_t indexCount{0};
-        ChunkDebugAttribution debugInfo{};
-    };
-    std::vector<SwapVisualReady> visualReadyEntries;
-    visualReadyEntries.reserve(toSwap.size());
-
-    // Phase 2 (unique lock): swap components, collect old buffer slices for deferred free.
-    size_t swapped = 0;
-    const glm::ivec3 center = m_chunkManager
-        ? m_chunkManager->getCenterChunk()
-        : glm::ivec3(0, 0, 0);
-    {
-        std::unique_lock regLock(m_registryMutex);
-        for (auto entity : toSwap) {
-            if (!m_registry.valid(entity)) continue;
-            if (!m_registry.all_of<PendingMeshHandle>(entity)) continue;
-
-            auto& pending = m_registry.get<PendingMeshHandle>(entity);
-            // Re-validate: a newer upload may have changed batchId or gpuReadyValue.
-            if (pending.batchId != 0 || pending.handle.gpuReadyValue > deviceTimeline) continue;
-
-            if (m_registry.all_of<MeshHandle>(entity)) {
-                auto& oldHandle = m_registry.get<MeshHandle>(entity);
-                meshStatsSub(oldHandle);
-                DeferredFree df;
-                oldHandle.collectBufferSlices(df.vbs, df.ibs);
-                // Normal path typically reuses culling slot. Only free when slot changes.
-                if (oldHandle.gpuCullingSlot != UINT32_MAX &&
-                    oldHandle.gpuCullingSlot != pending.handle.gpuCullingSlot) {
-                    df.gpuCullingSlot = oldHandle.gpuCullingSlot;
-                }
-                deferredFrees.push_back(std::move(df));
-            }
-
-            meshStatsAdd(pending.handle);
-            // Capture visual-ready diagnostics before removing PendingMeshHandle.
-            if (m_registry.all_of<ChunkCoord>(entity)) {
-                SwapVisualReady vr;
-                vr.coord = m_registry.get<ChunkCoord>(entity).toVec3();
-                vr.uploadEnqueueTime = pending.uploadEnqueueTime;
-                vr.lodLevel = m_registry.all_of<Chunk>(entity)
-                    ? m_registry.get<Chunk>(entity).lodLevel
-                    : 0;
-                vr.vramBytes = pending.handle.getTotalVramBytes();
-                vr.vertexCount = pending.handle.getTotalVertexCount();
-                vr.indexCount = pending.handle.getTotalIndexCount();
-                vr.debugInfo = pending.debugInfo;
-                if (vr.debugInfo.uploadBytes == 0) {
-                    vr.debugInfo.uploadBytes = vr.vramBytes;
-                }
-                if (vr.debugInfo.subChunkCount == 0) {
-                    vr.debugInfo.subChunkCount = pending.handle.subChunkCount;
-                }
-                vr.debugInfo.residency = deriveChunkResidencyKind(
-                    /*gpuResident=*/true,
-                    vr.debugInfo.artifactCacheResident,
-                    /*pendingBatch=*/false);
-                visualReadyEntries.push_back(std::move(vr));
-            }
-
-            if (m_registry.all_of<Chunk, ChunkCoord>(entity)) {
-                auto& chunk = m_registry.get<Chunk>(entity);
-                const glm::ivec3 coord = m_registry.get<ChunkCoord>(entity).toVec3();
-                const int lodLevel = chunk.lodLevel;
-                chunk.effectiveDataLod = static_cast<uint8_t>(
-                    std::clamp(getEffectiveLODForChunk(coord, lodLevel), 0, 255));
-
-                const TerrainType chunkType = getTerrainTypeForChunk(coord, lodLevel);
-                if (chunkType == TerrainType::DCCM) {
-                    uint8_t casingMask = 0;
-                    if (m_chunkManager) {
-                        static const glm::ivec3 nOff[4] = {
-                            {-1, 0, 0}, {1, 0, 0}, {0, 0, -1}, {0, 0, 1}
-                        };
-                        for (int e = 0; e < 4; ++e) {
-                            const glm::ivec3 nb = coord + nOff[e];
-                            const int nbRing = m_chunkManager->calculateRingNumber(nb, center);
-                            const int nbLOD = m_chunkManager->calculateLODFromRing(nbRing);
-                            if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM) {
-                                casingMask |= (1 << e);
-                            }
-                        }
-                    }
-                    chunk.casingSeamMask = casingMask;
-                    chunk.voxelSeamMask = 0;
-                } else {
-                    chunk.voxelSeamMask = (lodLevel > 0 && m_chunkManager)
-                        ? m_chunkManager->getSeamEdgeMask(coord, center)
-                        : 0;
-                    chunk.casingSeamMask = 0;
-                }
-            }
-
-            m_registry.emplace_or_replace<MeshHandle>(entity, pending.handle);
-            m_registry.remove<PendingMeshHandle>(entity);
-            ++swapped;
-        }
-    }
-
-    if (swapped > 0) {
-        std::vector<glm::ivec3> changedCoords;
-        changedCoords.reserve(visualReadyEntries.size());
-        size_t shadowAffectingSwaps = 0;
-        for (const auto& entry : visualReadyEntries) {
-            if (entry.debugInfo.affectsShadowGeometry) {
-                ++shadowAffectingSwaps;
-                changedCoords.push_back(entry.coord);
-            }
-        }
-        if (shadowAffectingSwaps == 0) {
-            // Material-only mesh swaps keep the depth/shadow shape identical.
-        } else if (changedCoords.size() == shadowAffectingSwaps) {
-            recordMeshTopologyChanges(changedCoords);
-        } else {
-            recordGlobalMeshTopologyChange();
-        }
-    }
-
-    // Phase 3: retire old resources outside registry lock.
-    {
-        std::vector<uint32_t> cullingSlots;
-        cullingSlots.reserve(deferredFrees.size());
-        uint32_t queuedBufferFrees = 0;
-        for (auto& df : deferredFrees) {
-            const size_t freeCount = std::max(df.vbs.size(), df.ibs.size());
-            for (size_t i = 0; i < freeCount; ++i) {
-                BufferSlice vb = (i < df.vbs.size()) ? df.vbs[i] : BufferSlice{};
-                BufferSlice ib = (i < df.ibs.size()) ? df.ibs[i] : BufferSlice{};
-                if (vb.isValid() || ib.isValid()) {
-                    m_pendingMeshBufferFrees.push_back(PendingMeshBufferFree{vb, ib});
-                    ++queuedBufferFrees;
-                }
-            }
-            if (df.gpuCullingSlot != UINT32_MAX)
-                cullingSlots.push_back(df.gpuCullingSlot);
-        }
-        if (queuedBufferFrees > 0) {
-            m_currentFinalizeDiag.lodSwapFreeQueuedCount += queuedBufferFrees;
-            m_currentFinalizeDiag.lodSwapFreeBacklog =
-                static_cast<uint32_t>(std::min<size_t>(
-                    m_pendingMeshBufferFrees.size(),
-                    static_cast<size_t>(std::numeric_limits<uint32_t>::max())));
-        }
-        if (m_gpuCulling && !cullingSlots.empty())
-            m_gpuCulling->freeSlots(cullingSlots.data(), cullingSlots.size());
-    }
-
-    // Phase 4: emit visual-ready logs (finalize path misses these while pending).
-    if (!visualReadyEntries.empty()) {
-        const auto finalizeTime = std::chrono::steady_clock::now();
-        for (const auto& entry : visualReadyEntries) {
-            noteChunkVisualReady(
-                entry.coord,
-                entry.uploadEnqueueTime,
-                finalizeTime,
-                entry.lodLevel,
-                entry.vramBytes,
-                entry.vertexCount,
-                entry.indexCount,
-                &entry.debugInfo);
-        }
-    }
-
-    return swapped;
-}
-
-void World::updateLODSwitchDiag() {
-    if (!m_lodSwitchDiag.active) return;
-
-    auto now = std::chrono::steady_clock::now();
-    if (m_lodSwitchDiag.completedMs == 0.0f) {
-        m_lodSwitchDiag.elapsedMs = std::chrono::duration<float, std::milli>(now - m_lodSwitchDiag.startTime).count();
-        m_lodSwitchDiag.lastFrameSwapped = m_currentFinalizeDiag.lodSwapEntityCount;
-        m_lodSwitchDiag.chunksSwappedTotal += m_currentFinalizeDiag.lodSwapEntityCount;
-
-        // Pipeline stage snapshot
-        m_lodSwitchDiag.activeBatches = static_cast<uint32_t>(
-            m_chunkManager ? m_chunkManager->getActiveBatchCount() : 0);
-        m_lodSwitchDiag.pendingRemeshes = static_cast<uint32_t>(m_pendingLODRemeshes.size());
-        m_lodSwitchDiag.lodRemeshQueueSize = static_cast<uint32_t>(m_lodSystem.getRemeshQueueSize());
-        m_lodSwitchDiag.uploadQueueSize = m_uploadSystem.getQueueSize();
-        m_lodSwitchDiag.finalizeQueueSize = static_cast<uint32_t>(m_uploadSystem.getFinalizeQueueSize());
-        m_lodSwitchDiag.peakActiveBatches = std::max(
-            m_lodSwitchDiag.peakActiveBatches, m_lodSwitchDiag.activeBatches);
-
-        // Sparkline: record swaps per frame
-        m_lodSwitchDiag.sparkline[m_lodSwitchDiag.sparklineIdx % LODSwitchDiag::SPARKLINE_SIZE] =
-            m_currentFinalizeDiag.lodSwapEntityCount;
-        m_lodSwitchDiag.sparklineIdx++;
-
-        // Mark complete when all batches and pipeline queues are drained
-        if (m_lodSwitchDiag.activeBatches == 0 &&
-            m_lodSwitchDiag.pendingRemeshes == 0 &&
-            m_lodSwitchDiag.lodRemeshQueueSize == 0) {
-            m_lodSwitchDiag.completedMs = m_lodSwitchDiag.elapsedMs;
-        }
-    }
-
-    // Post-completion audit: scan all chunks in the band to find any still stuck
-    if (m_lodSwitchDiag.completedMs > 0.0f && !m_lodSwitchDiag.auditDone) {
-        m_lodSwitchDiag.auditDone = true;
-        m_lodSwitchDiag.auditMs = m_lodSwitchDiag.elapsedMs;
-        uint32_t stuckReady = 0, stuckNotReady = 0;
-        {
-            std::shared_lock regLock(m_registryMutex);
-            auto view = m_registry.view<Chunk, ChunkCoord, ChunkState>();
-            for (auto entity : view) {
-                auto& chunk = view.get<Chunk>(entity);
-                if (chunk.lodLevel != m_lodSwitchDiag.band) continue;
-                const glm::ivec3 coord = view.get<ChunkCoord>(entity).toVec3();
-                if (getTerrainTypeForChunk(coord, m_lodSwitchDiag.band) == TerrainType::DCCM) continue;
-                int desired = getEffectiveLODForChunk(coord, m_lodSwitchDiag.band);
-                if (chunk.effectiveDataLod != static_cast<uint8_t>(std::clamp(desired, 0, 255))) {
-                    auto& state = view.get<ChunkState>(entity);
-                    if (state.state == ChunkState::State::Ready) {
-                        ++stuckReady;
-                    } else {
-                        ++stuckNotReady;
-                    }
-                }
-            }
-        }
-        m_lodSwitchDiag.auditStuckReady = stuckReady;
-        m_lodSwitchDiag.auditStuckNotReady = stuckNotReady;
-        m_lodSwitchDiag.auditStuckChunks = stuckReady + stuckNotReady;
-        if (m_lodSwitchDiag.auditStuckChunks > 0) {
-            std::cout << "[LOD-AUDIT] Band " << m_lodSwitchDiag.band
-                      << " switch reported complete but " << m_lodSwitchDiag.auditStuckChunks
-                      << " chunks stuck (ready=" << stuckReady
-                      << " notReady=" << stuckNotReady << ")" << std::endl;
-        }
-    }
-}
-
-std::string World::formatLODSwitchDiagReport() const {
-    const auto& d = m_lodSwitchDiag;
-    if (!d.active) return "No LOD switch active.\n";
-
-    const char* lodNames[] = { "Full", "1/2", "1/4", "1/8", "1/16" };
-    auto safeName = [&](int idx) { return lodNames[std::clamp(idx, 0, 4)]; };
-
-    std::string r;
-    r.reserve(2048);
-    r += "=== LOD Switch Diagnostics ===\n";
-    r += "Band " + std::to_string(d.band) + ": " + safeName(d.oldDataLOD) + " -> " + safeName(d.newDataLOD) + "\n";
-    r += "Status: " + std::string(d.completedMs > 0.0f ? "COMPLETE" : "IN PROGRESS") + "\n\n";
-
-    // Timing
-    float elapsed = d.completedMs > 0.0f ? d.completedMs : d.elapsedMs;
-    r += "--- Timing ---\n";
-    r += "Setup scan:    " + std::to_string(d.setupMs) + " ms\n";
-    if (elapsed < 1000.0f)
-        r += "Total elapsed: " + std::to_string(elapsed) + " ms\n";
-    else
-        r += "Total elapsed: " + std::to_string(elapsed / 1000.0f) + " s\n";
-
-    // Initial scan
-    r += "\n--- Initial Scan ---\n";
-    r += "Total chunks in band:   " + std::to_string(d.totalChunksInBand) + "\n";
-    r += "Queued for remesh:      " + std::to_string(d.totalChunksQueued) + "\n";
-    r += "Skipped (already OK):   " + std::to_string(d.skippedAlreadyCorrect) + "\n";
-    r += "Skipped (DCCM):         " + std::to_string(d.skippedDCCM) + "\n";
-    r += "Deferred (non-Ready):   " + std::to_string(d.deferredChunks) + "\n";
-    if (d.deferredChunks > 0) {
-        r += "  Loading: " + std::to_string(d.deferredLoading) +
-             "  Meshing: " + std::to_string(d.deferredMeshing) +
-             "  Other: " + std::to_string(d.deferredOther) + "\n";
-    }
-    r += "Cancelled old batches:  " + std::to_string(d.cancelledOldBatches) + "\n";
-    r += "Batches created:        " + std::to_string(d.batchesCreated) + "\n";
-
-    // Progress
-    r += "\n--- Progress ---\n";
-    r += "Chunks swapped: " + std::to_string(d.chunksSwappedTotal) + " / " + std::to_string(d.totalChunksQueued) + "\n";
-    r += "Active batches: " + std::to_string(d.activeBatches) + " (peak " + std::to_string(d.peakActiveBatches) + ")\n";
-    r += "Pending remeshes: " + std::to_string(d.pendingRemeshes) + "\n";
-    r += "LOD remesh queue: " + std::to_string(d.lodRemeshQueueSize) + "\n";
-    r += "Upload queue:     " + std::to_string(d.uploadQueueSize) + "\n";
-    r += "Finalize queue:   " + std::to_string(d.finalizeQueueSize) + "\n";
-
-    r += "\n--- Attribution ---\n";
-    r += "Visual entries:    " + std::to_string(d.readyVisualEntries) + "\n";
-    r += "Uploaded bytes:    " + std::to_string(d.uploadedBytesTotal) + "\n";
-    r += "Artifact builds:   " + std::to_string(d.artifactBuilds) + "\n";
-    r += "Artifact cache:    " + std::to_string(d.artifactCacheHits) + "\n";
-    r += "Precomputed:       " + std::to_string(d.precomputedLoads) + "\n";
-    r += "Collision base:    " + std::to_string(d.collisionBaseCache) + "\n";
-    r += "Collision edit:    " + std::to_string(d.collisionEditPacked) + "\n";
-    r += "Collision refresh: " + std::to_string(d.collisionArtifactRefresh) + "\n";
-    r += "Collision reused:  " + std::to_string(d.collisionExistingEdit) + "\n";
-    r += "GPU resident:      " + std::to_string(d.gpuResidentChunks) + "\n";
-    r += "Artifact resident: " + std::to_string(d.artifactResidentChunks) + "\n";
-    r += "Monolithic work:   " + std::to_string(d.monolithicChunks) + "\n";
-    r += "Paged work:        " + std::to_string(d.pagedChunks) + "\n";
-    r += "Dirty pages:       " + std::to_string(d.dirtyPages) + "\n";
-    r += "Rebuilt pages:     " + std::to_string(d.rebuiltPages) + "\n";
-    r += "Resident pages:    " + std::to_string(d.residentPages) + "\n";
-    r += "Evicted pages:     " + std::to_string(d.evictedPages) + "\n";
-
-    // Errors
-    uint32_t totalErr = d.errTotalFromSwaps + d.errFilteredByDrain;
-    r += "\n--- Errors ---\n";
-    r += "Total errors:          " + std::to_string(totalErr) + "\n";
-    if (d.errInvalidEntities > 0)
-        r += "  Invalid entities:    " + std::to_string(d.errInvalidEntities) + "\n";
-    if (d.errMissingPending > 0)
-        r += "  Missing pending:     " + std::to_string(d.errMissingPending) + "\n";
-    if (d.errMismatchedBatch > 0)
-        r += "  Mismatched batch:    " + std::to_string(d.errMismatchedBatch) + "\n";
-    if (d.errFilteredByDrain > 0)
-        r += "  Filtered by drain:   " + std::to_string(d.errFilteredByDrain) + "\n";
-
-    // Audit
-    if (d.auditDone) {
-        r += "\n--- Post-Completion Audit ---\n";
-        r += "Audit at: " + std::to_string(d.auditMs) + " ms\n";
-        r += "Stuck chunks: " + std::to_string(d.auditStuckChunks) + "\n";
-        if (d.auditStuckChunks > 0) {
-            r += "  Ready (should have been caught): " + std::to_string(d.auditStuckReady) + "\n";
-            r += "  Not-Ready (still in pipeline):   " + std::to_string(d.auditStuckNotReady) + "\n";
-        }
-    }
-
-    return r;
-}
-
-````
-
-## MISSING: src/world/WorldLODTransitions.h
-
-
-## src\world\WorldUpdateLODScan.cpp
-
-Description: No CC-DESC found. C++ struct 'PendingLODInfo'.
-
-````cpp
-#include "world/World.h"
-#include "world/chunks/core/Chunk.h"
-#include "world/config/WorldConfig.h"
 #include "world/ChunkHoleTracker.h"
-#include <iostream>
-#include <algorithm>
-#include <cmath>
-#include <unordered_map>
-#include <unordered_set>
-
-// updateLODTransitions() — extracted from updateChunkLoader()
-// LOD mismatch scan + eager LOD remesh drain.
-
-void World::updateLODTransitions(float deltaTime, bool centerChanged) {
-    // ---------------------------------------------------------------
-    // LOD TRANSITION DETECTION (runs in World, not ChunkManager)
-    //
-    // On center change:
-    //   1. Cancel all in-flight LOD batches (stale transitions)
-    //   2. Clean up orphaned PendingMeshHandles (free GPU resources)
-    //   3. Scan ALL Ready chunks: compare chunk.lodLevel (actual mesh LOD)
-    //      vs desired LOD from ring position.  Queue mismatches.
-    //   4. Sort closest-first for visual priority.
-    //
-    // Every frame: drain the queue as fast as the rest of the pipeline allows.
-    //
-    // KEY INVARIANT: chunk.lodLevel is ONLY updated when the new mesh
-    // is actually swapped in (processLODSwaps), never when enqueued.
-    // This ensures the scan always sees the TRUE mesh LOD.
-    // ---------------------------------------------------------------
-    if (centerChanged) {
-        // Do NOT cancel LOD batches or clear the remesh queue on center change.
-        // Slider/UI-triggered LOD batches (from applyLODChangesIncrementally)
-        // must survive movement — they represent deliberate user changes.
-        // The version system + desiredLOD checks in updateMeshingSystem handle
-        // stale jobs gracefully: if a batch's targetLOD no longer matches the
-        // desired LOD (because the center moved), the entity is signaled and
-        // dropped, and the next LOD scan re-queues it with the correct target.
-
-        // Rate-limited diagnostic log (once per second)
-        static float s_lodDiagTimer = 0.0f;
-        s_lodDiagTimer += deltaTime;
-        if (s_lodDiagTimer >= 1.0f) {
-            s_lodDiagTimer = 0.0f;
-            int effDist = m_chunkManager->getEffectiveRenderDistance();
-            int baseDist = m_chunkManager->getRenderDistanceRings();
-            int extRings = m_chunkManager->getExtensionRings();
-            size_t lodQueueSize = m_lodSystem.getRemeshQueueSize();
-            size_t pendingRemeshes = m_pendingLODRemeshes.size();
-            std::cout << "[World] Center-change LOD: effectiveDist=" << effDist
-                      << " (base=" << baseDist << " + ext=" << extRings << ")"
-                      << ", lodQueue=" << lodQueueSize
-                      << ", pendingRemeshes=" << pendingRemeshes
-                      << ", bufPressure=" << (m_chunkManager->hasBufferPressure() ? "YES" : "no")
-                      << std::endl;
-        }
-    }
-    
-    // LOD mismatch scan: runs on center change AND periodically (every
-    // LOD_SCAN_INTERVAL frames) to catch chunks that reached Ready state
-    // after the last scan.  Instead of clearing the queue, we MERGE new
-    // mismatches so far-away chunks aren't perpetually evicted.
-    // During burst recovery, scan every frame to catch chunks that
-    // reach Ready state after a large teleport.
-    static constexpr size_t LOD_SCAN_INTERVAL = 60;
-    m_lodScanCounter++;
-    bool runLodScan = centerChanged || (m_lodScanCounter >= LOD_SCAN_INTERVAL)
-                      || (m_burstRecoveryFrames > 0);
-
-    // Tick down burst recovery counter (after using it for this frame's decisions)
-    if (m_burstRecoveryFrames > 0) {
-        m_burstRecoveryFrames--;
-    }
-    
-    if (runLodScan) {
-        m_lodScanCounter = 0;
-        glm::ivec3 newCenter = m_chunkManager->getCenterChunk();
-
-        // Build a map of pending entries for O(1) update/remove.
-        // Key = coord, Value = {desired LOD, isCasingUpdate}.
-        struct PendingLODInfo {
-            int newLOD{0};
-            bool isCasingUpdate{false};
-        };
-        std::unordered_map<glm::ivec3, PendingLODInfo, IVec3Hash> pendingMap;
-        pendingMap.reserve(m_pendingLODRemeshes.size());
-
-        auto lodThresholds = m_chunkManager->getLODThresholdRings();
-
-        // Helper: compute DCCM casing mask for a position relative to a center
-        auto computeDCCMCasingMask = [&](const glm::ivec3& pos,
-                                         const glm::ivec3& center) -> uint8_t {
-            static const glm::ivec3 nOff[4] = {{-1,0,0},{1,0,0},{0,0,-1},{0,0,1}};
-            uint8_t mask = 0;
-            for (int e = 0; e < 4; ++e) {
-                glm::ivec3 nb = pos + nOff[e];
-                int nbRing = m_chunkManager->calculateRingNumber(nb, center);
-                int nbLOD  = m_chunkManager->calculateLODFromRing(nbRing);
-                if (getTerrainTypeForChunk(nb, nbLOD) != TerrainType::DCCM)
-                    mask |= (1 << e);
-            }
-            return mask;
-        };
-
-        auto computeVoxelSeamMask = [&](const glm::ivec3& pos,
-                                        const glm::ivec3& center,
-                                        int lodLevel) -> uint8_t {
-            if (!m_chunkManager || lodLevel <= 0) return 0;
-            return m_chunkManager->getSeamEdgeMask(pos, center);
-        };
-
-        std::unordered_set<entt::entity> scanInFlightSet;
-        auto addAllInFlightEntities = [&]() {
-            std::scoped_lock vLock(m_chunkVersionMutex);
-            scanInFlightSet.reserve(m_chunkVersionStates.size());
-            for (const auto& [ent, vs] : m_chunkVersionStates) {
-                if (vs && vs->inFlight.load(std::memory_order_acquire)) {
-                    scanInFlightSet.insert(ent);
-                }
-            }
-        };
-        auto addCandidateInFlightEntities = [&](const std::vector<entt::entity>& entities) {
-            if (entities.empty()) return;
-            scanInFlightSet.reserve(entities.size());
-            std::scoped_lock vLock(m_chunkVersionMutex);
-            for (entt::entity ent : entities) {
-                auto it = m_chunkVersionStates.find(ent);
-                if (it != m_chunkVersionStates.end() && it->second &&
-                    it->second->inFlight.load(std::memory_order_acquire)) {
-                    scanInFlightSet.insert(ent);
-                }
-            }
-        };
-
-        if (centerChanged) {
-            // Center-change LOD scan: enumerate only the square-band cells
-            // whose classification can actually change.  For each true LOD
-            // boundary T, the changed set is the symmetric difference of the
-            // old/new Chebyshev squares of radius T, expanded by one cell so
-            // same-LOD seam/casing removals on the former boundary are seen.
-            glm::ivec3 prevCenter = m_chunkManager->getPreviousCenter();
-            int moveDist = std::max(std::abs(newCenter.x - prevCenter.x),
-                                    std::abs(newCenter.z - prevCenter.z));
-            int effectiveDist = m_chunkManager->getEffectiveRenderDistance();
-
-            // Lambda to check one coordinate position for LOD mismatch.
-            auto checkPos = [&](const glm::ivec3& pos) {
-                const int ring = m_chunkManager->calculateRingNumber(pos, newCenter);
-                if (ring >= effectiveDist) return;
-
-                auto entityIt = m_chunkEntityMap.find(pos);
-                if (entityIt == m_chunkEntityMap.end()) return;
-                entt::entity entity = entityIt->second;
-
-                if (!m_registry.valid(entity)) return;
-                if (!m_registry.all_of<Chunk, ChunkState>(entity)) return;
-                if (m_registry.get<ChunkState>(entity).state != ChunkState::State::Ready) return;
-
-                // Skip chunks whose new mesh is already uploaded and waiting for batch swap.
-                // Re-detecting them would create a duplicate batch that overwrites batch info,
-                // causing VersionMismatchDrop cascades and mismatched-batch errors.
-                if (m_registry.all_of<PendingMeshHandle>(entity)) return;
-
-                // Skip entities whose remesh pipeline is in-flight or queued.
-                if (scanInFlightSet.count(entity)) return;
-                if (m_lodSystem.isPending(entity)) return;
-
-                auto& chunk = m_registry.get<Chunk>(entity);
-                int desiredLOD = m_chunkManager->calculateLODFromRing(ring);
-                int currentLOD = chunk.lodLevel;
-
-                if (currentLOD != desiredLOD) {
-                    pendingMap[pos] = {desiredLOD, false};
-                } else {
-                    const int desiredEffectiveDataLod = getEffectiveLODForChunk(pos, currentLOD);
-                    if (chunk.effectiveDataLod != desiredEffectiveDataLod) {
-                        // During an active data-LOD switch, setDataLODForBand already
-                        // queued all chunks in this band.  Re-detecting them fills
-                        // m_pendingLODRemeshes with redundant entries that the drain
-                        // converts into duplicate batches — overwriting batch info,
-                        // causing VersionMismatchDrop and mismatched-batch errors.
-                        if (m_lodSwitchDiag.active && m_lodSwitchDiag.completedMs == 0.0f &&
-                            currentLOD == m_lodSwitchDiag.band) {
-                            return;
-                        }
-                        pendingMap[pos] = {currentLOD, false};
-                        return;
-                    }
-
-                    // LOD matches — check if seam/casing topology changed
-                    TerrainType thisType = getTerrainTypeForChunk(pos, currentLOD);
-                    if (thisType == TerrainType::DCCM) {
-                        uint8_t newMask = computeDCCMCasingMask(pos, newCenter);
-                        if (newMask != chunk.casingSeamMask) {
-                            pendingMap[pos] = {currentLOD, true};
-                        } else {
-                            pendingMap.erase(pos);
-                        }
-                    } else {
-                        uint8_t newMask = computeVoxelSeamMask(pos, newCenter, currentLOD);
-                        if (newMask != chunk.voxelSeamMask) {
-                            pendingMap[pos] = {currentLOD, true};
-                        } else {
-                            pendingMap.erase(pos);
-                        }
-                    }
-                }
-            };
-
-            struct Rect {
-                int minX;
-                int maxX;
-                int minZ;
-                int maxZ;
-            };
-
-            std::vector<glm::ivec3> candidates;
-            candidates.reserve(std::max<size_t>(128, lodThresholds.size() *
-                static_cast<size_t>(std::max(1, moveDist + 2)) * 256u));
-
-            auto addRect = [&](int minX, int maxX, int minZ, int maxZ, int expand) {
-                if (minX > maxX || minZ > maxZ) return;
-                minX -= expand;
-                maxX += expand;
-                minZ -= expand;
-                maxZ += expand;
-                for (int z = minZ; z <= maxZ; ++z) {
-                    for (int x = minX; x <= maxX; ++x) {
-                        candidates.push_back(glm::ivec3{x, 0, z});
-                    }
-                }
-            };
-
-            auto addRectDifference = [&](const Rect& a, const Rect& b, int expand) {
-                addRect(a.minX, std::min(a.maxX, b.minX - 1), a.minZ, a.maxZ, expand);
-                addRect(std::max(a.minX, b.maxX + 1), a.maxX, a.minZ, a.maxZ, expand);
-
-                const int overlapMinX = std::max(a.minX, b.minX);
-                const int overlapMaxX = std::min(a.maxX, b.maxX);
-                if (overlapMinX > overlapMaxX) return;
-
-                addRect(overlapMinX, overlapMaxX, a.minZ, std::min(a.maxZ, b.minZ - 1), expand);
-                addRect(overlapMinX, overlapMaxX, std::max(a.minZ, b.maxZ + 1), a.maxZ, expand);
-            };
-
-            auto addThresholdCandidates = [&](int threshold) {
-                if (threshold < 0 || threshold >= effectiveDist) return;
-                if (m_chunkManager->calculateLODFromRing(threshold) ==
-                    m_chunkManager->calculateLODFromRing(threshold + 1)) {
-                    return;
-                }
-
-                Rect oldRect{
-                    prevCenter.x - threshold,
-                    prevCenter.x + threshold,
-                    prevCenter.z - threshold,
-                    prevCenter.z + threshold
-                };
-                Rect newRect{
-                    newCenter.x - threshold,
-                    newCenter.x + threshold,
-                    newCenter.z - threshold,
-                    newCenter.z + threshold
-                };
-
-                addRectDifference(oldRect, newRect, 1);
-                addRectDifference(newRect, oldRect, 1);
-            };
-
-            for (int threshold : lodThresholds) {
-                addThresholdCandidates(threshold);
-            }
-
-            // Preserve already-deferred work, but re-validate it below so stale
-            // center-change entries don't keep cycling through the queue.
-            for (const auto& req : m_pendingLODRemeshes) {
-                candidates.push_back(req.coord);
-            }
-
-            std::sort(candidates.begin(), candidates.end(),
-                [](const glm::ivec3& a, const glm::ivec3& b) {
-                    if (a.x != b.x) return a.x < b.x;
-                    if (a.z != b.z) return a.z < b.z;
-                    return a.y < b.y;
-                });
-            candidates.erase(
-                std::unique(candidates.begin(), candidates.end(),
-                    [](const glm::ivec3& a, const glm::ivec3& b) {
-                        return a.x == b.x && a.y == b.y && a.z == b.z;
-                    }),
-                candidates.end());
-
-            // Build the in-flight snapshot only for differential candidates.
-            // A center change usually touches a few boundary strips; scanning
-            // every version state here was pure overhead during movement.
-            std::vector<entt::entity> candidateEntities;
-            candidateEntities.reserve(candidates.size());
-            {
-                std::shared_lock regLock(m_registryMutex);
-                for (const glm::ivec3& pos : candidates) {
-                    auto entityIt = m_chunkEntityMap.find(pos);
-                    if (entityIt != m_chunkEntityMap.end()) {
-                        candidateEntities.push_back(entityIt->second);
-                    }
-                }
-            }
-            addCandidateInFlightEntities(candidateEntities);
-
-            {
-                std::shared_lock csLock(m_chunkStateMutex);
-                std::shared_lock regLock(m_registryMutex);
-                for (const glm::ivec3& pos : candidates) {
-                    checkPos(pos);
-                }
-            }
-        } else {
-            // Full periodic scan: build a full in-flight snapshot once, then
-            // do O(1) membership checks while walking the ECS view.
-            addAllInFlightEntities();
-
-            for (const auto& req : m_pendingLODRemeshes)
-                pendingMap[req.coord] = {req.newLOD, req.isCasingUpdate};
-
-            // Periodic scan (every LOD_SCAN_INTERVAL frames): iterate full ECS view
-            // as TRUE catch-all for any mismatches missed by the differential scan.
-            // This must check ALL chunks, not just near-boundary ones, to catch
-            // interior chunks that have wrong LOD after ring allocation changes.
-
-            // Storm detection: log when a chunk keeps getting re-queued with the same mismatch
-            static std::unordered_map<glm::ivec3, uint32_t, IVec3Hash> s_remeshStormCounts;
-
-            {
-                std::shared_lock regLock(m_registryMutex);
-                auto view = m_registry.view<ChunkCoord, Chunk, ChunkState>();
-                for (auto entity : view) {
-                    auto& state = view.get<ChunkState>(entity);
-                    if (state.state != ChunkState::State::Ready) continue;
-
-                    // Skip chunks whose new mesh is already uploaded and waiting for batch swap.
-                    if (m_registry.all_of<PendingMeshHandle>(entity)) continue;
-
-                    // Skip entities whose remesh pipeline is in-flight or queued.
-                    if (scanInFlightSet.count(entity)) continue;
-                    if (m_lodSystem.isPending(entity)) continue;
-
-                    auto& coord = view.get<ChunkCoord>(entity);
-                    glm::ivec3 cv = coord.toVec3();
-                    int newRing = m_chunkManager->calculateRingNumber(cv, newCenter);
-
-                    auto& chunk = view.get<Chunk>(entity);
-                    int desiredLOD = m_chunkManager->calculateLODFromRing(newRing);
-
-                    if (chunk.lodLevel != desiredLOD) {
-                        pendingMap[cv] = {desiredLOD, false};
-                        if (++s_remeshStormCounts[cv] == 5) {
-                            std::cout << "[LOD-STORM] (" << cv.x << "," << cv.y << "," << cv.z << ")"
-                                      << " lodMismatch current=" << chunk.lodLevel
-                                      << " desired=" << desiredLOD << std::endl;
-                        }
-                    } else {
-                        const int desiredEffectiveDataLod = getEffectiveLODForChunk(cv, chunk.lodLevel);
-                        if (chunk.effectiveDataLod != desiredEffectiveDataLod) {
-                            // Suppress during active data-LOD switch (see center-change path).
-                            if (m_lodSwitchDiag.active && m_lodSwitchDiag.completedMs == 0.0f &&
-                                chunk.lodLevel == m_lodSwitchDiag.band) {
-                                continue;
-                            }
-                            pendingMap[cv] = {chunk.lodLevel, false};
-                            if (++s_remeshStormCounts[cv] == 5) {
-                                std::cout << "[LOD-STORM] (" << cv.x << "," << cv.y << "," << cv.z << ")"
-                                          << " dataLodMismatch current=" << (int)chunk.effectiveDataLod
-                                          << " desired=" << desiredEffectiveDataLod
-                                          << " lod=" << chunk.lodLevel << std::endl;
-                            }
-                            continue;
-                        }
-
-                        // LOD matches — check if seam/casing topology changed
-                        TerrainType thisType = getTerrainTypeForChunk(cv, chunk.lodLevel);
-                        if (thisType == TerrainType::DCCM) {
-                            uint8_t newMask = computeDCCMCasingMask(cv, newCenter);
-                            if (newMask != chunk.casingSeamMask) {
-                                pendingMap[cv] = {chunk.lodLevel, true};
-                                if (++s_remeshStormCounts[cv] == 5) {
-                                    std::cout << "[LOD-STORM] (" << cv.x << "," << cv.y << "," << cv.z << ")"
-                                              << " casingMismatch chunk=" << (int)chunk.casingSeamMask
-                                              << " computed=" << (int)newMask
-                                              << " lod=" << chunk.lodLevel << std::endl;
-                                }
-                            } else {
-                                pendingMap.erase(cv);
-                                s_remeshStormCounts.erase(cv);
-                            }
-                        } else {
-                            uint8_t newMask = computeVoxelSeamMask(cv, newCenter, chunk.lodLevel);
-                            if (newMask != chunk.voxelSeamMask) {
-                                pendingMap[cv] = {chunk.lodLevel, true};
-                                if (++s_remeshStormCounts[cv] == 5) {
-                                    std::cout << "[LOD-STORM] (" << cv.x << "," << cv.y << "," << cv.z << ")"
-                                              << " voxelSeamMismatch chunk=" << (int)chunk.voxelSeamMask
-                                              << " computed=" << (int)newMask
-                                              << " lod=" << chunk.lodLevel << std::endl;
-                                }
-                            } else {
-                                pendingMap.erase(cv);
-                                s_remeshStormCounts.erase(cv);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Rebuild vector from map
-        m_pendingLODRemeshes.clear();
-        m_pendingLODRemeshes.reserve(pendingMap.size());
-        for (const auto& [cv, info] : pendingMap)
-            m_pendingLODRemeshes.push_back({cv, info.newLOD, info.isCasingUpdate});
-
-        // Keep nearest work at the back so the per-frame drain can pop without
-        // shifting the remaining queue.
-        glm::ivec3 center = newCenter;
-        std::sort(m_pendingLODRemeshes.begin(), m_pendingLODRemeshes.end(),
-                  [&center](const ChunkManager::ChunkRemeshRequest& a,
-                            const ChunkManager::ChunkRemeshRequest& b) {
-                      int da = std::max(std::abs(a.coord.x - center.x),
-                                        std::abs(a.coord.z - center.z));
-                      int db = std::max(std::abs(b.coord.x - center.x),
-                                        std::abs(b.coord.z - center.z));
-                      return da > db;
-                  });
-
-        // Periodic LOD health diagnostic (rate-limited to once per second)
-        static float s_lodHealthTimer = 0.0f;
-        s_lodHealthTimer += deltaTime;
-        if (s_lodHealthTimer >= 1.0f) {
-            s_lodHealthTimer = 0.0f;
-            size_t lodQueueSize = m_lodSystem.getRemeshQueueSize();
-            if (!m_pendingLODRemeshes.empty() || lodQueueSize > 0) {
-                std::cout << "[LOD-diag] pendingRemeshes=" << m_pendingLODRemeshes.size()
-                          << " lodQueue=" << lodQueueSize
-                          << " activeBatches=" << m_chunkManager->getActiveBatchCount()
-                          << std::endl;
-            }
-        }
-    }
-    
-    // --- Drain pending LOD remesh queue ---
-    // Process the whole queue so movement doesn't leave remesh work parked
-    // behind arbitrary per-frame caps.
-    // Each drained chunk: resolve entity, verify still needs remesh,
-    // create batch, enqueue meshing job with targetLOD in batch info.
-    // chunk.lodLevel is NOT updated here — only in processLODSwaps.
-    {
-        size_t budget = m_pendingLODRemeshes.size();
-        if (budget > 0) {
-            // Extract this frame's nearest work from the back of the queue.
-            std::vector<ChunkManager::ChunkRemeshRequest> frameBatch;
-            frameBatch.reserve(budget);
-            for (size_t i = 0; i < budget; ++i) {
-                frameBatch.push_back(m_pendingLODRemeshes.back());
-                m_pendingLODRemeshes.pop_back();
-            }
-            
-            // Resolve entities and filter stale/no-op entries
-            struct ResolvedRemesh {
-                entt::entity entity;
-                glm::ivec3   coord;
-                int          newLOD;
-                bool         isCasingUpdate{false};
-            };
-            std::vector<ResolvedRemesh> resolved;
-            resolved.reserve(frameBatch.size());
-            {
-                std::shared_lock csLock(m_chunkStateMutex);
-                for (const auto& req : frameBatch) {
-                    auto it = m_chunkEntityMap.find(req.coord);
-                    if (it != m_chunkEntityMap.end())
-                        resolved.push_back({it->second, req.coord, req.newLOD, req.isCasingUpdate});
-                }
-            }
-
-            // Filter: skip entities that are gone or already at desired state.
-            // Same-LOD topology updates (voxel seam mask / DCCM casing mask)
-            // bypass the LOD equality check.
-            {
-                std::shared_lock regLock(m_registryMutex);
-                resolved.erase(
-                    std::remove_if(resolved.begin(), resolved.end(),
-                        [this](const ResolvedRemesh& r) {
-                            if (!m_registry.valid(r.entity) || !m_registry.all_of<Chunk>(r.entity))
-                                return true;
-                            // Skip entities whose new mesh is already waiting for batch swap.
-                            // Creating another batch would overwrite batch info, causing
-                            // mismatched-batch errors in processLODSwaps.
-                            if (m_registry.all_of<PendingMeshHandle>(r.entity))
-                                return true;
-                            if (r.isCasingUpdate) return false; // Always process casing updates
-                            auto& chunk = m_registry.get<Chunk>(r.entity);
-                            if (chunk.lodLevel != r.newLOD) return false; // LOD mismatch — needs remesh
-                            // LOD level matches — also check effectiveDataLod.
-                            // Data LOD switches keep lodLevel the same but change
-                            // the effective data LOD. Without this check, chunks
-                            // detected by the periodic scan as data-LOD-mismatched
-                            // were silently discarded here.
-                            int desiredDataLod = getEffectiveLODForChunk(r.coord, r.newLOD);
-                            return chunk.effectiveDataLod == static_cast<uint8_t>(
-                                std::clamp(desiredDataLod, 0, 255));
-                        }),
-                    resolved.end());
-            }
-
-            // Filter entities whose remesh pipeline is already in-flight.
-            // Without this, the drain creates duplicate batches that overwrite
-            // existing batch info via enqueueLODRemesh, causing version-mismatch
-            // cascades (upload version differs from bumped version) and
-            // mismatched-batch errors in processLODSwaps.
-            {
-                std::scoped_lock versionLock(m_chunkVersionMutex);
-                resolved.erase(
-                    std::remove_if(resolved.begin(), resolved.end(),
-                        [this](const ResolvedRemesh& r) {
-                            auto it = m_chunkVersionStates.find(r.entity);
-                            return it != m_chunkVersionStates.end() && it->second &&
-                                   it->second->inFlight.load(std::memory_order_acquire);
-                        }),
-                    resolved.end());
-            }
-
-            // Filter entities still queued for remesh (not yet dispatched).
-            // isPending is true between enqueueLODRemesh and dispatch in
-            // updateMeshingSystem — these entities' batches are already correct.
-            resolved.erase(
-                std::remove_if(resolved.begin(), resolved.end(),
-                    [this](const ResolvedRemesh& r) {
-                        return m_lodSystem.isPending(r.entity);
-                    }),
-                resolved.end());
-            
-            // Group by target LOD and create batches
-            if (!resolved.empty()) {
-                std::unordered_map<int, std::vector<ResolvedRemesh*>> lodGroups;
-                for (auto& r : resolved)
-                    lodGroups[r.newLOD].push_back(&r);
-                
-                for (auto& [targetLOD, group] : lodGroups) {
-                    static constexpr size_t MAX_LOD_BATCH_SIZE = 128;
-
-                    for (size_t batchStart = 0; batchStart < group.size(); batchStart += MAX_LOD_BATCH_SIZE) {
-                        const size_t batchEnd = std::min(batchStart + MAX_LOD_BATCH_SIZE, group.size());
-
-                        std::vector<entt::entity> batchEntities;
-                        batchEntities.reserve(batchEnd - batchStart);
-                        for (size_t i = batchStart; i < batchEnd; ++i) {
-                            batchEntities.push_back(group[i]->entity);
-                        }
-
-                        uint32_t batchId = m_chunkManager->createLODTransitionBatch(targetLOD, batchEntities);
-
-                        for (size_t i = batchStart; i < batchEnd; ++i) {
-                            auto* r = group[i];
-                            // Do not bump version here. If a mesh job is in-flight, let it finish;
-                            // updateMeshingSystem will schedule the remesh once inFlight clears.
-                            m_lodSystem.setDesiredLOD(r->coord, targetLOD);
-                            // Pass targetLOD through batch info — NOT via chunk.lodLevel.
-                            // If the entity was already pending with a different batch,
-                            // signal the old batch so it doesn't get permanently stuck.
-                            uint32_t oldBatchId = m_lodSystem.enqueueLODRemesh(r->entity, true, batchId, targetLOD);
-                            if (oldBatchId != 0 && m_chunkManager->isBatchActive(oldBatchId)) {
-                                m_chunkManager->signalBatchChunkReady(oldBatchId);
-                            }
-
-                            // ChunkHole tracking: record LOD remesh enqueue
-                            {
-                                ChunkHoleEvent ev{};
-                                ev.type = ChunkHoleEvent::Type::LODRemeshEnqueued;
-                                ev.timestampSec = ChunkHoleEvent::nowSec();
-                                ev.toLOD = targetLOD;
-                                ev.batchId = batchId;
-                                m_chunkHoleTracker.recordEvent(r->coord, std::move(ev));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-````
-
-## src\world\World.cpp
-
-Description: No CC-DESC found.
-
-````cpp
-#include "world/World.h"
-#include "ui/InGameDebug.h"
-#include "world/chunks/core/Chunk.h"
-#include "world/config/WorldConfig.h"
 #include "world/config/MapConfig.h"
-#include "world/chunks/core/ChunkJobs.h"
-#include "physics/PhysicsWorld.h"
-#include <Jolt/Jolt.h>
-#include <Jolt/Physics/Body/BodyID.h>
-#include "vulkan/BufferSuballocator.h"
-#include "vulkan/UploadArena.h"
-#include "rendering/common/VulkanHelpers.h"
-#include "rendering/culling/GPUCullingSystem.h"
-#include <iostream>
+#include "world/edit/TerrainEditTypes.h"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
-#include <chrono>
-#include <thread>
-#include <condition_variable>
-#include <limits>
-#include <iomanip>
-#include <sstream>
-#include <filesystem>
+#include <cstdlib>
 #include <ctime>
-#include <glm/gtc/matrix_transform.hpp>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
 
-void World::meshStatsAdd(const MeshHandle& h) {
-    if (h.subChunkCount > 0) {
-        m_statsChunksWithMesh.fetch_add(1, std::memory_order_relaxed);
-        m_statsTotalSubChunks.fetch_add(h.subChunkCount, std::memory_order_relaxed);
-        if (h.mainSubChunkCount > 1)
-            m_statsSplitChunks.fetch_add(1, std::memory_order_relaxed);
-        if (h.subChunkCount > h.mainSubChunkCount)
-            m_statsSeamSubChunks.fetch_add(h.subChunkCount - h.mainSubChunkCount, std::memory_order_relaxed);
+namespace {
+
+std::string makeTimestampString(const char* format) {
+    std::time_t now = std::time(nullptr);
+    std::tm tmBuf{};
+#ifdef _WIN32
+    localtime_s(&tmBuf, &now);
+#else
+    localtime_r(&now, &tmBuf);
+#endif
+    char buffer[64];
+    if (std::strftime(buffer, sizeof(buffer), format, &tmBuf) == 0) {
+        return "unknown";
     }
+    return buffer;
 }
 
-void World::meshStatsSub(const MeshHandle& h) {
-    if (h.subChunkCount > 0) {
-        m_statsChunksWithMesh.fetch_sub(1, std::memory_order_relaxed);
-        m_statsTotalSubChunks.fetch_sub(h.subChunkCount, std::memory_order_relaxed);
-        if (h.mainSubChunkCount > 1)
-            m_statsSplitChunks.fetch_sub(1, std::memory_order_relaxed);
-        if (h.subChunkCount > h.mainSubChunkCount)
-            m_statsSeamSubChunks.fetch_sub(h.subChunkCount - h.mainSubChunkCount, std::memory_order_relaxed);
+std::string sanitizeSnapshotId(const std::string& input) {
+    std::string result;
+    result.reserve(input.size());
+
+    for (char ch : input) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::isalnum(uch)) {
+            result.push_back(static_cast<char>(std::tolower(uch)));
+        } else if (ch == ' ' || ch == '-' || ch == '_') {
+            result.push_back('_');
+        }
     }
+
+    while (!result.empty() && result.front() == '_') {
+        result.erase(result.begin());
+    }
+    while (!result.empty() && result.back() == '_') {
+        result.pop_back();
+    }
+
+    if (result.empty()) {
+        result = "snapshot_" + makeTimestampString("%Y%m%d_%H%M%S");
+    }
+
+    return result;
 }
 
-World::World()
-    : m_chunkManager(std::make_unique<ChunkManager>())
+std::string trim(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        ++start;
+    }
+
+    size_t end = value.size();
+    while (end > start &&
+           std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+        --end;
+    }
+
+    return value.substr(start, end - start);
+}
+
+TerrainEdit::TerrainEditOverlayStore::ChunkSet expandRuntimeVoxelChunkShell(
+    const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunks)
 {
-    std::cout << "[World] Initialized with full terrain system" << std::endl;
-    
-    // Initialize subsystems with chunk manager reference
-    m_lodSystem.setChunkManager(m_chunkManager.get());
-    
-    // Set up debug overlay with World pointer
-    m_inGameDebug = std::make_unique<InGameDebug>();
-    m_inGameDebug->setWorld(this);
-
-    // Wire the new editable terrain foundation.
-    // Load the heightmap CSV as the base terrain field, then layer the sparse
-    // overlay on top for runtime edits.
-    m_terrainFieldSource.setOverlay(&m_terrainEditOverlay);
-    m_terrainFieldSource.setTextureMaterialStore(&m_textureMaterialStore);
-
-    {
-        std::string heightmapPath = MapConfig::getHeightmapPath();
-        if (m_heightmapSampler.load(heightmapPath)) {
-            m_terrainFieldSource.setBaseSampler(m_heightmapSampler.makeSamplerFunc());
-            std::cout << "[World] Heightmap base sampler wired ("
-                      << m_heightmapSampler.getMapWidth() << "x"
-                      << m_heightmapSampler.getMapHeight() << ")\n";
-        } else {
-            // No 2D heightmap — try 3D voxel base (worlds with overhangs / floating islands).
-            const std::string voxelBasePath = MapConfig::getBaseVoxelsBinPath();
-            if (m_voxelBaseSampler.load(voxelBasePath)) {
-                m_terrainFieldSource.setBaseSampler(m_voxelBaseSampler.makeSamplerFunc());
-                std::cout << "[World] 3D voxel base sampler wired (base_voxels.bin)\n";
-            } else {
-                std::cout << "[World] WARNING: No base terrain loaded"
-                             " — terrain edits will have no base data\n";
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet expanded = chunks;
+    for (const auto& chunk : chunks) {
+        // Horizontal 8-neighbor shell closes corner-intersection gaps.
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dz == 0) {
+                    continue;
+                }
+                expanded.insert(chunk + glm::ivec3(dx, 0, dz));
             }
         }
+        // Keep vertical face-neighbors for stacked chunk transitions.
+        expanded.insert(chunk + glm::ivec3(0, -1, 0));
+        expanded.insert(chunk + glm::ivec3(0,  1, 0));
     }
-    
-    // Initialize terrain file loader using MapConfig (flat maps/ directory)
-    std::string terrainFilePath = MapConfig::getTerrainBinPath();
-    std::string dccmTerrainFilePath = MapConfig::getDCCMTerrainBinPath();
-    std::string collisionFilePath = MapConfig::getCollisionPath();
-    m_baseTerrainPath = terrainFilePath;
-    m_baseCollisionPath = collisionFilePath;
-    m_snapshotRootDir = MapConfig::getMapsBasePath().string();
-    
-    std::cout << "[World] Loading terrain from maps/" << std::endl;
-    std::cout << "[World] Terrain (voxel): " << terrainFilePath << std::endl;
-    std::cout << "[World] Terrain (DCCM):  " << dccmTerrainFilePath << std::endl;
-    std::cout << "[World] Collision: " << collisionFilePath << std::endl;
-    
-    m_terrainLoader = std::make_unique<TerrainFileLoader>(terrainFilePath);
-    
-    // Load DCCM terrain file if it exists
-    if (MapConfig::dccmMapExists()) {
-        m_dccmTerrainLoader = std::make_unique<TerrainFileLoader>(dccmTerrainFilePath);
-        if (m_dccmTerrainLoader->isLoaded()) {
-            std::cout << "[World] DCCM terrain loaded successfully" << std::endl;
-        } else {
-            std::cout << "[World] DCCM terrain file exists but failed to load" << std::endl;
-            m_dccmTerrainLoader.reset();
+
+    return expanded;
+}
+
+TerrainEdit::TerrainEditOverlayStore::ChunkSet collectEditAffectedChunks(
+    const TerrainEdit::GridCoord& a,
+    const TerrainEdit::GridCoord& b)
+{
+    TerrainEdit::GridCoord minCoord(
+        std::min(a.x, b.x),
+        std::min(a.y, b.y),
+        std::min(a.z, b.z));
+    TerrainEdit::GridCoord maxCoord(
+        std::max(a.x, b.x),
+        std::max(a.y, b.y),
+        std::max(a.z, b.z));
+
+    // The mesher samples a 1-voxel halo around each chunk for border faces and AO.
+    // Any edit that reaches the boundary voxel of a chunk can therefore change the
+    // neighboring chunk even if no cell was written inside that neighbor.
+    const int halo = TerrainEdit::EDIT_CELLS_PER_VOXEL;
+    minCoord -= TerrainEdit::GridCoord(halo, halo, halo);
+    maxCoord += TerrainEdit::GridCoord(halo, halo, halo);
+
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet affected;
+    TerrainEdit::TerrainEditOverlayStore::collectTouchedChunksForBounds(
+        minCoord,
+        maxCoord,
+        affected);
+    return affected;
+}
+
+std::filesystem::path snapshotDirFor(const std::string& rootDir, const std::string& id) {
+    return std::filesystem::path(rootDir) / id;
+}
+
+std::filesystem::path snapshotMetaPathFor(const std::string& rootDir, const std::string& id) {
+    return snapshotDirFor(rootDir, id) / "snapshot.meta";
+}
+
+std::filesystem::path snapshotOverlayPathFor(const std::string& rootDir, const std::string& id) {
+    return snapshotDirFor(rootDir, id) / "terrain_overlay.bin";
+}
+
+std::filesystem::path snapshotTextureOverlayPathFor(const std::string& rootDir, const std::string& id) {
+    return snapshotDirFor(rootDir, id) / "texture_overlay.bin";
+}
+
+
+std::filesystem::path snapshotBoxesPathFor(const std::string& rootDir, const std::string& id) {
+    return snapshotDirFor(rootDir, id) / "terrain_boxes.bin";
+}
+
+std::filesystem::path snapshotCollisionPathFor(const std::string& rootDir, const std::string& id) {
+    return snapshotDirFor(rootDir, id) / "terrain_edit_collision.bin";
+}
+
+std::string formatByteCount(uintmax_t bytes) {
+    static constexpr const char* kUnits[] = {"B", "KB", "MB", "GB", "TB"};
+    double value = static_cast<double>(bytes);
+    size_t unitIndex = 0;
+    while (value >= 1024.0 && unitIndex + 1 < (sizeof(kUnits) / sizeof(kUnits[0]))) {
+        value /= 1024.0;
+        ++unitIndex;
+    }
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(unitIndex == 0 ? 0 : 2)
+        << value << ' ' << kUnits[unitIndex];
+    return out.str();
+}
+
+// -----------------------------------------------------------------------
+// Edit collision binary I/O
+// V1 Format: magic(4) | chunkCount(4) | per-chunk: [cx(4) cz(4) nVerts(4) nIdx(4) floats... uint32s...]
+// V2 Format: magic(4) | chunkCount(4) | per-chunk: [cx(4) cy(4) cz(4) nVerts(4) nIdx(4) floats... uint32s...]
+// -----------------------------------------------------------------------
+static constexpr uint32_t EDIT_COL_MAGIC_V1 = 0x4C4F4345; // "ECOL"
+static constexpr uint32_t EDIT_COL_MAGIC_V2 = 0x324C4345; // "ECL2"
+
+static bool saveEditCollisionToFile(
+    const std::filesystem::path& path,
+    const std::unordered_map<glm::ivec3, World::EditCollisionEntry, IVec3Hash>& data)
+{
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    f.write(reinterpret_cast<const char*>(&EDIT_COL_MAGIC_V2), 4);
+    uint32_t count = static_cast<uint32_t>(data.size());
+    f.write(reinterpret_cast<const char*>(&count), 4);
+    for (const auto& [coord, entry] : data) {
+        f.write(reinterpret_cast<const char*>(&coord.x), 4);
+        f.write(reinterpret_cast<const char*>(&coord.y), 4);
+        f.write(reinterpret_cast<const char*>(&coord.z), 4);
+        // Compute world-space floats on-the-fly from packed data.
+        const float baseX = static_cast<float>(coord.x * WorldConfig::CHUNK_SIZE) * WorldConfig::VOXEL_SIZE_M;
+        const float baseY = static_cast<float>(coord.y * WorldConfig::CHUNK_HEIGHT) * WorldConfig::VOXEL_SIZE_M;
+        const float baseZ = static_cast<float>(coord.z * WorldConfig::CHUNK_SIZE) * WorldConfig::VOXEL_SIZE_M;
+        uint32_t nv = static_cast<uint32_t>(entry.packedVerts.size() * 3);
+        uint32_t ni = static_cast<uint32_t>(entry.indices.size());
+        f.write(reinterpret_cast<const char*>(&nv), 4);
+        f.write(reinterpret_cast<const char*>(&ni), 4);
+        for (uint32_t p : entry.packedVerts) {
+            float x = baseX + static_cast<float>((p >>  0) & 0xFF) * 0.25f;
+            float y = baseY + static_cast<float>((p >>  8) & 0x3FF) * 0.25f;
+            float z = baseZ + static_cast<float>((p >> 18) & 0xFF) * 0.25f;
+            f.write(reinterpret_cast<const char*>(&x), 4);
+            f.write(reinterpret_cast<const char*>(&y), 4);
+            f.write(reinterpret_cast<const char*>(&z), 4);
         }
-    } else {
-        std::cout << "[World] No DCCM terrain file found (terrain_dccm.bin)" << std::endl;
+        if (ni > 0) f.write(reinterpret_cast<const char*>(entry.indices.data()), ni * sizeof(uint32_t));
     }
-    
-    // Set terrain center on ChunkManager based on actual terrain dimensions
-    auto dims = m_terrainLoader->getDimensions();
-    if (dims.chunksX > 0 && dims.chunksZ > 0) {
-        m_chunkManager->setTerrainCenter(dims.chunksX, dims.chunksZ);
-    }
-    
-    m_collisionCache = std::make_unique<Collision::CollisionCache>();
-    if (m_collisionCache->load(collisionFilePath)) {
-        std::cout << "[World] Loaded precomputed collision cache\n";
-    } else {
-        std::cout << "[World] No collision cache found, will compute at runtime\n";
-        m_collisionCache.reset();
-    }
-    
-    // Set world name
-    m_worldName = "terrain";
-    
-    // Get file modification time as generation date
-    try {
-        auto ftime = std::filesystem::last_write_time(terrainFilePath);
-        auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-            ftime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now()
-        );
-        std::time_t cftime = std::chrono::system_clock::to_time_t(sctp);
-        std::tm tm_buf;
-        localtime_s(&tm_buf, &cftime);
-        char buffer[64];
-        std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M", &tm_buf);
-        m_worldGenerationDate = buffer;
-    } catch (...) {
-        m_worldGenerationDate = "Unknown";
-    }
-    
-    std::cout << "[World] Loaded: " << m_worldName << " (Generated: " << m_worldGenerationDate << ")\n";
-
-    refreshSnapshots();
-    updateWorldIdentityFromActiveSnapshot();
-    
-    // Start lifecycle manager background thread
-    m_lifecycleManager.setCallback(this);
-    m_lifecycleManager.start();
-    std::cout << "[World] Background lifecycle thread started\n";
-    
-    // Set up batch signal callback for LOD transitions
-    m_uploadSystem.setBatchSignalCallback(this);
+    return f.good();
 }
 
-World::~World() {
-    // Stop lifecycle manager
-    m_lifecycleManager.stop();
-    std::cout << "[World] Background lifecycle thread stopped\n";
-    
-    // ChunkUploadSystem cleans up its own queue in destructor
-    // unique_ptr<InGameDebug> destructor runs here (InGameDebug is complete in this TU)
-}
-
-std::vector<FramePassKind> World::enumerateFramePasses() const {
-    // Current runtime only submits the voxel opaque pass; UI/debug remain inactive.
-    return {FramePassKind::VoxelOpaque};
-}
-
-// --- IChunkLifecycleCallback implementation ---
-
-std::vector<entt::entity> World::createChunkEntities(const std::vector<glm::ivec3>& coords) {
-    return createChunksBatch(coords);
-}
-
-void World::scheduleChunkJobs(entt::entity entity, const glm::ivec3& coord, const glm::ivec3& playerChunk) {
-    if (entity == entt::null) return;
-    
-    markChunkPending(coord);
-
-    int desiredLod = getDesiredLODForChunk(coord);
-    {
-        std::unique_lock regLock(m_registryMutex);
-        if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
-            auto& chunk = m_registry.get<Chunk>(entity);
-            chunk.lodLevel = desiredLod;
+static bool loadEditCollisionFromFile(
+    const std::filesystem::path& path,
+    std::unordered_map<glm::ivec3, World::EditCollisionEntry, IVec3Hash>& out)
+{
+    out.clear();
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    uint32_t magic = 0;
+    f.read(reinterpret_cast<char*>(&magic), 4);
+    if (magic != EDIT_COL_MAGIC_V1 && magic != EDIT_COL_MAGIC_V2) return false;
+    uint32_t count = 0;
+    f.read(reinterpret_cast<char*>(&count), 4);
+    for (uint32_t i = 0; i < count; ++i) {
+        glm::ivec3 coord(0);
+        f.read(reinterpret_cast<char*>(&coord.x), 4);
+        if (magic == EDIT_COL_MAGIC_V2) {
+            f.read(reinterpret_cast<char*>(&coord.y), 4);
         }
-    }
-    
-    auto versionState = ensureChunkVersionState(this, entity);
-    if (!versionState) {
-        return;
-    }
-    
-    // Start pipeline
-    versionState->inFlight.store(true, std::memory_order_release);
-    versionState->pending.store(false, std::memory_order_release);
-    
-    setChunkState(entity, ChunkState::State::Loading);
-    
-    ChunkCoord chunkCoord;
-    AABB aabb;
-    {
-        std::shared_lock regLock(m_registryMutex);
-        if (!m_registry.valid(entity)) return;
-        chunkCoord = m_registry.get<ChunkCoord>(entity);
-        aabb = m_registry.get<AABB>(entity);
-    }
-    
-    // Ring-based priority
-    int dx = std::abs(coord.x - playerChunk.x);
-    int dz = std::abs(coord.z - playerChunk.z);
-    int ringNumber = std::max(dx, dz);
-    int distSq = dx * dx + dz * dz;
-    int priority = ringNumber * 1000000 + distSq;
-    
-    auto* payload = m_payloadPool.acquire();
-    payload->world = this;
-    payload->entity = entity;
-    payload->coord = chunkCoord;
-    payload->bounds = aabb;
-    payload->versionState = versionState;
-    payload->version = versionState->version.load(std::memory_order_acquire);
-    payload->distanceFromPlayer = priority;
-    payload->lodLevel = desiredLod;
-    payload->centerAtEnqueue = playerChunk;
-    
-    int chunkPriority = 1000000 - priority;
-    
-    // Choose mesh pipeline based on whether chunk has runtime voxel edits
-    const bool useRuntimeVoxel = chunkNeedsRuntimeVoxel(coord);
-    const TerrainType lodTerrainType = getTerrainTypeForChunk(coord, desiredLod);
-    const bool isDCCM = (lodTerrainType == TerrainType::DCCM) && m_heightmapSampler.isLoaded();
-    const bool useEditMesher = useRuntimeVoxel && !isDCCM;
-    payload->fromTerrainEdit = useEditMesher;
-    auto loadJobFn = useEditMesher ? LoadEditMeshJob : LoadPrecomputedMeshJob;
-    
-    JobHandle load = m_jobSystem.makeWithPriority(loadJobFn, payload, 0, chunkPriority);
-    JobHandle upload = m_jobSystem.makeWithPriority(UploadChunkJob, payload, 0, chunkPriority);
-    JobHandle finalize = m_jobSystem.makeWithPriority(FinalizeChunkJob, payload, 0, chunkPriority);
-    
-    m_jobSystem.addDependency(upload, load);
-    m_jobSystem.addDependency(finalize, upload);
-    
-    payload->jobHandles = {load, upload, finalize};
-    
-    m_jobSystem.schedule(load);
-    m_jobSystem.schedule(upload);
-    m_jobSystem.schedule(finalize);
-}
-
-int World::destroyChunks(const std::vector<glm::ivec3>& coords) {
-    return tryDestroyChunksBatch(coords);
-}
-
-void World::cleanupStaleVersionStates() {
-    std::shared_lock regLock(m_registryMutex);   // protect registry.valid()
-    std::scoped_lock versionLock(m_chunkVersionMutex);
-    auto& states = m_chunkVersionStates;
-    for (auto it = states.begin(); it != states.end(); ) {
-        if (!m_registry.valid(it->first)) {
-            it = states.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-void World::transitionChunkState(entt::entity entity, ChunkState::State state) {
-    setChunkState(entity, state);
-}
-
-void World::setChunkState(entt::entity entity, ChunkState::State state) {
-    glm::ivec3 coord;
-    {
-        std::unique_lock lock(m_registryMutex);
-        if (!m_registry.valid(entity) ||
-            !m_registry.all_of<ChunkState, ChunkCoord>(entity)) {
-            return;
-        }
-        auto& chunkState = m_registry.get<ChunkState>(entity);
-        chunkState.state = state;
-        const auto& chunkCoord = m_registry.get<ChunkCoord>(entity);
-        coord = chunkCoord.toVec3();
-    }
-    setChunkState(coord, state);
-}
-
-void World::setChunkState(const glm::ivec3& coord, ChunkState::State state) {
-    ChunkState::State oldState = ChunkState::State::Unloaded;
-    {
-        std::unique_lock lock(m_chunkStateMutex);
-        auto it = m_chunkStateMap.find(coord);
-        if (it != m_chunkStateMap.end()) {
-            oldState = it->second;
-        }
-        m_chunkStateMap[coord] = state;
-    }
-    
-    // Update atomic counters (decrement old, increment new)
-    if (oldState == ChunkState::State::Loading) m_loadingCount.fetch_sub(1, std::memory_order_relaxed);
-    else if (oldState == ChunkState::State::Meshing) m_meshingCount.fetch_sub(1, std::memory_order_relaxed);
-    else if (oldState == ChunkState::State::Ready) m_readyCount.fetch_sub(1, std::memory_order_relaxed);
-    
-    if (state == ChunkState::State::Loading) m_loadingCount.fetch_add(1, std::memory_order_relaxed);
-    else if (state == ChunkState::State::Meshing) m_meshingCount.fetch_add(1, std::memory_order_relaxed);
-    else if (state == ChunkState::State::Ready) m_readyCount.fetch_add(1, std::memory_order_relaxed);
-
-    {
-        std::unique_lock setLock(m_chunkSetMutex);
-        if (state == ChunkState::State::Ready) {
-            m_readyChunkSet.insert(coord);
-            if (m_chunkManager && coord.y == 0) {
-                m_chunkManager->notifyChunkCreated(coord);
+        f.read(reinterpret_cast<char*>(&coord.z), 4);
+        uint32_t nv = 0, ni = 0;
+        f.read(reinterpret_cast<char*>(&nv), 4);
+        f.read(reinterpret_cast<char*>(&ni), 4);
+        World::EditCollisionEntry entry;
+        entry.chunkCoord = coord;
+        // File stores nv floats (3 per vertex) — re-pack to uint32_t packed format.
+        if (nv > 0) {
+            const uint32_t vertCount = nv / 3;
+            const float baseX = static_cast<float>(coord.x * WorldConfig::CHUNK_SIZE) * WorldConfig::VOXEL_SIZE_M;
+            const float baseY = static_cast<float>(coord.y * WorldConfig::CHUNK_HEIGHT) * WorldConfig::VOXEL_SIZE_M;
+            const float baseZ = static_cast<float>(coord.z * WorldConfig::CHUNK_SIZE) * WorldConfig::VOXEL_SIZE_M;
+            entry.packedVerts.resize(vertCount);
+            for (uint32_t v = 0; v < vertCount; ++v) {
+                float x, y, z;
+                f.read(reinterpret_cast<char*>(&x), 4);
+                f.read(reinterpret_cast<char*>(&y), 4);
+                f.read(reinterpret_cast<char*>(&z), 4);
+                uint32_t px = static_cast<uint32_t>((x - baseX) / 0.25f + 0.5f);
+                uint32_t py = static_cast<uint32_t>(((y - baseY) / 0.25f) + 0.5f);
+                uint32_t pz = static_cast<uint32_t>((z - baseZ) / 0.25f + 0.5f);
+                entry.packedVerts[v] = (px & 0xFF) | ((py & 0x3FF) << 8) | ((pz & 0xFF) << 18);
             }
-        } else {
-            m_readyChunkSet.erase(coord);
         }
+        if (ni > 0) { entry.indices.resize(ni); f.read(reinterpret_cast<char*>(entry.indices.data()), ni * sizeof(uint32_t)); }
+        out[coord] = std::move(entry);
     }
+    return f.good();
 }
 
-void World::removeChunkState(const glm::ivec3& coord) {
-    std::unique_lock lock(m_chunkStateMutex);
-    auto it = m_chunkStateMap.find(coord);
-    if (it != m_chunkStateMap.end()) {
-        ChunkState::State oldState = it->second;
-        if (oldState == ChunkState::State::Loading) m_loadingCount.fetch_sub(1, std::memory_order_relaxed);
-        else if (oldState == ChunkState::State::Meshing) m_meshingCount.fetch_sub(1, std::memory_order_relaxed);
-        else if (oldState == ChunkState::State::Ready) m_readyCount.fetch_sub(1, std::memory_order_relaxed);
-        m_chunkStateMap.erase(it);
-    }
-    m_chunkEntityMap.erase(coord);
-    lock.unlock();
-    if (m_chunkManager && coord.y == 0) {
-        m_chunkManager->notifyChunkDestroyed(coord);
-    }
-    {
-        std::unique_lock setLock(m_chunkSetMutex);
-        m_readyChunkSet.erase(coord);
-        m_existingChunkSet.erase(coord);
-    }
-}
-
-ChunkState::State World::getChunkStateSnapshot(const glm::ivec3& coord) const {
-    std::shared_lock lock(m_chunkStateMutex);
-    auto it = m_chunkStateMap.find(coord);
-    if (it != m_chunkStateMap.end()) {
-        return it->second;
-    }
-    return ChunkState::State::Unloaded;
-}
-
-void World::markChunkPending(const glm::ivec3& coord) {
-    std::lock_guard lock(m_pendingChunksMutex);
-    m_pendingChunks.insert(coord);
-}
-
-void World::clearChunkPending(const glm::ivec3& coord) {
-    std::lock_guard lock(m_pendingChunksMutex);
-    m_pendingChunks.erase(coord);
-}
-
-bool World::isChunkPending(const glm::ivec3& coord) const {
-    std::lock_guard lock(m_pendingChunksMutex);
-    return m_pendingChunks.find(coord) != m_pendingChunks.end();
-}
-
-// update(), updateChunkLoader(), updateMarkDirtyOnGeneration(),
-// updateMeshingSystem(), updateUploadQueueSystem(), onMeshUploaded(),
-// processFinalizeQueue() moved to WorldUpdate.cpp
-
-// createChunk() moved to WorldChunkCRUD.cpp
-
-// createChunksBatch(), tryDestroyChunk(), tryDestroyChunksBatch(),
-// resetChunkGeneration(), switchTerrainFile() moved to WorldChunkCRUD.cpp
-
-// setTerrainTypeForLOD(), applyLODChangesIncrementally(),
-// releaseMeshesForLOD(), reloadMeshesForLOD() moved to WorldLODTransitions.cpp
-
-int World::getDesiredLODForChunk(const glm::ivec3& coord) const {
-    return m_lodSystem.getDesiredLOD(coord);
-}
-
-entt::entity World::findChunk(const glm::ivec3& chunkCoord) const {
-    std::shared_lock lock(m_chunkStateMutex);
-    auto it = m_chunkEntityMap.find(chunkCoord);
-    if (it != m_chunkEntityMap.end()) {
-        return it->second;
-    }
-    return entt::null;
-}
-
-TerrainEdit::TerrainEditOverlayStore::ChunkSet World::collectExistingChunksInRange(
-    const glm::ivec3& minChunk,
-    const glm::ivec3& maxChunk) const {
-    TerrainEdit::TerrainEditOverlayStore::ChunkSet chunks;
-    const glm::ivec3 lo(
-        std::min(minChunk.x, maxChunk.x),
-        std::min(minChunk.y, maxChunk.y),
-        std::min(minChunk.z, maxChunk.z));
-    const glm::ivec3 hi(
-        std::max(minChunk.x, maxChunk.x),
-        std::max(minChunk.y, maxChunk.y),
-        std::max(minChunk.z, maxChunk.z));
-
-    std::shared_lock lock(m_chunkStateMutex);
-    for (const auto& [coord, entity] : m_chunkEntityMap) {
-        if (entity == entt::null) {
-            continue;
-        }
-        if (coord.x < lo.x || coord.x > hi.x ||
-            coord.y < lo.y || coord.y > hi.y ||
-            coord.z < lo.z || coord.z > hi.z) {
-            continue;
-        }
-        chunks.insert(coord);
-    }
-    return chunks;
-}
-
-World::LoadManagementDiag World::getLoadManagementDiag() const {
-    LoadManagementDiag diag{};
-    if (m_chunkManager) {
-        const auto info = m_chunkManager->getDebugInfo();
-        diag.baseRenderDist = info.baseRenderDist;
-        diag.effectiveRenderDist = info.effectiveRenderDist;
-        diag.extensionRings = info.extensionRings;
-        diag.measuredThroughput = info.measuredThroughput;
-        diag.pendingCreates = static_cast<uint32_t>(std::max(info.pendingCreates, 0));
-        diag.pendingDestroys = static_cast<uint32_t>(std::max(info.pendingDestroys, 0));
-        diag.bufferPressure = m_chunkManager->hasBufferPressure();
-    }
-
-    diag.lodRemeshQueue =
-        static_cast<uint32_t>(std::min<size_t>(m_lodSystem.getRemeshQueueSize(), UINT32_MAX));
-    diag.pendingLodRemeshes =
-        static_cast<uint32_t>(std::min<size_t>(m_pendingLODRemeshes.size(), UINT32_MAX));
-    diag.editRemeshPending =
-        static_cast<uint32_t>(std::min<size_t>(m_editRemeshScheduler.pendingCount(), UINT32_MAX));
-    diag.uploadQueue = m_uploadSystem.getQueueSize();
-    diag.finalizeQueue =
-        static_cast<uint32_t>(std::min<size_t>(m_uploadSystem.getFinalizeQueueSize(), UINT32_MAX));
-    return diag;
-}
-
-size_t World::getChunkCount() const {
-    std::shared_lock lock(m_registryMutex);
-    return m_registry.view<ChunkCoord>().size();
-}
-
-World::TerrainEditPlacementContext World::getTerrainEditPlacementContext(const glm::vec3& worldPos) const {
-    TerrainEditPlacementContext context;
-
-    const auto micro = WorldConfig::worldToMicroVoxel(worldPos);
-    const auto chunk = WorldConfig::microVoxelToChunk(micro);
-    context.chunkCoord = glm::ivec3(chunk.x, chunk.y, chunk.z);
-
-    int bandLodLevel = 0;
-    bool foundLoadedChunk = false;
-
-    entt::entity entity = findChunk(context.chunkCoord);
-    if (entity != entt::null) {
-        std::shared_lock regLock(m_registryMutex);
-        if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
-            bandLodLevel = m_registry.get<Chunk>(entity).lodLevel;
-            foundLoadedChunk = true;
-        }
-    }
-
-    if (!foundLoadedChunk) {
-        bandLodLevel = getDesiredLODForChunk(context.chunkCoord);
-        if (bandLodLevel < 0 && m_chunkManager) {
-            const glm::ivec3 center = m_chunkManager->getCenterChunk();
-            const int ring = m_chunkManager->calculateRingNumber(context.chunkCoord, center);
-            bandLodLevel = m_chunkManager->calculateLODFromRing(ring);
-        }
-    }
-
-    bandLodLevel = std::clamp(bandLodLevel, 0, MAX_LOD_LEVELS - 1);
-    context.valid = true;
-    context.bandLodLevel = bandLodLevel;
-    context.terrainType = getTerrainTypeForChunk(context.chunkCoord, bandLodLevel);
-    context.previewLodLevel = (context.terrainType == TerrainType::Voxel)
-        ? getEffectiveLODForChunk(context.chunkCoord, bandLodLevel)
-        : bandLodLevel;
-    context.previewLodLevel = std::clamp(context.previewLodLevel, 0, MAX_LOD_LEVELS - 1);
-    context.voxelSizeM = WorldConfig::getLODVoxelSizeM(context.previewLodLevel);
-
-    return context;
-}
-
-void World::clearEditArtifactCache() {
-    std::unique_lock lock(m_editArtifactCacheMutex);
-    m_editArtifactCache.clear();
-}
-
-void World::markRuntimeVoxelChunks(
-    const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords)
-{
-    if (chunkCoords.empty()) {
-        return;
-    }
-
-    std::unique_lock lock(m_runtimeVoxelChunkMutex);
-    m_runtimeVoxelChunks.insert(chunkCoords.begin(), chunkCoords.end());
-}
-
-void World::clearRuntimeVoxelChunks() {
-    std::unique_lock lock(m_runtimeVoxelChunkMutex);
-    m_runtimeVoxelChunks.clear();
-}
-
-TerrainEdit::TerrainEditOverlayStore::ChunkSet World::getRuntimeVoxelChunkCoords() const {
-    std::shared_lock lock(m_runtimeVoxelChunkMutex);
-    return m_runtimeVoxelChunks;
-}
-
-bool World::chunkNeedsRuntimeVoxel(const glm::ivec3& chunkCoord) const {
-    if (chunkCoord.y != 0 || m_terrainEditOverlay.hasEditsInChunk(chunkCoord)) {
-        return true;
-    }
-
-    const glm::ivec3 minVoxel = WorldConfig::chunkToMicroVoxel(chunkCoord);
-    const glm::ivec3 maxVoxel = minVoxel + glm::ivec3(
-        WorldConfig::CHUNK_SIZE,
-        WorldConfig::CHUNK_HEIGHT,
-        WorldConfig::CHUNK_SIZE);
-    if (m_textureMaterialStore.hasSurfaceTexturesInBox(minVoxel, maxVoxel, 0)) {
-        return true;
-    }
-
-    std::shared_lock lock(m_runtimeVoxelChunkMutex);
-    return m_runtimeVoxelChunks.find(chunkCoord) != m_runtimeVoxelChunks.end();
-}
-
-void World::markEditsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks) {
-    if (touchedChunks.empty()) return;
-    markRuntimeVoxelChunks(touchedChunks);
-    m_editRemeshScheduler.markChunksDirty(touchedChunks);
-}
-
-void World::markTextureMaterialsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks) {
-    if (touchedChunks.empty()) return;
-
-    // Texture paint changes material only, not occupancy/collision.
-    // Invalidate all cached runtime voxel artifacts for these chunks before
-    // scheduling the material-only rebake. Otherwise LOD swaps can reuse a
-    // pre-paint cached lower-LOD artifact, which makes LOD0 look correct while
-    // coarser LODs still show procedural/default material.
-    markRuntimeVoxelChunks(touchedChunks);
-    invalidateEditArtifacts(touchedChunks);
-    m_editRemeshScheduler.markMaterialChunksDirty(touchedChunks);
-}
-
-void World::invalidateEditArtifact(const glm::ivec3& chunkCoord) {
-    std::unique_lock lock(m_editArtifactCacheMutex);
-    for (auto it = m_editArtifactCache.begin(); it != m_editArtifactCache.end(); ) {
-        if (it->first.chunkCoord == chunkCoord) {
-            it = m_editArtifactCache.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-void World::invalidateEditArtifacts(
-    const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords)
-{
-    if (chunkCoords.empty()) {
-        return;
-    }
-
-    std::unique_lock lock(m_editArtifactCacheMutex);
-    for (auto it = m_editArtifactCache.begin(); it != m_editArtifactCache.end(); ) {
-        if (chunkCoords.find(it->first.chunkCoord) != chunkCoords.end()) {
-            it = m_editArtifactCache.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-void World::storeEditArtifact(const glm::ivec3& chunkCoord,
-                              TerrainType terrainType,
-                              int lodLevel,
-                              std::vector<Vertex>&& vertices,
-                              std::vector<uint32_t>&& indices,
-                              glm::vec3 aabbMin,
-                              glm::vec3 aabbMax,
-                              bool isEmpty,
-                              bool deferredBuild) {
-    EditArtifactKey key;
-    key.chunkCoord = chunkCoord;
-    key.terrainType = terrainType;
-    key.lodLevel = lodLevel;
-
-    EditArtifact artifact;
-    artifact.terrainType = terrainType;
-    artifact.lodLevel = lodLevel;
-    artifact.isEmpty = isEmpty;
-    artifact.deferredBuild = deferredBuild;
-    artifact.vertices = std::move(vertices);
-    artifact.indices = std::move(indices);
-    artifact.aabbMin = aabbMin;
-    artifact.aabbMax = aabbMax;
-
-    artifact.generation = ++m_editArtifactGenCounter;
-
-    std::unique_lock lock(m_editArtifactCacheMutex);
-    m_editArtifactCache[key] = std::move(artifact);
-}
-
-bool World::tryGetEditArtifact(const glm::ivec3& chunkCoord,
-                               TerrainType terrainType,
-                               int lodLevel,
-                               EditArtifact& outArtifact) const {
-    EditArtifactKey key;
-    key.chunkCoord = chunkCoord;
-    key.terrainType = terrainType;
-    key.lodLevel = lodLevel;
-
-    std::shared_lock lock(m_editArtifactCacheMutex);
-    auto it = m_editArtifactCache.find(key);
-    if (it == m_editArtifactCache.end()) {
+bool readSnapshotMetaFile(const std::filesystem::path& metaPath,
+                          World::SnapshotInfo& outInfo) {
+    std::ifstream file(metaPath);
+    if (!file.is_open()) {
         return false;
     }
 
-    outArtifact = it->second;
+    std::string line;
+    std::string id;
+    std::string displayName;
+    std::string createdAt;
+    uint64_t editedCells = 0;
+    uint64_t editedBricks = 0;
+
+    while (std::getline(file, line)) {
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+
+        const std::string key = trim(line.substr(0, eq));
+        const std::string value = trim(line.substr(eq + 1));
+
+        if (key == "id") {
+            id = value;
+        } else if (key == "displayName") {
+            displayName = value;
+        } else if (key == "createdAt") {
+            createdAt = value;
+        } else if (key == "editedCells") {
+            editedCells = static_cast<uint64_t>(std::strtoull(value.c_str(), nullptr, 10));
+        } else if (key == "editedBricks") {
+            editedBricks = static_cast<uint64_t>(std::strtoull(value.c_str(), nullptr, 10));
+        }
+    }
+
+    if (id.empty()) {
+        return false;
+    }
+
+    outInfo.id = id;
+    outInfo.displayName = displayName.empty() ? id : displayName;
+    outInfo.createdAt = createdAt.empty() ? "Unknown" : createdAt;
+    outInfo.isBase = false;
+    outInfo.editedCells = editedCells;
+    outInfo.editedBricks = editedBricks;
     return true;
 }
 
-uint64_t World::getEditArtifactGeneration(const glm::ivec3& chunkCoord,
-                                          TerrainType terrainType,
-                                          int lodLevel) const {
-    EditArtifactKey key;
-    key.chunkCoord = chunkCoord;
-    key.terrainType = terrainType;
-    key.lodLevel = lodLevel;
+bool writeSnapshotMetaFile(const std::filesystem::path& metaPath,
+                           const World::SnapshotInfo& info,
+                           const std::string& baseTerrainPath,
+                           const std::string& baseCollisionPath) {
+    if (metaPath.has_parent_path()) {
+        std::filesystem::create_directories(metaPath.parent_path());
+    }
 
-    std::shared_lock lock(m_editArtifactCacheMutex);
-    auto it = m_editArtifactCache.find(key);
-    return (it != m_editArtifactCache.end()) ? it->second.generation : 0;
+    std::ofstream file(metaPath, std::ios::trunc);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    file << "version=1\n";
+    file << "id=" << info.id << "\n";
+    file << "displayName=" << info.displayName << "\n";
+    file << "createdAt=" << info.createdAt << "\n";
+    file << "baseTerrain=" << baseTerrainPath << "\n";
+    file << "baseCollision=" << baseCollisionPath << "\n";
+    file << "editedCells=" << info.editedCells << "\n";
+    file << "editedBricks=" << info.editedBricks << "\n";
+    return file.good();
 }
 
-void World::preDeserializeCollisionShapes() {
-    if (m_collisionCache && m_collisionCache->isLoaded()) {
-        m_collisionCache->preDeserializeAll();
+} // namespace
+
+void World::refreshSnapshots() {
+    const std::string activeId =
+        (m_activeSnapshotIndex >= 0 &&
+         m_activeSnapshotIndex < static_cast<int>(m_snapshotInfos.size()))
+            ? m_snapshotInfos[static_cast<size_t>(m_activeSnapshotIndex)].id
+            : std::string{};
+
+    m_snapshotInfos.clear();
+
+    SnapshotInfo baseInfo;
+    baseInfo.id = "__base__";
+    baseInfo.displayName = "Base Terrain";
+    baseInfo.createdAt = m_worldGenerationDate.empty() ? "Unknown" : m_worldGenerationDate;
+    baseInfo.isBase = true;
+    baseInfo.editedCells = 0;
+    baseInfo.editedBricks = 0;
+    m_snapshotInfos.push_back(baseInfo);
+
+    if (!m_snapshotRootDir.empty()) {
+        std::filesystem::create_directories(m_snapshotRootDir);
+        for (const auto& entry : std::filesystem::directory_iterator(m_snapshotRootDir)) {
+            if (!entry.is_directory()) {
+                continue;
+            }
+
+            const std::filesystem::path metaPath = entry.path() / "snapshot.meta";
+            if (!std::filesystem::exists(metaPath)) {
+                continue;
+            }
+
+            SnapshotInfo info;
+            if (readSnapshotMetaFile(metaPath, info)) {
+                m_snapshotInfos.push_back(std::move(info));
+            }
+        }
+    }
+
+    std::sort(m_snapshotInfos.begin() + 1, m_snapshotInfos.end(),
+              [](const SnapshotInfo& a, const SnapshotInfo& b) {
+                  return a.displayName < b.displayName;
+              });
+
+    m_activeSnapshotIndex = 0;
+    if (!activeId.empty()) {
+        for (size_t i = 0; i < m_snapshotInfos.size(); ++i) {
+            if (m_snapshotInfos[i].id == activeId) {
+                m_activeSnapshotIndex = static_cast<int>(i);
+                break;
+            }
+        }
     }
 }
 
-// cleanupStalePendingMeshHandles(), onBatchChunkReady(),
-// processLODSwaps() moved to WorldLODTransitions.cpp
+void World::updateWorldIdentityFromActiveSnapshot() {
+    if (m_activeSnapshotIndex >= 0 &&
+        m_activeSnapshotIndex < static_cast<int>(m_snapshotInfos.size())) {
+        const SnapshotInfo& info = m_snapshotInfos[static_cast<size_t>(m_activeSnapshotIndex)];
+        m_worldName = info.displayName;
+        m_worldGenerationDate = info.createdAt;
+    }
+}
 
-// generateFinalizeDiagReport() moved to WorldDebugMetrics.cpp
+namespace {
+bool boxesIntersect(const World::TerrainBoxRecord& a, const World::TerrainBoxRecord& b) {
+    return a.minCorner.x <= b.maxCorner.x && a.maxCorner.x >= b.minCorner.x &&
+           a.minCorner.y <= b.maxCorner.y && a.maxCorner.y >= b.minCorner.y &&
+           a.minCorner.z <= b.maxCorner.z && a.maxCorner.z >= b.minCorner.z;
+}
 
-// gatherDrawCommands(), gatherDrawCommandsInSphere(),
-// enqueueMeshForUpload() moved to WorldRendering.cpp
+bool saveTerrainBoxesToFile(const std::filesystem::path& filePath,
+                            const std::vector<World::TerrainBoxRecord>& boxes) {
+    if (filePath.has_parent_path()) {
+        std::filesystem::create_directories(filePath.parent_path());
+    }
 
+    std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    const uint32_t magic = 0x58425454; // "TTBX"
+    const uint32_t version = 1;
+    const uint64_t count = static_cast<uint64_t>(boxes.size());
+    file.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    if (!boxes.empty()) {
+        file.write(reinterpret_cast<const char*>(boxes.data()),
+                   static_cast<std::streamsize>(boxes.size() * sizeof(World::TerrainBoxRecord)));
+    }
+    return file.good();
+}
+
+bool loadTerrainBoxesFromFile(const std::filesystem::path& filePath,
+                              std::vector<World::TerrainBoxRecord>& outBoxes) {
+    outBoxes.clear();
+
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint64_t count = 0;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char*>(&version), sizeof(version));
+    file.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!file.good() || magic != 0x58425454 || version != 1) {
+        return false;
+    }
+
+    outBoxes.resize(static_cast<size_t>(count));
+    if (count > 0) {
+        file.read(reinterpret_cast<char*>(outBoxes.data()),
+                  static_cast<std::streamsize>(count * sizeof(World::TerrainBoxRecord)));
+    }
+    return file.good();
+}
+} // namespace
+
+bool World::createSnapshot(const std::string& desiredName) {
+    // Flush any pending edits to the previous snapshot before branching.
+    flushDirtySnapshot();
+
+    std::string baseName = desiredName.empty() ? "snapshot" : desiredName;
+    std::string id = sanitizeSnapshotId(baseName);
+
+    auto idExists = [this](const std::string& candidate) {
+        return std::any_of(m_snapshotInfos.begin(), m_snapshotInfos.end(),
+                           [&candidate](const SnapshotInfo& info) {
+                               return info.id == candidate;
+                           });
+    };
+
+    if (idExists(id)) {
+        const std::string suffix = makeTimestampString("%Y%m%d_%H%M%S");
+        id += "_" + suffix;
+    }
+
+    SnapshotInfo info;
+    info.id = id;
+    info.displayName = desiredName.empty() ? ("Snapshot " + makeTimestampString("%Y-%m-%d %H:%M:%S")) : desiredName;
+    info.createdAt = makeTimestampString("%Y-%m-%d %H:%M:%S");
+    info.isBase = false;
+    info.editedCells = static_cast<uint64_t>(m_terrainEditOverlay.getEditedCellCount());
+    info.editedBricks = static_cast<uint64_t>(m_terrainEditOverlay.getBrickCount());
+
+    m_snapshotInfos.push_back(info);
+    m_activeSnapshotIndex = static_cast<int>(m_snapshotInfos.size() - 1);
+    ++m_terrainBoxRevision;
+    updateWorldIdentityFromActiveSnapshot();
+    return saveActiveSnapshot();
+}
+
+bool World::selectSnapshotByIndex(int index) {
+    if (index < 0 || index >= static_cast<int>(m_snapshotInfos.size())) {
+        m_lastSnapshotStatusMessage = "Snapshot switch failed: invalid snapshot index.";
+        m_lastSnapshotStatusIsError = true;
+        return false;
+    }
+
+    // Persist any dirty edits before switching away.
+    flushDirtySnapshot();
+
+    // Collect chunks currently owned by the runtime voxel/edit path so we can
+    // remesh them back to base terrain if the next snapshot no longer needs them.
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet previouslyEdited =
+        m_terrainEditOverlay.getEditedChunkCoords();
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet previouslyRuntimeVoxel =
+        getRuntimeVoxelChunkCoords();
+    for (const auto& chunk : previouslyEdited) {
+        previouslyRuntimeVoxel.insert(chunk);
+    }
+
+    if (index == 0) {
+        m_terrainEditOverlay.clear();
+        m_textureMaterialStore.clear();
+        m_terrainBoxes.clear();
+        // Destroy edit physics bodies before clearing the data so the old
+        // collision shapes don't persist as ghost geometry.
+        if (!m_editCollisionData.empty() && m_physics) {
+            for (const auto& [coord, entry] : m_editCollisionData) {
+                entt::entity entity = findChunk(coord);
+                if (entity != entt::null) {
+                    PendingCollision pc;
+                    pc.entity     = entity;
+                    pc.chunkCoord = coord;
+                    pc.fromEdit   = true;
+                    m_collisionSystem.enqueueCollision(std::move(pc));
+                }
+            }
+        }
+        m_editCollisionData.clear();
+        clearEditArtifactCache();
+        clearRuntimeVoxelChunks();
+        ++m_terrainBoxRevision;
+        m_activeSnapshotIndex = 0;
+        updateWorldIdentityFromActiveSnapshot();
+
+        // Mark previously runtime-owned chunks as dirty so the edit mesher
+        // re-generates them from the (now-empty) overlay + base terrain.
+        if (!previouslyRuntimeVoxel.empty()) {
+            m_editRemeshScheduler.markChunksDirty(previouslyRuntimeVoxel);
+            std::cout << "[Snapshot] Base selected — remeshing "
+                      << previouslyRuntimeVoxel.size() << " previously-edited chunk(s)\n";
+        }
+        m_snapshotDirty = false;
+        m_lastSnapshotStatusMessage = "Switched to Base Terrain.";
+        m_lastSnapshotStatusIsError = false;
+        return true;
+    }
+
+    const SnapshotInfo& info = m_snapshotInfos[static_cast<size_t>(index)];
+    const std::filesystem::path overlayPath = snapshotOverlayPathFor(m_snapshotRootDir, info.id);
+    if (std::filesystem::exists(overlayPath)) {
+        std::error_code sizeEc;
+        const uintmax_t overlayBytes = std::filesystem::file_size(overlayPath, sizeEc);
+        std::cout << "[Snapshot] Loading '" << info.displayName << "' from "
+                  << overlayPath << " ("
+                  << (sizeEc ? std::string("size unavailable") : formatByteCount(overlayBytes))
+                  << ", " << info.editedCells << " edited cells, "
+                  << info.editedBricks << " edit bricks)\n";
+    } else {
+        std::cout << "[Snapshot] Loading '" << info.displayName
+                  << "' with no overlay file present\n";
+    }
+
+    // Destroy edit physics bodies from the *previous* snapshot so they don't
+    // persist as ghost colliders for chunks not present in the new snapshot.
+    if (!m_editCollisionData.empty() && m_physics) {
+        for (const auto& [coord, entry] : m_editCollisionData) {
+            entt::entity entity = findChunk(coord);
+            if (entity != entt::null) {
+                PendingCollision pc;
+                pc.entity     = entity;
+                pc.chunkCoord = coord;
+                pc.fromEdit   = true;
+                m_collisionSystem.enqueueCollision(std::move(pc));
+            }
+        }
+        m_editCollisionData.clear();
+    }
+
+    if (std::filesystem::exists(overlayPath)) {
+        if (!m_terrainEditOverlay.loadFromFile(overlayPath.string())) {
+            m_lastSnapshotStatusMessage =
+                "Snapshot load failed for '" + info.displayName + "' overlay.";
+            m_lastSnapshotStatusIsError = true;
+            return false;
+        }
+    } else {
+        m_terrainEditOverlay.clear();
+    }
+
+    const std::filesystem::path texturePath = snapshotTextureOverlayPathFor(m_snapshotRootDir, info.id);
+    if (std::filesystem::exists(texturePath)) {
+        if (!m_textureMaterialStore.loadFromFile(texturePath.string().c_str())) {
+            m_lastSnapshotStatusMessage =
+                "Snapshot load failed for '" + info.displayName + "' texture overlay.";
+            m_lastSnapshotStatusIsError = true;
+            return false;
+        }
+    } else {
+        m_textureMaterialStore.clear();
+    }
+
+    clearEditArtifactCache();
+    clearRuntimeVoxelChunks();
+
+    const std::filesystem::path boxesPath = snapshotBoxesPathFor(m_snapshotRootDir, info.id);
+    if (std::filesystem::exists(boxesPath)) {
+        if (!loadTerrainBoxesFromFile(boxesPath, m_terrainBoxes)) {
+            m_terrainBoxes.clear();
+            m_lastSnapshotStatusMessage =
+                "Snapshot load failed for '" + info.displayName + "' terrain boxes.";
+            m_lastSnapshotStatusIsError = true;
+            return false;
+        }
+    } else {
+        m_terrainBoxes.clear();
+    }
+
+    m_activeSnapshotIndex = index;
+    ++m_terrainBoxRevision;
+    m_snapshotInfos[static_cast<size_t>(index)].editedCells =
+        static_cast<uint64_t>(m_terrainEditOverlay.getEditedCellCount());
+    m_snapshotInfos[static_cast<size_t>(index)].editedBricks =
+        static_cast<uint64_t>(m_terrainEditOverlay.getBrickCount());
+    updateWorldIdentityFromActiveSnapshot();
+
+    // Load persisted edit collision data and create physics bodies immediately
+    // so collision is correct from the first frame (no need to wait for remesh).
+    const std::filesystem::path colPath = snapshotCollisionPathFor(m_snapshotRootDir, info.id);
+    if (std::filesystem::exists(colPath)) {
+        loadEditCollisionFromFile(colPath, m_editCollisionData);
+        if (!m_editCollisionData.empty()) {
+            applyEditCollisionData();
+            std::cout << "[Snapshot] Loaded edit collision for "
+                      << m_editCollisionData.size() << " chunk(s)\n";
+        }
+    } else {
+        m_editCollisionData.clear();
+    }
+
+    // Merge previous runtime-owned chunks with the new snapshot's editable shell.
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet newEdited =
+        m_terrainEditOverlay.getEditedChunkCoords();
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet newRuntimeVoxel =
+        expandRuntimeVoxelChunkShell(newEdited);
+    markRuntimeVoxelChunks(newRuntimeVoxel);
+
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet remeshChunks = previouslyRuntimeVoxel;
+    remeshChunks.insert(newRuntimeVoxel.begin(), newRuntimeVoxel.end());
+    if (!remeshChunks.empty()) {
+        m_editRemeshScheduler.markChunksDirty(remeshChunks);
+        std::cout << "[Snapshot] '" << info.displayName
+                  << "' selected — remeshing " << remeshChunks.size() << " chunk(s)\n";
+    }
+
+    {
+        std::ostringstream status;
+        const auto textureStats = m_textureMaterialStore.getStats();
+        status << "Loaded '" << info.displayName << "' ("
+               << m_terrainEditOverlay.getEditedCellCount() << " edited cells, "
+               << m_terrainEditOverlay.getBrickCount() << " edit bricks, "
+               << textureStats.surfaceStampCount << " texture stamps";
+        if (std::filesystem::exists(overlayPath)) {
+            std::error_code sizeEc;
+            const uintmax_t overlayBytes = std::filesystem::file_size(overlayPath, sizeEc);
+            if (!sizeEc) {
+                status << ", overlay " << formatByteCount(overlayBytes);
+            }
+        }
+        if (std::filesystem::exists(texturePath)) {
+            std::error_code textureSizeEc;
+            const uintmax_t textureBytes = std::filesystem::file_size(texturePath, textureSizeEc);
+            if (!textureSizeEc) {
+                status << ", texture " << formatByteCount(textureBytes);
+            }
+        }
+        status << ")";
+        m_lastSnapshotStatusMessage = status.str();
+    }
+    m_lastSnapshotStatusIsError = false;
+    m_snapshotDirty = false;
+
+    return true;
+}
+
+bool World::saveActiveSnapshot() {
+    if (m_activeSnapshotIndex <= 0 ||
+        m_activeSnapshotIndex >= static_cast<int>(m_snapshotInfos.size())) {
+        m_lastSnapshotStatusMessage = "Snapshot save skipped: base terrain is read-only.";
+        m_lastSnapshotStatusIsError = true;
+        return false;
+    }
+
+    SnapshotInfo& info = m_snapshotInfos[static_cast<size_t>(m_activeSnapshotIndex)];
+    info.editedCells = static_cast<uint64_t>(m_terrainEditOverlay.getEditedCellCount());
+    info.editedBricks = static_cast<uint64_t>(m_terrainEditOverlay.getBrickCount());
+
+    const std::filesystem::path metaPath = snapshotMetaPathFor(m_snapshotRootDir, info.id);
+    const std::filesystem::path overlayPath = snapshotOverlayPathFor(m_snapshotRootDir, info.id);
+    const std::filesystem::path texturePath = snapshotTextureOverlayPathFor(m_snapshotRootDir, info.id);
+    const std::filesystem::path boxesPath = snapshotBoxesPathFor(m_snapshotRootDir, info.id);
+
+    if (!writeSnapshotMetaFile(metaPath, info, m_baseTerrainPath, m_baseCollisionPath)) {
+        m_lastSnapshotStatusMessage =
+            "Snapshot save failed for '" + info.displayName + "' metadata.";
+        m_lastSnapshotStatusIsError = true;
+        return false;
+    }
+
+    if (!m_terrainEditOverlay.saveToFile(overlayPath.string())) {
+        m_lastSnapshotStatusMessage =
+            "Snapshot save failed for '" + info.displayName + "' overlay.";
+        m_lastSnapshotStatusIsError = true;
+        return false;
+    }
+
+    if (!m_textureMaterialStore.saveToFile(texturePath.string().c_str())) {
+        m_lastSnapshotStatusMessage =
+            "Snapshot save failed for '" + info.displayName + "' texture overlay.";
+        m_lastSnapshotStatusIsError = true;
+        return false;
+    }
+
+    if (!saveTerrainBoxesToFile(boxesPath, m_terrainBoxes)) {
+        m_lastSnapshotStatusMessage =
+            "Snapshot save failed for '" + info.displayName + "' terrain boxes.";
+        m_lastSnapshotStatusIsError = true;
+        return false;
+    }
+
+    // Persist edit collision data for instant reload on snapshot switch.
+    const std::filesystem::path colPath = snapshotCollisionPathFor(m_snapshotRootDir, info.id);
+    if (!m_editCollisionData.empty()) {
+        saveEditCollisionToFile(colPath, m_editCollisionData);
+    }
+
+    updateWorldIdentityFromActiveSnapshot();
+    {
+        std::error_code sizeEc;
+        const uintmax_t overlayBytes = std::filesystem::file_size(overlayPath, sizeEc);
+        std::error_code textureSizeEc;
+        const uintmax_t textureBytes = std::filesystem::file_size(texturePath, textureSizeEc);
+        const auto textureStats = m_textureMaterialStore.getStats();
+        std::ostringstream status;
+        status << "Saved '" << info.displayName << "' ("
+               << info.editedCells << " edited cells, "
+               << info.editedBricks << " edit bricks, "
+               << textureStats.surfaceStampCount << " texture stamps";
+        if (!sizeEc) {
+            status << ", overlay " << formatByteCount(overlayBytes);
+        }
+        if (!textureSizeEc) {
+            status << ", texture " << formatByteCount(textureBytes);
+        }
+        status << ")";
+        m_lastSnapshotStatusMessage = status.str();
+    }
+    m_lastSnapshotStatusIsError = false;
+    return true;
+}
+
+bool World::deleteSnapshot(int index) {
+    if (index <= 0 || index >= static_cast<int>(m_snapshotInfos.size())) {
+        m_lastSnapshotStatusMessage = "Snapshot delete failed: invalid snapshot index.";
+        m_lastSnapshotStatusIsError = true;
+        return false;  // Cannot delete the base terrain (index 0) or invalid index
+    }
+
+    // Flush any dirty edits for the current snapshot before deleting.
+    flushDirtySnapshot();
+
+    const SnapshotInfo& info = m_snapshotInfos[static_cast<size_t>(index)];
+    if (info.isBase) {
+        m_lastSnapshotStatusMessage = "Snapshot delete failed: cannot delete the base terrain.";
+        m_lastSnapshotStatusIsError = true;
+        return false;  // Extra safety: never delete base
+    }
+
+    const std::string deletedDisplayName = info.displayName;
+
+    // Delete snapshot files from disk.
+    const std::filesystem::path dir = snapshotDirFor(m_snapshotRootDir, info.id);
+    std::error_code ec;
+    if (std::filesystem::exists(dir, ec)) {
+        std::filesystem::remove_all(dir, ec);
+        if (ec) {
+            std::cerr << "[Snapshot] Failed to remove directory: " << dir << " — " << ec.message() << "\n";
+        }
+    }
+
+    // If we're deleting the active snapshot, switch to base first.
+    const bool deletingActive = (index == m_activeSnapshotIndex);
+
+    // Remove from the info list.
+    m_snapshotInfos.erase(m_snapshotInfos.begin() + index);
+
+    // Fix up the active index.
+    if (deletingActive) {
+        // Collect runtime-owned chunks for remeshing after switch to base.
+        TerrainEdit::TerrainEditOverlayStore::ChunkSet previouslyEdited =
+            m_terrainEditOverlay.getEditedChunkCoords();
+        TerrainEdit::TerrainEditOverlayStore::ChunkSet previouslyRuntimeVoxel =
+            getRuntimeVoxelChunkCoords();
+        for (const auto& chunk : previouslyEdited) {
+            previouslyRuntimeVoxel.insert(chunk);
+        }
+
+        // Switch to base terrain.
+        m_activeSnapshotIndex = 0;
+        m_terrainEditOverlay.clear();
+        m_textureMaterialStore.clear();
+        m_terrainBoxes.clear();
+        // Destroy edit physics bodies before clearing the data.
+        if (!m_editCollisionData.empty() && m_physics) {
+            for (const auto& [coord, entry] : m_editCollisionData) {
+                entt::entity entity = findChunk(coord);
+                if (entity != entt::null) {
+                    PendingCollision pc;
+                    pc.entity     = entity;
+                    pc.chunkCoord = coord;
+                    pc.fromEdit   = true;
+                    m_collisionSystem.enqueueCollision(std::move(pc));
+                }
+            }
+        }
+        m_editCollisionData.clear();
+        clearEditArtifactCache();
+        clearRuntimeVoxelChunks();
+        ++m_terrainBoxRevision;
+        m_snapshotDirty = false;
+        updateWorldIdentityFromActiveSnapshot();
+
+        // Remesh previously runtime-owned chunks to restore base terrain geometry.
+        if (!previouslyRuntimeVoxel.empty()) {
+            m_editRemeshScheduler.markChunksDirty(previouslyRuntimeVoxel);
+            std::cout << "[Snapshot] Deleted active — remeshing "
+                      << previouslyRuntimeVoxel.size() << " chunk(s)\n";
+        }
+    } else if (m_activeSnapshotIndex > index) {
+        // The active snapshot shifted down by one.
+        --m_activeSnapshotIndex;
+    }
+
+    std::cout << "[Snapshot] Deleted snapshot at index " << index << "\n";
+    m_lastSnapshotStatusMessage = "Deleted snapshot '" + deletedDisplayName + "'.";
+    m_lastSnapshotStatusIsError = false;
+    return true;
+}
+
+void World::deleteAllSnapshots() {
+    // Collect runtime-owned chunks so they can be restored to base terrain.
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet previouslyEdited =
+        m_terrainEditOverlay.getEditedChunkCoords();
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet previouslyRuntimeVoxel =
+        getRuntimeVoxelChunkCoords();
+    for (const auto& chunk : previouslyEdited) {
+        previouslyRuntimeVoxel.insert(chunk);
+    }
+
+    // Destroy edit physics bodies.
+    if (!m_editCollisionData.empty() && m_physics) {
+        for (const auto& [coord, entry] : m_editCollisionData) {
+            entt::entity entity = findChunk(coord);
+            if (entity != entt::null) {
+                PendingCollision pc;
+                pc.entity     = entity;
+                pc.chunkCoord = coord;
+                pc.fromEdit   = true;
+                m_collisionSystem.enqueueCollision(std::move(pc));
+            }
+        }
+    }
+
+    // Delete all snapshot directories from disk.
+    for (size_t i = 1; i < m_snapshotInfos.size(); ++i) {
+        const SnapshotInfo& info = m_snapshotInfos[i];
+        if (info.isBase) continue;
+        const std::filesystem::path dir = snapshotDirFor(m_snapshotRootDir, info.id);
+        std::error_code ec;
+        if (std::filesystem::exists(dir, ec)) {
+            std::filesystem::remove_all(dir, ec);
+        }
+    }
+
+    // Keep only the base entry.
+    if (m_snapshotInfos.size() > 1) {
+        m_snapshotInfos.resize(1);
+    }
+
+    // Reset to base terrain state.
+    m_activeSnapshotIndex = 0;
+    m_terrainEditOverlay.clear();
+    m_textureMaterialStore.clear();
+    m_terrainBoxes.clear();
+    m_editCollisionData.clear();
+    clearEditArtifactCache();
+    clearRuntimeVoxelChunks();
+    ++m_terrainBoxRevision;
+    m_snapshotDirty = false;
+    updateWorldIdentityFromActiveSnapshot();
+
+    // Remesh previously runtime-owned chunks.
+    if (!previouslyRuntimeVoxel.empty()) {
+        m_editRemeshScheduler.markChunksDirty(previouslyRuntimeVoxel);
+        std::cout << "[Snapshot] Deleted ALL snapshots — remeshing "
+                  << previouslyRuntimeVoxel.size() << " chunk(s)\n";
+    }
+    m_lastSnapshotStatusMessage = "Deleted all snapshots and restored Base Terrain.";
+    m_lastSnapshotStatusIsError = false;
+}
+
+bool World::ensureEditableSnapshot() {
+    if (hasActiveEditableSnapshot()) {
+        return true;
+    }
+    return createSnapshot();
+}
+
+bool World::applyTerrainBoxEdit(const glm::vec3& minCorner,
+                                const glm::vec3& maxCorner,
+                                bool additive,
+                                float requestedStep,
+                                int brushShape) {
+    using Clock = std::chrono::high_resolution_clock;
+    const auto editStartTime = std::chrono::steady_clock::now();
+    const auto tApplyStart = Clock::now();
+
+    // Reset diagnostics for this edit
+    m_lastEditDiag = TerrainEditDiag{};
+    m_lastEditDiag.editId = m_nextTerrainEditId++;
+    m_lastEditDiag.editCenter = (minCorner + maxCorner) * 0.5f;
+    m_lastEditDiag.editSize = glm::length(maxCorner - minCorner);
+
+    if (!ensureEditableSnapshot()) {
+        return false;
+    }
+
+    const glm::vec3 clampedMin = glm::min(minCorner, maxCorner);
+    const glm::vec3 clampedMax = glm::max(minCorner, maxCorner);
+
+    const int32_t requestedStepCells = std::max(
+        1,
+        static_cast<int32_t>(std::lround(
+            std::max(requestedStep, TerrainEdit::EDIT_CELL_SIZE_M) /
+            TerrainEdit::EDIT_CELL_SIZE_M)));
+
+    auto alignDownToStep = [requestedStepCells](int32_t value) -> int32_t {
+        return TerrainEdit::floorDiv(value, requestedStepCells) * requestedStepCells;
+    };
+
+    auto alignUpToStep = [requestedStepCells](int32_t value) -> int32_t {
+        return TerrainEdit::floorDiv(value + requestedStepCells - 1, requestedStepCells) * requestedStepCells;
+    };
+
+    const int32_t rawStartX = static_cast<int32_t>(std::floor(clampedMin.x / TerrainEdit::EDIT_CELL_SIZE_M));
+    const int32_t rawStartY = static_cast<int32_t>(std::floor(clampedMin.y / TerrainEdit::EDIT_CELL_SIZE_M));
+    const int32_t rawStartZ = static_cast<int32_t>(std::floor(clampedMin.z / TerrainEdit::EDIT_CELL_SIZE_M));
+
+    const int32_t rawEndExclusiveX = static_cast<int32_t>(std::ceil(clampedMax.x / TerrainEdit::EDIT_CELL_SIZE_M));
+    const int32_t rawEndExclusiveY = static_cast<int32_t>(std::ceil(clampedMax.y / TerrainEdit::EDIT_CELL_SIZE_M));
+    const int32_t rawEndExclusiveZ = static_cast<int32_t>(std::ceil(clampedMax.z / TerrainEdit::EDIT_CELL_SIZE_M));
+
+    const int32_t startX = alignDownToStep(rawStartX);
+    const int32_t startY = alignDownToStep(rawStartY);
+    const int32_t startZ = alignDownToStep(rawStartZ);
+
+    const int32_t endExclusiveX = alignUpToStep(rawEndExclusiveX);
+    const int32_t endExclusiveY = alignUpToStep(rawEndExclusiveY);
+    const int32_t endExclusiveZ = alignUpToStep(rawEndExclusiveZ);
+
+    const int32_t endX = endExclusiveX - 1;
+    const int32_t endY = endExclusiveY - 1;
+    const int32_t endZ = endExclusiveZ - 1;
+
+    if (endX < startX || endY < startY || endZ < startZ) {
+        return false;
+    }
+
+    const TerrainEdit::GridCoord a(startX, startY, startZ);
+    const TerrainEdit::GridCoord b(endX, endY, endZ);
+
+    auto axisCount = [](int32_t start, int32_t end) -> uint64_t {
+        if (end < start) {
+            return 0;
+        }
+        return static_cast<uint64_t>(end - start) + 1u;
+    };
+
+    m_lastEditDiag.totalCells =
+        axisCount(a.x, b.x) *
+        axisCount(a.y, b.y) *
+        axisCount(a.z, b.z);
+
+    const TerrainEdit::CellValue cellValue = additive
+        ? TerrainEdit::makeSolidCell()
+        : TerrainEdit::makeAirCell();
+
+    // --- Timed: cell write loop ---
+    const auto tCellStart = Clock::now();
+    TerrainEdit::TerrainEditOverlayStore::BoxEditResult boxEdit;
+
+    if (brushShape == 1) {
+        // Sphere brush: O(1) write — distance test deferred to meshing.
+        boxEdit = m_terrainEditOverlay.writeSphere(a, b, cellValue);
+    } else {
+        // Square brush: fast rectangular write
+        boxEdit = m_terrainEditOverlay.writeBox(a, b, cellValue);
+    }
+    const auto tCellEnd = Clock::now();
+    m_lastEditDiag.cellWriteMs = std::chrono::duration<float, std::milli>(tCellEnd - tCellStart).count();
+    m_lastEditDiag.changedCells = boxEdit.cellsChanged;
+
+    // Record deferred fill list sizes for diagnostics.
+    {
+        const auto fc = m_terrainEditOverlay.getDeferredFillCounts();
+        m_lastEditDiag.sphereFillCount = fc.sphereFills;
+        m_lastEditDiag.boxFillCount = fc.boxFills;
+        m_lastEditDiag.cylinderFillCount = fc.cylinderFills;
+        m_lastEditDiag.brickCount = fc.bricks;
+    }
+
+    if (boxEdit.cellsChanged == 0) {
+        return false;
+    }
+
+    const auto affectedChunks = collectEditAffectedChunks(a, b);
+    beginTerrainEditVisualTracking(m_lastEditDiag.editId, affectedChunks, editStartTime);
+
+    // --- Timed: chunk marking ---
+    const auto tInvalidateStart = Clock::now();
+    {
+        invalidateEditArtifacts(affectedChunks);
+    }
+    const auto tInvalidateEnd = Clock::now();
+    m_lastEditDiag.invalidateMs = std::chrono::duration<float, std::milli>(tInvalidateEnd - tInvalidateStart).count();
+
+    const auto tMarkStart = Clock::now();
+    m_editRemeshScheduler.markChunksDirty(affectedChunks, &boxEdit.dirtyChunkPages);
+    const auto tMarkEnd = Clock::now();
+    m_lastEditDiag.chunkMarkMs = std::chrono::duration<float, std::milli>(tMarkEnd - tMarkStart).count();
+
+    // Rebuild runtime-voxel ownership from actual edited chunks + shell.
+    // Avoids unbounded growth from repeatedly unioning transient edit halos.
+    const auto previousRuntimeVoxel = getRuntimeVoxelChunkCoords();
+    const auto editedChunks = m_terrainEditOverlay.getEditedChunkCoords();
+    const auto runtimeVoxelChunks = expandRuntimeVoxelChunkShell(editedChunks);
+    clearRuntimeVoxelChunks();
+    markRuntimeVoxelChunks(runtimeVoxelChunks);
+
+    // Chunks that were runtime-owned but are no longer needed should be
+    // remeshed once so they can return to the precomputed path cleanly.
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet droppedRuntimeChunks;
+    for (const auto& coord : previousRuntimeVoxel) {
+        if (runtimeVoxelChunks.find(coord) == runtimeVoxelChunks.end()) {
+            droppedRuntimeChunks.insert(coord);
+        }
+    }
+    if (!droppedRuntimeChunks.empty()) {
+        invalidateEditArtifacts(droppedRuntimeChunks);
+        m_editRemeshScheduler.markChunksDirty(droppedRuntimeChunks);
+    }
+
+    // Flush remesh queue immediately so dirty chunks are dispatched in THIS
+    // frame instead of waiting for the next World::update().  Saves one
+    // full frame of latency (16 ms at 60 fps).
+    // Placed before box list/revision updates so dispatch happens ASAP.
+    const auto tRemeshStart = Clock::now();
+    m_editRemeshScheduler.processRemeshQueue(this, /*budget=*/0, /*dispatchOnly=*/true);
+    const auto tRemeshEnd = Clock::now();
+    m_lastEditDiag.inlineRemeshMs = std::chrono::duration<float, std::milli>(tRemeshEnd - tRemeshStart).count();
+
+    // --- Timed: box list update ---
+    const auto tBoxStart = Clock::now();
+    const TerrainBoxRecord editBox{clampedMin, clampedMax};
+    bool boxListChanged = false;
+    if (additive) {
+        m_terrainBoxes.push_back(editBox);
+        boxListChanged = true;
+    } else {
+        const size_t before = m_terrainBoxes.size();
+        m_terrainBoxes.erase(
+            std::remove_if(m_terrainBoxes.begin(), m_terrainBoxes.end(),
+                           [&editBox](const TerrainBoxRecord& existing) {
+                               return boxesIntersect(existing, editBox);
+                           }),
+            m_terrainBoxes.end());
+        boxListChanged = (m_terrainBoxes.size() != before);
+    }
+
+    if (boxListChanged) {
+        ++m_terrainBoxRevision;
+    }
+
+    // Always bump revision when cells changed so shadow cache invalidates
+    // even for digs into heightmap terrain (no box records to remove).
+    if (!boxListChanged && boxEdit.cellsChanged > 0) {
+        ++m_terrainBoxRevision;
+    }
+
+    m_snapshotDirty = true;
+    const auto tBoxEnd = Clock::now();
+    m_lastEditDiag.boxListMs = std::chrono::duration<float, std::milli>(tBoxEnd - tBoxStart).count();
+
+    const auto tApplyEnd = Clock::now();
+    m_lastEditDiag.applyTotalMs = std::chrono::duration<float, std::milli>(tApplyEnd - tApplyStart).count();
+    m_lastEditDiag.valid = true;
+
+    // Commit the edit to the rolling stats/history immediately. Waiting for a
+    // later collision frame duplicates entries and collapses multiple rapid
+    // edits into one stale record because m_lastEditDiag only stores the most
+    // recent edit.
+    m_editStats.push(m_lastEditDiag);
+
+    TerrainEditHistoryEntry histEntry{};
+    histEntry.editId = m_lastEditDiag.editId;
+    histEntry.applyMs = m_lastEditDiag.applyTotalMs;
+    histEntry.remeshMs = m_lastEditDiag.remeshTotalMs;
+    histEntry.grandMs = m_lastEditDiag.grandTotalMs;
+    histEntry.chunksRemeshed = m_lastEditDiag.chunksRemeshed;
+    histEntry.vertexCount = m_lastEditDiag.vertexCount;
+    histEntry.changedCells = m_lastEditDiag.changedCells;
+    histEntry.visualFirstChunkMs = m_lastEditDiag.visualFirstChunkMs;
+    histEntry.visualCompleteMs = m_lastEditDiag.visualCompleteMs;
+    histEntry.visualChunksTotal = m_lastEditDiag.visualChunksTotal;
+    histEntry.visualChunksReady = m_lastEditDiag.visualChunksReady;
+    histEntry.visualChunksSuperseded = m_lastEditDiag.visualChunksSuperseded;
+    histEntry.visualComplete = m_lastEditDiag.visualComplete;
+    histEntry.visualUploadBytes = m_lastEditDiag.visualUploadBytes;
+    histEntry.visualArtifactBuilds = m_lastEditDiag.visualArtifactBuilds;
+    histEntry.visualArtifactCacheHits = m_lastEditDiag.visualArtifactCacheHits;
+    histEntry.visualPrecomputedLoads = m_lastEditDiag.visualPrecomputedLoads;
+    histEntry.visualCollisionBaseCache = m_lastEditDiag.visualCollisionBaseCache;
+    histEntry.visualCollisionEditPacked = m_lastEditDiag.visualCollisionEditPacked;
+    histEntry.visualCollisionArtifactRefresh = m_lastEditDiag.visualCollisionArtifactRefresh;
+    histEntry.visualCollisionExistingEdit = m_lastEditDiag.visualCollisionExistingEdit;
+    histEntry.visualGpuResidentChunks = m_lastEditDiag.visualGpuResidentChunks;
+    histEntry.visualArtifactResidentChunks = m_lastEditDiag.visualArtifactResidentChunks;
+    histEntry.visualMonolithicChunks = m_lastEditDiag.visualMonolithicChunks;
+    histEntry.visualPagedChunks = m_lastEditDiag.visualPagedChunks;
+    histEntry.visualDirtyPages = m_lastEditDiag.visualDirtyPages;
+    histEntry.visualRebuiltPages = m_lastEditDiag.visualRebuiltPages;
+    histEntry.visualResidentPages = m_lastEditDiag.visualResidentPages;
+    histEntry.visualEvictedPages = m_lastEditDiag.visualEvictedPages;
+    histEntry.editCenter = m_lastEditDiag.editCenter;
+    histEntry.editSize = m_lastEditDiag.editSize;
+    histEntry.timestampSec = std::chrono::duration<float>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    m_editHistory.push(histEntry);
+
+    return true;
+}
+
+void World::flushDirtySnapshot() {
+    if (m_snapshotDirty) {
+        if (saveActiveSnapshot()) {
+            m_snapshotDirty = false;
+        }
+    }
+}
 
 ````
 
@@ -3902,6 +2397,678 @@ public:
 
 ````
 
+## src\world\World.cpp
+
+Description: No CC-DESC found.
+
+````cpp
+#include "world/World.h"
+#include "ui/InGameDebug.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/config/WorldConfig.h"
+#include "world/config/MapConfig.h"
+#include "world/chunks/core/ChunkJobs.h"
+#include "physics/PhysicsWorld.h"
+#include <Jolt/Jolt.h>
+#include <Jolt/Physics/Body/BodyID.h>
+#include "vulkan/BufferSuballocator.h"
+#include "vulkan/UploadArena.h"
+#include "rendering/common/VulkanHelpers.h"
+#include "rendering/culling/GPUCullingSystem.h"
+#include <iostream>
+#include <algorithm>
+#include <cmath>
+#include <chrono>
+#include <thread>
+#include <condition_variable>
+#include <limits>
+#include <iomanip>
+#include <sstream>
+#include <filesystem>
+#include <ctime>
+#include <glm/gtc/matrix_transform.hpp>
+
+void World::meshStatsAdd(const MeshHandle& h) {
+    if (h.subChunkCount > 0) {
+        m_statsChunksWithMesh.fetch_add(1, std::memory_order_relaxed);
+        m_statsTotalSubChunks.fetch_add(h.subChunkCount, std::memory_order_relaxed);
+        if (h.mainSubChunkCount > 1)
+            m_statsSplitChunks.fetch_add(1, std::memory_order_relaxed);
+        if (h.subChunkCount > h.mainSubChunkCount)
+            m_statsSeamSubChunks.fetch_add(h.subChunkCount - h.mainSubChunkCount, std::memory_order_relaxed);
+    }
+}
+
+void World::meshStatsSub(const MeshHandle& h) {
+    if (h.subChunkCount > 0) {
+        m_statsChunksWithMesh.fetch_sub(1, std::memory_order_relaxed);
+        m_statsTotalSubChunks.fetch_sub(h.subChunkCount, std::memory_order_relaxed);
+        if (h.mainSubChunkCount > 1)
+            m_statsSplitChunks.fetch_sub(1, std::memory_order_relaxed);
+        if (h.subChunkCount > h.mainSubChunkCount)
+            m_statsSeamSubChunks.fetch_sub(h.subChunkCount - h.mainSubChunkCount, std::memory_order_relaxed);
+    }
+}
+
+World::World()
+    : m_chunkManager(std::make_unique<ChunkManager>())
+{
+    std::cout << "[World] Initialized with full terrain system" << std::endl;
+    
+    // Initialize subsystems with chunk manager reference
+    m_lodSystem.setChunkManager(m_chunkManager.get());
+    
+    // Set up debug overlay with World pointer
+    m_inGameDebug = std::make_unique<InGameDebug>();
+    m_inGameDebug->setWorld(this);
+
+    // Wire the new editable terrain foundation.
+    // Load the heightmap CSV as the base terrain field, then layer the sparse
+    // overlay on top for runtime edits.
+    m_terrainFieldSource.setOverlay(&m_terrainEditOverlay);
+    m_terrainFieldSource.setTextureMaterialStore(&m_textureMaterialStore);
+
+    {
+        std::string heightmapPath = MapConfig::getHeightmapPath();
+        if (m_heightmapSampler.load(heightmapPath)) {
+            m_terrainFieldSource.setBaseSampler(m_heightmapSampler.makeSamplerFunc());
+            std::cout << "[World] Heightmap base sampler wired ("
+                      << m_heightmapSampler.getMapWidth() << "x"
+                      << m_heightmapSampler.getMapHeight() << ")\n";
+        } else {
+            // No 2D heightmap — try 3D voxel base (worlds with overhangs / floating islands).
+            const std::string voxelBasePath = MapConfig::getBaseVoxelsBinPath();
+            if (m_voxelBaseSampler.load(voxelBasePath)) {
+                m_terrainFieldSource.setBaseSampler(m_voxelBaseSampler.makeSamplerFunc());
+                std::cout << "[World] 3D voxel base sampler wired (base_voxels.bin)\n";
+            } else {
+                std::cout << "[World] WARNING: No base terrain loaded"
+                             " — terrain edits will have no base data\n";
+            }
+        }
+    }
+    
+    // Initialize terrain file loader using MapConfig (flat maps/ directory)
+    std::string terrainFilePath = MapConfig::getTerrainBinPath();
+    std::string dccmTerrainFilePath = MapConfig::getDCCMTerrainBinPath();
+    std::string collisionFilePath = MapConfig::getCollisionPath();
+    m_baseTerrainPath = terrainFilePath;
+    m_baseCollisionPath = collisionFilePath;
+    m_snapshotRootDir = MapConfig::getMapsBasePath().string();
+    
+    std::cout << "[World] Loading terrain from maps/" << std::endl;
+    std::cout << "[World] Terrain (voxel): " << terrainFilePath << std::endl;
+    std::cout << "[World] Terrain (DCCM):  " << dccmTerrainFilePath << std::endl;
+    std::cout << "[World] Collision: " << collisionFilePath << std::endl;
+    
+    m_terrainLoader = std::make_unique<TerrainFileLoader>(terrainFilePath);
+    
+    // Load DCCM terrain file if it exists
+    if (MapConfig::dccmMapExists()) {
+        m_dccmTerrainLoader = std::make_unique<TerrainFileLoader>(dccmTerrainFilePath);
+        if (m_dccmTerrainLoader->isLoaded()) {
+            std::cout << "[World] DCCM terrain loaded successfully" << std::endl;
+        } else {
+            std::cout << "[World] DCCM terrain file exists but failed to load" << std::endl;
+            m_dccmTerrainLoader.reset();
+        }
+    } else {
+        std::cout << "[World] No DCCM terrain file found (terrain_dccm.bin)" << std::endl;
+    }
+    
+    // Set terrain center on ChunkManager based on actual terrain dimensions
+    auto dims = m_terrainLoader->getDimensions();
+    if (dims.chunksX > 0 && dims.chunksZ > 0) {
+        m_chunkManager->setTerrainCenter(dims.chunksX, dims.chunksZ);
+    }
+    
+    m_collisionCache = std::make_unique<Collision::CollisionCache>();
+    if (m_collisionCache->load(collisionFilePath)) {
+        std::cout << "[World] Loaded precomputed collision cache\n";
+    } else {
+        std::cout << "[World] No collision cache found, will compute at runtime\n";
+        m_collisionCache.reset();
+    }
+    
+    // Set world name
+    m_worldName = "terrain";
+    
+    // Get file modification time as generation date
+    try {
+        auto ftime = std::filesystem::last_write_time(terrainFilePath);
+        auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
+            ftime - std::filesystem::file_time_type::clock::now() + std::chrono::system_clock::now()
+        );
+        std::time_t cftime = std::chrono::system_clock::to_time_t(sctp);
+        std::tm tm_buf;
+        localtime_s(&tm_buf, &cftime);
+        char buffer[64];
+        std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M", &tm_buf);
+        m_worldGenerationDate = buffer;
+    } catch (...) {
+        m_worldGenerationDate = "Unknown";
+    }
+    
+    std::cout << "[World] Loaded: " << m_worldName << " (Generated: " << m_worldGenerationDate << ")\n";
+
+    refreshSnapshots();
+    updateWorldIdentityFromActiveSnapshot();
+    
+    // Start lifecycle manager background thread
+    m_lifecycleManager.setCallback(this);
+    m_lifecycleManager.start();
+    std::cout << "[World] Background lifecycle thread started\n";
+    
+    // Set up batch signal callback for LOD transitions
+    m_uploadSystem.setBatchSignalCallback(this);
+}
+
+World::~World() {
+    // Stop lifecycle manager
+    m_lifecycleManager.stop();
+    std::cout << "[World] Background lifecycle thread stopped\n";
+    
+    // ChunkUploadSystem cleans up its own queue in destructor
+    // unique_ptr<InGameDebug> destructor runs here (InGameDebug is complete in this TU)
+}
+
+std::vector<FramePassKind> World::enumerateFramePasses() const {
+    // Current runtime only submits the voxel opaque pass; UI/debug remain inactive.
+    return {FramePassKind::VoxelOpaque};
+}
+
+// --- IChunkLifecycleCallback implementation ---
+
+std::vector<entt::entity> World::createChunkEntities(const std::vector<glm::ivec3>& coords) {
+    return createChunksBatch(coords);
+}
+
+void World::scheduleChunkJobs(entt::entity entity, const glm::ivec3& coord, const glm::ivec3& playerChunk) {
+    if (entity == entt::null) return;
+    
+    markChunkPending(coord);
+
+    int desiredLod = getDesiredLODForChunk(coord);
+    {
+        std::unique_lock regLock(m_registryMutex);
+        if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
+            auto& chunk = m_registry.get<Chunk>(entity);
+            chunk.lodLevel = desiredLod;
+        }
+    }
+    
+    auto versionState = ensureChunkVersionState(this, entity);
+    if (!versionState) {
+        return;
+    }
+    
+    // Start pipeline
+    versionState->inFlight.store(true, std::memory_order_release);
+    versionState->pending.store(false, std::memory_order_release);
+    
+    setChunkState(entity, ChunkState::State::Loading);
+    
+    ChunkCoord chunkCoord;
+    AABB aabb;
+    {
+        std::shared_lock regLock(m_registryMutex);
+        if (!m_registry.valid(entity)) return;
+        chunkCoord = m_registry.get<ChunkCoord>(entity);
+        aabb = m_registry.get<AABB>(entity);
+    }
+    
+    // Ring-based priority
+    int dx = std::abs(coord.x - playerChunk.x);
+    int dz = std::abs(coord.z - playerChunk.z);
+    int ringNumber = std::max(dx, dz);
+    int distSq = dx * dx + dz * dz;
+    int priority = ringNumber * 1000000 + distSq;
+    
+    auto* payload = m_payloadPool.acquire();
+    payload->world = this;
+    payload->entity = entity;
+    payload->coord = chunkCoord;
+    payload->bounds = aabb;
+    payload->versionState = versionState;
+    payload->version = versionState->version.load(std::memory_order_acquire);
+    payload->distanceFromPlayer = priority;
+    payload->lodLevel = desiredLod;
+    payload->centerAtEnqueue = playerChunk;
+    
+    int chunkPriority = 1000000 - priority;
+    
+    // Choose mesh pipeline based on whether chunk has runtime voxel edits
+    const bool useRuntimeVoxel = chunkNeedsRuntimeVoxel(coord);
+    const TerrainType lodTerrainType = getTerrainTypeForChunk(coord, desiredLod);
+    const bool isDCCM = (lodTerrainType == TerrainType::DCCM) && m_heightmapSampler.isLoaded();
+    const bool useEditMesher = useRuntimeVoxel && !isDCCM;
+    payload->fromTerrainEdit = useEditMesher;
+    auto loadJobFn = useEditMesher ? LoadEditMeshJob : LoadPrecomputedMeshJob;
+    
+    JobHandle load = m_jobSystem.makeWithPriority(loadJobFn, payload, 0, chunkPriority);
+    JobHandle upload = m_jobSystem.makeWithPriority(UploadChunkJob, payload, 0, chunkPriority);
+    JobHandle finalize = m_jobSystem.makeWithPriority(FinalizeChunkJob, payload, 0, chunkPriority);
+    
+    m_jobSystem.addDependency(upload, load);
+    m_jobSystem.addDependency(finalize, upload);
+    
+    payload->jobHandles = {load, upload, finalize};
+    
+    m_jobSystem.schedule(load);
+    m_jobSystem.schedule(upload);
+    m_jobSystem.schedule(finalize);
+}
+
+int World::destroyChunks(const std::vector<glm::ivec3>& coords) {
+    return tryDestroyChunksBatch(coords);
+}
+
+void World::cleanupStaleVersionStates() {
+    std::shared_lock regLock(m_registryMutex);   // protect registry.valid()
+    std::scoped_lock versionLock(m_chunkVersionMutex);
+    auto& states = m_chunkVersionStates;
+    for (auto it = states.begin(); it != states.end(); ) {
+        if (!m_registry.valid(it->first)) {
+            it = states.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void World::transitionChunkState(entt::entity entity, ChunkState::State state) {
+    setChunkState(entity, state);
+}
+
+void World::setChunkState(entt::entity entity, ChunkState::State state) {
+    glm::ivec3 coord;
+    {
+        std::unique_lock lock(m_registryMutex);
+        if (!m_registry.valid(entity) ||
+            !m_registry.all_of<ChunkState, ChunkCoord>(entity)) {
+            return;
+        }
+        auto& chunkState = m_registry.get<ChunkState>(entity);
+        chunkState.state = state;
+        const auto& chunkCoord = m_registry.get<ChunkCoord>(entity);
+        coord = chunkCoord.toVec3();
+    }
+    setChunkState(coord, state);
+}
+
+void World::setChunkState(const glm::ivec3& coord, ChunkState::State state) {
+    ChunkState::State oldState = ChunkState::State::Unloaded;
+    {
+        std::unique_lock lock(m_chunkStateMutex);
+        auto it = m_chunkStateMap.find(coord);
+        if (it != m_chunkStateMap.end()) {
+            oldState = it->second;
+        }
+        m_chunkStateMap[coord] = state;
+    }
+    
+    // Update atomic counters (decrement old, increment new)
+    if (oldState == ChunkState::State::Loading) m_loadingCount.fetch_sub(1, std::memory_order_relaxed);
+    else if (oldState == ChunkState::State::Meshing) m_meshingCount.fetch_sub(1, std::memory_order_relaxed);
+    else if (oldState == ChunkState::State::Ready) m_readyCount.fetch_sub(1, std::memory_order_relaxed);
+    
+    if (state == ChunkState::State::Loading) m_loadingCount.fetch_add(1, std::memory_order_relaxed);
+    else if (state == ChunkState::State::Meshing) m_meshingCount.fetch_add(1, std::memory_order_relaxed);
+    else if (state == ChunkState::State::Ready) m_readyCount.fetch_add(1, std::memory_order_relaxed);
+
+    {
+        std::unique_lock setLock(m_chunkSetMutex);
+        if (state == ChunkState::State::Ready) {
+            m_readyChunkSet.insert(coord);
+            if (m_chunkManager && coord.y == 0) {
+                m_chunkManager->notifyChunkCreated(coord);
+            }
+        } else {
+            m_readyChunkSet.erase(coord);
+        }
+    }
+}
+
+void World::removeChunkState(const glm::ivec3& coord) {
+    std::unique_lock lock(m_chunkStateMutex);
+    auto it = m_chunkStateMap.find(coord);
+    if (it != m_chunkStateMap.end()) {
+        ChunkState::State oldState = it->second;
+        if (oldState == ChunkState::State::Loading) m_loadingCount.fetch_sub(1, std::memory_order_relaxed);
+        else if (oldState == ChunkState::State::Meshing) m_meshingCount.fetch_sub(1, std::memory_order_relaxed);
+        else if (oldState == ChunkState::State::Ready) m_readyCount.fetch_sub(1, std::memory_order_relaxed);
+        m_chunkStateMap.erase(it);
+    }
+    m_chunkEntityMap.erase(coord);
+    lock.unlock();
+    if (m_chunkManager && coord.y == 0) {
+        m_chunkManager->notifyChunkDestroyed(coord);
+    }
+    {
+        std::unique_lock setLock(m_chunkSetMutex);
+        m_readyChunkSet.erase(coord);
+        m_existingChunkSet.erase(coord);
+    }
+}
+
+ChunkState::State World::getChunkStateSnapshot(const glm::ivec3& coord) const {
+    std::shared_lock lock(m_chunkStateMutex);
+    auto it = m_chunkStateMap.find(coord);
+    if (it != m_chunkStateMap.end()) {
+        return it->second;
+    }
+    return ChunkState::State::Unloaded;
+}
+
+void World::markChunkPending(const glm::ivec3& coord) {
+    std::lock_guard lock(m_pendingChunksMutex);
+    m_pendingChunks.insert(coord);
+}
+
+void World::clearChunkPending(const glm::ivec3& coord) {
+    std::lock_guard lock(m_pendingChunksMutex);
+    m_pendingChunks.erase(coord);
+}
+
+bool World::isChunkPending(const glm::ivec3& coord) const {
+    std::lock_guard lock(m_pendingChunksMutex);
+    return m_pendingChunks.find(coord) != m_pendingChunks.end();
+}
+
+// update(), updateChunkLoader(), updateMarkDirtyOnGeneration(),
+// updateMeshingSystem(), updateUploadQueueSystem(), onMeshUploaded(),
+// processFinalizeQueue() moved to WorldUpdate.cpp
+
+// createChunk() moved to WorldChunkCRUD.cpp
+
+// createChunksBatch(), tryDestroyChunk(), tryDestroyChunksBatch(),
+// resetChunkGeneration(), switchTerrainFile() moved to WorldChunkCRUD.cpp
+
+// setTerrainTypeForLOD(), applyLODChangesIncrementally(),
+// releaseMeshesForLOD(), reloadMeshesForLOD() moved to WorldLODTransitions.cpp
+
+int World::getDesiredLODForChunk(const glm::ivec3& coord) const {
+    return m_lodSystem.getDesiredLOD(coord);
+}
+
+entt::entity World::findChunk(const glm::ivec3& chunkCoord) const {
+    std::shared_lock lock(m_chunkStateMutex);
+    auto it = m_chunkEntityMap.find(chunkCoord);
+    if (it != m_chunkEntityMap.end()) {
+        return it->second;
+    }
+    return entt::null;
+}
+
+TerrainEdit::TerrainEditOverlayStore::ChunkSet World::collectExistingChunksInRange(
+    const glm::ivec3& minChunk,
+    const glm::ivec3& maxChunk) const {
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet chunks;
+    const glm::ivec3 lo(
+        std::min(minChunk.x, maxChunk.x),
+        std::min(minChunk.y, maxChunk.y),
+        std::min(minChunk.z, maxChunk.z));
+    const glm::ivec3 hi(
+        std::max(minChunk.x, maxChunk.x),
+        std::max(minChunk.y, maxChunk.y),
+        std::max(minChunk.z, maxChunk.z));
+
+    std::shared_lock lock(m_chunkStateMutex);
+    for (const auto& [coord, entity] : m_chunkEntityMap) {
+        if (entity == entt::null) {
+            continue;
+        }
+        if (coord.x < lo.x || coord.x > hi.x ||
+            coord.y < lo.y || coord.y > hi.y ||
+            coord.z < lo.z || coord.z > hi.z) {
+            continue;
+        }
+        chunks.insert(coord);
+    }
+    return chunks;
+}
+
+World::LoadManagementDiag World::getLoadManagementDiag() const {
+    LoadManagementDiag diag{};
+    if (m_chunkManager) {
+        const auto info = m_chunkManager->getDebugInfo();
+        diag.baseRenderDist = info.baseRenderDist;
+        diag.effectiveRenderDist = info.effectiveRenderDist;
+        diag.extensionRings = info.extensionRings;
+        diag.measuredThroughput = info.measuredThroughput;
+        diag.pendingCreates = static_cast<uint32_t>(std::max(info.pendingCreates, 0));
+        diag.pendingDestroys = static_cast<uint32_t>(std::max(info.pendingDestroys, 0));
+        diag.bufferPressure = m_chunkManager->hasBufferPressure();
+    }
+
+    diag.lodRemeshQueue =
+        static_cast<uint32_t>(std::min<size_t>(m_lodSystem.getRemeshQueueSize(), UINT32_MAX));
+    diag.pendingLodRemeshes =
+        static_cast<uint32_t>(std::min<size_t>(m_pendingLODRemeshes.size(), UINT32_MAX));
+    diag.editRemeshPending =
+        static_cast<uint32_t>(std::min<size_t>(m_editRemeshScheduler.pendingCount(), UINT32_MAX));
+    diag.uploadQueue = m_uploadSystem.getQueueSize();
+    diag.finalizeQueue =
+        static_cast<uint32_t>(std::min<size_t>(m_uploadSystem.getFinalizeQueueSize(), UINT32_MAX));
+    return diag;
+}
+
+size_t World::getChunkCount() const {
+    std::shared_lock lock(m_registryMutex);
+    return m_registry.view<ChunkCoord>().size();
+}
+
+World::TerrainEditPlacementContext World::getTerrainEditPlacementContext(const glm::vec3& worldPos) const {
+    TerrainEditPlacementContext context;
+
+    const auto micro = WorldConfig::worldToMicroVoxel(worldPos);
+    const auto chunk = WorldConfig::microVoxelToChunk(micro);
+    context.chunkCoord = glm::ivec3(chunk.x, chunk.y, chunk.z);
+
+    int bandLodLevel = 0;
+    bool foundLoadedChunk = false;
+
+    entt::entity entity = findChunk(context.chunkCoord);
+    if (entity != entt::null) {
+        std::shared_lock regLock(m_registryMutex);
+        if (m_registry.valid(entity) && m_registry.all_of<Chunk>(entity)) {
+            bandLodLevel = m_registry.get<Chunk>(entity).lodLevel;
+            foundLoadedChunk = true;
+        }
+    }
+
+    if (!foundLoadedChunk) {
+        bandLodLevel = getDesiredLODForChunk(context.chunkCoord);
+        if (bandLodLevel < 0 && m_chunkManager) {
+            const glm::ivec3 center = m_chunkManager->getCenterChunk();
+            const int ring = m_chunkManager->calculateRingNumber(context.chunkCoord, center);
+            bandLodLevel = m_chunkManager->calculateLODFromRing(ring);
+        }
+    }
+
+    bandLodLevel = std::clamp(bandLodLevel, 0, MAX_LOD_LEVELS - 1);
+    context.valid = true;
+    context.bandLodLevel = bandLodLevel;
+    context.terrainType = getTerrainTypeForChunk(context.chunkCoord, bandLodLevel);
+    context.previewLodLevel = (context.terrainType == TerrainType::Voxel)
+        ? getEffectiveLODForChunk(context.chunkCoord, bandLodLevel)
+        : bandLodLevel;
+    context.previewLodLevel = std::clamp(context.previewLodLevel, 0, MAX_LOD_LEVELS - 1);
+    context.voxelSizeM = WorldConfig::getLODVoxelSizeM(context.previewLodLevel);
+
+    return context;
+}
+
+void World::clearEditArtifactCache() {
+    std::unique_lock lock(m_editArtifactCacheMutex);
+    m_editArtifactCache.clear();
+}
+
+void World::markRuntimeVoxelChunks(
+    const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords)
+{
+    if (chunkCoords.empty()) {
+        return;
+    }
+
+    std::unique_lock lock(m_runtimeVoxelChunkMutex);
+    m_runtimeVoxelChunks.insert(chunkCoords.begin(), chunkCoords.end());
+}
+
+void World::clearRuntimeVoxelChunks() {
+    std::unique_lock lock(m_runtimeVoxelChunkMutex);
+    m_runtimeVoxelChunks.clear();
+}
+
+TerrainEdit::TerrainEditOverlayStore::ChunkSet World::getRuntimeVoxelChunkCoords() const {
+    std::shared_lock lock(m_runtimeVoxelChunkMutex);
+    return m_runtimeVoxelChunks;
+}
+
+bool World::chunkNeedsRuntimeVoxel(const glm::ivec3& chunkCoord) const {
+    if (chunkCoord.y != 0 || m_terrainEditOverlay.hasEditsInChunk(chunkCoord)) {
+        return true;
+    }
+
+    const glm::ivec3 minVoxel = WorldConfig::chunkToMicroVoxel(chunkCoord);
+    const glm::ivec3 maxVoxel = minVoxel + glm::ivec3(
+        WorldConfig::CHUNK_SIZE,
+        WorldConfig::CHUNK_HEIGHT,
+        WorldConfig::CHUNK_SIZE);
+    if (m_textureMaterialStore.hasSurfaceTexturesInBox(minVoxel, maxVoxel, 0)) {
+        return true;
+    }
+
+    std::shared_lock lock(m_runtimeVoxelChunkMutex);
+    return m_runtimeVoxelChunks.find(chunkCoord) != m_runtimeVoxelChunks.end();
+}
+
+void World::markEditsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks) {
+    if (touchedChunks.empty()) return;
+    markRuntimeVoxelChunks(touchedChunks);
+    m_editRemeshScheduler.markChunksDirty(touchedChunks);
+}
+
+void World::markTextureMaterialsDirty(const TerrainEdit::TerrainEditOverlayStore::ChunkSet& touchedChunks) {
+    if (touchedChunks.empty()) return;
+
+    // Texture paint changes material only, not occupancy/collision.
+    // Invalidate all cached runtime voxel artifacts for these chunks before
+    // scheduling the material-only rebake. Otherwise LOD swaps can reuse a
+    // pre-paint cached lower-LOD artifact, which makes LOD0 look correct while
+    // coarser LODs still show procedural/default material.
+    markRuntimeVoxelChunks(touchedChunks);
+    invalidateEditArtifacts(touchedChunks);
+    m_editRemeshScheduler.markMaterialChunksDirty(touchedChunks);
+}
+
+void World::invalidateEditArtifact(const glm::ivec3& chunkCoord) {
+    std::unique_lock lock(m_editArtifactCacheMutex);
+    for (auto it = m_editArtifactCache.begin(); it != m_editArtifactCache.end(); ) {
+        if (it->first.chunkCoord == chunkCoord) {
+            it = m_editArtifactCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void World::invalidateEditArtifacts(
+    const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunkCoords)
+{
+    if (chunkCoords.empty()) {
+        return;
+    }
+
+    std::unique_lock lock(m_editArtifactCacheMutex);
+    for (auto it = m_editArtifactCache.begin(); it != m_editArtifactCache.end(); ) {
+        if (chunkCoords.find(it->first.chunkCoord) != chunkCoords.end()) {
+            it = m_editArtifactCache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void World::storeEditArtifact(const glm::ivec3& chunkCoord,
+                              TerrainType terrainType,
+                              int lodLevel,
+                              std::vector<Vertex>&& vertices,
+                              std::vector<uint32_t>&& indices,
+                              glm::vec3 aabbMin,
+                              glm::vec3 aabbMax,
+                              bool isEmpty,
+                              bool deferredBuild) {
+    EditArtifactKey key;
+    key.chunkCoord = chunkCoord;
+    key.terrainType = terrainType;
+    key.lodLevel = lodLevel;
+
+    EditArtifact artifact;
+    artifact.terrainType = terrainType;
+    artifact.lodLevel = lodLevel;
+    artifact.isEmpty = isEmpty;
+    artifact.deferredBuild = deferredBuild;
+    artifact.vertices = std::move(vertices);
+    artifact.indices = std::move(indices);
+    artifact.aabbMin = aabbMin;
+    artifact.aabbMax = aabbMax;
+
+    artifact.generation = ++m_editArtifactGenCounter;
+
+    std::unique_lock lock(m_editArtifactCacheMutex);
+    m_editArtifactCache[key] = std::move(artifact);
+}
+
+bool World::tryGetEditArtifact(const glm::ivec3& chunkCoord,
+                               TerrainType terrainType,
+                               int lodLevel,
+                               EditArtifact& outArtifact) const {
+    EditArtifactKey key;
+    key.chunkCoord = chunkCoord;
+    key.terrainType = terrainType;
+    key.lodLevel = lodLevel;
+
+    std::shared_lock lock(m_editArtifactCacheMutex);
+    auto it = m_editArtifactCache.find(key);
+    if (it == m_editArtifactCache.end()) {
+        return false;
+    }
+
+    outArtifact = it->second;
+    return true;
+}
+
+uint64_t World::getEditArtifactGeneration(const glm::ivec3& chunkCoord,
+                                          TerrainType terrainType,
+                                          int lodLevel) const {
+    EditArtifactKey key;
+    key.chunkCoord = chunkCoord;
+    key.terrainType = terrainType;
+    key.lodLevel = lodLevel;
+
+    std::shared_lock lock(m_editArtifactCacheMutex);
+    auto it = m_editArtifactCache.find(key);
+    return (it != m_editArtifactCache.end()) ? it->second.generation : 0;
+}
+
+void World::preDeserializeCollisionShapes() {
+    if (m_collisionCache && m_collisionCache->isLoaded()) {
+        m_collisionCache->preDeserializeAll();
+    }
+}
+
+// cleanupStalePendingMeshHandles(), onBatchChunkReady(),
+// processLODSwaps() moved to WorldLODTransitions.cpp
+
+// generateFinalizeDiagReport() moved to WorldDebugMetrics.cpp
+
+// gatherDrawCommands(), gatherDrawCommandsInSphere(),
+// enqueueMeshForUpload() moved to WorldRendering.cpp
+
+
+````
+
 ## src\CMakeLists.txt
 
 Description: No CC-DESC found.
@@ -4026,13 +3193,15 @@ set(RENDERING_SOURCES
 set(WORLD_SOURCES
     world/World.cpp
     world/WorldUpdate.cpp
-    world/WorldUpdateLODScan.cpp
     world/WorldUpdateMeshing.cpp
     world/WorldUpdateFinalize.cpp
     world/WorldRendering.cpp
     world/WorldDebugMetrics.cpp
     world/WorldChunkCRUD.cpp
-    world/WorldLODTransitions.cpp
+    world/lod/WorldLODConfig.cpp
+    world/lod/WorldLODTransitions.cpp
+    world/lod/WorldLODSwaps.cpp
+    world/lod/WorldLODDiagnostics.cpp
     world/WorldSnapshots.cpp
     world/WorldTerrainEditCollision.cpp
     world/config/WorldConfig.cpp

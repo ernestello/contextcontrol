@@ -1,0 +1,332 @@
+// GPT-DESC: Owns snapshot list refresh, creation, editable branching, and terrain edit dirtying.
+#include "world/snapshot/WorldSnapshotInternal.h"
+
+using namespace WorldSnapshotInternal;
+
+void World::refreshSnapshots() {
+    const std::string activeId =
+        (m_activeSnapshotIndex >= 0 &&
+         m_activeSnapshotIndex < static_cast<int>(m_snapshotInfos.size()))
+            ? m_snapshotInfos[static_cast<size_t>(m_activeSnapshotIndex)].id
+            : std::string{};
+
+    m_snapshotInfos.clear();
+
+    SnapshotInfo baseInfo;
+    baseInfo.id = "__base__";
+    baseInfo.displayName = "Base Terrain";
+    baseInfo.createdAt = m_worldGenerationDate.empty() ? "Unknown" : m_worldGenerationDate;
+    baseInfo.isBase = true;
+    baseInfo.editedCells = 0;
+    baseInfo.editedBricks = 0;
+    m_snapshotInfos.push_back(baseInfo);
+
+    if (!m_snapshotRootDir.empty()) {
+        std::filesystem::create_directories(m_snapshotRootDir);
+        for (const auto& entry : std::filesystem::directory_iterator(m_snapshotRootDir)) {
+            if (!entry.is_directory()) {
+                continue;
+            }
+
+            const std::filesystem::path metaPath = entry.path() / "snapshot.meta";
+            if (!std::filesystem::exists(metaPath)) {
+                continue;
+            }
+
+            SnapshotInfo info;
+            if (readSnapshotMetaFile(metaPath, info)) {
+                m_snapshotInfos.push_back(std::move(info));
+            }
+        }
+    }
+
+    std::sort(m_snapshotInfos.begin() + 1, m_snapshotInfos.end(),
+              [](const SnapshotInfo& a, const SnapshotInfo& b) {
+                  return a.displayName < b.displayName;
+              });
+
+    m_activeSnapshotIndex = 0;
+    if (!activeId.empty()) {
+        for (size_t i = 0; i < m_snapshotInfos.size(); ++i) {
+            if (m_snapshotInfos[i].id == activeId) {
+                m_activeSnapshotIndex = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+}
+
+bool World::createSnapshot(const std::string& desiredName) {
+    // Flush any pending edits to the previous snapshot before branching.
+    flushDirtySnapshot();
+
+    std::string baseName = desiredName.empty() ? "snapshot" : desiredName;
+    std::string id = sanitizeSnapshotId(baseName);
+
+    auto idExists = [this](const std::string& candidate) {
+        return std::any_of(m_snapshotInfos.begin(), m_snapshotInfos.end(),
+                           [&candidate](const SnapshotInfo& info) {
+                               return info.id == candidate;
+                           });
+    };
+
+    if (idExists(id)) {
+        const std::string suffix = makeTimestampString("%Y%m%d_%H%M%S");
+        id += "_" + suffix;
+    }
+
+    SnapshotInfo info;
+    info.id = id;
+    info.displayName = desiredName.empty() ? ("Snapshot " + makeTimestampString("%Y-%m-%d %H:%M:%S")) : desiredName;
+    info.createdAt = makeTimestampString("%Y-%m-%d %H:%M:%S");
+    info.isBase = false;
+    info.editedCells = static_cast<uint64_t>(m_terrainEditOverlay.getEditedCellCount());
+    info.editedBricks = static_cast<uint64_t>(m_terrainEditOverlay.getBrickCount());
+
+    m_snapshotInfos.push_back(info);
+    m_activeSnapshotIndex = static_cast<int>(m_snapshotInfos.size() - 1);
+    ++m_terrainBoxRevision;
+    updateWorldIdentityFromActiveSnapshot();
+    return saveActiveSnapshot();
+}
+
+bool World::ensureEditableSnapshot() {
+    if (hasActiveEditableSnapshot()) {
+        return true;
+    }
+    return createSnapshot();
+}
+
+bool World::applyTerrainBoxEdit(const glm::vec3& minCorner,
+                                const glm::vec3& maxCorner,
+                                bool additive,
+                                float requestedStep,
+                                int brushShape) {
+    using Clock = std::chrono::high_resolution_clock;
+    const auto editStartTime = std::chrono::steady_clock::now();
+    const auto tApplyStart = Clock::now();
+
+    // Reset diagnostics for this edit
+    m_lastEditDiag = TerrainEditDiag{};
+    m_lastEditDiag.editId = m_nextTerrainEditId++;
+    m_lastEditDiag.editCenter = (minCorner + maxCorner) * 0.5f;
+    m_lastEditDiag.editSize = glm::length(maxCorner - minCorner);
+
+    if (!ensureEditableSnapshot()) {
+        return false;
+    }
+
+    const glm::vec3 clampedMin = glm::min(minCorner, maxCorner);
+    const glm::vec3 clampedMax = glm::max(minCorner, maxCorner);
+
+    const int32_t requestedStepCells = std::max(
+        1,
+        static_cast<int32_t>(std::lround(
+            std::max(requestedStep, TerrainEdit::EDIT_CELL_SIZE_M) /
+            TerrainEdit::EDIT_CELL_SIZE_M)));
+
+    auto alignDownToStep = [requestedStepCells](int32_t value) -> int32_t {
+        return TerrainEdit::floorDiv(value, requestedStepCells) * requestedStepCells;
+    };
+
+    auto alignUpToStep = [requestedStepCells](int32_t value) -> int32_t {
+        return TerrainEdit::floorDiv(value + requestedStepCells - 1, requestedStepCells) * requestedStepCells;
+    };
+
+    const int32_t rawStartX = static_cast<int32_t>(std::floor(clampedMin.x / TerrainEdit::EDIT_CELL_SIZE_M));
+    const int32_t rawStartY = static_cast<int32_t>(std::floor(clampedMin.y / TerrainEdit::EDIT_CELL_SIZE_M));
+    const int32_t rawStartZ = static_cast<int32_t>(std::floor(clampedMin.z / TerrainEdit::EDIT_CELL_SIZE_M));
+
+    const int32_t rawEndExclusiveX = static_cast<int32_t>(std::ceil(clampedMax.x / TerrainEdit::EDIT_CELL_SIZE_M));
+    const int32_t rawEndExclusiveY = static_cast<int32_t>(std::ceil(clampedMax.y / TerrainEdit::EDIT_CELL_SIZE_M));
+    const int32_t rawEndExclusiveZ = static_cast<int32_t>(std::ceil(clampedMax.z / TerrainEdit::EDIT_CELL_SIZE_M));
+
+    const int32_t startX = alignDownToStep(rawStartX);
+    const int32_t startY = alignDownToStep(rawStartY);
+    const int32_t startZ = alignDownToStep(rawStartZ);
+
+    const int32_t endExclusiveX = alignUpToStep(rawEndExclusiveX);
+    const int32_t endExclusiveY = alignUpToStep(rawEndExclusiveY);
+    const int32_t endExclusiveZ = alignUpToStep(rawEndExclusiveZ);
+
+    const int32_t endX = endExclusiveX - 1;
+    const int32_t endY = endExclusiveY - 1;
+    const int32_t endZ = endExclusiveZ - 1;
+
+    if (endX < startX || endY < startY || endZ < startZ) {
+        return false;
+    }
+
+    const TerrainEdit::GridCoord a(startX, startY, startZ);
+    const TerrainEdit::GridCoord b(endX, endY, endZ);
+
+    auto axisCount = [](int32_t start, int32_t end) -> uint64_t {
+        if (end < start) {
+            return 0;
+        }
+        return static_cast<uint64_t>(end - start) + 1u;
+    };
+
+    m_lastEditDiag.totalCells =
+        axisCount(a.x, b.x) *
+        axisCount(a.y, b.y) *
+        axisCount(a.z, b.z);
+
+    const TerrainEdit::CellValue cellValue = additive
+        ? TerrainEdit::makeSolidCell()
+        : TerrainEdit::makeAirCell();
+
+    // --- Timed: cell write loop ---
+    const auto tCellStart = Clock::now();
+    TerrainEdit::TerrainEditOverlayStore::BoxEditResult boxEdit;
+
+    if (brushShape == 1) {
+        // Sphere brush: O(1) write — distance test deferred to meshing.
+        boxEdit = m_terrainEditOverlay.writeSphere(a, b, cellValue);
+    } else {
+        // Square brush: fast rectangular write
+        boxEdit = m_terrainEditOverlay.writeBox(a, b, cellValue);
+    }
+    const auto tCellEnd = Clock::now();
+    m_lastEditDiag.cellWriteMs = std::chrono::duration<float, std::milli>(tCellEnd - tCellStart).count();
+    m_lastEditDiag.changedCells = boxEdit.cellsChanged;
+
+    // Record deferred fill list sizes for diagnostics.
+    {
+        const auto fc = m_terrainEditOverlay.getDeferredFillCounts();
+        m_lastEditDiag.sphereFillCount = fc.sphereFills;
+        m_lastEditDiag.boxFillCount = fc.boxFills;
+        m_lastEditDiag.cylinderFillCount = fc.cylinderFills;
+        m_lastEditDiag.brickCount = fc.bricks;
+    }
+
+    if (boxEdit.cellsChanged == 0) {
+        return false;
+    }
+
+    const auto affectedChunks = collectEditAffectedChunks(a, b);
+    beginTerrainEditVisualTracking(m_lastEditDiag.editId, affectedChunks, editStartTime);
+
+    // --- Timed: chunk marking ---
+    const auto tInvalidateStart = Clock::now();
+    {
+        invalidateEditArtifacts(affectedChunks);
+    }
+    const auto tInvalidateEnd = Clock::now();
+    m_lastEditDiag.invalidateMs = std::chrono::duration<float, std::milli>(tInvalidateEnd - tInvalidateStart).count();
+
+    const auto tMarkStart = Clock::now();
+    m_editRemeshScheduler.markChunksDirty(affectedChunks, &boxEdit.dirtyChunkPages);
+    const auto tMarkEnd = Clock::now();
+    m_lastEditDiag.chunkMarkMs = std::chrono::duration<float, std::milli>(tMarkEnd - tMarkStart).count();
+
+    // Rebuild runtime-voxel ownership from actual edited chunks + shell.
+    // Avoids unbounded growth from repeatedly unioning transient edit halos.
+    const auto previousRuntimeVoxel = getRuntimeVoxelChunkCoords();
+    const auto editedChunks = m_terrainEditOverlay.getEditedChunkCoords();
+    const auto runtimeVoxelChunks = expandRuntimeVoxelChunkShell(editedChunks);
+    clearRuntimeVoxelChunks();
+    markRuntimeVoxelChunks(runtimeVoxelChunks);
+
+    // Chunks that were runtime-owned but are no longer needed should be
+    // remeshed once so they can return to the precomputed path cleanly.
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet droppedRuntimeChunks;
+    for (const auto& coord : previousRuntimeVoxel) {
+        if (runtimeVoxelChunks.find(coord) == runtimeVoxelChunks.end()) {
+            droppedRuntimeChunks.insert(coord);
+        }
+    }
+    if (!droppedRuntimeChunks.empty()) {
+        invalidateEditArtifacts(droppedRuntimeChunks);
+        m_editRemeshScheduler.markChunksDirty(droppedRuntimeChunks);
+    }
+
+    // Flush remesh queue immediately so dirty chunks are dispatched in THIS
+    // frame instead of waiting for the next World::update().  Saves one
+    // full frame of latency (16 ms at 60 fps).
+    // Placed before box list/revision updates so dispatch happens ASAP.
+    const auto tRemeshStart = Clock::now();
+    m_editRemeshScheduler.processRemeshQueue(this, /*budget=*/0, /*dispatchOnly=*/true);
+    const auto tRemeshEnd = Clock::now();
+    m_lastEditDiag.inlineRemeshMs = std::chrono::duration<float, std::milli>(tRemeshEnd - tRemeshStart).count();
+
+    // --- Timed: box list update ---
+    const auto tBoxStart = Clock::now();
+    const TerrainBoxRecord editBox{clampedMin, clampedMax};
+    bool boxListChanged = false;
+    if (additive) {
+        m_terrainBoxes.push_back(editBox);
+        boxListChanged = true;
+    } else {
+        const size_t before = m_terrainBoxes.size();
+        m_terrainBoxes.erase(
+            std::remove_if(m_terrainBoxes.begin(), m_terrainBoxes.end(),
+                           [&editBox](const TerrainBoxRecord& existing) {
+                               return boxesIntersect(existing, editBox);
+                           }),
+            m_terrainBoxes.end());
+        boxListChanged = (m_terrainBoxes.size() != before);
+    }
+
+    if (boxListChanged) {
+        ++m_terrainBoxRevision;
+    }
+
+    // Always bump revision when cells changed so shadow cache invalidates
+    // even for digs into heightmap terrain (no box records to remove).
+    if (!boxListChanged && boxEdit.cellsChanged > 0) {
+        ++m_terrainBoxRevision;
+    }
+
+    m_snapshotDirty = true;
+    const auto tBoxEnd = Clock::now();
+    m_lastEditDiag.boxListMs = std::chrono::duration<float, std::milli>(tBoxEnd - tBoxStart).count();
+
+    const auto tApplyEnd = Clock::now();
+    m_lastEditDiag.applyTotalMs = std::chrono::duration<float, std::milli>(tApplyEnd - tApplyStart).count();
+    m_lastEditDiag.valid = true;
+
+    // Commit the edit to the rolling stats/history immediately. Waiting for a
+    // later collision frame duplicates entries and collapses multiple rapid
+    // edits into one stale record because m_lastEditDiag only stores the most
+    // recent edit.
+    m_editStats.push(m_lastEditDiag);
+
+    TerrainEditHistoryEntry histEntry{};
+    histEntry.editId = m_lastEditDiag.editId;
+    histEntry.applyMs = m_lastEditDiag.applyTotalMs;
+    histEntry.remeshMs = m_lastEditDiag.remeshTotalMs;
+    histEntry.grandMs = m_lastEditDiag.grandTotalMs;
+    histEntry.chunksRemeshed = m_lastEditDiag.chunksRemeshed;
+    histEntry.vertexCount = m_lastEditDiag.vertexCount;
+    histEntry.changedCells = m_lastEditDiag.changedCells;
+    histEntry.visualFirstChunkMs = m_lastEditDiag.visualFirstChunkMs;
+    histEntry.visualCompleteMs = m_lastEditDiag.visualCompleteMs;
+    histEntry.visualChunksTotal = m_lastEditDiag.visualChunksTotal;
+    histEntry.visualChunksReady = m_lastEditDiag.visualChunksReady;
+    histEntry.visualChunksSuperseded = m_lastEditDiag.visualChunksSuperseded;
+    histEntry.visualComplete = m_lastEditDiag.visualComplete;
+    histEntry.visualUploadBytes = m_lastEditDiag.visualUploadBytes;
+    histEntry.visualArtifactBuilds = m_lastEditDiag.visualArtifactBuilds;
+    histEntry.visualArtifactCacheHits = m_lastEditDiag.visualArtifactCacheHits;
+    histEntry.visualPrecomputedLoads = m_lastEditDiag.visualPrecomputedLoads;
+    histEntry.visualCollisionBaseCache = m_lastEditDiag.visualCollisionBaseCache;
+    histEntry.visualCollisionEditPacked = m_lastEditDiag.visualCollisionEditPacked;
+    histEntry.visualCollisionArtifactRefresh = m_lastEditDiag.visualCollisionArtifactRefresh;
+    histEntry.visualCollisionExistingEdit = m_lastEditDiag.visualCollisionExistingEdit;
+    histEntry.visualGpuResidentChunks = m_lastEditDiag.visualGpuResidentChunks;
+    histEntry.visualArtifactResidentChunks = m_lastEditDiag.visualArtifactResidentChunks;
+    histEntry.visualMonolithicChunks = m_lastEditDiag.visualMonolithicChunks;
+    histEntry.visualPagedChunks = m_lastEditDiag.visualPagedChunks;
+    histEntry.visualDirtyPages = m_lastEditDiag.visualDirtyPages;
+    histEntry.visualRebuiltPages = m_lastEditDiag.visualRebuiltPages;
+    histEntry.visualResidentPages = m_lastEditDiag.visualResidentPages;
+    histEntry.visualEvictedPages = m_lastEditDiag.visualEvictedPages;
+    histEntry.editCenter = m_lastEditDiag.editCenter;
+    histEntry.editSize = m_lastEditDiag.editSize;
+    histEntry.timestampSec = std::chrono::duration<float>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()).count();
+    m_editHistory.push(histEntry);
+
+    return true;
+}

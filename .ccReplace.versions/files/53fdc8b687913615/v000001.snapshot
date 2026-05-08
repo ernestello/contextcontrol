@@ -1,0 +1,391 @@
+#pragma once
+
+// GPT-DESC: Private snapshot-system helpers shared by World snapshot implementation units.
+#include "world/World.h"
+#include "world/ChunkHoleTracker.h"
+#include "world/config/MapConfig.h"
+#include "world/edit/TerrainEditTypes.h"
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdlib>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <unordered_map>
+
+namespace WorldSnapshotInternal {
+
+static std::string makeTimestampString(const char* format) {
+    std::time_t now = std::time(nullptr);
+    std::tm tmBuf{};
+#ifdef _WIN32
+    localtime_s(&tmBuf, &now);
+#else
+    localtime_r(&now, &tmBuf);
+#endif
+    char buffer[64];
+    if (std::strftime(buffer, sizeof(buffer), format, &tmBuf) == 0) {
+        return "unknown";
+    }
+    return buffer;
+}
+
+static std::string sanitizeSnapshotId(const std::string& input) {
+    std::string result;
+    result.reserve(input.size());
+
+    for (char ch : input) {
+        const unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::isalnum(uch)) {
+            result.push_back(static_cast<char>(std::tolower(uch)));
+        } else if (ch == ' ' || ch == '-' || ch == '_') {
+            result.push_back('_');
+        }
+    }
+
+    while (!result.empty() && result.front() == '_') {
+        result.erase(result.begin());
+    }
+    while (!result.empty() && result.back() == '_') {
+        result.pop_back();
+    }
+
+    if (result.empty()) {
+        result = "snapshot_" + makeTimestampString("%Y%m%d_%H%M%S");
+    }
+
+    return result;
+}
+
+static std::string trim(const std::string& value) {
+    size_t start = 0;
+    while (start < value.size() &&
+           std::isspace(static_cast<unsigned char>(value[start])) != 0) {
+        ++start;
+    }
+
+    size_t end = value.size();
+    while (end > start &&
+           std::isspace(static_cast<unsigned char>(value[end - 1])) != 0) {
+        --end;
+    }
+
+    return value.substr(start, end - start);
+}
+
+static TerrainEdit::TerrainEditOverlayStore::ChunkSet expandRuntimeVoxelChunkShell(
+    const TerrainEdit::TerrainEditOverlayStore::ChunkSet& chunks)
+{
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet expanded = chunks;
+    for (const auto& chunk : chunks) {
+        // Horizontal 8-neighbor shell closes corner-intersection gaps.
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dz == 0) {
+                    continue;
+                }
+                expanded.insert(chunk + glm::ivec3(dx, 0, dz));
+            }
+        }
+        // Keep vertical face-neighbors for stacked chunk transitions.
+        expanded.insert(chunk + glm::ivec3(0, -1, 0));
+        expanded.insert(chunk + glm::ivec3(0,  1, 0));
+    }
+
+    return expanded;
+}
+
+static TerrainEdit::TerrainEditOverlayStore::ChunkSet collectEditAffectedChunks(
+    const TerrainEdit::GridCoord& a,
+    const TerrainEdit::GridCoord& b)
+{
+    TerrainEdit::GridCoord minCoord(
+        std::min(a.x, b.x),
+        std::min(a.y, b.y),
+        std::min(a.z, b.z));
+    TerrainEdit::GridCoord maxCoord(
+        std::max(a.x, b.x),
+        std::max(a.y, b.y),
+        std::max(a.z, b.z));
+
+    // The mesher samples a 1-voxel halo around each chunk for border faces and AO.
+    // Any edit that reaches the boundary voxel of a chunk can therefore change the
+    // neighboring chunk even if no cell was written inside that neighbor.
+    const int halo = TerrainEdit::EDIT_CELLS_PER_VOXEL;
+    minCoord -= TerrainEdit::GridCoord(halo, halo, halo);
+    maxCoord += TerrainEdit::GridCoord(halo, halo, halo);
+
+    TerrainEdit::TerrainEditOverlayStore::ChunkSet affected;
+    TerrainEdit::TerrainEditOverlayStore::collectTouchedChunksForBounds(
+        minCoord,
+        maxCoord,
+        affected);
+    return affected;
+}
+
+static std::filesystem::path snapshotDirFor(const std::string& rootDir, const std::string& id) {
+    return std::filesystem::path(rootDir) / id;
+}
+
+static std::filesystem::path snapshotMetaPathFor(const std::string& rootDir, const std::string& id) {
+    return snapshotDirFor(rootDir, id) / "snapshot.meta";
+}
+
+static std::filesystem::path snapshotOverlayPathFor(const std::string& rootDir, const std::string& id) {
+    return snapshotDirFor(rootDir, id) / "terrain_overlay.bin";
+}
+
+static std::filesystem::path snapshotTextureOverlayPathFor(const std::string& rootDir, const std::string& id) {
+    return snapshotDirFor(rootDir, id) / "texture_overlay.bin";
+}
+
+
+static std::filesystem::path snapshotBoxesPathFor(const std::string& rootDir, const std::string& id) {
+    return snapshotDirFor(rootDir, id) / "terrain_boxes.bin";
+}
+
+static std::filesystem::path snapshotCollisionPathFor(const std::string& rootDir, const std::string& id) {
+    return snapshotDirFor(rootDir, id) / "terrain_edit_collision.bin";
+}
+
+static std::string formatByteCount(uintmax_t bytes) {
+    static constexpr const char* kUnits[] = {"B", "KB", "MB", "GB", "TB"};
+    double value = static_cast<double>(bytes);
+    size_t unitIndex = 0;
+    while (value >= 1024.0 && unitIndex + 1 < (sizeof(kUnits) / sizeof(kUnits[0]))) {
+        value /= 1024.0;
+        ++unitIndex;
+    }
+
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(unitIndex == 0 ? 0 : 2)
+        << value << ' ' << kUnits[unitIndex];
+    return out.str();
+}
+
+// -----------------------------------------------------------------------
+// Edit collision binary I/O
+// V1 Format: magic(4) | chunkCount(4) | per-chunk: [cx(4) cz(4) nVerts(4) nIdx(4) floats... uint32s...]
+// V2 Format: magic(4) | chunkCount(4) | per-chunk: [cx(4) cy(4) cz(4) nVerts(4) nIdx(4) floats... uint32s...]
+// -----------------------------------------------------------------------
+static constexpr uint32_t EDIT_COL_MAGIC_V1 = 0x4C4F4345; // "ECOL"
+static constexpr uint32_t EDIT_COL_MAGIC_V2 = 0x324C4345; // "ECL2"
+
+static bool saveEditCollisionToFile(
+    const std::filesystem::path& path,
+    const std::unordered_map<glm::ivec3, World::EditCollisionEntry, IVec3Hash>& data)
+{
+    std::ofstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    f.write(reinterpret_cast<const char*>(&EDIT_COL_MAGIC_V2), 4);
+    uint32_t count = static_cast<uint32_t>(data.size());
+    f.write(reinterpret_cast<const char*>(&count), 4);
+    for (const auto& [coord, entry] : data) {
+        f.write(reinterpret_cast<const char*>(&coord.x), 4);
+        f.write(reinterpret_cast<const char*>(&coord.y), 4);
+        f.write(reinterpret_cast<const char*>(&coord.z), 4);
+        // Compute world-space floats on-the-fly from packed data.
+        const float baseX = static_cast<float>(coord.x * WorldConfig::CHUNK_SIZE) * WorldConfig::VOXEL_SIZE_M;
+        const float baseY = static_cast<float>(coord.y * WorldConfig::CHUNK_HEIGHT) * WorldConfig::VOXEL_SIZE_M;
+        const float baseZ = static_cast<float>(coord.z * WorldConfig::CHUNK_SIZE) * WorldConfig::VOXEL_SIZE_M;
+        uint32_t nv = static_cast<uint32_t>(entry.packedVerts.size() * 3);
+        uint32_t ni = static_cast<uint32_t>(entry.indices.size());
+        f.write(reinterpret_cast<const char*>(&nv), 4);
+        f.write(reinterpret_cast<const char*>(&ni), 4);
+        for (uint32_t p : entry.packedVerts) {
+            float x = baseX + static_cast<float>((p >>  0) & 0xFF) * 0.25f;
+            float y = baseY + static_cast<float>((p >>  8) & 0x3FF) * 0.25f;
+            float z = baseZ + static_cast<float>((p >> 18) & 0xFF) * 0.25f;
+            f.write(reinterpret_cast<const char*>(&x), 4);
+            f.write(reinterpret_cast<const char*>(&y), 4);
+            f.write(reinterpret_cast<const char*>(&z), 4);
+        }
+        if (ni > 0) f.write(reinterpret_cast<const char*>(entry.indices.data()), ni * sizeof(uint32_t));
+    }
+    return f.good();
+}
+
+static bool loadEditCollisionFromFile(
+    const std::filesystem::path& path,
+    std::unordered_map<glm::ivec3, World::EditCollisionEntry, IVec3Hash>& out)
+{
+    out.clear();
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return false;
+    uint32_t magic = 0;
+    f.read(reinterpret_cast<char*>(&magic), 4);
+    if (magic != EDIT_COL_MAGIC_V1 && magic != EDIT_COL_MAGIC_V2) return false;
+    uint32_t count = 0;
+    f.read(reinterpret_cast<char*>(&count), 4);
+    for (uint32_t i = 0; i < count; ++i) {
+        glm::ivec3 coord(0);
+        f.read(reinterpret_cast<char*>(&coord.x), 4);
+        if (magic == EDIT_COL_MAGIC_V2) {
+            f.read(reinterpret_cast<char*>(&coord.y), 4);
+        }
+        f.read(reinterpret_cast<char*>(&coord.z), 4);
+        uint32_t nv = 0, ni = 0;
+        f.read(reinterpret_cast<char*>(&nv), 4);
+        f.read(reinterpret_cast<char*>(&ni), 4);
+        World::EditCollisionEntry entry;
+        entry.chunkCoord = coord;
+        // File stores nv floats (3 per vertex) — re-pack to uint32_t packed format.
+        if (nv > 0) {
+            const uint32_t vertCount = nv / 3;
+            const float baseX = static_cast<float>(coord.x * WorldConfig::CHUNK_SIZE) * WorldConfig::VOXEL_SIZE_M;
+            const float baseY = static_cast<float>(coord.y * WorldConfig::CHUNK_HEIGHT) * WorldConfig::VOXEL_SIZE_M;
+            const float baseZ = static_cast<float>(coord.z * WorldConfig::CHUNK_SIZE) * WorldConfig::VOXEL_SIZE_M;
+            entry.packedVerts.resize(vertCount);
+            for (uint32_t v = 0; v < vertCount; ++v) {
+                float x, y, z;
+                f.read(reinterpret_cast<char*>(&x), 4);
+                f.read(reinterpret_cast<char*>(&y), 4);
+                f.read(reinterpret_cast<char*>(&z), 4);
+                uint32_t px = static_cast<uint32_t>((x - baseX) / 0.25f + 0.5f);
+                uint32_t py = static_cast<uint32_t>(((y - baseY) / 0.25f) + 0.5f);
+                uint32_t pz = static_cast<uint32_t>((z - baseZ) / 0.25f + 0.5f);
+                entry.packedVerts[v] = (px & 0xFF) | ((py & 0x3FF) << 8) | ((pz & 0xFF) << 18);
+            }
+        }
+        if (ni > 0) { entry.indices.resize(ni); f.read(reinterpret_cast<char*>(entry.indices.data()), ni * sizeof(uint32_t)); }
+        out[coord] = std::move(entry);
+    }
+    return f.good();
+}
+
+static bool readSnapshotMetaFile(const std::filesystem::path& metaPath,
+                          World::SnapshotInfo& outInfo) {
+    std::ifstream file(metaPath);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    std::string line;
+    std::string id;
+    std::string displayName;
+    std::string createdAt;
+    uint64_t editedCells = 0;
+    uint64_t editedBricks = 0;
+
+    while (std::getline(file, line)) {
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+
+        const std::string key = trim(line.substr(0, eq));
+        const std::string value = trim(line.substr(eq + 1));
+
+        if (key == "id") {
+            id = value;
+        } else if (key == "displayName") {
+            displayName = value;
+        } else if (key == "createdAt") {
+            createdAt = value;
+        } else if (key == "editedCells") {
+            editedCells = static_cast<uint64_t>(std::strtoull(value.c_str(), nullptr, 10));
+        } else if (key == "editedBricks") {
+            editedBricks = static_cast<uint64_t>(std::strtoull(value.c_str(), nullptr, 10));
+        }
+    }
+
+    if (id.empty()) {
+        return false;
+    }
+
+    outInfo.id = id;
+    outInfo.displayName = displayName.empty() ? id : displayName;
+    outInfo.createdAt = createdAt.empty() ? "Unknown" : createdAt;
+    outInfo.isBase = false;
+    outInfo.editedCells = editedCells;
+    outInfo.editedBricks = editedBricks;
+    return true;
+}
+
+static bool writeSnapshotMetaFile(const std::filesystem::path& metaPath,
+                           const World::SnapshotInfo& info,
+                           const std::string& baseTerrainPath,
+                           const std::string& baseCollisionPath) {
+    if (metaPath.has_parent_path()) {
+        std::filesystem::create_directories(metaPath.parent_path());
+    }
+
+    std::ofstream file(metaPath, std::ios::trunc);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    file << "version=1\n";
+    file << "id=" << info.id << "\n";
+    file << "displayName=" << info.displayName << "\n";
+    file << "createdAt=" << info.createdAt << "\n";
+    file << "baseTerrain=" << baseTerrainPath << "\n";
+    file << "baseCollision=" << baseCollisionPath << "\n";
+    file << "editedCells=" << info.editedCells << "\n";
+    file << "editedBricks=" << info.editedBricks << "\n";
+    return file.good();
+}
+
+static bool boxesIntersect(const World::TerrainBoxRecord& a, const World::TerrainBoxRecord& b) {
+    return a.minCorner.x <= b.maxCorner.x && a.maxCorner.x >= b.minCorner.x &&
+           a.minCorner.y <= b.maxCorner.y && a.maxCorner.y >= b.minCorner.y &&
+           a.minCorner.z <= b.maxCorner.z && a.maxCorner.z >= b.minCorner.z;
+}
+
+static bool saveTerrainBoxesToFile(const std::filesystem::path& filePath,
+                            const std::vector<World::TerrainBoxRecord>& boxes) {
+    if (filePath.has_parent_path()) {
+        std::filesystem::create_directories(filePath.parent_path());
+    }
+
+    std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    const uint32_t magic = 0x58425454; // "TTBX"
+    const uint32_t version = 1;
+    const uint64_t count = static_cast<uint64_t>(boxes.size());
+    file.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    file.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    if (!boxes.empty()) {
+        file.write(reinterpret_cast<const char*>(boxes.data()),
+                   static_cast<std::streamsize>(boxes.size() * sizeof(World::TerrainBoxRecord)));
+    }
+    return file.good();
+}
+
+static bool loadTerrainBoxesFromFile(const std::filesystem::path& filePath,
+                              std::vector<World::TerrainBoxRecord>& outBoxes) {
+    outBoxes.clear();
+
+    std::ifstream file(filePath, std::ios::binary);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    uint64_t count = 0;
+    file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    file.read(reinterpret_cast<char*>(&version), sizeof(version));
+    file.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!file.good() || magic != 0x58425454 || version != 1) {
+        return false;
+    }
+
+    outBoxes.resize(static_cast<size_t>(count));
+    if (count > 0) {
+        file.read(reinterpret_cast<char*>(outBoxes.data()),
+                  static_cast<std::streamsize>(count * sizeof(World::TerrainBoxRecord)));
+    }
+    return file.good();
+}
+
+} // namespace WorldSnapshotInternal

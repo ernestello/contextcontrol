@@ -1016,7 +1016,7 @@
                       "Path":  "src/world/WorldSnapshots.cpp",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\world\\WorldSnapshots.cpp",
                       "Key":  "f033b602e05c74a0",
-                      "CurrentVersion":  6,
+                      "CurrentVersion":  7,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1053,6 +1053,12 @@
                                            "Timestamp":  "2026-05-07T17:58:58.5343378Z",
                                            "Snapshot":  "files\\f033b602e05c74a0\\v000006.snapshot",
                                            "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  7,
+                                           "Timestamp":  "2026-05-08T12:14:20.2353262Z",
+                                           "Snapshot":  "files\\f033b602e05c74a0\\v000007.snapshot",
+                                           "Reason":  "applied whole_file"
                                        }
                                    ]
                   },
@@ -1146,7 +1152,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  12,
+                      "CurrentVersion":  13,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1218,6 +1224,12 @@
                                            "Version":  12,
                                            "Timestamp":  "2026-05-08T12:10:14.9943764Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000012.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  13,
+                                           "Timestamp":  "2026-05-08T12:14:20.2593696Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000013.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -2334,6 +2346,120 @@
                                            "Version":  2,
                                            "Timestamp":  "2026-05-08T12:10:14.9671799Z",
                                            "Snapshot":  "files\\616db278bfcf2491\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/snapshot/WorldSnapshotInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\snapshot\\WorldSnapshotInternal.h",
+                      "Key":  "53fdc8b687913615",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:14:20.1022942Z",
+                                           "Snapshot":  "files\\53fdc8b687913615\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/snapshot/WorldSnapshotStore.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\snapshot\\WorldSnapshotStore.cpp",
+                      "Key":  "dd6e318e08084f03",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:14:20.1232306Z",
+                                           "Snapshot":  "files\\dd6e318e08084f03\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:19:16.0491730Z",
+                                           "Snapshot":  "files\\dd6e318e08084f03\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/snapshot/WorldSnapshotLoad.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\snapshot\\WorldSnapshotLoad.cpp",
+                      "Key":  "c65620afd0d14485",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:14:20.1462925Z",
+                                           "Snapshot":  "files\\c65620afd0d14485\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:19:16.0743048Z",
+                                           "Snapshot":  "files\\c65620afd0d14485\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/snapshot/WorldSnapshotSave.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\snapshot\\WorldSnapshotSave.cpp",
+                      "Key":  "773ce4c18fbf411f",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:14:20.1677385Z",
+                                           "Snapshot":  "files\\773ce4c18fbf411f\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:19:16.0974109Z",
+                                           "Snapshot":  "files\\773ce4c18fbf411f\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/snapshot/WorldSnapshotDelete.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\snapshot\\WorldSnapshotDelete.cpp",
+                      "Key":  "1f94f500c7ff138f",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:14:20.1888773Z",
+                                           "Snapshot":  "files\\1f94f500c7ff138f\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:19:16.1210826Z",
+                                           "Snapshot":  "files\\1f94f500c7ff138f\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/snapshot/WorldSnapshotIdentity.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\snapshot\\WorldSnapshotIdentity.cpp",
+                      "Key":  "c906fe569d248af4",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:14:20.2089556Z",
+                                           "Snapshot":  "files\\c906fe569d248af4\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:19:16.1667331Z",
+                                           "Snapshot":  "files\\c906fe569d248af4\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
