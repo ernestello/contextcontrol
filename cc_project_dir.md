@@ -87,7 +87,6 @@ vulkanas/
 │   │   │   └── VulkanHelpers.h
 │   │   ├── culling/
 │   │   │   ├── GPUCullingSystem.h
-│   │   │   ├── GPUCullingSystem.h.gptbak.20260503_124406
 │   │   │   └── HiZPyramid.h
 │   │   ├── hotreload/
 │   │   │   ├── ShaderCompiler.h
@@ -150,8 +149,7 @@ vulkanas/
 │   │   │   │   ├── ObjectManagerWindow.h
 │   │   │   │   ├── TerrainEditTool.h
 │   │   │   │   └── TexturePaintTool.h
-│   │   │   ├── IconManagerForDebug.h
-│   │   │   └── RenderSettingsWindow.h
+│   │   │   └── IconManagerForDebug.h
 │   │   ├── style/
 │   │   │   ├── EngineTheme.h
 │   │   │   └── UIAnimator.h
@@ -190,6 +188,8 @@ vulkanas/
 │   │   │   ├── ObjectManager.h
 │   │   │   └── WorldConfig.h
 │   │   ├── edit/
+│   │   │   ├── texture/
+│   │   │   │   └── TextureBrushStyles.h
 │   │   │   ├── HeightmapBaseSampler.h
 │   │   │   ├── TerrainEditDCCMMesher.h
 │   │   │   ├── TerrainEditMesher.h
@@ -198,8 +198,6 @@ vulkanas/
 │   │   │   ├── TerrainEditTypes.h
 │   │   │   ├── TerrainFieldSource.h
 │   │   │   ├── TextureOverlayStore.h
-│   │   │   ├── TextureOverlayStore.h.gptbak.20260503_152500
-│   │   │   ├── TextureOverlayStore.h.gptbak.20260503_153527
 │   │   │   └── VoxelBaseSampler.h
 │   │   ├── vxm/
 │   │   │   └── VxmImport.h
@@ -236,6 +234,18 @@ vulkanas/
 │   │   └── snapshot.meta
 │   ├── snapshot_20260508_100943/
 │   │   └── snapshot.meta
+│   ├── snapshot_20260508_133000/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260508_142327/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260508_144032/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260508_144506/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260508_144913/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260508_145702/
+│   │   └── snapshot.meta
 │   ├── heightmap.csv
 │   └── heightmap.hbin
 ├── shaders/
@@ -247,8 +257,6 @@ vulkanas/
 │   ├── culling/
 │   │   ├── depth_reduce.comp
 │   │   ├── frustum_cull.comp
-│   │   ├── frustum_cull.comp.gptbak.20260503_124408
-│   │   ├── frustum_cull.comp.gptbak.20260503_220727
 │   │   ├── frustum_dispatch.comp
 │   │   └── frustum_filter.comp
 │   ├── lighting/
@@ -271,7 +279,6 @@ vulkanas/
 │   │   ├── star.frag
 │   │   └── star.vert
 │   ├── terrain/
-│   │   ├── backupAOupdate.frag
 │   │   ├── cube.frag
 │   │   ├── cube.vert
 │   │   ├── cube_debug.frag
@@ -285,22 +292,34 @@ vulkanas/
 ├── src/
 │   ├── core/
 │   │   ├── engine/
-│   │   │   ├── Engine.cpp
-│   │   │   ├── EngineCleanup.cpp
-│   │   │   ├── EngineCommandBuffer.cpp
-│   │   │   ├── EngineDebugWiring.cpp
-│   │   │   ├── EngineDepthPrePass.cpp
-│   │   │   ├── EngineGameplayRendering.cpp
-│   │   │   ├── EngineRenderLoop.cpp
-│   │   │   ├── EngineSettingsPersistence.cpp
-│   │   │   ├── EngineShaderHotReload.cpp
-│   │   │   ├── EngineShadowPass.cpp
-│   │   │   ├── EngineSubsystemInit.cpp
-│   │   │   ├── EngineSubsystemInit.cpp.gptbak.20260503_004542
-│   │   │   ├── EngineSubsystemInit.cpp.gptbak.20260503_124409
-│   │   │   ├── EngineTimestamps.cpp
-│   │   │   ├── EngineTimestamps.cpp.gptbak.20260503_220727
-│   │   │   └── EngineVulkanInit.cpp
+│   │   │   ├── diagnostics/
+│   │   │   │   ├── EngineGModeControls.cpp
+│   │   │   │   ├── EngineGModeDiagnostics.cpp
+│   │   │   │   ├── EnginePerfDiagnostics.cpp
+│   │   │   │   └── EngineTimestamps.cpp
+│   │   │   ├── init/
+│   │   │   │   ├── EngineDebugWiring.cpp
+│   │   │   │   ├── EngineMaterialOverlay.cpp
+│   │   │   │   ├── EngineRenderResources.cpp
+│   │   │   │   ├── EngineSettingsPersistence.cpp
+│   │   │   │   ├── EngineShaderHotReload.cpp
+│   │   │   │   ├── EngineSubsystemInit.cpp
+│   │   │   │   └── EngineVulkanInit.cpp
+│   │   │   ├── lifecycle/
+│   │   │   │   ├── EngineCleanup.cpp
+│   │   │   │   └── EngineLifecycle.cpp
+│   │   │   ├── rendering/
+│   │   │   │   ├── EngineCommandBuffer.cpp
+│   │   │   │   ├── EngineDepthPrePass.cpp
+│   │   │   │   ├── EngineGameplayRendering.cpp
+│   │   │   │   ├── EngineRenderLoop.cpp
+│   │   │   │   ├── EngineShadowPass.cpp
+│   │   │   │   └── EngineSwapchainLifecycle.cpp
+│   │   │   ├── window/
+│   │   │   │   ├── EngineGameplayWindow.cpp
+│   │   │   │   ├── EngineWindow.cpp
+│   │   │   │   └── EngineWindowControls.cpp
+│   │   │   └── Engine.cpp
 │   │   ├── CodeRebuildService.cpp
 │   │   ├── EngineImGui.cpp
 │   │   ├── GameplayWindow.cpp
@@ -332,11 +351,22 @@ vulkanas/
 │   │   │   ├── ShaderCompiler.cpp
 │   │   │   └── ShaderHotReloadService.cpp
 │   │   ├── lighting/
+│   │   │   ├── shadow/
+│   │   │   │   ├── sun/
+│   │   │   │   │   ├── ShadowSunDiagnostics.cpp
+│   │   │   │   │   ├── ShadowSunGather.cpp
+│   │   │   │   │   ├── ShadowSunRender.cpp
+│   │   │   │   │   └── ShadowSunScroll.cpp
+│   │   │   │   ├── ShadowCache.cpp
+│   │   │   │   ├── ShadowInternal.h
+│   │   │   │   ├── ShadowMatrices.cpp
+│   │   │   │   ├── ShadowPass.cpp
+│   │   │   │   ├── ShadowPointLights.cpp
+│   │   │   │   └── ShadowSunCascades.cpp
 │   │   │   ├── ClusteredLightingSystem.cpp
 │   │   │   ├── LightGlowSystem.cpp
 │   │   │   ├── LightingSettings.cpp
 │   │   │   ├── ShadowDiagnostics.cpp
-│   │   │   ├── ShadowMapRendering.cpp
 │   │   │   ├── ShadowSystem.cpp
 │   │   │   ├── ShadowSystemResources.cpp
 │   │   │   └── ShadowSystemUpdate.cpp
@@ -383,6 +413,13 @@ vulkanas/
 │   │   │   │   ├── ShaderHotReloadWindow.cpp
 │   │   │   │   └── SkyEnclosureWindow.cpp
 │   │   │   ├── world/
+│   │   │   │   ├── texture_paint/
+│   │   │   │   │   ├── TexturePaintTool.cpp
+│   │   │   │   │   ├── TexturePaintToolDiagnostics.cpp
+│   │   │   │   │   ├── TexturePaintToolExecution.cpp
+│   │   │   │   │   ├── TexturePaintToolInternal.h
+│   │   │   │   │   ├── TexturePaintToolPreview.cpp
+│   │   │   │   │   └── TexturePaintToolUI.cpp
 │   │   │   │   ├── ChunkDebugWindow.cpp
 │   │   │   │   ├── ChunkHolesWindow.cpp
 │   │   │   │   ├── ChunkMinimapCullingOverlay.cpp
@@ -393,16 +430,8 @@ vulkanas/
 │   │   │   │   ├── MinimapCullingReadback.cpp
 │   │   │   │   ├── ObjectManagerWindow.cpp
 │   │   │   │   ├── TerrainEditTool.cpp
-│   │   │   │   ├── TexturePaintTool.cpp
-│   │   │   │   ├── TexturePaintTool.cpp.gptbak.20260503_005128
-│   │   │   │   ├── TexturePaintTool.cpp.gptbak.20260503_010736
-│   │   │   │   ├── TexturePaintTool.cpp.gptbak.20260503_130543
-│   │   │   │   ├── TexturePaintTool.cpp.gptbak.20260503_150217
-│   │   │   │   ├── TexturePaintTool.cpp.gptbak.20260503_152502
-│   │   │   │   ├── TexturePaintTool.cpp.gptbak.20260503_214910
-│   │   │   │   └── TexturePaintTool.cpp.gptbak.20260503_221426
-│   │   │   ├── IconManagerForDebug.cpp
-│   │   │   └── RenderSettingsWindow.cpp
+│   │   │   │   └── TexturePaintTool.cpp
+│   │   │   └── IconManagerForDebug.cpp
 │   │   ├── style/
 │   │   │   ├── EngineTheme.cpp
 │   │   │   └── UIAnimator.cpp
@@ -439,13 +468,43 @@ vulkanas/
 │   │   ├── config/
 │   │   │   └── WorldConfig.cpp
 │   │   ├── edit/
+│   │   │   ├── meshing/
+│   │   │   │   ├── greedy/
+│   │   │   │   │   ├── TerrainEditGreedyCache.cpp
+│   │   │   │   │   ├── TerrainEditGreedyMesh.cpp
+│   │   │   │   │   └── TerrainEditGreedyRegions.cpp
+│   │   │   │   ├── TerrainEditMaterialResolve.cpp
+│   │   │   │   ├── TerrainEditMesher.cpp
+│   │   │   │   ├── TerrainEditMesherInternal.h
+│   │   │   │   ├── TerrainEditSolidCache.cpp
+│   │   │   │   └── TerrainEditSubMeshSplit.cpp
+│   │   │   ├── overlay/
+│   │   │   │   ├── TerrainEditOverlayBrush.cpp
+│   │   │   │   ├── TerrainEditOverlayDeferredFill.cpp
+│   │   │   │   ├── TerrainEditOverlayInternal.h
+│   │   │   │   ├── TerrainEditOverlayQuery.cpp
+│   │   │   │   ├── TerrainEditOverlaySolidCache.cpp
+│   │   │   │   └── TerrainEditOverlayStore.cpp
+│   │   │   ├── remesh/
+│   │   │   │   ├── RemeshScheduler.cpp
+│   │   │   │   ├── RemeshSchedulerArtifacts.cpp
+│   │   │   │   ├── RemeshSchedulerInternal.h
+│   │   │   │   ├── RemeshSchedulerJobs.cpp
+│   │   │   │   ├── RemeshSchedulerPagedRuntime.cpp
+│   │   │   │   └── RemeshSchedulerQueue.cpp
+│   │   │   ├── texture/
+│   │   │   │   ├── TextureBrushStyles.cpp
+│   │   │   │   ├── TextureOverlayCells.cpp
+│   │   │   │   ├── TextureOverlayGPU.cpp
+│   │   │   │   ├── TextureOverlayInternal.h
+│   │   │   │   ├── TextureOverlayIO.cpp
+│   │   │   │   ├── TextureOverlayPaint.cpp
+│   │   │   │   ├── TextureOverlayStamps.cpp
+│   │   │   │   └── TextureOverlayStore.cpp
 │   │   │   ├── HeightmapBaseSampler.cpp
 │   │   │   ├── TerrainEditDCCMMesher.cpp
-│   │   │   ├── TerrainEditMesher.cpp
-│   │   │   ├── TerrainEditMesher.cpp.gptbak.20260503_221426
 │   │   │   ├── TerrainEditOverlayStore.cpp
 │   │   │   ├── TerrainEditOverlayStore_IO.cpp
-│   │   │   ├── TerrainEditRemeshScheduler.cpp
 │   │   │   ├── TerrainFieldSource.cpp
 │   │   │   ├── TextureOverlayStore.cpp
 │   │   │   └── VoxelBaseSampler.cpp
