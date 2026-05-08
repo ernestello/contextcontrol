@@ -1,0 +1,173 @@
+#include "ShadowInternal.h"
+
+// GPT-DESC: Implements shadow cache hashing and equality helpers shared by sun and point shadow passes.
+
+#include <algorithm>
+#include <cstring>
+#include <type_traits>
+
+namespace ShadowSystemInternal {
+
+uint32_t floatToBits(float value) {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &value, sizeof(bits));
+    return bits;
+}
+
+void hashCombine64(uint64_t& hash, uint64_t v) {
+    hash ^= v + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+}
+
+uint64_t rotl64(uint64_t v, uint32_t shift) {
+    return (v << shift) | (v >> (64u - shift));
+}
+
+bool nearlyEqual(float a, float b, float eps) {
+    return std::abs(a - b) <= eps;
+}
+
+bool nearlyEqualVec3(const glm::vec3& a, const glm::vec3& b, float eps) {
+    return nearlyEqual(a.x, b.x, eps) &&
+           nearlyEqual(a.y, b.y, eps) &&
+           nearlyEqual(a.z, b.z, eps);
+}
+
+bool sameBitsVec3(const glm::vec3& a, const glm::vec3& b) {
+    return floatToBits(a.x) == floatToBits(b.x) &&
+           floatToBits(a.y) == floatToBits(b.y) &&
+           floatToBits(a.z) == floatToBits(b.z);
+}
+
+uint64_t hashTerrainDrawContext(const ShadowSystem::DrawContext& ctx) {
+    auto handleToU64 = [](auto handle) -> uint64_t {
+        using T = decltype(handle);
+        if constexpr (std::is_pointer_v<T>) {
+            return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(handle));
+        } else {
+            return static_cast<uint64_t>(handle);
+        }
+    };
+
+    uint64_t h = 1469598103934665603ull;
+    hashCombine64(h, handleToU64(ctx.terrainVertexBuffer));
+    hashCombine64(h, handleToU64(ctx.terrainIndexBuffer));
+    hashCombine64(h, handleToU64(ctx.indirectBuffer));
+    hashCombine64(h, static_cast<uint64_t>(ctx.indirectDrawCount));
+    hashCombine64(h, static_cast<uint64_t>(ctx.useGPUCulling ? 1u : 0u));
+    hashCombine64(h, handleToU64(ctx.gpuVisibleDrawsBuffer));
+    hashCombine64(h, handleToU64(ctx.gpuDrawCountBuffer));
+    hashCombine64(h, static_cast<uint64_t>(ctx.gpuMaxDraws));
+    hashCombine64(h, ctx.terrainEditRevision);
+    hashCombine64(h, ctx.terrainMeshRevision);
+    return h;
+}
+
+uint64_t hashTerrainDrawKey(const VkDrawIndexedIndirectCommand& d, const glm::vec4& o) {
+    uint64_t h = 1469598103934665603ull;
+    hashCombine64(h, static_cast<uint64_t>(d.indexCount));
+    hashCombine64(h, static_cast<uint64_t>(d.firstIndex));
+    hashCombine64(h, static_cast<uint64_t>(static_cast<uint32_t>(d.vertexOffset)));
+    hashCombine64(h, static_cast<uint64_t>(floatToBits(o.x)));
+    hashCombine64(h, static_cast<uint64_t>(floatToBits(o.y)));
+    hashCombine64(h, static_cast<uint64_t>(floatToBits(o.z)));
+    return h;
+}
+
+void hashTerrainDrawSetAdd(uint64_t key,
+                           uint64_t& sumA,
+                           uint64_t& sumB,
+                           uint64_t& xorA) {
+    constexpr uint64_t kMulA = 0xbf58476d1ce4e5b9ull;
+    constexpr uint64_t kMulB = 0x94d049bb133111ebull;
+    sumA += key;
+    sumB += rotl64(key * kMulA, 23u) ^ (key * kMulB);
+    xorA ^= key + 0x9e3779b97f4a7c15ull;
+}
+
+uint64_t finishTerrainDrawSetHash(uint32_t count,
+                                  uint64_t sumA,
+                                  uint64_t sumB,
+                                  uint64_t xorA) {
+    uint64_t h = 1469598103934665603ull;
+    hashCombine64(h, static_cast<uint64_t>(count));
+    hashCombine64(h, sumA);
+    hashCombine64(h, sumB);
+    hashCombine64(h, xorA);
+    return h;
+}
+
+uint64_t hashLocalTerrainDraws(const std::vector<VkDrawIndexedIndirectCommand>& draws,
+                               const std::vector<glm::vec4>& origins,
+                               uint32_t count) {
+    uint64_t sumA = 0u;
+    uint64_t sumB = 0u;
+    uint64_t xorA = 0u;
+    for (uint32_t i = 0; i < count; ++i) {
+        hashTerrainDrawSetAdd(hashTerrainDrawKey(draws[i], origins[i]), sumA, sumB, xorA);
+    }
+    return finishTerrainDrawSetHash(count, sumA, sumB, xorA);
+}
+
+uint64_t hashSunCascadeVP(const std::array<glm::mat4, ShadowSystem::MAX_SUN_SHADOW_CASCADES>& vps,
+                          uint32_t cascadeCount) {
+    uint64_t h = 1469598103934665603ull;
+    hashCombine64(h, static_cast<uint64_t>(cascadeCount));
+    const uint32_t count = std::min<uint32_t>(cascadeCount, ShadowSystem::MAX_SUN_SHADOW_CASCADES);
+    for (uint32_t c = 0; c < count; ++c) {
+        const glm::mat4& m = vps[c];
+        for (int col = 0; col < 4; ++col) {
+            for (int row = 0; row < 4; ++row) {
+                hashCombine64(h, static_cast<uint64_t>(floatToBits(m[col][row])));
+            }
+        }
+    }
+    return h;
+}
+
+std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES>
+hashLocalTerrainDrawsPerCascade(
+    const std::vector<VkDrawIndexedIndirectCommand>& draws,
+    const std::vector<glm::vec4>& origins,
+    const std::vector<uint16_t>& cascadeMasks,
+    uint32_t count,
+    uint32_t cascadeCount) {
+    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> hashes{};
+    std::array<uint32_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> counts{};
+    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> sumA{};
+    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> sumB{};
+    std::array<uint64_t, ShadowSystem::MAX_SUN_SHADOW_CASCADES> xorA{};
+
+    const uint32_t evalCount =
+        std::min<uint32_t>(cascadeCount, ShadowSystem::MAX_SUN_SHADOW_CASCADES);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& d = draws[i];
+        const auto& o = origins[i];
+        const uint16_t mask = cascadeMasks[i];
+        const uint64_t key = hashTerrainDrawKey(d, o);
+        for (uint32_t c = 0; c < evalCount; ++c) {
+            if ((mask & static_cast<uint16_t>(1u << c)) == 0u) {
+                continue;
+            }
+            ++counts[c];
+            hashTerrainDrawSetAdd(key, sumA[c], sumB[c], xorA[c]);
+        }
+    }
+
+    for (uint32_t c = 0; c < evalCount; ++c) {
+        hashes[c] = finishTerrainDrawSetHash(counts[c], sumA[c], sumB[c], xorA[c]);
+        hashCombine64(hashes[c], static_cast<uint64_t>(c));
+    }
+    return hashes;
+}
+
+uint64_t hashSunCascadeLayerVP(const glm::mat4& vp) {
+    uint64_t h = 1469598103934665603ull;
+    for (int col = 0; col < 4; ++col) {
+        for (int row = 0; row < 4; ++row) {
+            hashCombine64(h, static_cast<uint64_t>(floatToBits(vp[col][row])));
+        }
+    }
+    return h;
+}
+
+} // namespace ShadowSystemInternal

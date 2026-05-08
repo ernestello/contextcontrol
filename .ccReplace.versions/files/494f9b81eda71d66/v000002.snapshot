@@ -1,0 +1,261 @@
+#include "rendering/lighting/ShadowSystem.h"
+
+#include "world/config/WorldConfig.h"
+
+// GPT-DESC: Builds point-light cube face matrices and directional sun shadow VP matrices.
+
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/gtc/matrix_transform.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+
+std::array<glm::mat4, 6> ShadowSystem::buildPointLightFaceMatrices(const glm::vec3& lightPos,
+                                                                    float nearPlane,
+                                                                    float farPlane) const {
+    const glm::mat4 proj = glm::perspective(glm::radians(90.0f), 1.0f, nearPlane, farPlane);
+
+    const std::array<glm::vec3, 6> dirs = {
+        glm::vec3(1.0f, 0.0f, 0.0f),
+        glm::vec3(-1.0f, 0.0f, 0.0f),
+        glm::vec3(0.0f, 1.0f, 0.0f),
+        glm::vec3(0.0f, -1.0f, 0.0f),
+        glm::vec3(0.0f, 0.0f, 1.0f),
+        glm::vec3(0.0f, 0.0f, -1.0f)
+    };
+    const std::array<glm::vec3, 6> ups = {
+        glm::vec3(0.0f, -1.0f, 0.0f),
+        glm::vec3(0.0f, -1.0f, 0.0f),
+        glm::vec3(0.0f, 0.0f, 1.0f),
+        glm::vec3(0.0f, 0.0f, -1.0f),
+        glm::vec3(0.0f, -1.0f, 0.0f),
+        glm::vec3(0.0f, -1.0f, 0.0f)
+    };
+
+    std::array<glm::mat4, 6> out{};
+    for (size_t i = 0; i < 6; ++i) {
+        const glm::mat4 view = glm::lookAt(lightPos, lightPos + dirs[i], ups[i]);
+        out[i] = proj * view;
+    }
+    return out;
+}
+
+glm::mat4 ShadowSystem::buildSunLightVP(const glm::vec3& cameraPos,
+                                          float azimuthDeg,
+                                          float elevationDeg,
+                                          float halfExtentMeters,
+                                          float texelMeters,
+                                          bool enableTexelSnap,
+                                          bool enableShearQuantization,
+                                          glm::vec3* outQuantizedSunDir,
+                                          bool isHDCascade) {
+    // ─── Sun shadow projection (clean rewrite) ─────────────────────────
+    //
+    // Design goals:
+    //   1. Texel grid is FIXED at one shadow-texel == one light-grid cell
+    //      (0.015625 m == VOXEL_SIZE_M / 16). Changing the fade radius does
+    //      NOT change the texel size — the shadow ortho footprint is
+    //      always runtimeMapSize * texel (derived from budget + texels/voxel).
+    //      Circular fade is handled separately in the shader.
+    //   2. The shadow center tracks the player with deterministic steps:
+    //      camera XZ is snapped to the voxel grid (0.25 m, i.e. 16 texels).
+    //   3. NO shear quantization, NO origin hysteresis, NO sinEl clamp.
+    //      The continuous mathematical projection is used directly. Pixel
+    //      stability comes solely from snapping camera XZ to the texel
+    //      grid (which itself is world-axis-aligned and invariant under
+    //      sun motion). Realtime celestial motion therefore yields
+    //      continuous, single-pixel-step shadow movement without the
+    //      whole-map texel jumps that the old shear-quantum produced
+    //      whenever the sun crossed a quantum threshold.
+    //
+    // The two `enable*` flags are kept for source-compatibility but are
+    // intentionally ignored: the new projection has no quantization to
+    // toggle. `outQuantizedSunDir` returns the exact sun direction used
+    // to build the VP so the GLSL receiver push lines up with the
+    // rendered depth content.
+    (void)enableTexelSnap;
+    (void)enableShearQuantization;
+
+    m_prevQuantizedSunShearValid = false;
+    m_prevQuantizedSunOriginValid = false;
+
+    // ── Sun direction (towards the ground) ─────────────────────────────
+    // Azimuth: 0 = North (+Z), 90 = East (+X), clockwise from above.
+    // Elevation: 0 = horizontal, 90 = overhead.
+    //
+    // SHADOW-LENGTH CAP: clamp elevation so shadows below kMinShadowElevDeg
+    // keep the same shear they have at that elevation.
+    //
+    // We use a UNIFIED 13° floor for ALL cascades. Earlier the HD cascade
+    // used a 5° clamp to keep shadows attached to their casters at low sun
+    // — but that produced two artifacts in realtime mode:
+    //   1. Shadow length kept growing well past sunset (shadows from the
+    //      HD ring would stretch ~10× longer than at 13°).
+    //   2. Below ~5° the HD ring (clamped at 5°) drew long shadows while
+    //      far cascades (clamped at 13°) drew shorter ones, creating a
+    //      visible "shadow disappears in 64 m circle and a shorter one
+    //      appears beneath it" pop on jumping (the two cascade shears
+    //      disagreed by cot(5°) − cot(13°) ≈ 7×).
+    // Keeping the floor uniform at 13° makes the shear identical across
+    // all active cascades and stops further elongation past 13°.
+    const float kMinShadowElevDeg = 13.0f;
+    (void)isHDCascade;
+    const float clampedElevDeg = std::max(elevationDeg, kMinShadowElevDeg);
+    const float azRad = glm::radians(azimuthDeg);
+    const float elRad = glm::radians(clampedElevDeg);
+    const float cosEl = std::cos(elRad);
+    const float sinEl = std::sin(elRad);
+
+    glm::vec3 sunDir(
+        -std::sin(azRad) * cosEl,
+        -sinEl,
+         -std::cos(azRad) * cosEl);
+    sunDir = glm::normalize(sunDir);
+
+    // ── Fixed ortho footprint ──────────────────────────────────────────
+    // Keep one texel == one light-grid cell (0.015625 m) at all times.
+    const float kSunShadowTexelMeters = std::max(texelMeters, 1e-5f);
+    const float halfExtent = std::max(halfExtentMeters, kSunShadowTexelMeters);
+
+    // ── Shear factors ──────────────────────────────────────────────────
+    // Oblique parallel projection: shadow UV = world XZ + Y * shear, so
+    // shadow texels are world-axis-aligned and never rotate with azimuth.
+    // |sunDir.y| is guaranteed > sin(0.01°) by the elevation clamp above
+    // and the elevation fade keeps the contribution at zero before sinEl
+    // becomes small enough to matter, so a hard floor here is not needed.
+    const float invSinEl = 1.0f / std::max(-sunDir.y, 1e-4f);
+    const float shearX = sunDir.x * invSinEl;
+    const float shearZ = sunDir.z * invSinEl;
+
+    // ── Snap shadow ORIGIN to the voxel grid (16 texels = 0.25 m) ─────
+    // Stability pivot: the shader UV for a receiver at world Y is
+    //
+    //   UV = (worldXZ + worldY*shear - origin) / halfExtent
+    //
+    // so the residual (origin - raw) that stays after snapping is
+    // distributed linearly in (worldY - pivotY), where `pivotY` is the
+    // Y at which we chose to zero the residual. Previously we snapped
+    // `cameraXZ + cameraY*shear` — pivot at Y = 0, residual maximal at
+    // the player. On vertical faces that made a single 1° azimuth tick
+    // jitter the UV by a Y-dependent amount across the whole face, and
+    // wherever that crosses a caster-boundary texel the user saw a
+    // horizontal line appear for one frame.
+    //
+    // ── Texel-grid snap of the shadow ORIGIN ──────────────────────────
+    // The shader UV for a receiver at world (Wx,Wy,Wz) is
+    //     UV = (Wxz + Wy*shear − origin) / halfExtent
+    // For UV stability under arbitrary camera motion (XZ AND Y, e.g. the
+    // player jumping), we must snap the camera's PROJECTED position in
+    // shadow space — i.e. snap (cameraXZ + cameraY*shear) to the texel
+    // grid. Then any sub-texel motion of the camera (in any axis)
+    // produces zero UV change for every receiver, and motion past one
+    // texel produces exactly a one-texel UV jump for every receiver. No
+    // axis becomes a "pivot" that propagates camera-motion as a Y- or
+    // azimuth-dependent UV smear.
+    //
+    // For the HD cascade (first 64 m) the snap is applied in shadow
+    // space and the snap step is exactly one shadow texel (and by
+    // construction one light-grid cell == 0.015625 m for the default
+    // profile), so vertical faces and corner alignment stay perfect
+    // across player jumps and continuous sun motion.
+    //
+    // For far cascades we keep the legacy world-XZ snap (no Y term) so
+    // the cascade footprint stays centered around the player horizontally
+    // independent of altitude, avoiding the visible cascade-shrink that
+    // a large shear*cameraY shift would cause on the wide rings.
+    constexpr float kVoxelSizeMeters = 0.25f;
+    // Snap step: one shadow texel for the HD cascade (texel-perfect
+    // stability), one voxel for far cascades (legacy stable behaviour).
+    // Round texelMeters UP to a multiple of the voxel size for far
+    // cascades so cross-cascade phase alignment is preserved.
+    const float kSnapStepMeters = isHDCascade
+        ? kSunShadowTexelMeters
+        : std::max(
+              kVoxelSizeMeters,
+              std::ceil(kSunShadowTexelMeters / kVoxelSizeMeters) * kVoxelSizeMeters);
+    auto snapTo = [](float v, float step) {
+        return std::floor(v / step + 0.5f) * step;
+    };
+
+    float originX;
+    float originZ;
+    if (isHDCascade) {
+        // Snap the projected camera position (shadow-space) to the texel
+        // grid. This yields whole-texel UV jumps under any motion.
+        const float projCamX = cameraPos.x + cameraPos.y * shearX;
+        const float projCamZ = cameraPos.z + cameraPos.y * shearZ;
+        originX = snapTo(projCamX, kSnapStepMeters);
+        originZ = snapTo(projCamZ, kSnapStepMeters);
+    } else {
+        originX = snapTo(cameraPos.x, kSnapStepMeters);
+        originZ = snapTo(cameraPos.z, kSnapStepMeters);
+    }
+
+    // ── Depth range (along sunDir) ─────────────────────────────────────
+    // Must contain every caster that can shadow into the ortho footprint
+    // plus terrain elevation variation.
+    //
+    // IMPORTANT: low-elevation sun significantly increases the horizontal
+    // caster reach (height * shear). Without accounting for that in depth
+    // range, portions of the near ring can drop out at specific elevations
+    // because valid caster depths are clipped out of [0,1].
+    const float horizontalDepthReach =
+        halfExtent * (std::abs(sunDir.x) + std::abs(sunDir.z));
+    const float verticalDepthReach =
+        WorldConfig::CHUNK_HEIGHT_M * std::abs(sunDir.y);
+    const float shearCasterReachX = WorldConfig::CHUNK_HEIGHT_M * std::abs(shearX);
+    const float shearCasterReachZ = WorldConfig::CHUNK_HEIGHT_M * std::abs(shearZ);
+    float shearDepthReach =
+        shearCasterReachX * std::abs(sunDir.x) +
+        shearCasterReachZ * std::abs(sunDir.z);
+    // Clamp extreme near-horizon amplification to preserve depth precision.
+    shearDepthReach = std::min(shearDepthReach, halfExtent * 8.0f);
+    const float depthHalfRange = std::max(
+        horizontalDepthReach + verticalDepthReach + shearDepthReach + WorldConfig::CHUNK_SIZE_M * 2.0f,
+        halfExtent * 2.0f);
+    const float depthRange = depthHalfRange * 2.0f;
+
+    // Reference depth at the camera, snapped to the same voxel grid
+    // along the sun direction. refDepth is a scalar anchor that shifts
+    // compareDepth uniformly across all receivers, so a snap step here
+    // only causes a global depth rebase — not a Y-dependent line like
+    // the XZ origin did. Keeping the snap bounds depth drift at ½
+    // voxel per sun tick without affecting vertical-face UV stability.
+    const float refDepthRaw =
+        cameraPos.x * sunDir.x +
+        cameraPos.y * sunDir.y +
+        cameraPos.z * sunDir.z;
+    const float refDepth = snapTo(refDepthRaw, kSnapStepMeters);
+
+    // ── Build the VP ───────────────────────────────────────────────────
+    // For a world point P:
+    //   clip.x = (P.x - originX + P.y * shearX) / halfExtent
+    //   clip.y = (P.z - originZ + P.y * shearZ) / halfExtent
+    //   clip.z = (dot(P, sunDir) - refDepth + depthHalfRange) / depthRange
+    // The constant terms (-originX, -originZ, refDepth) collapse into
+    // vp[3]; the per-vertex shear contribution lives on row 1 as before.
+    glm::mat4 vp(0.0f);
+
+    vp[0][0] = 1.0f / halfExtent;          // worldX → clip.x
+    vp[0][2] = sunDir.x / depthRange;      // worldX → clip.z
+
+    vp[1][0] = shearX / halfExtent;        // worldY → clip.x (shear)
+    vp[1][1] = shearZ / halfExtent;        // worldY → clip.y (shear)
+    vp[1][2] = sunDir.y / depthRange;      // worldY → clip.z
+
+    vp[2][1] = 1.0f / halfExtent;          // worldZ → clip.y
+    vp[2][2] = sunDir.z / depthRange;      // worldZ → clip.z
+
+    vp[3][0] = -originX / halfExtent;
+    vp[3][1] = -originZ / halfExtent;
+    vp[3][2] = (depthHalfRange - refDepth) / depthRange;
+    vp[3][3] = 1.0f;
+
+    if (outQuantizedSunDir) {
+        *outQuantizedSunDir = sunDir;
+    }
+
+    return vp;
+}

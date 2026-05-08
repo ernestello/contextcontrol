@@ -1,0 +1,14 @@
+#include "rendering/lighting/ShadowSystem.h"
+
+// GPT-DESC: Coordinates shadow pass recording across sun and point-light domain implementations.
+
+void ShadowSystem::recordShadowPasses(VkCommandBuffer cmd,
+                                      uint32_t imageIndex,
+                                      const DrawContext& ctx) {
+    if (!m_initialized || imageIndex >= m_shadowDataBuffers.size()) {
+        return;
+    }
+
+    recordSunShadowPasses(cmd, imageIndex, ctx);
+    recordPointShadowPasses(cmd, imageIndex, ctx);
+}

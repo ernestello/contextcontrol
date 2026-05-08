@@ -1053,6 +1053,148 @@
                                            "Reason":  "applied function"
                                        }
                                    ]
+                  },
+                  {
+                      "Path":  "src/rendering/lighting/shadow/ShadowPass.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\rendering\\lighting\\shadow\\ShadowPass.cpp",
+                      "Key":  "0d2dbcee70ad1632",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T09:30:12.3660296Z",
+                                           "Snapshot":  "files\\0d2dbcee70ad1632\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T09:58:21.8601595Z",
+                                           "Snapshot":  "files\\0d2dbcee70ad1632\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/rendering/lighting/shadow/ShadowMatrices.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\rendering\\lighting\\shadow\\ShadowMatrices.cpp",
+                      "Key":  "494f9b81eda71d66",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T09:30:12.3838012Z",
+                                           "Snapshot":  "files\\494f9b81eda71d66\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T09:58:21.9996680Z",
+                                           "Snapshot":  "files\\494f9b81eda71d66\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/CMakeLists.txt",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
+                      "Key":  "631c8d07f5ea23b9",
+                      "CurrentVersion":  3,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T09:30:12.3994324Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T09:30:12.4132720Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-08T09:58:22.0367969Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "include/rendering/lighting/ShadowSystem.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\include\\rendering\\lighting\\ShadowSystem.h",
+                      "Key":  "45fc8e1864708356",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T09:58:21.7699177Z",
+                                           "Snapshot":  "files\\45fc8e1864708356\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T09:58:21.7902781Z",
+                                           "Snapshot":  "files\\45fc8e1864708356\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/rendering/lighting/shadow/ShadowInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\rendering\\lighting\\shadow\\ShadowInternal.h",
+                      "Key":  "e4a44f7106f04f79",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T09:58:21.8174597Z",
+                                           "Snapshot":  "files\\e4a44f7106f04f79\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/rendering/lighting/shadow/ShadowSunCascades.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\rendering\\lighting\\shadow\\ShadowSunCascades.cpp",
+                      "Key":  "f4620a3f1c0ec1e8",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T09:58:21.9039369Z",
+                                           "Snapshot":  "files\\f4620a3f1c0ec1e8\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/rendering/lighting/shadow/ShadowPointLights.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\rendering\\lighting\\shadow\\ShadowPointLights.cpp",
+                      "Key":  "bfbd5e4cd8966bfc",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T09:58:21.9367946Z",
+                                           "Snapshot":  "files\\bfbd5e4cd8966bfc\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/rendering/lighting/shadow/ShadowCache.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\rendering\\lighting\\shadow\\ShadowCache.cpp",
+                      "Key":  "00e8eb85ab3b8a9f",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T09:58:21.9664934Z",
+                                           "Snapshot":  "files\\00e8eb85ab3b8a9f\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
                   }
               ]
 }

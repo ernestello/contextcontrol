@@ -1,0 +1,295 @@
+#include "rendering/lighting/ShadowSystem.h"
+
+#include "ShadowInternal.h"
+#include "world/World.h"
+
+// GPT-DESC: Records point-light shadow cube-map passes and point-shadow cache reuse.
+
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+
+using namespace ShadowSystemInternal;
+
+void ShadowSystem::recordPointShadowPasses(VkCommandBuffer cmd,
+                                          uint32_t imageIndex,
+                                          const DrawContext& ctx) {
+    const bool haveTimingQueries =
+        (m_lightTimingQueryPool != VK_NULL_HANDLE) &&
+        (imageIndex < m_lightTimingImageCount) &&
+        (imageIndex < m_querySourceByImage.size()) &&
+        (imageIndex < m_queryLightCountByImage.size());
+    const uint32_t queryBase = imageIndex * (MAX_POINT_SHADOW_LIGHTS * 2u);
+
+    if (haveTimingQueries) {
+        vkCmdResetQueryPool(cmd, m_lightTimingQueryPool, queryBase, MAX_POINT_SHADOW_LIGHTS * 2u);
+        m_queryLightCountByImage[imageIndex] = 0u;
+        m_querySourceByImage[imageIndex].fill(kInvalidSourceIndex);
+    }
+
+
+    using Clock = std::chrono::high_resolution_clock;
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Point light shadow passes
+    // ═══════════════════════════════════════════════════════════════════
+
+    if (m_activeLights.empty()) {
+        return;
+    }
+
+    VkViewport viewport{};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = static_cast<float>(POINT_SHADOW_MAP_SIZE);
+    viewport.height = static_cast<float>(POINT_SHADOW_MAP_SIZE);
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    VkRect2D scissor{};
+    scissor.offset = {0, 0};
+    scissor.extent = {POINT_SHADOW_MAP_SIZE, POINT_SHADOW_MAP_SIZE};
+
+    VkClearValue clearValue{};
+    clearValue.depthStencil = {1.0f, 0};
+
+    VkDeviceSize zeroOffset = 0;
+
+    const uint32_t activeCount = std::min<uint32_t>(
+        static_cast<uint32_t>(m_activeLights.size()),
+        MAX_POINT_SHADOW_LIGHTS);
+    if (haveTimingQueries) {
+        m_queryLightCountByImage[imageIndex] = activeCount;
+    }
+    const uint64_t perLightShadowTexels =
+        static_cast<uint64_t>(kPointShadowFacesPerLight) *
+        static_cast<uint64_t>(POINT_SHADOW_MAP_SIZE) *
+        static_cast<uint64_t>(POINT_SHADOW_MAP_SIZE);
+    const uint64_t terrainSignature = hashTerrainDrawContext(ctx);
+    const bool useLocalSphereTerrain = (ctx.world != nullptr);
+    const uint32_t localDrawCapacity = useLocalSphereTerrain
+        ? std::max<uint32_t>(ctx.gpuMaxDraws, std::max<uint32_t>(ctx.indirectDrawCount, 65536u))
+        : 0u;
+    if (useLocalSphereTerrain) {
+        if (m_localTerrainDrawScratch.size() < localDrawCapacity) {
+            m_localTerrainDrawScratch.resize(localDrawCapacity);
+            m_localTerrainOriginScratch.resize(localDrawCapacity);
+        }
+    }
+    m_frameDiagnostics.totalRenderedFaces = 0u;
+    m_frameDiagnostics.totalShadowMapTexelsRendered = 0u;
+
+    for (uint32_t lightSlot = 0; lightSlot < activeCount; ++lightSlot) {
+        const ActiveLight& light = m_activeLights[lightSlot];
+        const auto lightCpuStart = Clock::now();
+        if (haveTimingQueries) {
+            m_querySourceByImage[imageIndex][lightSlot] = light.sourceIndex;
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, m_lightTimingQueryPool,
+                                queryBase + lightSlot * 2u);
+        }
+
+        uint32_t localTerrainDrawCount = 0u;
+        float terrainGatherMs = 0.0f;
+        uint64_t lightTerrainSignature = terrainSignature;
+        bool reusedFromCache = false;
+        if (lightSlot < m_slotShadowCache.size()) {
+            const auto& cache = m_slotShadowCache[lightSlot];
+            const bool allowReuseThisFrame = (!ctx.useGPUCulling) || useLocalSphereTerrain;
+            reusedFromCache =
+                allowReuseThisFrame &&
+                cache.valid &&
+                cache.sourceIndex == light.sourceIndex &&
+                nearlyEqualVec3(cache.lightPosition, light.position) &&
+                nearlyEqual(cache.nearPlane, light.nearPlane) &&
+                nearlyEqual(cache.farPlane, light.farPlane) &&
+                cache.terrainSignature == lightTerrainSignature;
+        }
+        if (!reusedFromCache &&
+            useLocalSphereTerrain &&
+            !m_localTerrainDrawScratch.empty() &&
+            !m_localTerrainOriginScratch.empty()) {
+            const auto terrainGatherStart = Clock::now();
+            localTerrainDrawCount = ctx.world->gatherDrawCommandsInSphere(
+                light.position,
+                light.farPlane,
+                m_localTerrainDrawScratch.data(),
+                m_localTerrainOriginScratch.data(),
+                localDrawCapacity,
+                ctx.uploadTimelineValue);
+            terrainGatherMs = std::chrono::duration<float, std::milli>(
+                Clock::now() - terrainGatherStart).count();
+        }
+        if (light.sourceIndex < m_lightDiagnostics.size()) {
+            auto& diag = m_lightDiagnostics[light.sourceIndex];
+            diag.cpuTerrainGatherMs = terrainGatherMs;
+            diag.usedLocalTerrainCulling = useLocalSphereTerrain;
+            diag.localTerrainDrawCount = localTerrainDrawCount;
+            diag.localTerrainDrawCapacity = localDrawCapacity;
+        }
+        if (!reusedFromCache) {
+            const auto faceVP = buildPointLightFaceMatrices(light.position, light.nearPlane, light.farPlane);
+            for (uint32_t face = 0; face < kPointShadowFacesPerLight; ++face) {
+                const uint32_t layer = lightSlot * kPointShadowFacesPerLight + face;
+
+                VkRenderPassBeginInfo rpBegin{};
+                rpBegin.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+                rpBegin.renderPass = m_shadowRenderPass;
+                rpBegin.framebuffer = m_shadowFramebuffers[layer];
+                rpBegin.renderArea.offset = {0, 0};
+                rpBegin.renderArea.extent = {POINT_SHADOW_MAP_SIZE, POINT_SHADOW_MAP_SIZE};
+                rpBegin.clearValueCount = 1;
+                rpBegin.pClearValues = &clearValue;
+
+                vkCmdBeginRenderPass(cmd, &rpBegin, VK_SUBPASS_CONTENTS_INLINE);
+                vkCmdSetViewport(cmd, 0, 1, &viewport);
+                vkCmdSetScissor(cmd, 0, 1, &scissor);
+                vkCmdSetDepthBias(cmd, 1.35f, 0.0f, 1.75f);
+
+                ShadowPushConstants push{};
+                push.lightVP = faceVP[face];
+                push.lightPosFar = glm::vec4(light.position, light.farPlane);
+                push.terrainChunkCoordMode = glm::vec4(0.0f);
+
+                if (ctx.terrainDescriptorSet != VK_NULL_HANDLE &&
+                    ctx.terrainVertexBuffer != VK_NULL_HANDLE &&
+                    ctx.terrainIndexBuffer != VK_NULL_HANDLE) {
+
+                    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, m_terrainShadowPipeline);
+                    vkCmdBindDescriptorSets(
+                        cmd,
+                        VK_PIPELINE_BIND_POINT_GRAPHICS,
+                        m_terrainShadowPipelineLayout,
+                        0,
+                        1,
+                        &ctx.terrainDescriptorSet,
+                        0,
+                        nullptr);
+
+                    vkCmdBindVertexBuffers(cmd, 0, 1, &ctx.terrainVertexBuffer, &zeroOffset);
+                    vkCmdBindIndexBuffer(cmd, ctx.terrainIndexBuffer, 0, VK_INDEX_TYPE_UINT16);
+
+                    if (useLocalSphereTerrain) {
+                        for (uint32_t drawIndex = 0; drawIndex < localTerrainDrawCount; ++drawIndex) {
+                            const auto& terrainDraw = m_localTerrainDrawScratch[drawIndex];
+                            const glm::vec4& chunkOrigin = m_localTerrainOriginScratch[drawIndex];
+                            push.terrainChunkCoordMode = glm::vec4(
+                                chunkOrigin.x,
+                                chunkOrigin.y,
+                                chunkOrigin.z,
+                                1.0f);
+                            vkCmdPushConstants(
+                                cmd,
+                                m_terrainShadowPipelineLayout,
+                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                0,
+                                sizeof(ShadowPushConstants),
+                                &push);
+                            vkCmdDrawIndexed(
+                                cmd,
+                                terrainDraw.indexCount,
+                                1u,
+                                terrainDraw.firstIndex,
+                                terrainDraw.vertexOffset,
+                                0u);
+                        }
+                    } else if (ctx.useGPUCulling &&
+                        ctx.gpuVisibleDrawsBuffer != VK_NULL_HANDLE &&
+                        ctx.gpuDrawCountBuffer != VK_NULL_HANDLE &&
+                        ctx.gpuMaxDraws > 0) {
+                        // Phase D: signal point_shadow_terrain.vert to read from
+                        // bindless ChunkOrigins[1] (GPU visible-origins) instead of slot 0.
+                        push.terrainChunkCoordMode = glm::vec4(0.0f, 0.0f, 0.0f, 2.0f);
+                        vkCmdPushConstants(
+                            cmd,
+                            m_terrainShadowPipelineLayout,
+                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                            0,
+                            sizeof(ShadowPushConstants),
+                            &push);
+                        vkCmdDrawIndexedIndirectCount(
+                            cmd,
+                            ctx.gpuVisibleDrawsBuffer,
+                            0,
+                            ctx.gpuDrawCountBuffer,
+                            0,
+                            ctx.gpuMaxDraws,
+                            sizeof(VkDrawIndexedIndirectCommand));
+                    } else if (ctx.indirectBuffer != VK_NULL_HANDLE && ctx.indirectDrawCount > 0) {
+                        vkCmdPushConstants(
+                            cmd,
+                            m_terrainShadowPipelineLayout,
+                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                            0,
+                            sizeof(ShadowPushConstants),
+                            &push);
+                        vkCmdDrawIndexedIndirect(
+                            cmd,
+                            ctx.indirectBuffer,
+                            0,
+                            ctx.indirectDrawCount,
+                            sizeof(VkDrawIndexedIndirectCommand));
+                    }
+                }
+
+                vkCmdEndRenderPass(cmd);
+            }
+
+            m_frameDiagnostics.totalRenderedFaces += kPointShadowFacesPerLight;
+            m_frameDiagnostics.totalShadowMapTexelsRendered += perLightShadowTexels;
+
+            if (lightSlot < m_slotShadowCache.size()) {
+                auto& cache = m_slotShadowCache[lightSlot];
+                cache.valid = true;
+                cache.sourceIndex = light.sourceIndex;
+                cache.lightPosition = light.position;
+                cache.nearPlane = light.nearPlane;
+                cache.farPlane = light.farPlane;
+                cache.terrainSignature = lightTerrainSignature;
+            }
+        }
+
+        if (haveTimingQueries) {
+            vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, m_lightTimingQueryPool,
+                                queryBase + lightSlot * 2u + 1u);
+        }
+
+        const float lightCpuMs = std::chrono::duration<float, std::milli>(Clock::now() - lightCpuStart).count();
+        if (light.sourceIndex < m_lightDiagnostics.size()) {
+            auto& diag = m_lightDiagnostics[light.sourceIndex];
+            diag.reusedShadowCache = reusedFromCache;
+            diag.renderedFaces = reusedFromCache ? 0u : kPointShadowFacesPerLight;
+            diag.reusedFaces = reusedFromCache ? kPointShadowFacesPerLight : 0u;
+            diag.shadowMapTexelsRendered = reusedFromCache ? 0u : perLightShadowTexels;
+            diag.cpuCommandRecordMs = std::max(0.0f, lightCpuMs - terrainGatherMs);
+            diag.cpuTotalMs += diag.cpuTerrainGatherMs + diag.cpuCommandRecordMs;
+        }
+    }
+
+    VkImageMemoryBarrier2 barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    barrier.srcStageMask = VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    barrier.srcAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    barrier.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    barrier.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = m_pointShadowImage;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    barrier.subresourceRange.baseMipLevel = 0;
+    barrier.subresourceRange.levelCount = 1;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = MAX_POINT_SHADOW_LIGHTS * 6;
+
+    VkDependencyInfo depInfo{};
+    depInfo.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    depInfo.imageMemoryBarrierCount = 1;
+    depInfo.pImageMemoryBarriers = &barrier;
+    vkCmdPipelineBarrier2(cmd, &depInfo);
+}
