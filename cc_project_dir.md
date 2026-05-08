@@ -205,7 +205,14 @@ vulkanas/
 │   │   ├── TerrainFileLoader.h
 │   │   ├── World.h
 │   │   ├── WorldDiagnostics.h
-│   │   └── WorldTypes.h
+│   │   ├── WorldEditArtifactTypes.h
+│   │   ├── WorldRenderTypes.h
+│   │   ├── WorldSnapshotTypes.h
+│   │   ├── WorldStreamingTypes.h
+│   │   ├── WorldTerrainEditTypes.h
+│   │   ├── WorldTopologyTypes.h
+│   │   ├── WorldTypes.h
+│   │   └── WorldUpdateTypes.h
 │   └── pch.h
 ├── maps/
 │   ├── snapshot/
@@ -248,6 +255,8 @@ vulkanas/
 │   │   └── snapshot.meta
 │   ├── snapshot_20260508_150335/
 │   │   └── snapshot.meta
+│   ├── snapshot_20260508_152523/
+│   │   └── snapshot.meta
 │   ├── heightmap.csv
 │   └── heightmap.hbin
 ├── shaders/
@@ -255,7 +264,10 @@ vulkanas/
 │   │   ├── clustered_lighting.glsl
 │   │   ├── dither_utils.glsl
 │   │   ├── shadow_sampling.glsl
-│   │   └── sky_enclosure.glsl
+│   │   ├── sky_enclosure.glsl
+│   │   ├── terrain_ao.glsl
+│   │   ├── terrain_bindings.glsl
+│   │   └── terrain_materials.glsl
 │   ├── culling/
 │   │   ├── depth_reduce.comp
 │   │   ├── frustum_cull.comp
@@ -469,6 +481,13 @@ vulkanas/
 │   │   ├── config/
 │   │   │   └── WorldConfig.cpp
 │   │   ├── edit/
+│   │   │   ├── dccm/
+│   │   │   │   ├── DCCMBoundaryRepair.cpp
+│   │   │   │   ├── DCCMFeatureMesh.cpp
+│   │   │   │   ├── DCCMHeightAnalysis.cpp
+│   │   │   │   ├── DCCMWeldCleanup.cpp
+│   │   │   │   ├── TerrainEditDCCMInternal.h
+│   │   │   │   └── TerrainEditDCCMMesher.cpp
 │   │   │   ├── meshing/
 │   │   │   │   ├── greedy/
 │   │   │   │   │   ├── TerrainEditGreedyCache.cpp
@@ -507,6 +526,11 @@ vulkanas/
 │   │   │   ├── TerrainEditOverlayStore_IO.cpp
 │   │   │   ├── TerrainFieldSource.cpp
 │   │   │   └── VoxelBaseSampler.cpp
+│   │   ├── finalize/
+│   │   │   ├── WorldFinalizeQueue.cpp
+│   │   │   └── WorldTopologyChanges.cpp
+│   │   ├── jobs/
+│   │   │   └── WorldChunkJobScheduling.cpp
 │   │   ├── lod/
 │   │   │   ├── WorldLODConfig.cpp
 │   │   │   ├── WorldLODDiagnostics.cpp
@@ -520,6 +544,12 @@ vulkanas/
 │   │   │   ├── WorldSnapshotLoad.cpp
 │   │   │   ├── WorldSnapshotSave.cpp
 │   │   │   └── WorldSnapshotStore.cpp
+│   │   ├── update/
+│   │   │   ├── WorldChunkLoader.cpp
+│   │   │   ├── WorldMeshingDispatch.cpp
+│   │   │   └── WorldUpdateLoop.cpp
+│   │   ├── upload/
+│   │   │   └── WorldUploadQueue.cpp
 │   │   ├── vxm/
 │   │   │   └── VxmImport.cpp
 │   │   ├── ChunkHoleTracker.cpp
@@ -540,6 +570,21 @@ vulkanas/
 │   ├── CMakeLists.txt
 │   └── main.cpp
 ├── tools/
+│   ├── dccm_gap_fix/
+│   │   ├── DCCMAOSmoothing.cpp
+│   │   ├── DCCMBoundary.cpp
+│   │   ├── DCCMGapFixInternal.h
+│   │   ├── DCCMGapFixTool.cpp
+│   │   └── DCCMWeld.cpp
+│   ├── heightmap_mesh/
+│   │   ├── GreedyMesher.cpp
+│   │   ├── HeightfieldMesher.cpp
+│   │   ├── HeightmapIO.cpp
+│   │   ├── HeightmapMeshInternal.h
+│   │   ├── HeightmapMeshTool.cpp
+│   │   ├── MeshOptimization.cpp
+│   │   ├── TerrainFileWriter.cpp
+│   │   └── VoxelChunkBuilder.cpp
 │   ├── CMakeLists.txt
 │   ├── convert_heightmap_to_meshes.cpp
 │   ├── convert_heightmap_to_svo.cpp
