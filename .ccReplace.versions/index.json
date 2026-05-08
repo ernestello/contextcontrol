@@ -1188,7 +1188,7 @@
                       "Path":  "src/CMakeLists.txt",
                       "FullPath":  "D:\\projects\\vulkanas\\src\\CMakeLists.txt",
                       "Key":  "631c8d07f5ea23b9",
-                      "CurrentVersion":  14,
+                      "CurrentVersion":  15,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -1272,6 +1272,12 @@
                                            "Version":  14,
                                            "Timestamp":  "2026-05-08T12:24:26.0912519Z",
                                            "Snapshot":  "files\\631c8d07f5ea23b9\\v000014.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  15,
+                                           "Timestamp":  "2026-05-08T12:55:50.2746373Z",
+                                           "Snapshot":  "files\\631c8d07f5ea23b9\\v000015.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -2791,6 +2797,110 @@
                                            "Timestamp":  "2026-05-08T12:39:45.8665283Z",
                                            "Snapshot":  "files\\b7b0f51f04cf58c5\\v000002.snapshot",
                                            "Reason":  "applied append_to_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/TerrainEditDCCMMesher.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\TerrainEditDCCMMesher.cpp",
+                      "Key":  "7cb953043d790884",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:55:50.0893807Z",
+                                           "Snapshot":  "files\\7cb953043d790884\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-08T12:55:50.1084362Z",
+                                           "Snapshot":  "files\\7cb953043d790884\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/dccm/TerrainEditDCCMInternal.h",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\dccm\\TerrainEditDCCMInternal.h",
+                      "Key":  "80d7b5ed2cdf5f73",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:55:50.1295277Z",
+                                           "Snapshot":  "files\\80d7b5ed2cdf5f73\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/dccm/DCCMHeightAnalysis.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\dccm\\DCCMHeightAnalysis.cpp",
+                      "Key":  "841cf5c95ff3fe83",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:55:50.1517980Z",
+                                           "Snapshot":  "files\\841cf5c95ff3fe83\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/dccm/DCCMWeldCleanup.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\dccm\\DCCMWeldCleanup.cpp",
+                      "Key":  "1d94fe3d6e755e32",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:55:50.1748527Z",
+                                           "Snapshot":  "files\\1d94fe3d6e755e32\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/dccm/DCCMBoundaryRepair.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\dccm\\DCCMBoundaryRepair.cpp",
+                      "Key":  "593f2455610d4b9c",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:55:50.1959771Z",
+                                           "Snapshot":  "files\\593f2455610d4b9c\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/dccm/DCCMFeatureMesh.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\dccm\\DCCMFeatureMesh.cpp",
+                      "Key":  "3811770188c73a1a",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:55:50.2205507Z",
+                                           "Snapshot":  "files\\3811770188c73a1a\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/dccm/TerrainEditDCCMMesher.cpp",
+                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\dccm\\TerrainEditDCCMMesher.cpp",
+                      "Key":  "2326565c8649af9e",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-08T12:55:50.2460114Z",
+                                           "Snapshot":  "files\\2326565c8649af9e\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
                                        }
                                    ]
                   }

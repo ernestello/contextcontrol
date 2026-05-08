@@ -1,0 +1,246 @@
+// GPT-DESC: Builds runtime DCCM solid, height, and feature fields from heightmap plus edit overlay data.
+#include "TerrainEditDCCMInternal.h"
+
+namespace TerrainEdit::DCCMInternal {
+
+int computeEffectiveHeight(const HeightmapBaseSampler& heightmap,
+                           const TerrainEditOverlayStore* overlay,
+                           int worldVoxelX,
+                           int worldVoxelZ,
+                           int chunkHeight,
+                           int overlayMinY,
+                           int overlayMaxY)
+{
+    const int mapW = heightmap.getMapWidth();
+    const int mapH = heightmap.getMapHeight();
+
+    int baseH = 0;
+    if (worldVoxelX >= 0 && worldVoxelX < mapW &&
+        worldVoxelZ >= 0 && worldVoxelZ < mapH) {
+        baseH = heightmap.getHeightAtVoxel(worldVoxelX, worldVoxelZ);
+    }
+
+    if (!overlay || !overlay->hasAnyEdits()) {
+        return std::min(baseH, chunkHeight);
+    }
+
+    const int cellsPerVoxel = EDIT_CELLS_PER_VOXEL;
+    const int cellX = worldVoxelX * cellsPerVoxel + cellsPerVoxel / 2;
+    const int cellZ = worldVoxelZ * cellsPerVoxel + cellsPerVoxel / 2;
+    const bool hasOverlayRange = overlayMinY <= overlayMaxY;
+    const int scanTop = std::min(
+        chunkHeight,
+        hasOverlayRange ? std::max(baseH, overlayMaxY + 1) : baseH);
+    const int scanBot = std::max(
+        0,
+        hasOverlayRange ? std::min(baseH, overlayMinY) : std::max(0, baseH - 1));
+
+    int effectiveH = -1;
+    for (int vy = scanTop - 1; vy >= scanBot; --vy) {
+        const int cellY = vy * cellsPerVoxel + cellsPerVoxel / 2;
+        const GridCoord gridCoord(cellX, cellY, cellZ);
+        const auto overrideValue = overlay->getOverride(gridCoord);
+
+        if (overrideValue.has_value()) {
+            if (overrideValue->solid) {
+                effectiveH = vy + 1;
+                break;
+            }
+        } else if (vy < baseH) {
+            effectiveH = baseH;
+            break;
+        }
+    }
+
+    if (effectiveH < 0) {
+        effectiveH = baseH;
+    }
+
+    return std::min(effectiveH, chunkHeight);
+}
+
+int sampleBaseHeight(const HeightmapBaseSampler& heightmap,
+                     int worldVoxelX,
+                     int worldVoxelZ,
+                     int chunkHeight)
+{
+    const int mapW = heightmap.getMapWidth();
+    const int mapH = heightmap.getMapHeight();
+    if (worldVoxelX < 0 || worldVoxelX >= mapW ||
+        worldVoxelZ < 0 || worldVoxelZ >= mapH) {
+        return 0;
+    }
+    return std::min(heightmap.getHeightAtVoxel(worldVoxelX, worldVoxelZ), chunkHeight);
+}
+
+HybridFieldData buildHybridFieldData(const HeightmapBaseSampler& heightmap,
+                                     const TerrainEditOverlayStore* overlay,
+                                     int chunkX,
+                                     int chunkZ,
+                                     int chunkSize,
+                                     int chunkHeight)
+{
+    HybridFieldData data;
+    data.chunkBaseX = chunkX * chunkSize;
+    data.chunkBaseZ = chunkZ * chunkSize;
+    data.chunkSize = chunkSize;
+    data.chunkHeight = chunkHeight;
+    data.cacheBaseX = data.chunkBaseX - 1;
+    data.cacheBaseZ = data.chunkBaseZ - 1;
+    data.cacheMinY = 0;
+    data.cacheDimXZ = chunkSize + 2;
+    data.cacheDimY = chunkHeight;
+    data.solidCache.resize(static_cast<size_t>(data.cacheDimXZ) *
+                           static_cast<size_t>(data.cacheDimXZ) *
+                           static_cast<size_t>(data.cacheDimY), 0);
+
+    for (int localZ = 0; localZ < data.cacheDimXZ; ++localZ) {
+        const int worldZ = data.cacheBaseZ + localZ;
+        for (int localX = 0; localX < data.cacheDimXZ; ++localX) {
+            const int worldX = data.cacheBaseX + localX;
+            const int baseHeight = sampleBaseHeight(heightmap, worldX, worldZ, chunkHeight);
+            for (int worldY = 0; worldY < baseHeight; ++worldY) {
+                data.solidCache[static_cast<size_t>((worldY * data.cacheDimXZ + localZ) * data.cacheDimXZ + localX)] = 1;
+            }
+        }
+    }
+
+    if (overlay && overlay->hasAnyEdits()) {
+        overlay->bulkApplyToSolidCache(
+            data.solidCache.data(),
+            data.cacheBaseX,
+            data.cacheBaseZ,
+            data.cacheMinY,
+            data.cacheDimXZ,
+            data.cacheDimY);
+    }
+
+    const int gridStride = chunkSize + 1;
+    data.heights.resize(static_cast<size_t>(gridStride) * gridStride, 0);
+    data.featureGrid.resize(static_cast<size_t>(gridStride) * gridStride, 0);
+    data.featureColumns.resize(static_cast<size_t>(chunkSize) * chunkSize, 0);
+
+    auto analyzeColumn = [&](int worldX, int worldZ) {
+        ColumnAnalysis analysis;
+        const int baseHeight = sampleBaseHeight(heightmap, worldX, worldZ, chunkHeight);
+        for (int worldY = 0; worldY < chunkHeight; ++worldY) {
+            const bool currentSolid = data.cacheSolid(worldX, worldY, worldZ);
+            const bool baseSolid = worldY < baseHeight;
+            if (currentSolid) {
+                analysis.topHeight = worldY + 1;
+            }
+            if (currentSolid != baseSolid) {
+                analysis.hasDifference = true;
+                analysis.diffMinY = std::min(analysis.diffMinY, worldY);
+                analysis.diffMaxY = std::max(analysis.diffMaxY, worldY);
+            }
+        }
+        return analysis;
+    };
+
+    for (int localZ = 0; localZ <= chunkSize; ++localZ) {
+        for (int localX = 0; localX <= chunkSize; ++localX) {
+            const int worldX = data.chunkBaseX + localX;
+            const int worldZ = data.chunkBaseZ + localZ;
+            const ColumnAnalysis analysis = analyzeColumn(worldX, worldZ);
+            data.heights[static_cast<size_t>(localZ * gridStride + localX)] = analysis.topHeight;
+            data.featureGrid[static_cast<size_t>(localZ * gridStride + localX)] =
+                analysis.hasDifference ? uint8_t(1) : uint8_t(0);
+
+            if (localX < chunkSize && localZ < chunkSize && analysis.hasDifference) {
+                data.featureColumns[static_cast<size_t>(localZ * chunkSize + localX)] = 1;
+                data.featureMinX = std::min(data.featureMinX, localX);
+                data.featureMaxX = std::max(data.featureMaxX, localX);
+                data.featureMinZ = std::min(data.featureMinZ, localZ);
+                data.featureMaxZ = std::max(data.featureMaxZ, localZ);
+                data.featureMinY = std::min(data.featureMinY, analysis.diffMinY);
+                data.featureMaxY = std::max(data.featureMaxY, analysis.diffMaxY);
+            }
+        }
+    }
+
+    return data;
+}
+
+MacroFieldData buildMacroFieldData(const HeightmapBaseSampler& heightmap,
+                                   const HybridFieldData& data,
+                                   int lodLevel)
+{
+    MacroFieldData macro;
+    macro.step = 1 << lodLevel;
+    macro.gridSizeXZ = data.chunkSize / macro.step;
+    macro.gridSizeY = data.chunkHeight / macro.step;
+    macro.solidCells.resize(static_cast<size_t>(macro.gridSizeXZ) *
+                            static_cast<size_t>(macro.gridSizeXZ) *
+                            static_cast<size_t>(macro.gridSizeY), 0);
+    macro.featureCells.resize(static_cast<size_t>(macro.gridSizeXZ) *
+                              static_cast<size_t>(macro.gridSizeXZ), 0);
+
+    auto macroIndex = [&](int x, int y, int z) {
+        return static_cast<size_t>((y * macro.gridSizeXZ + z) * macro.gridSizeXZ + x);
+    };
+
+    const int macroVolume = macro.step * macro.step * macro.step;
+    const int solidThreshold = (macroVolume + 1) / 2;
+    for (int macroZ = 0; macroZ < macro.gridSizeXZ; ++macroZ) {
+        for (int macroX = 0; macroX < macro.gridSizeXZ; ++macroX) {
+            bool feature = false;
+            int changedMinY = INT_MAX;
+            int changedMaxY = INT_MIN;
+
+            for (int macroY = 0; macroY < macro.gridSizeY; ++macroY) {
+                int solidCount = 0;
+                int baseSolidCount = 0;
+                const int worldBaseX = data.chunkBaseX + macroX * macro.step;
+                const int worldBaseZ = data.chunkBaseZ + macroZ * macro.step;
+                const int worldBaseY = macroY * macro.step;
+
+                for (int localY = 0; localY < macro.step; ++localY) {
+                    const int worldY = worldBaseY + localY;
+                    for (int localZ = 0; localZ < macro.step; ++localZ) {
+                        const int worldZ = worldBaseZ + localZ;
+                        for (int localX = 0; localX < macro.step; ++localX) {
+                            const int worldX = worldBaseX + localX;
+                            const int baseHeight = sampleBaseHeight(heightmap, worldX, worldZ, data.chunkHeight);
+                            const bool currentSolid = data.cacheSolid(worldX, worldY, worldZ);
+                            const bool baseSolid = worldY < baseHeight;
+                            solidCount += currentSolid ? 1 : 0;
+                            baseSolidCount += baseSolid ? 1 : 0;
+                        }
+                    }
+                }
+
+                const bool currentMacroSolid = solidCount >= solidThreshold;
+                const bool baseMacroSolid = baseSolidCount >= solidThreshold;
+                if (currentMacroSolid) {
+                    macro.solidCells[macroIndex(macroX, macroY, macroZ)] = 1;
+                }
+
+                if (currentMacroSolid != baseMacroSolid) {
+                    feature = true;
+                    changedMinY = std::min(changedMinY, macroY);
+                    changedMaxY = std::max(changedMaxY, macroY);
+                }
+            }
+
+            if (feature) {
+                macro.featureCells[static_cast<size_t>(macroZ * macro.gridSizeXZ + macroX)] = 1;
+                macro.featureMinX = std::min(macro.featureMinX, macroX);
+                macro.featureMaxX = std::max(macro.featureMaxX, macroX);
+                macro.featureMinZ = std::min(macro.featureMinZ, macroZ);
+                macro.featureMaxZ = std::max(macro.featureMaxZ, macroZ);
+                macro.featureMinY = std::min(macro.featureMinY, changedMinY);
+                macro.featureMaxY = std::max(macro.featureMaxY, changedMaxY);
+            }
+        }
+    }
+
+    if (macro.hasFeatureCells() && macro.featureMinY > macro.featureMaxY) {
+        macro.featureMinY = std::max(0, data.featureMinY / macro.step);
+        macro.featureMaxY = std::min(macro.gridSizeY - 1, data.featureMaxY / macro.step);
+    }
+
+    return macro;
+}
+
+} // namespace TerrainEdit::DCCMInternal

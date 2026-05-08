@@ -1,0 +1,197 @@
+// GPT-DESC: Provides runtime DCCM vertex packing, indexing, welding, and duplicate triangle cleanup.
+#include "TerrainEditDCCMInternal.h"
+
+namespace TerrainEdit::DCCMInternal {
+
+uint8_t unpackX(const Vertex& vertex) {
+    return static_cast<uint8_t>((vertex.packed >> 0) & 0xFFu);
+}
+
+uint16_t unpackY(const Vertex& vertex) {
+    return static_cast<uint16_t>((vertex.packed >> 8) & 0x3FFu);
+}
+
+uint8_t unpackZ(const Vertex& vertex) {
+    return static_cast<uint8_t>((vertex.packed >> 18) & 0xFFu);
+}
+
+uint8_t unpackFace(const Vertex& vertex) {
+    return static_cast<uint8_t>((vertex.packed >> 26) & 0x7u);
+}
+
+uint8_t unpackAO(const Vertex& vertex) {
+    return static_cast<uint8_t>((vertex.packed >> 29) & 0x7u);
+}
+
+Vertex packVertex(uint8_t x, uint16_t y, uint8_t z, uint8_t face, uint8_t ao) {
+    return {
+        (static_cast<uint32_t>(x) << 0) |
+        (static_cast<uint32_t>(y) << 8) |
+        (static_cast<uint32_t>(z) << 18) |
+        (static_cast<uint32_t>(face & 7u) << 26) |
+        (static_cast<uint32_t>(ao & 7u) << 29)
+    };
+}
+
+void updateAABB(MeshResult& mesh, uint8_t px, uint16_t py, uint8_t pz) {
+    constexpr float voxelSize = 0.25f;
+    const glm::vec3 point(
+        static_cast<float>(px) * voxelSize,
+        static_cast<float>(py) * voxelSize,
+        static_cast<float>(pz) * voxelSize);
+    mesh.aabbMin = glm::min(mesh.aabbMin, point);
+    mesh.aabbMax = glm::max(mesh.aabbMax, point);
+}
+
+uint32_t positionKey(uint8_t x, uint16_t y, uint8_t z) {
+    return static_cast<uint32_t>(x) |
+           (static_cast<uint32_t>(y) << 8) |
+           (static_cast<uint32_t>(z) << 18);
+}
+
+std::unordered_map<uint32_t, uint32_t> buildPositionIndex(const MeshResult& mesh) {
+    std::unordered_map<uint32_t, uint32_t> index;
+    index.reserve(mesh.vertices.size());
+    for (uint32_t i = 0; i < static_cast<uint32_t>(mesh.vertices.size()); ++i) {
+        const Vertex& vertex = mesh.vertices[i];
+        index.emplace(positionKey(unpackX(vertex), unpackY(vertex), unpackZ(vertex)), i);
+    }
+    return index;
+}
+
+uint32_t getOrCreateVertex(MeshResult& mesh,
+                           std::unordered_map<uint32_t, uint32_t>& posIndex,
+                           uint8_t x,
+                           uint16_t y,
+                           uint8_t z,
+                           uint8_t face,
+                           uint8_t ao)
+{
+    const uint32_t key = positionKey(x, y, z);
+    const auto existing = posIndex.find(key);
+    if (existing != posIndex.end()) {
+        return existing->second;
+    }
+
+    const uint32_t newIndex = static_cast<uint32_t>(mesh.vertices.size());
+    mesh.vertices.push_back(packVertex(x, y, z, face, ao));
+    updateAABB(mesh, x, y, z);
+    posIndex.emplace(key, newIndex);
+    return newIndex;
+}
+
+uint64_t xzKey(uint8_t x, uint8_t z) {
+    return (static_cast<uint64_t>(x) << 32) | static_cast<uint64_t>(z);
+}
+
+void weldVertices(MeshResult& mesh) {
+    if (mesh.empty()) {
+        return;
+    }
+
+    std::unordered_map<uint32_t, uint16_t> canonByPosition;
+    canonByPosition.reserve(mesh.vertices.size());
+    std::vector<uint16_t> remap(mesh.vertices.size(), UINT16_MAX);
+
+    for (uint32_t i = 0; i < static_cast<uint32_t>(mesh.vertices.size()); ++i) {
+        const Vertex& vertex = mesh.vertices[i];
+        const uint32_t key = positionKey(unpackX(vertex), unpackY(vertex), unpackZ(vertex));
+        const auto [it, inserted] = canonByPosition.emplace(key, static_cast<uint16_t>(i));
+        remap[i] = it->second;
+        if (!inserted) {
+            Vertex& canon = mesh.vertices[it->second];
+            const uint8_t mergedAO = std::min(unpackAO(canon), unpackAO(vertex));
+            canon = packVertex(unpackX(canon), unpackY(canon), unpackZ(canon), unpackFace(canon), mergedAO);
+        }
+    }
+
+    for (uint16_t& index : mesh.indices) {
+        index = remap[index];
+    }
+
+    std::vector<uint16_t> compactIndices;
+    compactIndices.reserve(mesh.indices.size());
+    for (size_t tri = 0; tri + 2 < mesh.indices.size(); tri += 3) {
+        const uint16_t a = mesh.indices[tri + 0];
+        const uint16_t b = mesh.indices[tri + 1];
+        const uint16_t c = mesh.indices[tri + 2];
+        if (a == b || b == c || a == c) {
+            continue;
+        }
+        compactIndices.push_back(a);
+        compactIndices.push_back(b);
+        compactIndices.push_back(c);
+    }
+    mesh.indices = std::move(compactIndices);
+
+    std::vector<uint16_t> compactRemap(mesh.vertices.size(), UINT16_MAX);
+    std::vector<Vertex> compactVertices;
+    compactVertices.reserve(mesh.vertices.size());
+    for (uint16_t& index : mesh.indices) {
+        if (compactRemap[index] == UINT16_MAX) {
+            compactRemap[index] = static_cast<uint16_t>(compactVertices.size());
+            compactVertices.push_back(mesh.vertices[index]);
+        }
+        index = compactRemap[index];
+    }
+    mesh.vertices = std::move(compactVertices);
+}
+
+void removeOverlappingTriangles(MeshResult& mesh) {
+    if (mesh.indices.size() < 6) {
+        return;
+    }
+
+    auto triangleKey = [&](size_t tri) -> uint64_t {
+        uint32_t k[3] = {
+            mesh.indices[tri + 0],
+            mesh.indices[tri + 1],
+            mesh.indices[tri + 2]
+        };
+        if (k[0] > k[1]) std::swap(k[0], k[1]);
+        if (k[1] > k[2]) std::swap(k[1], k[2]);
+        if (k[0] > k[1]) std::swap(k[0], k[1]);
+        return (static_cast<uint64_t>(k[0]) << 40) |
+               (static_cast<uint64_t>(k[1]) << 20) |
+               static_cast<uint64_t>(k[2]);
+    };
+
+    auto positionTriangleKey = [&](size_t tri) -> std::array<uint32_t, 3> {
+        std::array<uint32_t, 3> k{};
+        for (int j = 0; j < 3; ++j) {
+            const Vertex& vertex = mesh.vertices[mesh.indices[tri + j]];
+            k[j] = positionKey(unpackX(vertex), unpackY(vertex), unpackZ(vertex));
+        }
+        std::sort(k.begin(), k.end());
+        return k;
+    };
+
+    std::map<uint64_t, int> triangleCounts;
+    std::map<std::array<uint32_t, 3>, int> positionCounts;
+    for (size_t tri = 0; tri + 2 < mesh.indices.size(); tri += 3) {
+        triangleCounts[triangleKey(tri)]++;
+        positionCounts[positionTriangleKey(tri)]++;
+    }
+
+    std::set<uint64_t> seenTriangles;
+    std::set<std::array<uint32_t, 3>> seenPositions;
+    std::vector<uint16_t> filtered;
+    filtered.reserve(mesh.indices.size());
+    for (size_t tri = 0; tri + 2 < mesh.indices.size(); tri += 3) {
+        const uint64_t key = triangleKey(tri);
+        const std::array<uint32_t, 3> pos = positionTriangleKey(tri);
+        const bool duplicateTriangle =
+            triangleCounts[key] > 1 && !seenTriangles.insert(key).second;
+        const bool duplicatePositions =
+            positionCounts[pos] > 1 && !seenPositions.insert(pos).second;
+        if (duplicateTriangle || duplicatePositions) {
+            continue;
+        }
+        filtered.push_back(mesh.indices[tri + 0]);
+        filtered.push_back(mesh.indices[tri + 1]);
+        filtered.push_back(mesh.indices[tri + 2]);
+    }
+    mesh.indices = std::move(filtered);
+}
+
+} // namespace TerrainEdit::DCCMInternal
