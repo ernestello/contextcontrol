@@ -1,0 +1,185 @@
+import { detectContextControl, readCcArtifact, runCcAction, writeCcArtifact } from "../core/bridge";
+import { actions, defaultSourceRequest, subsystemRows } from "../core/model";
+import type { CcActionId, CcActionState, CcDetection } from "../core/types";
+
+interface State {
+  projectRoot: string;
+  toolRoot: string;
+  detection?: CcDetection;
+  view: "overview" | "dir" | "source" | "patch" | "logs";
+  actions: CcActionState[];
+  sourceRequest: string;
+  patchText: string;
+  artifactText: string;
+  logs: string;
+  devOpen: boolean;
+}
+
+const state: State = {
+  projectRoot: "",
+  toolRoot: "",
+  view: "overview",
+  actions: actions.map((x) => ({ ...x })),
+  sourceRequest: defaultSourceRequest,
+  patchText: "",
+  artifactText: "",
+  logs: "",
+  devOpen: false
+};
+
+let root: HTMLElement | null = null;
+
+export function mountContextControlApp(element: HTMLElement | null): void {
+  root = element;
+  render();
+}
+
+async function run(id: CcActionId): Promise<void> {
+  if (id === "detect") {
+    await detect();
+    return;
+  }
+
+  if (!state.projectRoot.trim() || !state.toolRoot.trim()) {
+    log("Open a project and run Detect CC first.");
+    render();
+    return;
+  }
+
+  setAction(id, { status: "running", error: undefined });
+  render();
+
+  try {
+    let stdinText = "";
+    if (id === "cc") stdinText = state.sourceRequest.endsWith("\n") ? state.sourceRequest : `${state.sourceRequest}\n`;
+    if (id === "replaceDryRun" || id === "replaceApply") {
+      await writeCcArtifact(state.toolRoot, "patch.txt", state.patchText);
+    }
+
+    const result = await runCcAction({ projectRoot: state.projectRoot, toolRoot: state.toolRoot, action: id, stdinText });
+    setAction(id, { status: result.ok ? "success" : "failed", result });
+    log(formatResult(id, result));
+
+    if (id === "dir") {
+      state.artifactText = await readCcArtifact(state.toolRoot, "cc_project_dir.md");
+      state.view = "dir";
+    } else if (id === "cc") {
+      state.artifactText = await readCcArtifact(state.toolRoot, "cc_code_export.md");
+      state.view = "source";
+    } else {
+      state.view = "logs";
+    }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    setAction(id, { status: "failed", error: message });
+    log(`[${id}] ${message}`);
+  }
+
+  render();
+}
+
+async function detect(): Promise<void> {
+  setAction("detect", { status: "running" });
+  render();
+
+  try {
+    const detection = await detectContextControl(state.projectRoot);
+    state.detection = detection;
+    state.toolRoot = detection.tool_root;
+    setAction("detect", { status: detection.exists ? "success" : "failed" });
+    log(detection.message);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    setAction("detect", { status: "failed", error: message });
+    log(`[detect] ${message}`);
+  }
+
+  render();
+}
+
+function setAction(id: CcActionId, patch: Partial<CcActionState>): void {
+  state.actions = state.actions.map((a) => a.id === id ? { ...a, ...patch } : a);
+}
+
+function log(text: string): void {
+  state.logs += `${state.logs ? "\n\n" : ""}[${new Date().toLocaleTimeString()}] ${text}`;
+}
+
+function formatResult(id: CcActionId, result: { ok: boolean; code: number | null; stdout: string; stderr: string; duration_ms: number }): string {
+  return [
+    `${id}: ${result.ok ? "OK" : "FAILED"} | ${result.duration_ms}ms | code ${result.code ?? "none"}`,
+    result.stdout.trim() ? `stdout:\n${result.stdout.trim()}` : "",
+    result.stderr.trim() ? `stderr:\n${result.stderr.trim()}` : ""
+  ].filter(Boolean).join("\n");
+}
+
+function render(): void {
+  if (!root) return;
+  root.innerHTML = `
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand"><span class="orb"></span><div><b>Context Control</b><small>Calm Command IDE</small></div></div>
+        <label class="project"><span>Project root</span><input id="projectRoot" value="${html(state.projectRoot)}" placeholder="D:\\Projects\\vulkanas or /Users/you/project" /></label>
+        <div class="top-actions"><span class="pill ${state.detection?.exists ? "ok" : ""}">${state.detection?.exists ? "CC online" : "CC offline"}</span><button id="dev">${state.devOpen ? "Hide Console" : "Dev Console"}</button></div>
+      </header>
+      <section class="body">
+        ${sidebar()}
+        <section class="workspace"><nav>${tab("overview", "Overview")}${tab("dir", "Project Map")}${tab("source", "Source")}${tab("patch", "Patch")}${tab("logs", "Logs")}</nav><div class="panel">${view()}</div></section>
+        ${stateRail()}
+      </section>
+      ${state.devOpen ? `<section class="console"><b>Developer Console</b><pre>${html(state.logs || "No backend output yet.")}</pre></section>` : ""}
+    </main>
+  `;
+  bind();
+}
+
+function sidebar(): string {
+  return `<aside class="sidebar"><h3>Project Structure</h3><p>Subsystem-first map. Low relationship complexity.</p>${
+    subsystemRows.map(([kind, name, version, loc]) => `<button class="file ${kind}"><span>${name}</span><em>${version}</em><strong>${loc}</strong></button>`).join("")
+  }</aside>`;
+}
+
+function stateRail(): string {
+  return `<aside class="rail"><h3>State</h3>${state.actions.map((a) => `<div class="state ${a.status}"><span>${a.title}</span><b>${a.status}</b></div>`).join("")}</aside>`;
+}
+
+function tab(id: State["view"], label: string): string {
+  return `<button class="tab ${state.view === id ? "active" : ""}" data-view="${id}">${label}</button>`;
+}
+
+function view(): string {
+  if (state.view === "source") return sourceView();
+  if (state.view === "patch") return patchView();
+  if (state.view === "dir") return artifactView("Project Map", state.artifactText || "Run Build Project Map.");
+  if (state.view === "logs") return artifactView("Logs", state.logs || "No logs yet.");
+  return `<div class="hero"><span>TERMINAL CORE / VISUAL COMMAND SURFACE</span><h1>Open project. Choose context. Preflight. Apply.</h1><p>CC stays deterministic and script-powered. The app turns DIR, CC, and GO into polished visual actions.</p><div class="cards">${state.actions.map(actionCard).join("")}</div></div>`;
+}
+
+function actionCard(a: CcActionState): string {
+  return `<button class="card ${a.status}" data-action="${a.id}"><b>${a.title}</b><span>${a.subtitle}</span><em>${a.status}</em></button>`;
+}
+
+function sourceView(): string {
+  return `<div class="split"><div><h2>Source Export Request</h2><textarea id="sourceRequest">${html(state.sourceRequest)}</textarea><button class="primary" data-action="cc">Export Source</button></div><div><h2>Latest Export</h2><pre>${html(state.artifactText || "cc_code_export.md will appear here.")}</pre></div></div>`;
+}
+
+function patchView(): string {
+  return `<div class="split"><div><h2>Patch Draft</h2><textarea id="patchText">${html(state.patchText)}</textarea></div><div><h2>Patch Actions</h2><button class="primary" data-action="replaceDryRun">Dry Run Patch</button><button class="danger" data-action="replaceApply">Apply Patch</button><pre>${html(state.logs || "Preflight/apply output will appear here.")}</pre></div></div>`;
+}
+
+function artifactView(title: string, text: string): string {
+  return `<h2>${title}</h2><pre>${html(text)}</pre>`;
+}
+
+function bind(): void {
+  document.querySelector<HTMLInputElement>("#projectRoot")?.addEventListener("input", (e) => state.projectRoot = (e.target as HTMLInputElement).value);
+  document.querySelector<HTMLTextAreaElement>("#sourceRequest")?.addEventListener("input", (e) => state.sourceRequest = (e.target as HTMLTextAreaElement).value);
+  document.querySelector<HTMLTextAreaElement>("#patchText")?.addEventListener("input", (e) => state.patchText = (e.target as HTMLTextAreaElement).value);
+  document.querySelector("#dev")?.addEventListener("click", () => { state.devOpen = !state.devOpen; render(); });
+  document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((b) => b.onclick = () => { state.view = b.dataset.view as State["view"]; render(); });
+  document.querySelectorAll<HTMLButtonElement>("[data-action]").forEach((b) => b.onclick = () => void run(b.dataset.action as CcActionId));
+}
+
+function html(text: string): string {
+  return text.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+}

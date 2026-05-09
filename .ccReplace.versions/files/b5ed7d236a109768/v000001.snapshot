@@ -1,0 +1,26 @@
+import type { CcActionState } from "./types";
+
+export const actions: CcActionState[] = [
+  { id: "detect", title: "Detect CC", subtitle: "Find backend scripts and project state.", status: "idle" },
+  { id: "dir", title: "Build Project Map", subtitle: "Run ccDir and create the visual navigation artifact.", status: "idle" },
+  { id: "cc", title: "Export Source", subtitle: "Run cc with selected file/function input.", status: "idle" },
+  { id: "replaceDryRun", title: "Dry Run Patch", subtitle: "Run ccReplace without writing.", status: "idle" },
+  { id: "replaceApply", title: "Apply Patch", subtitle: "Apply patch.txt through CC.", status: "idle" },
+  { id: "help", title: "Backend Help", subtitle: "Show raw ccReplace help for development.", status: "idle" }
+];
+
+export const defaultSourceRequest = [
+  "contextcontrol/cc.ps1",
+  "contextcontrol/ccDir.ps1",
+  "contextcontrol/ccReplace.ps1",
+  "END"
+].join("\n");
+
+export const subsystemRows = [
+  ["entry", "cc.ps1", "v15", "23 LOC"],
+  ["entry", "ccReplace.ps1", "v93", "50 LOC"],
+  ["entry", "ccDir.ps1", "v9+", "~342 LOC"],
+  ["shared", "lib/shared", "core", "foundation"],
+  ["export", "lib/export", "core", "source pipeline"],
+  ["replace", "lib/replace", "core", "patch engine"]
+] as const;

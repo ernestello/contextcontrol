@@ -1,0 +1,4 @@
+import "./styles/app.css";
+import { mountContextControlApp } from "./ui/App";
+
+mountContextControlApp(document.querySelector<HTMLDivElement>("#app"));

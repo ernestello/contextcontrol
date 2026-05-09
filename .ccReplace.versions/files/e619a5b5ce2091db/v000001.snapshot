@@ -1,0 +1,27 @@
+export type CcActionId = "detect" | "dir" | "cc" | "replaceDryRun" | "replaceApply" | "help";
+export type CcStatus = "idle" | "running" | "success" | "failed";
+
+export interface CcDetection {
+  project_root: string;
+  tool_root: string;
+  exists: boolean;
+  scripts: Record<string, boolean>;
+  message: string;
+}
+
+export interface CcCommandResult {
+  ok: boolean;
+  code: number | null;
+  stdout: string;
+  stderr: string;
+  duration_ms: number;
+}
+
+export interface CcActionState {
+  id: CcActionId;
+  title: string;
+  subtitle: string;
+  status: CcStatus;
+  result?: CcCommandResult;
+  error?: string;
+}

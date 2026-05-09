@@ -1,0 +1,23 @@
+# CC-DESC: Thin entrypoint for Context Control source/function/FIND exports.
+# cc.ps1
+
+param(
+    [string]$OutputFile = "cc_code_export.md",
+    [int]$MaxFileKB = 512,
+    [switch]$ForceLargeFiles,
+    [switch]$NoClipboard,
+    [switch]$HashHints
+)
+
+$ErrorActionPreference = "Stop"
+
+$script:CcToolRoot = if ($PSScriptRoot -ne "") { $PSScriptRoot } else { (Get-Location).Path }
+. (Join-Path $script:CcToolRoot "lib/shared/Cc.Bootstrap.ps1")
+. (Join-Path $script:CcLibRoot "export/Cc.Export.Source.ps1")
+
+Invoke-CcSourceExport `
+    -OutputFile $OutputFile `
+    -MaxFileKB $MaxFileKB `
+    -ForceLargeFiles:$ForceLargeFiles `
+    -NoClipboard:$NoClipboard `
+    -HashHints:$HashHints

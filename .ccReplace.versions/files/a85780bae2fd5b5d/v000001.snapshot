@@ -1,0 +1,19 @@
+# CC-DESC: Loads the shared and replace-specific Context Control modules.
+
+if ([string]::IsNullOrWhiteSpace($script:CcToolRoot)) {
+    $candidateRoot = if ($PSScriptRoot -ne "") { $PSScriptRoot } else { (Get-Location).Path }
+    if ((Split-Path -Leaf $candidateRoot) -ieq "lib") {
+        $script:CcToolRoot = Split-Path -Parent $candidateRoot
+    }
+    else {
+        $script:CcToolRoot = $candidateRoot
+    }
+}
+
+$script:CcLibRoot = Join-Path $script:CcToolRoot "lib"
+
+. (Join-Path $script:CcLibRoot "Cc.Bootstrap.ps1")
+. (Join-Path $script:CcLibRoot "Cc.Replace.Parse.ps1")
+. (Join-Path $script:CcLibRoot "Cc.Replace.Target.ps1")
+. (Join-Path $script:CcLibRoot "Cc.Replace.Ranges.ps1")
+. (Join-Path $script:CcLibRoot "Cc.Replace.Hash.ps1")

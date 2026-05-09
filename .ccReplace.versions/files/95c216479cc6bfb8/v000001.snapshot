@@ -1,0 +1,28 @@
+import { invoke } from "@tauri-apps/api/core";
+import type { CcActionId, CcCommandResult, CcDetection } from "./types";
+
+export function detectContextControl(projectRoot: string): Promise<CcDetection> {
+  return invoke("detect_context_control", { projectRoot });
+}
+
+export function runCcAction(args: {
+  projectRoot: string;
+  toolRoot: string;
+  action: CcActionId;
+  stdinText?: string;
+}): Promise<CcCommandResult> {
+  return invoke("run_cc_action", {
+    projectRoot: args.projectRoot,
+    toolRoot: args.toolRoot,
+    action: args.action,
+    stdinText: args.stdinText ?? ""
+  });
+}
+
+export function readCcArtifact(toolRoot: string, fileName: string): Promise<string> {
+  return invoke("read_cc_artifact", { toolRoot, fileName });
+}
+
+export function writeCcArtifact(toolRoot: string, fileName: string, text: string): Promise<void> {
+  return invoke("write_cc_artifact", { toolRoot, fileName, text });
+}

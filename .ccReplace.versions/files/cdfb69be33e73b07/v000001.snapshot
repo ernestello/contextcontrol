@@ -1,0 +1,3 @@
+fn main() {
+    context_control_app_lib::run();
+}

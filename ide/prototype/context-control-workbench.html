@@ -1,0 +1,873 @@
+<!--
+CC-DESC: Static prototype for the future Context Control change-centered IDE/workbench.
+Open this file directly in a browser to preview the intended UI direction.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Context Control Workbench Prototype</title>
+  <style>
+    :root {
+      --bg: #101114;
+      --panel: #17191f;
+      --panel-soft: #1d2028;
+      --panel-lift: #232733;
+      --line: #333845;
+      --line-soft: #262a35;
+      --text: #e7eaf0;
+      --muted: #9ca3b3;
+      --faint: #6f7788;
+      --accent: #86a8ff;
+      --accent-soft: rgba(134, 168, 255, 0.16);
+      --ok: #6ee7a8;
+      --warn: #ffd166;
+      --bad: #ff7b7b;
+      --radius-lg: 18px;
+      --radius-md: 12px;
+      --radius-sm: 8px;
+      --shadow: 0 18px 55px rgba(0, 0, 0, 0.32);
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at top left, rgba(134, 168, 255, 0.11), transparent 30%),
+        radial-gradient(circle at bottom right, rgba(110, 231, 168, 0.08), transparent 34%),
+        var(--bg);
+      color: var(--text);
+      font-family: var(--sans);
+      overflow: hidden;
+    }
+
+    .app {
+      height: 100vh;
+      display: grid;
+      grid-template-rows: 58px 1fr 64px;
+      padding: 12px;
+      gap: 12px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: rgba(23, 25, 31, 0.88);
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-lg);
+      padding: 0 16px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .mark {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+      background:
+        linear-gradient(135deg, rgba(134, 168, 255, 0.95), rgba(110, 231, 168, 0.82));
+      box-shadow: 0 0 25px rgba(134, 168, 255, 0.22);
+    }
+
+    .brand-text {
+      min-width: 0;
+    }
+
+    .title {
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+
+    .subtitle {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .top-status {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      font-family: var(--mono);
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 7px 10px;
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent);
+    }
+
+    .dot.ok {
+      background: var(--ok);
+    }
+
+    .dot.warn {
+      background: var(--warn);
+    }
+
+    .dot.bad {
+      background: var(--bad);
+    }
+
+    .main {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 276px minmax(460px, 1fr) 330px;
+      gap: 12px;
+    }
+
+    .panel {
+      min-height: 0;
+      background: rgba(23, 25, 31, 0.92);
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-lg);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-header {
+      height: 44px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--line-soft);
+      padding: 0 14px;
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .panel-title {
+      font-size: 12px;
+      font-weight: 800;
+      color: var(--muted);
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .panel-count {
+      color: var(--faint);
+      font-size: 12px;
+      font-family: var(--mono);
+    }
+
+    .scroll {
+      height: calc(100% - 44px);
+      overflow: auto;
+      padding: 12px;
+    }
+
+    .capsule-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .capsule {
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-md);
+      padding: 12px;
+      background: var(--panel-soft);
+    }
+
+    .capsule.active {
+      border-color: rgba(134, 168, 255, 0.55);
+      background:
+        linear-gradient(180deg, rgba(134, 168, 255, 0.12), rgba(134, 168, 255, 0.035)),
+        var(--panel-soft);
+    }
+
+    .capsule-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+
+    .capsule-name {
+      font-size: 13px;
+      font-weight: 750;
+      line-height: 1.25;
+    }
+
+    .risk {
+      flex: 0 0 auto;
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      border-radius: 999px;
+      padding: 4px 7px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    .risk.low {
+      color: var(--ok);
+      border-color: rgba(110, 231, 168, 0.34);
+      background: rgba(110, 231, 168, 0.07);
+    }
+
+    .risk.med {
+      color: var(--warn);
+      border-color: rgba(255, 209, 102, 0.34);
+      background: rgba(255, 209, 102, 0.07);
+    }
+
+    .risk.high {
+      color: var(--bad);
+      border-color: rgba(255, 123, 123, 0.34);
+      background: rgba(255, 123, 123, 0.07);
+    }
+
+    .capsule-meta {
+      margin-top: 9px;
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 11px;
+      font-family: var(--mono);
+    }
+
+    .canvas {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      min-height: 0;
+    }
+
+    .canvas-hero {
+      padding: 16px;
+      border-bottom: 1px solid var(--line-soft);
+      background:
+        linear-gradient(135deg, rgba(134, 168, 255, 0.10), transparent 42%),
+        rgba(255, 255, 255, 0.018);
+    }
+
+    .canvas-kicker {
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 11px;
+      margin-bottom: 7px;
+    }
+
+    .canvas-title {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+      letter-spacing: -0.03em;
+    }
+
+    .canvas-subtitle {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      max-width: 860px;
+    }
+
+    .canvas-body {
+      min-height: 0;
+      overflow: auto;
+      padding: 14px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      align-content: start;
+      gap: 12px;
+    }
+
+    .card {
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-md);
+      background: var(--panel-soft);
+      overflow: hidden;
+    }
+
+    .card.wide {
+      grid-column: 1 / -1;
+    }
+
+    .card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 11px 12px;
+      border-bottom: 1px solid var(--line-soft);
+    }
+
+    .card-title {
+      font-size: 13px;
+      font-weight: 780;
+    }
+
+    .card-tag {
+      color: var(--faint);
+      font-size: 11px;
+      font-family: var(--mono);
+    }
+
+    .card-body {
+      padding: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.48;
+    }
+
+    .card-body p {
+      margin: 0 0 10px;
+    }
+
+    .card-body p:last-child {
+      margin-bottom: 0;
+    }
+
+    .mono-block {
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.55;
+      color: #d7dceb;
+      background: #101219;
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-sm);
+      padding: 10px;
+      overflow: auto;
+      white-space: pre;
+    }
+
+    .symbol-list {
+      display: grid;
+      gap: 7px;
+      font-family: var(--mono);
+      font-size: 12px;
+    }
+
+    .symbol {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-sm);
+      padding: 8px;
+      background: rgba(255, 255, 255, 0.025);
+    }
+
+    .symbol span:first-child {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .symbol-kind {
+      flex: 0 0 auto;
+      color: var(--faint);
+      font-size: 10px;
+    }
+
+    .step-list {
+      display: grid;
+      gap: 8px;
+    }
+
+    .step {
+      display: grid;
+      grid-template-columns: 22px 1fr;
+      gap: 8px;
+      align-items: start;
+    }
+
+    .step-number {
+      width: 22px;
+      height: 22px;
+      display: grid;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-size: 11px;
+      font-family: var(--mono);
+    }
+
+    .step-text {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.42;
+    }
+
+    .inspector-section {
+      border-bottom: 1px solid var(--line-soft);
+      padding: 12px;
+    }
+
+    .inspector-section:last-child {
+      border-bottom: 0;
+    }
+
+    .section-title {
+      margin-bottom: 9px;
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      font-weight: 800;
+    }
+
+    .kv {
+      display: grid;
+      gap: 7px;
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+
+    .kv-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      border-bottom: 1px dashed rgba(255, 255, 255, 0.08);
+      padding-bottom: 6px;
+    }
+
+    .kv-row:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+    }
+
+    .kv-key {
+      color: var(--faint);
+    }
+
+    .kv-value {
+      color: var(--text);
+      text-align: right;
+    }
+
+    .mini-list {
+      display: grid;
+      gap: 7px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }
+
+    .mini-item {
+      display: grid;
+      grid-template-columns: 10px 1fr;
+      gap: 8px;
+      align-items: start;
+    }
+
+    .mini-bullet {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      margin-top: 5px;
+    }
+
+    .mini-bullet.ok {
+      background: var(--ok);
+    }
+
+    .mini-bullet.warn {
+      background: var(--warn);
+    }
+
+    .mini-bullet.bad {
+      background: var(--bad);
+    }
+
+    .timeline {
+      display: grid;
+      gap: 8px;
+    }
+
+    .timeline-item {
+      display: grid;
+      grid-template-columns: 58px 1fr;
+      gap: 8px;
+      font-size: 12px;
+    }
+
+    .timeline-id {
+      color: var(--faint);
+      font-family: var(--mono);
+    }
+
+    .timeline-text {
+      color: var(--muted);
+      line-height: 1.35;
+    }
+
+    .action-rail {
+      display: grid;
+      grid-template-columns: repeat(8, 1fr);
+      gap: 10px;
+      background: rgba(23, 25, 31, 0.88);
+      border: 1px solid var(--line-soft);
+      border-radius: var(--radius-lg);
+      padding: 10px;
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+    }
+
+    .action {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: var(--panel-soft);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: 0.03em;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      min-width: 0;
+      user-select: none;
+    }
+
+    .action.primary {
+      border-color: rgba(134, 168, 255, 0.5);
+      background: var(--accent-soft);
+      color: #dce5ff;
+    }
+
+    .action .key {
+      color: var(--faint);
+      font-size: 10px;
+    }
+
+    @media (max-width: 1180px) {
+      .main {
+        grid-template-columns: 240px minmax(420px, 1fr) 280px;
+      }
+
+      .canvas-body {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 900px) {
+      body {
+        overflow: auto;
+      }
+
+      .app {
+        height: auto;
+        min-height: 100vh;
+        grid-template-rows: auto auto auto;
+      }
+
+      .main {
+        grid-template-columns: 1fr;
+      }
+
+      .panel {
+        min-height: 380px;
+      }
+
+      .action-rail {
+        grid-template-columns: repeat(2, 1fr);
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mark" aria-hidden="true"></div>
+        <div class="brand-text">
+          <div class="title">Context Control Workbench</div>
+          <div class="subtitle">Project: VulkanVX · Mode: Change-Centered Prototype</div>
+        </div>
+      </div>
+
+      <div class="top-status">
+        <div class="status-pill"><span class="dot ok"></span> local</div>
+        <div class="status-pill"><span class="dot warn"></span> prototype</div>
+        <div class="status-pill">capsule: paint-lag</div>
+      </div>
+    </header>
+
+    <main class="main">
+      <aside class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Change Stack</div>
+          <div class="panel-count">4</div>
+        </div>
+
+        <div class="scroll">
+          <div class="capsule-list">
+            <section class="capsule active">
+              <div class="capsule-row">
+                <div class="capsule-name">Texture paint visual latency</div>
+                <div class="risk high">high</div>
+              </div>
+              <div class="capsule-meta">
+                <div>status: investigating</div>
+                <div>context: 7 functions · 3 files</div>
+                <div>last: build passed</div>
+              </div>
+            </section>
+
+            <section class="capsule">
+              <div class="capsule-row">
+                <div class="capsule-name">World rendering split</div>
+                <div class="risk med">med</div>
+              </div>
+              <div class="capsule-meta">
+                <div>status: patch ready</div>
+                <div>context: 11 functions · 5 files</div>
+                <div>last: pending</div>
+              </div>
+            </section>
+
+            <section class="capsule">
+              <div class="capsule-row">
+                <div class="capsule-name">Hi-Z movement regression</div>
+                <div class="risk med">med</div>
+              </div>
+              <div class="capsule-meta">
+                <div>status: paused</div>
+                <div>context: 4 shaders · 2 cpp</div>
+                <div>last: do not touch hiz</div>
+              </div>
+            </section>
+
+            <section class="capsule">
+              <div class="capsule-row">
+                <div class="capsule-name">CC macOS parity</div>
+                <div class="risk low">low</div>
+              </div>
+              <div class="capsule-meta">
+                <div>status: design</div>
+                <div>context: scripts only</div>
+                <div>last: not started</div>
+              </div>
+            </section>
+          </div>
+        </div>
+      </aside>
+
+      <section class="panel canvas">
+        <div class="canvas-hero">
+          <div class="canvas-kicker">CHANGE CAPSULE / ACTIVE</div>
+          <h1 class="canvas-title">Texture Paint Visual Latency</h1>
+          <p class="canvas-subtitle">
+            Goal: make max-radius brush feedback visually immediate by separating the tiny logical paint write
+            from slow remesh/upload/visibility paths.
+          </p>
+        </div>
+
+        <div class="canvas-body">
+          <article class="card wide">
+            <div class="card-head">
+              <div class="card-title">Goal</div>
+              <div class="card-tag">task-first</div>
+            </div>
+            <div class="card-body">
+              <p>
+                Paint should replace the material state that the world already owns. It should not accumulate a long-lived
+                overlay layer that makes CPU/GPU cost grow with every brush stroke.
+              </p>
+              <p>
+                The UI keeps the task goal visible so the developer does not drift into unrelated refactors.
+              </p>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <div class="card-title">Evidence</div>
+              <div class="card-tag">diagnostics</div>
+            </div>
+            <div class="card-body">
+              <div class="mono-block">store_ms:             0.018
+schedule_ms:          0.014
+visual_chunks_total:  60
+visual_chunks_ready:  0
+visual_chunks_pending:60
+suspicion: visual path gated by remesh/upload</div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <div class="card-title">Relevant Symbols</div>
+              <div class="card-tag">context lens</div>
+            </div>
+            <div class="card-body">
+              <div class="symbol-list">
+                <div class="symbol"><span>TexturePaintTool::place</span><span class="symbol-kind">func</span></div>
+                <div class="symbol"><span>TexturePaintTool::flushPendingTextureDirtyChunks</span><span class="symbol-kind">func</span></div>
+                <div class="symbol"><span>World::noteChunkVisualReady</span><span class="symbol-kind">func</span></div>
+                <div class="symbol"><span>World::syncTerrainEditVisualState</span><span class="symbol-kind">func</span></div>
+              </div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <div class="card-title">Patch Plan</div>
+              <div class="card-tag">controlled transform</div>
+            </div>
+            <div class="card-body">
+              <div class="step-list">
+                <div class="step">
+                  <div class="step-number">1</div>
+                  <div class="step-text">Confirm whether visual readiness is gated by remesh or upload completion.</div>
+                </div>
+                <div class="step">
+                  <div class="step-number">2</div>
+                  <div class="step-text">Persist painted material directly into the editable terrain/material state.</div>
+                </div>
+                <div class="step">
+                  <div class="step-number">3</div>
+                  <div class="step-text">Keep immediate visual update independent from heavy rebuild paths.</div>
+                </div>
+              </div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <div class="card-title">Validation</div>
+              <div class="card-tag">not just build</div>
+            </div>
+            <div class="card-body">
+              <div class="mono-block">build:              passed
+runtime check:      pending
+expected metric:    visual_complete_ms decreases
+regression risk:    chunk-border holes
+rollback:           available</div>
+            </div>
+          </article>
+
+          <article class="card wide">
+            <div class="card-head">
+              <div class="card-title">Patch Block Preview</div>
+              <div class="card-tag">deterministic output</div>
+            </div>
+            <div class="card-body">
+              <div class="mono-block">BEGIN CC-REPLACE
+FILE: src/ui/debug_menu/world/TexturePaintTool.cpp
+MODE:function
+FUNCTION: TexturePaintTool::place
+---
+/*
+  Model proposes the transformation.
+  Context Control applies it mechanically.
+*/
+END CC-REPLACE</div>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <aside class="panel">
+        <div class="panel-header">
+          <div class="panel-title">Inspector</div>
+          <div class="panel-count">lens</div>
+        </div>
+
+        <div class="scroll" style="padding: 0;">
+          <section class="inspector-section">
+            <div class="section-title">Capsule State</div>
+            <div class="kv">
+              <div class="kv-row"><span class="kv-key">status</span><span class="kv-value">investigating</span></div>
+              <div class="kv-row"><span class="kv-key">risk</span><span class="kv-value">high</span></div>
+              <div class="kv-row"><span class="kv-key">files</span><span class="kv-value">3</span></div>
+              <div class="kv-row"><span class="kv-key">symbols</span><span class="kv-value">7</span></div>
+              <div class="kv-row"><span class="kv-key">patches</span><span class="kv-value">0</span></div>
+            </div>
+          </section>
+
+          <section class="inspector-section">
+            <div class="section-title">Relevant Files</div>
+            <div class="mini-list">
+              <div class="mini-item"><span class="mini-bullet"></span><span>src/ui/debug_menu/world/TexturePaintTool.cpp</span></div>
+              <div class="mini-item"><span class="mini-bullet"></span><span>include/ui/debug_menu/world/TexturePaintTool.h</span></div>
+              <div class="mini-item"><span class="mini-bullet"></span><span>include/world/World.h</span></div>
+            </div>
+          </section>
+
+          <section class="inspector-section">
+            <div class="section-title">Unknowns</div>
+            <div class="mini-list">
+              <div class="mini-item"><span class="mini-bullet warn"></span><span>Is visual_complete gated by remesh?</span></div>
+              <div class="mini-item"><span class="mini-bullet warn"></span><span>Does painted state replace default snapshot material?</span></div>
+              <div class="mini-item"><span class="mini-bullet warn"></span><span>Are chunk-edge holes caused by touched chunk bounds?</span></div>
+            </div>
+          </section>
+
+          <section class="inspector-section">
+            <div class="section-title">Patch Timeline</div>
+            <div class="timeline">
+              <div class="timeline-item">
+                <div class="timeline-id">P00</div>
+                <div class="timeline-text">Capsule created. No code touched.</div>
+              </div>
+              <div class="timeline-item">
+                <div class="timeline-id">P01</div>
+                <div class="timeline-text">Awaiting exported context.</div>
+              </div>
+            </div>
+          </section>
+
+          <section class="inspector-section">
+            <div class="section-title">Design Rule</div>
+            <div class="mini-list">
+              <div class="mini-item"><span class="mini-bullet ok"></span><span>The task is the center.</span></div>
+              <div class="mini-item"><span class="mini-bullet ok"></span><span>The file tree is secondary.</span></div>
+              <div class="mini-item"><span class="mini-bullet ok"></span><span>The terminal is backend, not the interface.</span></div>
+            </div>
+          </section>
+        </div>
+      </aside>
+    </main>
+
+    <nav class="action-rail" aria-label="Context Control actions">
+      <div class="action primary">DIR <span class="key">F1</span></div>
+      <div class="action">CONTEXT <span class="key">F2</span></div>
+      <div class="action">ASK <span class="key">F3</span></div>
+      <div class="action">PATCH <span class="key">F4</span></div>
+      <div class="action">BUILD <span class="key">F5</span></div>
+      <div class="action">RUN <span class="key">F6</span></div>
+      <div class="action">VERIFY <span class="key">F7</span></div>
+      <div class="action">COMMIT <span class="key">F8</span></div>
+    </nav>
+  </div>
+</body>
+</html>

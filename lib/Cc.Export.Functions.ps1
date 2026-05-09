@@ -1,0 +1,648 @@
+# CC-DESC: FUNCTION/FUNC/FIND source discovery and body extraction for Context Control exports.
+
+function Get-SearchCandidateFiles {
+    $candidateRoots = @("src", "include", "shaders", "tools")
+    $seen = @{}
+    $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+
+    foreach ($rootName in $candidateRoots) {
+        if (-not (Test-Path -LiteralPath $rootName)) {
+            continue
+        }
+
+        $rootItem = Get-Item -LiteralPath $rootName
+
+        if (-not $rootItem.PSIsContainer) {
+            continue
+        }
+
+        $items = Get-ChildItem -LiteralPath $rootName -Recurse -Force -File -ErrorAction SilentlyContinue
+
+        foreach ($file in $items) {
+            if (-not (Is-TextSearchCandidate $file)) {
+                continue
+            }
+
+            $key = ($file.FullName -replace '\\', '/').ToLowerInvariant()
+            if ($seen.ContainsKey($key)) {
+                continue
+            }
+
+            $seen[$key] = $true
+            $files.Add($file)
+        }
+    }
+
+    # Root-level code/config only. This will include CMakeLists.txt and scripts,
+    # but not cc_code_export.md or normal markdown exports.
+    $rootFiles = Get-ChildItem -LiteralPath "." -Force -File -ErrorAction SilentlyContinue
+    foreach ($file in $rootFiles) {
+        if (-not (Is-TextSearchCandidate $file)) {
+            continue
+        }
+
+        $key = ($file.FullName -replace '\\', '/').ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+
+        $seen[$key] = $true
+        $files.Add($file)
+    }
+
+    return @($files.ToArray() | Sort-Object FullName)
+}
+
+function Test-FileContainsSymbol {
+    param(
+        [string]$Path,
+        [string]$Symbol
+    )
+
+    if (Is-ExcludedPath $Path) {
+        return $false
+    }
+
+    $symbolText = if ($null -eq $Symbol) { "" } else { $Symbol.Trim() }
+    if ($symbolText -eq "") {
+        return $false
+    }
+
+    try {
+        $text = Read-TextFileAutoEncoding $Path
+    }
+    catch {
+        return $false
+    }
+
+    if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($symbolText)) {
+        $regexText = [System.Management.Automation.WildcardPattern]::ToWql($symbolText)
+        # ToWql is not regex. Keep wildcard support explicit and conservative.
+        $regexText = [regex]::Escape($symbolText)
+        $regexText = $regexText -replace '\\`\\*', '.*'
+        $regexText = $regexText -replace '\\`\\?', '.'
+        $regexText = $regexText -replace '\\\*', '.*'
+        $regexText = $regexText -replace '\\\?', '.'
+        return [regex]::IsMatch($text, $regexText, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    }
+
+    $escaped = [System.Text.RegularExpressions.Regex]::Escape($symbolText)
+    $pattern = "(?<![A-Za-z0-9_])$escaped(?![A-Za-z0-9_])"
+    $regex = New-Object System.Text.RegularExpressions.Regex($pattern, [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    return $regex.IsMatch($text)
+}
+
+function Test-RequestPathHasWildcard {
+    param([string]$Path)
+
+    if ($null -eq $Path) {
+        return $false
+    }
+
+    return [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($Path)
+}
+
+function Get-FunctionLeafName {
+    param([string]$Symbol)
+
+    if ($null -eq $Symbol) {
+        return ""
+    }
+
+    $text = $Symbol.Trim()
+    if ($text -eq "") {
+        return ""
+    }
+
+    return (($text -split '::')[-1]).Trim()
+}
+
+function Resolve-FunctionRequestFiles {
+    param([string]$Path)
+
+    $pathText = if ($null -eq $Path) { "" } else { $Path.Trim() }
+    $normalizedRequest = ($pathText -replace '\\', '/').Trim()
+    $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $seen = @{}
+
+    if ($normalizedRequest -eq "") {
+        return @()
+    }
+
+    $items = @()
+
+    if (Test-RequestPathHasWildcard $normalizedRequest) {
+        # PowerShell wildcard expansion treats ** inconsistently across versions and
+        # providers. Resolve FUNCTION globs ourselves so src/**/*.cpp means true
+        # recursive matching and path tokens are never stripped/sanitized away.
+        $segments = @($normalizedRequest -split '/')
+        $rootParts = New-Object System.Collections.Generic.List[string]
+
+        foreach ($segment in $segments) {
+            if ($segment -eq "" -or [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($segment)) {
+                break
+            }
+            $rootParts.Add($segment)
+        }
+
+        $rootText = if ($rootParts.Count -gt 0) { [string]::Join([System.IO.Path]::DirectorySeparatorChar, [string[]]$rootParts.ToArray()) } else { "." }
+        if (-not (Test-Path -LiteralPath $rootText)) {
+            return @()
+        }
+
+        $rootFull = (Resolve-Path -LiteralPath $rootText).Path
+        $allFiles = @(Get-ChildItem -LiteralPath $rootFull -Recurse -Force -File -ErrorAction SilentlyContinue)
+
+        $requestRegex = [regex]::Escape($normalizedRequest)
+        $requestRegex = $requestRegex -replace '\\\*\\\*', '.*'
+        $requestRegex = $requestRegex -replace '\\\*', '[^/]*'
+        $requestRegex = $requestRegex -replace '\\\?', '[^/]'
+        $requestRegex = '^' + $requestRegex + '$'
+
+        foreach ($candidate in $allFiles) {
+            $relative = Get-RelativeDisplayPath $candidate.FullName
+            $relative = ($relative -replace '\\', '/')
+            if ([regex]::IsMatch($relative, $requestRegex, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) {
+                $items += $candidate
+            }
+        }
+    }
+    else {
+        $clean = $normalizedRequest -replace '/', [System.IO.Path]::DirectorySeparatorChar
+
+        if (Test-Path -LiteralPath $clean) {
+            $item = Get-Item -LiteralPath $clean
+            if ($item.PSIsContainer) {
+                $items = @(Get-ChildItem -LiteralPath $clean -Recurse -Force -File -ErrorAction SilentlyContinue)
+            }
+            else {
+                $items = @($item)
+            }
+        }
+        else {
+            return @()
+        }
+    }
+
+    foreach ($item in $items) {
+        if ($null -eq $item) {
+            continue
+        }
+
+        if (Is-ExcludedPath $item.FullName) {
+            continue
+        }
+
+        $ext = [System.IO.Path]::GetExtension($item.FullName).ToLowerInvariant()
+        if ($script:BinaryExtensions -contains $ext) {
+            continue
+        }
+
+        if (-not ($script:TextExtensions -contains $ext)) {
+            continue
+        }
+
+        $key = ($item.FullName -replace '\\', '/').ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+
+        $seen[$key] = $true
+        $files.Add($item)
+    }
+
+    return @($files.ToArray() | Sort-Object FullName)
+}
+
+function Test-FunctionBlockMatchesScopedSymbol {
+    param(
+        [string]$BlockText,
+        [string]$Symbol
+    )
+
+    if ($null -eq $BlockText -or $null -eq $Symbol) {
+        return $false
+    }
+
+    $symbolText = $Symbol.Trim()
+    if ($symbolText -eq "") {
+        return $false
+    }
+
+    if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($symbolText)) {
+        $regexText = [regex]::Escape($symbolText)
+        $regexText = $regexText -replace '\\\*', '.*'
+        $regexText = $regexText -replace '\\\?', '.'
+        return [regex]::IsMatch($BlockText, $regexText, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+    }
+
+    if ($BlockText.IndexOf($symbolText, [System.StringComparison]::Ordinal) -ge 0) {
+        return $true
+    }
+
+    if ($symbolText.Contains("::")) {
+        $pattern = [regex]::Escape($symbolText) -replace '::', '\s*::\s*'
+        return [regex]::IsMatch($BlockText, $pattern)
+    }
+
+    return $false
+}
+
+function Add-RawSymbolOccurrencePreview {
+    param(
+        [string]$Path,
+        [string]$Symbol,
+        [int]$MaxHits = 12
+    )
+
+    $symbolText = if ($null -eq $Symbol) { "" } else { $Symbol.Trim() }
+    if ($symbolText -eq "") {
+        return
+    }
+
+    try {
+        $content = Read-TextFileAutoEncoding $Path
+        $lines = @(ConvertTo-LineArray $content)
+    }
+    catch {
+        return
+    }
+
+    $escaped = [regex]::Escape($symbolText)
+    if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($symbolText)) {
+        $escaped = $escaped -replace '\\\*', '.*'
+        $escaped = $escaped -replace '\\\?', '.'
+    }
+
+    $hitCount = 0
+
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ([regex]::IsMatch([string]$lines[$i], $escaped, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) {
+            $lineNo = $i + 1
+            $text = ([string]$lines[$i]).Trim()
+            if ($text.Length -gt 220) {
+                $text = $text.Substring(0, 220) + " ..."
+            }
+            Add-Line "- $(Get-RelativeDisplayPath $Path):${lineNo}: $text"
+            $hitCount++
+            if ($hitCount -ge $MaxHits) { break }
+        }
+    }
+}
+
+function Add-FunctionBodyBlocksFromFile {
+    param(
+        [string]$Path,
+        [string]$Symbol,
+        [switch]$ReportNoMatch
+    )
+
+    $symbolText = if ($null -eq $Symbol) { "" } else { $Symbol.Trim() }
+    $leafName = Get-FunctionLeafName $symbolText
+    $symbolHasWildcard = [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($symbolText)
+    $leafHasWildcard = [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($leafName)
+
+    if ($leafName -eq "") {
+        if ($ReportNoMatch) {
+            Add-Line "Malformed function request: empty function name after ::."
+            Add-Line ""
+        }
+        return 0
+    }
+
+    $fileInfo = Get-Item -LiteralPath $Path
+    $sizeKB = [math]::Ceiling($fileInfo.Length / 1024.0)
+    if ((-not $ForceLargeFiles) -and $sizeKB -gt ($MaxFileKB * 4)) {
+        if ($ReportNoMatch) {
+            Add-Line "Skipped function extraction from very large text file: $(Get-RelativeDisplayPath $Path) ($sizeKB KB)."
+            Add-Line "Re-run cc.ps1 with -ForceLargeFiles if this exact function is truly needed."
+            Add-Line ""
+        }
+        return 0
+    }
+
+    try {
+        $content = Read-TextFileAutoEncoding $Path
+        $lines = @(ConvertTo-LineArray $content)
+    }
+    catch {
+        if ($ReportNoMatch) {
+            Add-Line "Failed to read file for function extraction: $(Get-RelativeDisplayPath $Path)"
+            Add-Line ""
+        }
+        return 0
+    }
+
+    $ranges = @(Find-HashableFunctionRanges $Path $lines 100000)
+
+    if ($leafHasWildcard) {
+        $leafPattern = New-Object System.Management.Automation.WildcardPattern($leafName, ([System.Management.Automation.WildcardOptions]::IgnoreCase))
+        $leafMatches = @($ranges | Where-Object { $leafPattern.IsMatch($_.Name) })
+    }
+    else {
+        $leafMatches = @($ranges | Where-Object { $_.Name -eq $leafName })
+    }
+
+    if ($leafMatches.Count -eq 0) {
+        if ($ReportNoMatch) {
+            Add-Line "No brace-delimited function body found for symbol: $symbolText"
+            Add-Line "File: $(Get-RelativeDisplayPath $Path)"
+            Add-Line ""
+
+            if (Test-FileContainsSymbol $Path $symbolText) {
+                Add-Line "Raw symbol occurrences exist, but they do not look like function bodies. Nearest raw occurrences:"
+                Add-RawSymbolOccurrencePreview -Path $Path -Symbol $symbolText
+            }
+            else {
+                $leaf = Get-FunctionLeafName $symbolText
+                if ($leaf -ne $symbolText -and (Test-FileContainsSymbol $Path $leaf)) {
+                    Add-Line "The leaf name '$leaf' occurs in the file, but the full scoped symbol '$symbolText' was not found as a body."
+                    Add-Line "Nearest leaf occurrences:"
+                    Add-RawSymbolOccurrencePreview -Path $Path -Symbol $leaf
+                }
+                else {
+                    Add-Line "Requested symbol was not found in the requested file."
+                }
+            }
+
+            Add-Line ""
+        }
+        return 0
+    }
+
+    $selected = New-Object System.Collections.Generic.List[object]
+    $scopeWasExact = $true
+
+    if ($symbolText.Contains("::") -or $symbolHasWildcard) {
+        foreach ($range in $leafMatches) {
+            $blockText = (($lines[$range.Start..($range.End - 1)]) -join "`n")
+            if (Test-FunctionBlockMatchesScopedSymbol $blockText $symbolText) {
+                $selected.Add($range)
+            }
+        }
+
+        if ($selected.Count -eq 0) {
+            $scopeWasExact = $false
+        }
+    }
+
+    if ($selected.Count -eq 0) {
+        foreach ($range in $leafMatches) {
+            $selected.Add($range)
+        }
+    }
+
+    $lang = Get-CodeFenceLanguage $Path
+    $displayPath = Get-RelativeDisplayPath $Path
+    $count = 0
+
+    if ($selected.Count -gt 1) {
+        Add-Line "Multiple matching function bodies found in $displayPath; exporting all matching overloads/scopes."
+        Add-Line ""
+    }
+
+    if (-not $scopeWasExact -and $symbolText.Contains("::")) {
+        Add-Line "WARNING: Found leaf function '$leafName' in $displayPath, but the exact scoped text '$symbolText' was not visible in the detected signature. Exporting leaf match as fallback."
+        Add-Line ""
+    }
+
+    foreach ($range in $selected) {
+        $startLine = $range.Start + 1
+        $endLine = $range.End
+        $blockText = (($lines[$range.Start..($range.End - 1)]) -join "`n")
+
+        Add-Line "Source: $displayPath lines $startLine-$endLine"
+        if ($HashHints) {
+            Add-Line "Hash hint for optional CC-REPLACE header: MODE: function | NAME: $symbolText | HASH: $($range.Hash)"
+        }
+        Add-Line ""
+        Add-Line ($script:Fence4 + $lang)
+        Add-Line $blockText
+        Add-Line $script:Fence4
+        Add-Line ""
+        $count++
+    }
+
+    return $count
+}
+
+function Add-FunctionSearchExport {
+    param([string]$Symbol)
+
+    $symbol = $Symbol.Trim()
+
+    if ($symbol -eq "") {
+        return
+    }
+
+    # De-duplicate repeated FUNC:/FUNCTION: input lines.
+    if ($null -eq $script:FunctionSearchKeys) {
+        $script:FunctionSearchKeys = @{}
+    }
+
+    $symbolKey = $symbol.ToLowerInvariant()
+    if ($script:FunctionSearchKeys.ContainsKey($symbolKey)) {
+        Write-Host "Skipping duplicate function search: $symbol"
+        return
+    }
+    $script:FunctionSearchKeys[$symbolKey] = $true
+
+    Write-Host "Searching function body: $symbol"
+
+    $candidates = @(Get-SearchCandidateFiles)
+    Write-Host "  Candidate text files: $($candidates.Count)"
+
+    $leafName = Get-FunctionLeafName $symbol
+    $rawMatches = New-Object System.Collections.Generic.List[string]
+    $bodyMatches = 0
+
+    Add-Line ""
+    Add-Line "## FOUND FUNCTION: $symbol"
+    Add-Line ""
+
+    foreach ($file in $candidates) {
+        $shouldTry = $false
+
+        if ($symbol.Contains("::")) {
+            if ((Test-FileContainsSymbol $file.FullName $symbol) -or (Test-FileContainsSymbol $file.FullName $leafName)) {
+                $shouldTry = $true
+            }
+        }
+        elseif (Test-FileContainsSymbol $file.FullName $leafName) {
+            $shouldTry = $true
+        }
+
+        if (-not $shouldTry) {
+            continue
+        }
+
+        if ((Test-FileContainsSymbol $file.FullName $symbol) -or (Test-FileContainsSymbol $file.FullName $leafName)) {
+            $rawMatches.Add($file.FullName)
+        }
+
+        $count = Add-FunctionBodyBlocksFromFile -Path $file.FullName -Symbol $symbol
+        $bodyMatches += $count
+    }
+
+    if ($bodyMatches -eq 0) {
+        if ($rawMatches.Count -eq 0) {
+            Add-Line "No matching code file found for function symbol: $symbol"
+        }
+        else {
+            Add-Line "Raw symbol matches were found, but no brace-delimited function bodies were isolated."
+            Add-Line "Use FIND: $symbol to discover exact matching files, then request the specific file/path you actually need."
+            Add-Line ""
+            Add-Line "Raw matched files:"
+            foreach ($path in $rawMatches) {
+                Add-Line "- $(Get-RelativeDisplayPath $path)"
+            }
+        }
+        Add-Line ""
+    }
+
+    Write-Host "  Function bodies exported: $bodyMatches"
+}
+
+function Add-FindSearchExport {
+    param([string]$Pattern)
+
+    $patternText = if ($null -eq $Pattern) { "" } else { $Pattern.Trim() }
+
+    if ($patternText -eq "") {
+        return
+    }
+
+    # De-duplicate repeated FIND: input lines.
+    if ($null -eq $script:FindSearchKeys) {
+        $script:FindSearchKeys = @{}
+    }
+
+    $patternKey = $patternText.ToLowerInvariant()
+    if ($script:FindSearchKeys.ContainsKey($patternKey)) {
+        Write-Host "Skipping duplicate file discovery search: $patternText"
+        return
+    }
+    $script:FindSearchKeys[$patternKey] = $true
+
+    Write-Host "Discovering matching files: $patternText"
+
+    $candidates = @(Get-SearchCandidateFiles)
+    Write-Host "  Candidate text files: $($candidates.Count)"
+
+    $matches = New-Object System.Collections.Generic.List[string]
+
+    foreach ($file in $candidates) {
+        if (Test-FileContainsSymbol $file.FullName $patternText) {
+            $matches.Add($file.FullName)
+        }
+    }
+
+    Add-Line ""
+    Add-Line "## FIND: $patternText"
+    Add-Line ""
+
+    if ($matches.Count -eq 0) {
+        Add-Line "No matching code file found for: $patternText"
+        Add-Line ""
+        Write-Host "  Found: 0"
+        return
+    }
+
+    Add-Line "Matched code files only; file contents were not exported."
+    Add-Line "Request exact paths or FUNCTION exports from this list in the next cc.ps1 run."
+    Add-Line ""
+    Add-Line "Matched code files:"
+    foreach ($path in $matches) {
+        Add-Line "- $(Get-RelativeDisplayPath $path)"
+    }
+
+    Add-Line ""
+    Add-Line "Occurrence preview:"
+    foreach ($path in $matches) {
+        Add-RawSymbolOccurrencePreview -Path $path -Symbol $patternText -MaxHits 4
+    }
+    Add-Line ""
+
+    Write-Host "  Found: $($matches.Count)"
+}
+
+function Add-ScopedFunctionRequestReport {
+    param(
+        [string]$Path,
+        [string]$Symbol
+    )
+
+    $pathText = if ($null -eq $Path) { "" } else { $Path.Trim() }
+    $symbolText = if ($null -eq $Symbol) { "" } else { $Symbol.Trim() }
+    $cleanPath = $pathText -replace '/', [System.IO.Path]::DirectorySeparatorChar
+
+    Add-Line ""
+    Add-Line "## FUNCTION $pathText :: $symbolText"
+    Add-Line ""
+
+    if ([string]::IsNullOrWhiteSpace($pathText) -or [string]::IsNullOrWhiteSpace($symbolText)) {
+        Add-Line "Malformed function request."
+        Add-Line "Expected syntax: FUNCTION src/path/File.cpp :: SymbolName"
+        Add-Line ""
+        return
+    }
+
+    $files = @(Resolve-FunctionRequestFiles $pathText)
+
+    if ($files.Count -eq 0) {
+        if (Test-RequestPathHasWildcard $cleanPath) {
+            Add-Line "No files matched FUNCTION path pattern: $pathText"
+        }
+        else {
+            Add-Line "Requested FUNCTION path is missing: $pathText"
+        }
+        Add-Line ""
+        return
+    }
+
+    $isBroadRequest = (Test-RequestPathHasWildcard $cleanPath) -or ($files.Count -gt 1)
+    if ((-not (Test-RequestPathHasWildcard $cleanPath)) -and (Test-Path -LiteralPath $cleanPath)) {
+        $item = Get-Item -LiteralPath $cleanPath
+        if ($item.PSIsContainer) {
+            $isBroadRequest = $true
+        }
+    }
+
+    if ($isBroadRequest) {
+        Add-Line "Resolved FUNCTION target to $($files.Count) candidate files. Exporting only matching function bodies."
+        Add-Line ""
+    }
+
+    $totalBodies = 0
+    $rawMatches = New-Object System.Collections.Generic.List[string]
+    $leafName = Get-FunctionLeafName $symbolText
+
+    foreach ($file in $files) {
+        if ((Test-FileContainsSymbol $file.FullName $symbolText) -or (Test-FileContainsSymbol $file.FullName $leafName)) {
+            $rawMatches.Add($file.FullName)
+        }
+
+        $reportNoMatch = -not $isBroadRequest
+        $count = Add-FunctionBodyBlocksFromFile -Path $file.FullName -Symbol $symbolText -ReportNoMatch:$reportNoMatch
+        $totalBodies += $count
+    }
+
+    if ($totalBodies -eq 0 -and $isBroadRequest) {
+        Add-Line "No function body found for symbol: $symbolText in resolved FUNCTION target: $pathText"
+        Add-Line ""
+
+        if ($rawMatches.Count -gt 0) {
+            Add-Line "Raw symbol/leaf occurrences were found in:"
+            foreach ($path in $rawMatches) {
+                Add-Line "- $(Get-RelativeDisplayPath $path)"
+            }
+            Add-Line ""
+            Add-Line "This usually means the request hit declarations, macros, generated wrappers, or a parser edge case. Use FIND: $symbolText to discover exact matching files, then request the specific file/path you actually need."
+        }
+        else {
+            Add-Line "No raw symbol occurrences found either. The function name or path pattern is probably wrong."
+        }
+
+        Add-Line ""
+    }
+}

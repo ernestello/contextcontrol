@@ -1,6 +1,6 @@
 # Project directory for Context Control
 
-Project root: D:\projects\vulkanas
+Project root: D:\Projects\vulkanas
 Detected profile: vulkanvx
 
 ## Prompt
