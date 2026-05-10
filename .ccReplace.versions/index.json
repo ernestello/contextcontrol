@@ -458,9 +458,9 @@
                   },
                   {
                       "Path":  "shaders/culling/frustum_cull.comp",
-                      "FullPath":  "D:\\projects\\vulkanas\\shaders\\culling\\frustum_cull.comp",
+                      "FullPath":  "D:\\Projects\\vulkanas\\shaders\\culling\\frustum_cull.comp",
                       "Key":  "763642b091d4b996",
-                      "CurrentVersion":  21,
+                      "CurrentVersion":  22,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -587,6 +587,12 @@
                                            "Timestamp":  "2026-05-07T11:31:50.4898138Z",
                                            "Snapshot":  "files\\763642b091d4b996\\v000021.snapshot",
                                            "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  22,
+                                           "Timestamp":  "2026-05-10T06:12:21.9715416Z",
+                                           "Snapshot":  "files\\763642b091d4b996\\v000022.snapshot",
+                                           "Reason":  "applied whole_file"
                                        }
                                    ]
                   },
