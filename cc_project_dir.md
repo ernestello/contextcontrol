@@ -48,9 +48,9 @@ Map-stage reminders:
 vulkanas/
 ├── assets/
 │   ├── fonts/
-│   │   ├── inter.zip
 │   │   ├── Inter-Medium.ttf
-│   │   └── Inter-Regular.ttf
+│   │   ├── Inter-Regular.ttf
+│   │   └── inter.zip
 │   ├── img/
 │   │   ├── cursor16x16.aseprite
 │   │   └── vulkanvx.ico
@@ -172,6 +172,7 @@ vulkanas/
 │   │   ├── chunks/
 │   │   │   ├── core/
 │   │   │   │   ├── Chunk.h
+│   │   │   │   ├── ChunkCoordHash.h
 │   │   │   │   ├── ChunkJobs.h
 │   │   │   │   ├── ChunkLifecycleManager.h
 │   │   │   │   ├── ChunkLODSystem.h
@@ -257,6 +258,10 @@ vulkanas/
 │   │   └── snapshot.meta
 │   ├── snapshot_20260508_152523/
 │   │   └── snapshot.meta
+│   ├── snapshot_20260509_170302/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_152936/
+│   │   └── snapshot.meta
 │   ├── heightmap.csv
 │   └── heightmap.hbin
 ├── shaders/
@@ -293,11 +298,11 @@ vulkanas/
 │   │   ├── star.frag
 │   │   └── star.vert
 │   ├── terrain/
-│   │   ├── cube.frag
-│   │   ├── cube.vert
 │   │   ├── cube_debug.frag
 │   │   ├── cube_debug.vert
 │   │   ├── cube_zonly.vert
+│   │   ├── cube.frag
+│   │   ├── cube.vert
 │   │   ├── dccm_terrain.frag
 │   │   └── dccm_terrain.vert
 │   └── tjunctionfix/
@@ -438,9 +443,9 @@ vulkanas/
 │   │   │   │   ├── ChunkHolesWindow.cpp
 │   │   │   │   ├── ChunkMinimapCullingOverlay.cpp
 │   │   │   │   ├── ChunkMinimapWindow.cpp
-│   │   │   │   ├── ChunkVramWindow.cpp
 │   │   │   │   ├── ChunkVramWindow_Internal.h
 │   │   │   │   ├── ChunkVramWindow_Text.cpp
+│   │   │   │   ├── ChunkVramWindow.cpp
 │   │   │   │   ├── MinimapCullingReadback.cpp
 │   │   │   │   ├── ObjectManagerWindow.cpp
 │   │   │   │   └── TerrainEditTool.cpp

@@ -1,56 +1,171 @@
 # CC-DESC: FUNCTION/FUNC/FIND source discovery and body extraction for Context Control exports.
 
 function Get-SearchCandidateFiles {
-    $candidateRoots = @("src", "include", "shaders", "tools")
+    $rootKey = Get-PathKey "."
+    if ($null -ne $script:SearchCandidateFilesCache -and
+        $script:SearchCandidateFilesCacheRoot -eq $rootKey) {
+        return @($script:SearchCandidateFilesCache)
+    }
+
     $seen = @{}
     $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    $pending = New-Object System.Collections.Generic.Stack[string]
 
-    foreach ($rootName in $candidateRoots) {
-        if (-not (Test-Path -LiteralPath $rootName)) {
+    if (-not (Test-Path -LiteralPath ".")) {
+        return @()
+    }
+
+    $root = (Resolve-Path -LiteralPath ".").Path
+    [void]$pending.Push($root)
+
+    while ($pending.Count -gt 0) {
+        $dir = $pending.Pop()
+        if (Is-ExcludedPath $dir) {
             continue
         }
 
-        $rootItem = Get-Item -LiteralPath $rootName
-
-        if (-not $rootItem.PSIsContainer) {
+        try {
+            $items = @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)
+        }
+        catch {
             continue
         }
 
-        $items = Get-ChildItem -LiteralPath $rootName -Recurse -Force -File -ErrorAction SilentlyContinue
-
-        foreach ($file in $items) {
-            if (-not (Is-TextSearchCandidate $file)) {
+        foreach ($item in $items) {
+            if ($null -eq $item) {
                 continue
             }
 
-            $key = ($file.FullName -replace '\\', '/').ToLowerInvariant()
+            if ($item.PSIsContainer) {
+                if (Is-ExcludedPath $item.FullName) {
+                    continue
+                }
+
+                if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    continue
+                }
+
+                [void]$pending.Push($item.FullName)
+                continue
+            }
+
+            if (-not (Is-TextSearchCandidate $item)) {
+                continue
+            }
+
+            $key = ($item.FullName -replace '\\', '/').ToLowerInvariant()
             if ($seen.ContainsKey($key)) {
                 continue
             }
 
             $seen[$key] = $true
-            $files.Add($file)
+            $files.Add($item)
         }
     }
 
-    # Root-level code/config only. This will include CMakeLists.txt and scripts,
-    # but not cc_code_export.md or normal markdown exports.
-    $rootFiles = Get-ChildItem -LiteralPath "." -Force -File -ErrorAction SilentlyContinue
-    foreach ($file in $rootFiles) {
-        if (-not (Is-TextSearchCandidate $file)) {
-            continue
-        }
+    $result = @($files.ToArray() | Sort-Object FullName)
+    $script:SearchCandidateFilesCacheRoot = $rootKey
+    $script:SearchCandidateFilesCache = $result
+    return @($result)
+}
 
-        $key = ($file.FullName -replace '\\', '/').ToLowerInvariant()
-        if ($seen.ContainsKey($key)) {
-            continue
-        }
+function Get-CachedSearchFileText {
+    param([string]$Path)
 
-        $seen[$key] = $true
-        $files.Add($file)
+    if ($null -eq $script:SearchTextCache) {
+        $script:SearchTextCache = @{}
     }
 
-    return @($files.ToArray() | Sort-Object FullName)
+    $key = Get-PathKey $Path
+    if (-not $script:SearchTextCache.ContainsKey($key)) {
+        $script:SearchTextCache[$key] = Read-TextFileAutoEncoding $Path
+    }
+
+    return [string]$script:SearchTextCache[$key]
+}
+
+function Get-CachedSearchFileLines {
+    param([string]$Path)
+
+    if ($null -eq $script:SearchLineCache) {
+        $script:SearchLineCache = @{}
+    }
+
+    $key = Get-PathKey $Path
+    if (-not $script:SearchLineCache.ContainsKey($key)) {
+        $script:SearchLineCache[$key] = [string[]](ConvertTo-LineArray (Get-CachedSearchFileText $Path))
+    }
+
+    return [string[]]$script:SearchLineCache[$key]
+}
+
+function Get-CachedHashableFunctionRanges {
+    param(
+        [string]$Path,
+        [int]$MaxCount = 100000
+    )
+
+    if ($null -eq $script:SearchFunctionRangeCache) {
+        $script:SearchFunctionRangeCache = @{}
+    }
+
+    $key = "$(Get-PathKey $Path)|$MaxCount"
+    if (-not $script:SearchFunctionRangeCache.ContainsKey($key)) {
+        $script:SearchFunctionRangeCache[$key] = @(Find-HashableFunctionRanges $Path (Get-CachedSearchFileLines $Path) $MaxCount)
+    }
+
+    return @($script:SearchFunctionRangeCache[$key])
+}
+
+function Get-CachedSymbolSearchRegex {
+    param([string]$Symbol)
+
+    if ($null -eq $script:SearchRegexCache) {
+        $script:SearchRegexCache = @{}
+    }
+
+    $symbolText = if ($null -eq $Symbol) { "" } else { $Symbol.Trim() }
+    $hasWildcard = [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($symbolText)
+    $cacheKey = if ($hasWildcard) { "wildcard|$($symbolText.ToLowerInvariant())" } else { "exact|$symbolText" }
+
+    if (-not $script:SearchRegexCache.ContainsKey($cacheKey)) {
+        if ($hasWildcard) {
+            $regexText = [regex]::Escape($symbolText)
+            $regexText = $regexText -replace '\\`\\*', '.*'
+            $regexText = $regexText -replace '\\`\\?', '.'
+            $regexText = $regexText -replace '\\\*', '.*'
+            $regexText = $regexText -replace '\\\?', '.'
+            $options = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+            $script:SearchRegexCache[$cacheKey] = New-Object System.Text.RegularExpressions.Regex($regexText, $options)
+        }
+        else {
+            $escaped = [System.Text.RegularExpressions.Regex]::Escape($symbolText)
+            $pattern = "(?<![A-Za-z0-9_])$escaped(?![A-Za-z0-9_])"
+            $script:SearchRegexCache[$cacheKey] = New-Object System.Text.RegularExpressions.Regex($pattern, [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
+        }
+    }
+
+    return [System.Text.RegularExpressions.Regex]$script:SearchRegexCache[$cacheKey]
+}
+
+function Test-TextContainsSymbol {
+    param(
+        [string]$Text,
+        [string]$Symbol
+    )
+
+    $symbolText = if ($null -eq $Symbol) { "" } else { $Symbol.Trim() }
+    if ($symbolText -eq "") {
+        return $false
+    }
+
+    if (-not [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($symbolText)) {
+        if ($Text.IndexOf($symbolText, [System.StringComparison]::Ordinal) -lt 0) {
+            return $false
+        }
+    }
+
+    return (Get-CachedSymbolSearchRegex $symbolText).IsMatch($Text)
 }
 
 function Test-FileContainsSymbol {
@@ -69,27 +184,13 @@ function Test-FileContainsSymbol {
     }
 
     try {
-        $text = Read-TextFileAutoEncoding $Path
+        $text = Get-CachedSearchFileText $Path
     }
     catch {
         return $false
     }
 
-    if ([System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($symbolText)) {
-        $regexText = [System.Management.Automation.WildcardPattern]::ToWql($symbolText)
-        # ToWql is not regex. Keep wildcard support explicit and conservative.
-        $regexText = [regex]::Escape($symbolText)
-        $regexText = $regexText -replace '\\`\\*', '.*'
-        $regexText = $regexText -replace '\\`\\?', '.'
-        $regexText = $regexText -replace '\\\*', '.*'
-        $regexText = $regexText -replace '\\\?', '.'
-        return [regex]::IsMatch($text, $regexText, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
-    }
-
-    $escaped = [System.Text.RegularExpressions.Regex]::Escape($symbolText)
-    $pattern = "(?<![A-Za-z0-9_])$escaped(?![A-Za-z0-9_])"
-    $regex = New-Object System.Text.RegularExpressions.Regex($pattern, [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)
-    return $regex.IsMatch($text)
+    return Test-TextContainsSymbol $text $symbolText
 }
 
 function Test-RequestPathHasWildcard {
@@ -115,6 +216,53 @@ function Get-FunctionLeafName {
     }
 
     return (($text -split '::')[-1]).Trim()
+}
+
+function Add-FunctionResolverVariant {
+    param(
+        [System.Collections.Generic.List[string]]$Variants,
+        [hashtable]$Seen,
+        [string]$Symbol
+    )
+
+    $symbolText = if ($null -eq $Symbol) { "" } else { $Symbol.Trim() }
+    if ($symbolText -eq "") {
+        return
+    }
+
+    $key = $symbolText.ToLowerInvariant()
+    if ($Seen.ContainsKey($key)) {
+        return
+    }
+
+    $Seen[$key] = $true
+    [void]$Variants.Add($symbolText)
+}
+
+function Get-CppFunctionResolverVariants {
+    param([string]$Symbol)
+
+    $symbolText = if ($null -eq $Symbol) { "" } else { $Symbol.Trim() }
+    $variants = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+
+    Add-FunctionResolverVariant $variants $seen $symbolText
+
+    if ($symbolText -eq "" -or
+        $symbolText.Contains("::") -or
+        [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters($symbolText)) {
+        return @($variants.ToArray())
+    }
+
+    switch -Exact ($symbolText) {
+        "new_block_broadcast" {
+            Add-FunctionResolverVariant $variants $seen "ValidatorManagerImpl::new_block_broadcast"
+            Add-FunctionResolverVariant $variants $seen "FullNodeImpl::process_block_broadcast"
+            Add-FunctionResolverVariant $variants $seen "FullNodeShardImpl::process_block_broadcast"
+        }
+    }
+
+    return @($variants.ToArray())
 }
 
 function Resolve-FunctionRequestFiles {
@@ -198,7 +346,7 @@ function Resolve-FunctionRequestFiles {
             continue
         }
 
-        if (-not ($script:TextExtensions -contains $ext)) {
+        if (-not (Is-CodeSearchExtension $item.FullName)) {
             continue
         }
 
@@ -261,8 +409,7 @@ function Add-RawSymbolOccurrencePreview {
     }
 
     try {
-        $content = Read-TextFileAutoEncoding $Path
-        $lines = @(ConvertTo-LineArray $content)
+        $lines = @(Get-CachedSearchFileLines $Path)
     }
     catch {
         return
@@ -274,10 +421,13 @@ function Add-RawSymbolOccurrencePreview {
         $escaped = $escaped -replace '\\\?', '.'
     }
 
+    $previewOptions = [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant
+    $regex = New-Object System.Text.RegularExpressions.Regex($escaped, $previewOptions)
+
     $hitCount = 0
 
     for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ([regex]::IsMatch([string]$lines[$i], $escaped, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::CultureInvariant)) {
+        if ($regex.IsMatch([string]$lines[$i])) {
             $lineNo = $i + 1
             $text = ([string]$lines[$i]).Trim()
             if ($text.Length -gt 220) {
@@ -294,7 +444,8 @@ function Add-FunctionBodyBlocksFromFile {
     param(
         [string]$Path,
         [string]$Symbol,
-        [switch]$ReportNoMatch
+        [switch]$ReportNoMatch,
+        [hashtable]$ExportedRangeKeys = $null
     )
 
     $symbolText = if ($null -eq $Symbol) { "" } else { $Symbol.Trim() }
@@ -322,8 +473,7 @@ function Add-FunctionBodyBlocksFromFile {
     }
 
     try {
-        $content = Read-TextFileAutoEncoding $Path
-        $lines = @(ConvertTo-LineArray $content)
+        $lines = @(Get-CachedSearchFileLines $Path)
     }
     catch {
         if ($ReportNoMatch) {
@@ -333,7 +483,7 @@ function Add-FunctionBodyBlocksFromFile {
         return 0
     }
 
-    $ranges = @(Find-HashableFunctionRanges $Path $lines 100000)
+    $ranges = @(Get-CachedHashableFunctionRanges $Path 100000)
 
     if ($leafHasWildcard) {
         $leafPattern = New-Object System.Management.Automation.WildcardPattern($leafName, ([System.Management.Automation.WildcardOptions]::IgnoreCase))
@@ -407,6 +557,14 @@ function Add-FunctionBodyBlocksFromFile {
     }
 
     foreach ($range in $selected) {
+        if ($null -ne $ExportedRangeKeys) {
+            $rangeKey = ("$(Get-PathKey $Path)|$($range.Start)|$($range.End)").ToLowerInvariant()
+            if ($ExportedRangeKeys.ContainsKey($rangeKey)) {
+                continue
+            }
+            $ExportedRangeKeys[$rangeKey] = $true
+        }
+
         $startLine = $range.Start + 1
         $endLine = $range.End
         $blockText = (($lines[$range.Start..($range.End - 1)]) -join "`n")
@@ -452,36 +610,49 @@ function Add-FunctionSearchExport {
     $candidates = @(Get-SearchCandidateFiles)
     Write-Host "  Candidate text files: $($candidates.Count)"
 
-    $leafName = Get-FunctionLeafName $symbol
+    $resolverSymbols = @(Get-CppFunctionResolverVariants $symbol)
     $rawMatches = New-Object System.Collections.Generic.List[string]
+    $exportedRangeKeys = @{}
     $bodyMatches = 0
 
     Add-Line ""
     Add-Line "## FOUND FUNCTION: $symbol"
     Add-Line ""
 
-    foreach ($file in $candidates) {
-        $shouldTry = $false
+    if ($resolverSymbols.Count -gt 1) {
+        Add-Line "Resolver variants tried:"
+        foreach ($resolverSymbol in $resolverSymbols) {
+            Add-Line "- $resolverSymbol"
+        }
+        Add-Line ""
+    }
 
-        if ($symbol.Contains("::")) {
-            if ((Test-FileContainsSymbol $file.FullName $symbol) -or (Test-FileContainsSymbol $file.FullName $leafName)) {
-                $shouldTry = $true
+    foreach ($file in $candidates) {
+        $matchedResolverSymbols = New-Object System.Collections.Generic.List[string]
+
+        foreach ($resolverSymbol in $resolverSymbols) {
+            $resolverLeaf = Get-FunctionLeafName $resolverSymbol
+
+            if ($resolverSymbol.Contains("::")) {
+                if ((Test-FileContainsSymbol $file.FullName $resolverSymbol) -or (Test-FileContainsSymbol $file.FullName $resolverLeaf)) {
+                    [void]$matchedResolverSymbols.Add($resolverSymbol)
+                }
+            }
+            elseif (Test-FileContainsSymbol $file.FullName $resolverLeaf) {
+                [void]$matchedResolverSymbols.Add($resolverSymbol)
             }
         }
-        elseif (Test-FileContainsSymbol $file.FullName $leafName) {
-            $shouldTry = $true
-        }
 
-        if (-not $shouldTry) {
+        if ($matchedResolverSymbols.Count -eq 0) {
             continue
         }
 
-        if ((Test-FileContainsSymbol $file.FullName $symbol) -or (Test-FileContainsSymbol $file.FullName $leafName)) {
-            $rawMatches.Add($file.FullName)
-        }
+        $rawMatches.Add($file.FullName)
 
-        $count = Add-FunctionBodyBlocksFromFile -Path $file.FullName -Symbol $symbol
-        $bodyMatches += $count
+        foreach ($resolverSymbol in $matchedResolverSymbols) {
+            $count = Add-FunctionBodyBlocksFromFile -Path $file.FullName -Symbol $resolverSymbol -ExportedRangeKeys $exportedRangeKeys
+            $bodyMatches += $count
+        }
     }
 
     if ($bodyMatches -eq 0) {
@@ -503,67 +674,97 @@ function Add-FunctionSearchExport {
     Write-Host "  Function bodies exported: $bodyMatches"
 }
 
-function Add-FindSearchExport {
-    param([string]$Pattern)
+function Add-FindSearchExports {
+    param([string[]]$Patterns)
 
-    $patternText = if ($null -eq $Pattern) { "" } else { $Pattern.Trim() }
+    $requests = New-Object System.Collections.Generic.List[object]
 
-    if ($patternText -eq "") {
+    foreach ($pattern in @($Patterns)) {
+        $patternText = if ($null -eq $pattern) { "" } else { $pattern.Trim() }
+
+        if ($patternText -eq "") {
+            continue
+        }
+
+        # De-duplicate repeated FIND: input lines.
+        if ($null -eq $script:FindSearchKeys) {
+            $script:FindSearchKeys = @{}
+        }
+
+        $patternKey = $patternText.ToLowerInvariant()
+        if ($script:FindSearchKeys.ContainsKey($patternKey)) {
+            Write-Host "Skipping duplicate file discovery search: $patternText"
+            continue
+        }
+        $script:FindSearchKeys[$patternKey] = $true
+
+        Write-Host "Discovering matching files: $patternText"
+        $requests.Add([pscustomobject]@{
+            Pattern = $patternText
+            Matches = (New-Object System.Collections.Generic.List[string])
+        })
+    }
+
+    if ($requests.Count -eq 0) {
         return
     }
-
-    # De-duplicate repeated FIND: input lines.
-    if ($null -eq $script:FindSearchKeys) {
-        $script:FindSearchKeys = @{}
-    }
-
-    $patternKey = $patternText.ToLowerInvariant()
-    if ($script:FindSearchKeys.ContainsKey($patternKey)) {
-        Write-Host "Skipping duplicate file discovery search: $patternText"
-        return
-    }
-    $script:FindSearchKeys[$patternKey] = $true
-
-    Write-Host "Discovering matching files: $patternText"
 
     $candidates = @(Get-SearchCandidateFiles)
-    Write-Host "  Candidate text files: $($candidates.Count)"
 
-    $matches = New-Object System.Collections.Generic.List[string]
+    foreach ($request in $requests) {
+        Write-Host "  Candidate text files: $($candidates.Count)"
+    }
 
     foreach ($file in $candidates) {
-        if (Test-FileContainsSymbol $file.FullName $patternText) {
-            $matches.Add($file.FullName)
+        try {
+            $text = Get-CachedSearchFileText $file.FullName
+        }
+        catch {
+            continue
+        }
+
+        foreach ($request in $requests) {
+            if (Test-TextContainsSymbol $text $request.Pattern) {
+                $request.Matches.Add($file.FullName)
+            }
         }
     }
 
-    Add-Line ""
-    Add-Line "## FIND: $patternText"
-    Add-Line ""
-
-    if ($matches.Count -eq 0) {
-        Add-Line "No matching code file found for: $patternText"
+    foreach ($request in $requests) {
         Add-Line ""
-        Write-Host "  Found: 0"
-        return
-    }
+        Add-Line "## FIND: $($request.Pattern)"
+        Add-Line ""
 
-    Add-Line "Matched code files only; file contents were not exported."
-    Add-Line "Request exact paths or FUNCTION exports from this list in the next cc.ps1 run."
-    Add-Line ""
-    Add-Line "Matched code files:"
-    foreach ($path in $matches) {
-        Add-Line "- $(Get-RelativeDisplayPath $path)"
-    }
+        if ($request.Matches.Count -eq 0) {
+            Add-Line "No matching code file found for: $($request.Pattern)"
+            Add-Line ""
+            Write-Host "  Found: 0"
+            continue
+        }
 
-    Add-Line ""
-    Add-Line "Occurrence preview:"
-    foreach ($path in $matches) {
-        Add-RawSymbolOccurrencePreview -Path $path -Symbol $patternText -MaxHits 4
-    }
-    Add-Line ""
+        Add-Line "Matched code files only; file contents were not exported."
+        Add-Line "Request exact paths or FUNCTION exports from this list in the next cc.ps1 run."
+        Add-Line ""
+        Add-Line "Matched code files:"
+        foreach ($path in $request.Matches) {
+            Add-Line "- $(Get-RelativeDisplayPath $path)"
+        }
 
-    Write-Host "  Found: $($matches.Count)"
+        Add-Line ""
+        Add-Line "Occurrence preview:"
+        foreach ($path in $request.Matches) {
+            Add-RawSymbolOccurrencePreview -Path $path -Symbol $request.Pattern -MaxHits 4
+        }
+        Add-Line ""
+
+        Write-Host "  Found: $($request.Matches.Count)"
+    }
+}
+
+function Add-FindSearchExport {
+    param([string]$Pattern)
+
+    Add-FindSearchExports @($Pattern)
 }
 
 function Add-ScopedFunctionRequestReport {

@@ -203,11 +203,17 @@ function Format-CcReplaceVersionTimestamp {
         return "unknown time"
     }
 
+    $normalizedTimestamp = $Timestamp.Trim()
+
     try {
-        return ([DateTime]::Parse($Timestamp)).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")
+        return ([DateTime]::Parse($normalizedTimestamp)).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")
     }
     catch {
-        return $Timestamp
+        if ($normalizedTimestamp -match '^\d{4}-\d{2}-\d{2}$') {
+            return "$normalizedTimestamp 00:00:00"
+        }
+
+        return $normalizedTimestamp
     }
 }
 

@@ -2,7 +2,11 @@
 
 function New-CcSharedDefaultSettings {
     return [pscustomobject]@{
-        ProjectRoot = ".."
+        # "auto" detects the project root from the Context Control tool location.
+        # Default layout: <project-root>/contextcontrol/, so auto selects the parent
+        # project. Explicit paths are respected exactly; use "." to make the
+        # Context Control tool folder itself the project root.
+        ProjectRoot = "auto"
         OutputRoot = "."
     }
 }
@@ -25,6 +29,82 @@ function Get-CcSharedSettingsPath {
     return (Join-Path (Get-CcSharedScriptDirectory) ".ccReplace.settings.json")
 }
 
+
+function Normalize-CcSharedSettingPathText {
+    param(
+        [string]$PathText,
+        [string]$Fallback = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PathText)) {
+        return $Fallback
+    }
+
+    $clean = [string]$PathText
+    $clean = $clean -replace "`0", ""
+
+    $parts = @($clean -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+    if ($parts.Count -gt 0) {
+        $clean = $parts[$parts.Count - 1]
+    }
+
+    $clean = $clean.Trim().Trim('"')
+
+    for ($i = 0; $i -lt 4; $i++) {
+        $next = $clean
+
+        if ($next -match '^\s*(?:Resolved\s+)?(?:project\s+root|output\s+folder)\s*:\s*(.+)$') {
+            $next = $Matches[1].Trim()
+        }
+        elseif ($next -match '^\s*(?:project\s+root|output\s+folder)\s*=\s*(.+)$') {
+            $next = $Matches[1].Trim()
+        }
+
+        $next = $next.Trim().Trim('"')
+        if ($next -eq $clean) {
+            break
+        }
+
+        $clean = $next
+    }
+
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        return $Fallback
+    }
+
+    if ($clean -match '^\s*(?:Resolved\s+)?(?:project\s+root|output\s+folder)\s*:?\s*$') {
+        return $Fallback
+    }
+
+    return $clean
+}
+
+function Repair-CcSharedSettingsInPlace {
+    param($Settings)
+
+    if ($null -eq $Settings) {
+        return $false
+    }
+
+    $changed = $false
+
+    $projectRoot = Normalize-CcSharedSettingPathText ([string]$Settings.ProjectRoot) "auto"
+    if ([string]::IsNullOrWhiteSpace($projectRoot)) { $projectRoot = "auto" }
+    if ([string]$Settings.ProjectRoot -ne $projectRoot) {
+        $Settings.ProjectRoot = $projectRoot
+        $changed = $true
+    }
+
+    $outputRoot = Normalize-CcSharedSettingPathText ([string]$Settings.OutputRoot) "."
+    if ([string]::IsNullOrWhiteSpace($outputRoot)) { $outputRoot = "." }
+    if ([string]$Settings.OutputRoot -ne $outputRoot) {
+        $Settings.OutputRoot = $outputRoot
+        $changed = $true
+    }
+
+    return $changed
+}
+
 function Merge-CcSharedSettings {
     param($Loaded)
 
@@ -40,6 +120,7 @@ function Merge-CcSharedSettings {
         }
     }
 
+    [void](Repair-CcSharedSettingsInPlace $settings)
     return $settings
 }
 
@@ -67,11 +148,11 @@ function Read-CcSharedSettings {
 function Resolve-CcSharedPathRelativeToScript {
     param([string]$PathText)
 
-    if ([string]::IsNullOrWhiteSpace($PathText)) {
+    $clean = Normalize-CcSharedSettingPathText $PathText ""
+    if ([string]::IsNullOrWhiteSpace($clean)) {
         return (Get-CcSharedScriptDirectory)
     }
 
-    $clean = $PathText.Trim()
     $clean = $clean -replace '/', [System.IO.Path]::DirectorySeparatorChar
 
     if ([System.IO.Path]::IsPathRooted($clean)) {
@@ -84,36 +165,33 @@ function Resolve-CcSharedPathRelativeToScript {
 function Resolve-CcSharedProjectRoot {
     param($Settings)
 
-    $root = ".."
+    $root = "auto"
     if ($null -ne $Settings -and
         ($Settings.PSObject.Properties.Name -contains "ProjectRoot") -and
         -not [string]::IsNullOrWhiteSpace([string]$Settings.ProjectRoot)) {
         $root = [string]$Settings.ProjectRoot
     }
 
-    $resolvedRoot = Resolve-CcSharedPathRelativeToScript $root
+    $clean = Normalize-CcSharedSettingPathText $root "auto"
 
-    # Context Control is designed to live at:
-    #   <project-root>/contextcontrol/
-    # If an old settings file says ProjectRoot="." or the tool is launched from
-    # inside contextcontrol/, do not treat the tool folder as the codebase. Promote
-    # source exports/searches to the parent engine folder automatically.
-    $leaf = Split-Path -Leaf $resolvedRoot
-    if ($leaf -ieq "contextcontrol") {
-        $hasContextControlScripts =
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccDir.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "cc.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccReplace.ps1"))
+    if ([string]::IsNullOrWhiteSpace($clean) -or $clean -ieq "auto") {
+        $toolRoot = Get-CcSharedScriptDirectory
+        $leaf = Split-Path -Leaf $toolRoot
 
-        if ($hasContextControlScripts) {
-            $parent = Split-Path -Parent $resolvedRoot
+        if ($leaf -ieq "contextcontrol") {
+            $parent = Split-Path -Parent $toolRoot
             if (-not [string]::IsNullOrWhiteSpace($parent)) {
                 return [System.IO.Path]::GetFullPath($parent)
             }
         }
+
+        return [System.IO.Path]::GetFullPath($toolRoot)
     }
 
-    return $resolvedRoot
+    # Explicit user paths must win. In particular, do not auto-promote
+    # D:\...\contextcontrol or "." to the parent repo; those are valid when
+    # editing Context Control itself.
+    return Resolve-CcSharedPathRelativeToScript $clean
 }
 
 function Resolve-CcSharedOutputRoot {
@@ -139,7 +217,7 @@ function Resolve-CcSharedOutputPath {
         throw "Missing output path."
     }
 
-    $clean = $PathText.Trim()
+    $clean = Normalize-CcSharedSettingPathText $PathText ""
     $clean = $clean -replace '/', [System.IO.Path]::DirectorySeparatorChar
 
     if ([System.IO.Path]::IsPathRooted($clean)) {

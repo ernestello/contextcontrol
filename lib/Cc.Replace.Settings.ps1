@@ -2,9 +2,12 @@
 
 function New-CcReplaceDefaultSettings {
     return [pscustomobject]@{
-        # ProjectRoot is resolved relative to this ccReplace.ps1 file when it is not absolute.
-        # Default layout: <project-root>/contextcontrol/ccReplace.ps1, so ".." means the parent project folder.
-        ProjectRoot = ".."
+        # ProjectRoot is resolved relative to this ccReplace.ps1 file when it is
+        # not absolute. "auto" keeps the normal layout zero-config:
+        #   <project-root>/contextcontrol/ccReplace.ps1
+        # In that layout, auto resolves to the parent project folder.
+        # Explicit paths are respected exactly; use "." to edit Context Control itself.
+        ProjectRoot = "auto"
 
         # OutputRoot is where Context Control working files live by default.
         # Default "." means the contextcontrol/ folder, keeping the project root clean.
@@ -48,14 +51,109 @@ function Get-CcReplaceSettingsPath {
     return (Join-Path (Get-CcReplaceScriptDirectory) ".ccReplace.settings.json")
 }
 
+
+function Normalize-CcReplaceSettingPathText {
+    param(
+        [string]$PathText,
+        [string]$Fallback = ""
+    )
+
+    if ([string]::IsNullOrWhiteSpace($PathText)) {
+        return $Fallback
+    }
+
+    $clean = [string]$PathText
+    $clean = $clean -replace "`0", ""
+
+    # If a whole console line or multi-line paste was accidentally saved, prefer
+    # the last non-empty line. This catches pasted menu output without making
+    # normal absolute/relative paths slower or more magical.
+    $parts = @($clean -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne "" })
+    if ($parts.Count -gt 0) {
+        $clean = $parts[$parts.Count - 1]
+    }
+
+    $clean = $clean.Trim().Trim('"')
+
+    for ($i = 0; $i -lt 4; $i++) {
+        $next = $clean
+
+        if ($next -match '^\s*(?:Resolved\s+)?(?:project\s+root|output\s+folder|version\s+cache|version\s+cache\s+directory|patch\s+file)\s*:\s*(.+)$') {
+            $next = $Matches[1].Trim()
+        }
+        elseif ($next -match '^\s*(?:project\s+root|output\s+folder|version\s+cache|version\s+cache\s+directory|patch\s+file)\s*=\s*(.+)$') {
+            $next = $Matches[1].Trim()
+        }
+
+        $next = $next.Trim().Trim('"')
+        if ($next -eq $clean) {
+            break
+        }
+
+        $clean = $next
+    }
+
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        return $Fallback
+    }
+
+    # A label without a usable value is not a path. Fall back instead of feeding
+    # garbage into System.IO.Path.GetFullPath and killing the settings menu.
+    if ($clean -match '^\s*(?:Resolved\s+)?(?:project\s+root|output\s+folder|version\s+cache|version\s+cache\s+directory|patch\s+file)\s*:?\s*$') {
+        return $Fallback
+    }
+
+    return $clean
+}
+
+function Repair-CcReplaceSettingsInPlace {
+    param($Settings)
+
+    if ($null -eq $Settings) {
+        return $false
+    }
+
+    $changed = $false
+
+    $projectRoot = Normalize-CcReplaceSettingPathText ([string]$Settings.ProjectRoot) "auto"
+    if ([string]::IsNullOrWhiteSpace($projectRoot)) { $projectRoot = "auto" }
+    if ([string]$Settings.ProjectRoot -ne $projectRoot) {
+        $Settings.ProjectRoot = $projectRoot
+        $changed = $true
+    }
+
+    $outputRoot = Normalize-CcReplaceSettingPathText ([string]$Settings.OutputRoot) "."
+    if ([string]::IsNullOrWhiteSpace($outputRoot)) { $outputRoot = "." }
+    if ([string]$Settings.OutputRoot -ne $outputRoot) {
+        $Settings.OutputRoot = $outputRoot
+        $changed = $true
+    }
+
+    $patchFile = Normalize-CcReplaceSettingPathText ([string]$Settings.DefaultPatchFile) "patch.txt"
+    if ([string]::IsNullOrWhiteSpace($patchFile)) { $patchFile = "patch.txt" }
+    if ([string]$Settings.DefaultPatchFile -ne $patchFile) {
+        $Settings.DefaultPatchFile = $patchFile
+        $changed = $true
+    }
+
+    $versionRoot = Normalize-CcReplaceSettingPathText ([string]$Settings.VersionCacheRoot) ".ccReplace.versions"
+    if ([string]::IsNullOrWhiteSpace($versionRoot)) { $versionRoot = ".ccReplace.versions" }
+    if ([string]$Settings.VersionCacheRoot -ne $versionRoot) {
+        $Settings.VersionCacheRoot = $versionRoot
+        $changed = $true
+    }
+
+    return $changed
+}
+
 function Resolve-CcPathRelativeToScript {
     param([string]$PathText)
 
-    if ([string]::IsNullOrWhiteSpace($PathText)) {
+    $clean = Normalize-CcReplaceSettingPathText $PathText ""
+    if ([string]::IsNullOrWhiteSpace($clean)) {
         return (Get-Location).Path
     }
 
-    $clean = $PathText.Trim()
     $clean = $clean -replace '/', [System.IO.Path]::DirectorySeparatorChar
 
     if ([System.IO.Path]::IsPathRooted($clean)) {
@@ -68,37 +166,33 @@ function Resolve-CcPathRelativeToScript {
 function Resolve-CcProjectRoot {
     param($Settings)
 
-    $root = ".."
+    $root = "auto"
     if ($null -ne $Settings -and
         ($Settings.PSObject.Properties.Name -contains "ProjectRoot") -and
         -not [string]::IsNullOrWhiteSpace([string]$Settings.ProjectRoot)) {
         $root = [string]$Settings.ProjectRoot
     }
 
-    $resolvedRoot = Resolve-CcPathRelativeToScript $root
+    $clean = Normalize-CcReplaceSettingPathText $root "auto"
 
-    # Context Control is designed to live at:
-    #   <project-root>/contextcontrol/
-    # If an old settings file says ProjectRoot="." or the tool is launched from
-    # inside contextcontrol/, patch targets should still resolve from the parent
-    # project root. This keeps FILE: contextcontrol/ccDir.ps1 and engine paths
-    # working consistently.
-    $leaf = Split-Path -Leaf $resolvedRoot
-    if ($leaf -ieq "contextcontrol") {
-        $hasContextControlScripts =
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccDir.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "cc.ps1")) -or
-            (Test-Path -LiteralPath (Join-Path $resolvedRoot "ccReplace.ps1"))
+    if ([string]::IsNullOrWhiteSpace($clean) -or $clean -ieq "auto") {
+        $toolRoot = Get-CcReplaceScriptDirectory
+        $leaf = Split-Path -Leaf $toolRoot
 
-        if ($hasContextControlScripts) {
-            $parent = Split-Path -Parent $resolvedRoot
+        if ($leaf -ieq "contextcontrol") {
+            $parent = Split-Path -Parent $toolRoot
             if (-not [string]::IsNullOrWhiteSpace($parent)) {
                 return [System.IO.Path]::GetFullPath($parent)
             }
         }
+
+        return [System.IO.Path]::GetFullPath($toolRoot)
     }
 
-    return $resolvedRoot
+    # Explicit user paths must win. In particular, do not auto-promote
+    # D:\...\contextcontrol or "." to the parent repo; those are valid when
+    # editing Context Control itself.
+    return Resolve-CcPathRelativeToScript $clean
 }
 
 function Resolve-CcOutputRoot {
@@ -124,7 +218,7 @@ function Resolve-CcOutputPath {
         throw "Missing output path."
     }
 
-    $clean = $PathText.Trim()
+    $clean = Normalize-CcReplaceSettingPathText $PathText ""
     $clean = $clean -replace '/', [System.IO.Path]::DirectorySeparatorChar
 
     if ([System.IO.Path]::IsPathRooted($clean)) {
@@ -180,11 +274,12 @@ function Read-CcReplaceSettings {
 
         $loaded = $json | ConvertFrom-Json
         $settings = Merge-CcReplaceSettings $loaded
+        $wasRepaired = Repair-CcReplaceSettingsInPlace $settings
 
         # Persist newly introduced settings on first run after an update. Do not
         # override existing user choices; only normalize missing keys into the
         # settings file so Windows/macOS/Linux all start from the same durable state.
-        $shouldSave = $false
+        $shouldSave = [bool]$wasRepaired
         foreach ($prop in $settings.PSObject.Properties.Name) {
             if (-not ($loaded.PSObject.Properties.Name -contains $prop)) {
                 $shouldSave = $true
@@ -208,6 +303,8 @@ function Read-CcReplaceSettings {
 
 function Save-CcReplaceSettings {
     param($Settings)
+
+    [void](Repair-CcReplaceSettingsInPlace $Settings)
 
     $path = Get-CcReplaceSettingsPath
     $json = $Settings | ConvertTo-Json -Depth 8
@@ -269,7 +366,7 @@ function Show-CcReplaceSettingsMenu {
                 Write-Host "Patch file: " -NoNewline
                 $path = [Console]::ReadLine()
                 if ($null -ne $path -and $path.Trim() -ne "") {
-                    $settings.DefaultPatchFile = $path.Trim()
+                    $settings.DefaultPatchFile = Normalize-CcReplaceSettingPathText $path "patch.txt"
                 }
             }
             "8" { $settings.VersionCacheEnabled = -not [bool]$settings.VersionCacheEnabled }
@@ -280,16 +377,18 @@ function Show-CcReplaceSettingsMenu {
                 Write-Host "Version cache directory: " -NoNewline
                 $path = [Console]::ReadLine()
                 if ($null -ne $path -and $path.Trim() -ne "") {
-                    $settings.VersionCacheRoot = $path.Trim()
+                    $settings.VersionCacheRoot = Normalize-CcReplaceSettingPathText $path ".ccReplace.versions"
                 }
             }
             "11" {
                 Write-Host "Enter project root path. Relative paths are resolved from the Context Control folder." -ForegroundColor DarkGray
-                Write-Host "Default for <project>/contextcontrol is: .." -ForegroundColor DarkGray
+                Write-Host "Default: auto  (when this tool lives in <project>/contextcontrol, use the parent project)" -ForegroundColor DarkGray
+                Write-Host "Use '.' for the Context Control tool folder itself." -ForegroundColor DarkGray
+                Write-Host "Use '..' for the parent project explicitly, or paste any absolute project path." -ForegroundColor DarkGray
                 Write-Host "Project root: " -NoNewline
                 $path = [Console]::ReadLine()
                 if ($null -ne $path -and $path.Trim() -ne "") {
-                    $settings.ProjectRoot = $path.Trim()
+                    $settings.ProjectRoot = Normalize-CcReplaceSettingPathText $path "auto"
                 }
             }
             "12" {
@@ -298,7 +397,7 @@ function Show-CcReplaceSettingsMenu {
                 Write-Host "Output folder: " -NoNewline
                 $path = [Console]::ReadLine()
                 if ($null -ne $path -and $path.Trim() -ne "") {
-                    $settings.OutputRoot = $path.Trim()
+                    $settings.OutputRoot = Normalize-CcReplaceSettingPathText $path "."
                 }
             }
             "0" {

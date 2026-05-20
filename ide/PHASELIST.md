@@ -18,27 +18,27 @@ The main UI object is a Change Capsule: a local, inspectable unit of software ev
 
 ---
 
-## Phase 0 — Design scaffold
+## Phase 0 — Native desktop shell scaffold
 
 Goal:
 
-Create the first visible artifact for the future IDE without touching backend behavior.
+Create the first visible native artifact for the future IDE without touching backend behavior.
 
 Deliverables:
 
 - `contextcontrol/ide/PHASELIST.md`
-- `contextcontrol/ide/prototype/context-control-workbench.html`
+- `contextcontrol/ide/ContextControl.Workbench/`
 
 Rules:
 
 - No backend changes.
 - No build changes.
-- No dependency changes.
 - No script behavior changes.
+- No browser, WebView, Electron, Tauri, or HTML UI layer.
 
 Purpose:
 
-Give the project a concrete target UI so future implementation phases do not drift into a generic editor, terminal wrapper, or chat interface.
+Give the project a concrete native target UI so future implementation phases do not drift into a generic editor, terminal wrapper, chat interface, or web page.
 
 ---
 
@@ -46,31 +46,30 @@ Give the project a concrete target UI so future implementation phases do not dri
 
 Goal:
 
-Create a real app shell around the static prototype.
+Create a real app shell around the current Context Control workflow.
 
-Possible implementation options:
+Chosen implementation:
 
-- Tauri
-- Electron
-- native desktop wrapper
-- local browser-hosted UI
-- later custom native UI
+- Avalonia desktop app on .NET.
+- No HTML shell and no WebView runtime.
+- Existing PowerShell scripts stay the backend contract.
 
 Deliverables:
 
 - app entry point
-- static assets loaded from local files
+- native desktop window
 - project selector placeholder
-- mocked Change Stack
-- mocked Task Canvas
-- mocked Inspector
-- mocked Action Rail
+- project hierarchy sidebar
+- file history sidebar
+- empty main work area
+- mocked project data until the PowerShell bridge is wired
 
 Rules:
 
 - Actions may still be mocked.
 - No destructive filesystem operations.
 - No patch execution from UI yet.
+- Prefer virtualized/native controls over custom rendering unless profiling proves otherwise.
 
 ---
 
@@ -390,19 +389,20 @@ The first real target is not a complete IDE.
 The first target is:
 
 ```text id="j0fz3b"
-A local static Change Capsule workbench prototype
+A local native project workbench shell
 ```
 
 It should visually prove:
 
-- Change Stack
-- Task Canvas
-- Context Lens
-- Patch Timeline
-- Action Rail
+- Header project open/create controls
+- Open-project switcher
+- Project metadata
+- Project hierarchy sidebar
+- File history sidebar
+- Empty main work area
 
 This is implemented in:
 
 ```text id="qvqhmz"
-contextcontrol/ide/prototype/context-control-workbench.html
+contextcontrol/ide/ContextControl.Workbench/
 ```

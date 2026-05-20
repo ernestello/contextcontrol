@@ -1,0 +1,230 @@
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Data;
+using Avalonia.Layout;
+using Avalonia.Media;
+using ContextControl.Workbench.Services;
+
+namespace ContextControl.Workbench.Views;
+
+public sealed partial class ThemeSettingsWindow : Window
+{
+    private bool _fileRulesSectionAttached;
+
+    public ThemeSettingsWindow()
+    {
+        InitializeComponent();
+        WorkbenchThemeResources.Apply(this, "empty");
+    }
+
+    protected override void OnOpened(EventArgs e)
+    {
+        base.OnOpened(e);
+        AttachFileRulesSection();
+    }
+
+    public void ApplyTheme(string? themeKey)
+    {
+        WorkbenchThemeResources.Apply(this, themeKey);
+    }
+
+    private void AttachFileRulesSection()
+    {
+        if (_fileRulesSectionAttached)
+        {
+            return;
+        }
+
+        var section = BuildFileRulesSection();
+        if (Content is ScrollViewer { Content: StackPanel scrollStack })
+        {
+            scrollStack.Children.Add(section);
+        }
+        else if (Content is StackPanel stack)
+        {
+            stack.Children.Add(section);
+        }
+        else if (Content is Border { Child: StackPanel borderStack })
+        {
+            borderStack.Children.Add(section);
+        }
+        else if (Content is Control existingContent)
+        {
+            Content = new ScrollViewer
+            {
+                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Content = new StackPanel
+                {
+                    Spacing = 10,
+                    Margin = new Thickness(12),
+                    Children =
+                    {
+                        existingContent,
+                        section
+                    }
+                }
+            };
+        }
+        else
+        {
+            Content = section;
+        }
+
+        _fileRulesSectionAttached = true;
+    }
+
+    private static Control BuildFileRulesSection()
+    {
+        var status = new TextBlock
+        {
+            FontSize = 11,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.72
+        };
+        status.Bind(TextBlock.TextProperty, new Binding("FileRulesStatus"));
+
+        var path = new TextBlock
+        {
+            FontSize = 10,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.62
+        };
+        path.Bind(TextBlock.TextProperty, new Binding("FileRulesPath"));
+
+        var editorGrid = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("*,*,*"),
+            ColumnSpacing = 8,
+            MinHeight = 180
+        };
+        editorGrid.Children.Add(CreateRuleEditor(
+            "Allowed file types",
+            "SupportedFileTypesText",
+            "Extensions that CC may show, count, export, and track."));
+        var ignoredFiles = CreateRuleEditor(
+            "Unallowed file types",
+            "IgnoredFileTypesText",
+            "Extensions ignored even when they would otherwise be supported.");
+        Grid.SetColumn(ignoredFiles, 1);
+        editorGrid.Children.Add(ignoredFiles);
+
+        var ignoredDirectories = CreateRuleEditor(
+            "Unallowed folders",
+            "IgnoredDirectoriesText",
+            "Directory names ignored by the IDE tree and external update watcher.");
+        Grid.SetColumn(ignoredDirectories, 2);
+        editorGrid.Children.Add(ignoredDirectories);
+
+        var saveButton = new Button
+        {
+            Content = "Save file rules",
+            MinHeight = 30,
+            Padding = new Thickness(12, 2),
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center
+        };
+        saveButton.Bind(Button.CommandProperty, new Binding("SaveFileRulesCommand"));
+
+        var resetButton = new Button
+        {
+            Content = "Reset defaults",
+            MinHeight = 30,
+            Padding = new Thickness(12, 2),
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center
+        };
+        resetButton.Bind(Button.CommandProperty, new Binding("ResetFileRulesCommand"));
+
+        return new Border
+        {
+            Margin = new Thickness(0, 10, 0, 0),
+            Padding = new Thickness(12),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(8),
+            Child = new StackPanel
+            {
+                Spacing = 8,
+                Children =
+                {
+                    new TextBlock
+                    {
+                        Text = "File rules",
+                        FontSize = 14,
+                        FontWeight = FontWeight.Bold
+                    },
+                    new TextBlock
+                    {
+                        Text = "Configure what files the IDE tree, file history, and external-update tracker can read or must ignore. One entry per line or comma-separated.",
+                        FontSize = 11,
+                        TextWrapping = TextWrapping.Wrap,
+                        Opacity = 0.72
+                    },
+                    path,
+                    editorGrid,
+                    new StackPanel
+                    {
+                        Orientation = Orientation.Horizontal,
+                        Spacing = 8,
+                        HorizontalAlignment = HorizontalAlignment.Right,
+                        Children =
+                        {
+                            resetButton,
+                            saveButton
+                        }
+                    },
+                    status
+                }
+            }
+        };
+    }
+
+    private static Control CreateRuleEditor(string title, string bindingPath, string help)
+    {
+        var textBox = new TextBox
+        {
+            AcceptsReturn = true,
+            MinHeight = 128,
+            TextWrapping = TextWrapping.NoWrap,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Watermark = ".cs, .cpp, .ps1"
+        };
+        textBox.Bind(TextBox.TextProperty, new Binding(bindingPath) { Mode = BindingMode.TwoWay });
+
+        var titleBlock = new TextBlock
+        {
+            Text = title,
+            FontSize = 12,
+            FontWeight = FontWeight.Bold
+        };
+
+        var helpBlock = new TextBlock
+        {
+            Text = help,
+            FontSize = 10,
+            TextWrapping = TextWrapping.Wrap,
+            Opacity = 0.62
+        };
+        Grid.SetRow(helpBlock, 1);
+        Grid.SetRow(textBox, 2);
+
+        return new Border
+        {
+            Padding = new Thickness(8),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(6),
+            Child = new Grid
+            {
+                RowDefinitions = new RowDefinitions("Auto,Auto,*"),
+                RowSpacing = 5,
+                Children =
+                {
+                    titleBlock,
+                    helpBlock,
+                    textBox
+                }
+            }
+        };
+    }
+}

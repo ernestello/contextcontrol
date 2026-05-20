@@ -1,0 +1,238 @@
+// CC-DESC: Main window event bridge for project loading, theme changes, history gestures, and external queue title status.
+
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Input;
+using Avalonia.Platform.Storage;
+using Avalonia.Threading;
+using System.ComponentModel;
+using ContextControl.Workbench.Services;
+using ContextControl.Workbench.ViewModels;
+
+namespace ContextControl.Workbench.Views;
+
+public sealed partial class MainWindow : Window
+{
+    private readonly DispatcherTimer _closeHistoryTimer;
+    private WorkbenchViewModel? _subscribedViewModel;
+    private ThemeSettingsWindow? _themeSettingsWindow;
+
+    public MainWindow()
+    {
+        InitializeComponent();
+
+        _closeHistoryTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(520)
+        };
+        _closeHistoryTimer.Tick += (_, _) =>
+        {
+            _closeHistoryTimer.Stop();
+            ViewModel?.CloseHistory();
+        };
+
+        WorkbenchThemeResources.Apply(this, "empty");
+    }
+
+    private WorkbenchViewModel? ViewModel => DataContext as WorkbenchViewModel;
+
+    protected override void OnOpened(EventArgs e)
+    {
+        base.OnOpened(e);
+        AttachThemeHandler();
+        ApplySelectedTheme();
+        RefreshWindowTitle();
+        FitToWorkingArea();
+    }
+
+    protected override void OnDataContextChanged(EventArgs e)
+    {
+        base.OnDataContextChanged(e);
+        AttachThemeHandler();
+        ApplySelectedTheme();
+        RefreshWindowTitle();
+    }
+
+    private async void OnOpenProjectClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        await PickAndLoadProjectAsync("Open Project");
+    }
+
+    private async void OnNewProjectClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        await PickAndLoadProjectAsync("Add Project");
+    }
+
+    private void OnSettingsClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if (ViewModel is null)
+        {
+            return;
+        }
+
+        if (_themeSettingsWindow is null)
+        {
+            _themeSettingsWindow = new ThemeSettingsWindow
+            {
+                DataContext = ViewModel
+            };
+            _themeSettingsWindow.Closed += (_, _) => _themeSettingsWindow = null;
+        }
+
+        _themeSettingsWindow.ApplyTheme(ViewModel.ThemeKey);
+        if (!_themeSettingsWindow.IsVisible)
+        {
+            _themeSettingsWindow.Show(this);
+        }
+
+        _themeSettingsWindow.Activate();
+    }
+
+    private async Task PickAndLoadProjectAsync(string title)
+    {
+        var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            Title = title,
+            AllowMultiple = false
+        });
+
+        var folder = folders.Count > 0 ? folders[0].TryGetLocalPath() : null;
+        if (string.IsNullOrWhiteSpace(folder) || ViewModel is null)
+        {
+            return;
+        }
+
+        await ViewModel.LoadProjectAsync(folder);
+        RefreshWindowTitle();
+    }
+
+    private void OnKeyDown(object? sender, KeyEventArgs e)
+    {
+        _closeHistoryTimer.Stop();
+        ViewModel?.ScanExternalChangesNow();
+    }
+
+    private void OnWorkspacePointerMoved(object? sender, PointerEventArgs e)
+    {
+        _closeHistoryTimer.Stop();
+    }
+
+    private void AttachThemeHandler()
+    {
+        if (ReferenceEquals(_subscribedViewModel, ViewModel))
+        {
+            return;
+        }
+
+        if (_subscribedViewModel is not null)
+        {
+            _subscribedViewModel.PropertyChanged -= OnViewModelPropertyChanged;
+        }
+
+        _subscribedViewModel = ViewModel;
+        if (_subscribedViewModel is not null)
+        {
+            _subscribedViewModel.PropertyChanged += OnViewModelPropertyChanged;
+        }
+    }
+
+    private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(WorkbenchViewModel.ThemeKey))
+        {
+            ApplySelectedTheme();
+        }
+
+        if (e.PropertyName == nameof(WorkbenchViewModel.ExternalQueueTitle)
+            || e.PropertyName == nameof(WorkbenchViewModel.HasExternalChanges)
+            || e.PropertyName == nameof(WorkbenchViewModel.CurrentProject))
+        {
+            RefreshWindowTitle();
+        }
+    }
+
+    private void ApplySelectedTheme()
+    {
+        var key = ViewModel?.ThemeKey ?? "empty";
+        WorkbenchThemeResources.Apply(this, key);
+        _themeSettingsWindow?.ApplyTheme(key);
+    }
+
+    private void RefreshWindowTitle()
+    {
+        var projectName = ViewModel?.CurrentProject?.Name;
+        var queueLabel = ViewModel?.HasExternalChanges == true
+            ? $" - {ViewModel.ExternalQueueTitle}"
+            : "";
+        Title = string.IsNullOrWhiteSpace(projectName)
+            ? $"Context Control{queueLabel}"
+            : $"Context Control - {projectName}{queueLabel}";
+    }
+
+    private void OnProjectTreeSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (ViewModel is null || e.AddedItems.Count == 0)
+        {
+            return;
+        }
+
+        if (e.AddedItems[0] is TreeRowViewModel row)
+        {
+            ViewModel.SelectedTreeRow = row;
+        }
+    }
+
+    private void OnProjectTreeRowPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (ViewModel is null || sender is not Control { DataContext: TreeRowViewModel row })
+        {
+            return;
+        }
+
+        ViewModel.SelectTreeRow(row, e.ClickCount >= 2);
+    }
+
+    private void OnHistoryVersionPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (ViewModel is null || sender is not Control { DataContext: VersionEntryViewModel version })
+        {
+            return;
+        }
+
+        ViewModel.OpenVersionFromHistory(version);
+        e.Handled = true;
+    }
+
+    private static bool ContainsPointer(Control control, PointerEventArgs e)
+    {
+        var point = e.GetPosition(control);
+        return point.X >= 0
+            && point.Y >= 0
+            && point.X <= control.Bounds.Width
+            && point.Y <= control.Bounds.Height;
+    }
+
+    private void FitToWorkingArea()
+    {
+        var screen = Screens.ScreenFromWindow(this) ?? Screens.Primary;
+        if (screen is null)
+        {
+            return;
+        }
+
+        var usableHeight = Math.Max(MinHeight, (screen.WorkingArea.Height / screen.Scaling) - 18);
+        MaxHeight = usableHeight;
+        if (Height > usableHeight)
+        {
+            Height = usableHeight;
+        }
+
+        var widthPixels = (int)Math.Ceiling(Math.Max(Width, MinWidth) * screen.Scaling);
+        var heightPixels = (int)Math.Ceiling(Height * screen.Scaling);
+        var maxX = Math.Max(screen.WorkingArea.X, screen.WorkingArea.X + screen.WorkingArea.Width - widthPixels);
+        var maxY = Math.Max(screen.WorkingArea.Y, screen.WorkingArea.Y + screen.WorkingArea.Height - heightPixels);
+        Position = new PixelPoint(
+            Math.Clamp(Position.X, screen.WorkingArea.X, maxX),
+            Math.Clamp(Position.Y, screen.WorkingArea.Y, maxY));
+    }
+}

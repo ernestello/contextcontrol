@@ -1,0 +1,1153 @@
+// CC-DESC: Coordinates project tabs, tree selection, history, and external-change queues.
+
+using System.Collections.ObjectModel;
+using System.Threading;
+using System.Windows.Input;
+using ContextControl.Workbench.Services;
+
+namespace ContextControl.Workbench.ViewModels;
+
+public sealed class WorkbenchViewModel : ObservableObject, IDisposable
+{
+    private readonly Dictionary<string, ProjectWorkspaceState> _workspaceByProjectId = [];
+    private readonly Dictionary<string, ExternalChangeTracker> _trackersByProjectId = [];
+    private readonly SynchronizationContext? _uiContext;
+    private readonly Timer _externalScanTimer;
+    private Dictionary<string, FileHistoryViewModel> _historyByPath;
+    private ProjectTabViewModel? _currentProject;
+    private ProjectNodeViewModel? _selectedNode;
+    private TreeRowViewModel? _selectedTreeRow;
+    private FileHistoryViewModel? _selectedHistory;
+    private VersionEntryViewModel? _selectedVersion;
+    private EditorDocumentViewModel? _activeDocument;
+    private ThemeOptionViewModel _selectedTheme;
+    private ThemeOptionViewModel _selectedSyntaxTheme;
+    private bool _isHistoryOpen;
+    private bool _isProjectInfoHistoryMode;
+    private double _historyWidth;
+    private double _historyOpacity;
+    private double _historyGutter;
+    private string _supportedFileTypesLabel = "";
+    private string _ignoredFileTypesLabel = "";
+    private string _fileRulesPath = "";
+
+    private WorkbenchViewModel(
+        ObservableCollection<ProjectTabViewModel> projects,
+        ObservableCollection<ProjectNodeViewModel> projectTree,
+        Dictionary<string, FileHistoryViewModel> historyByPath,
+        ProjectFileRules? fileRules = null)
+    {
+        _uiContext = SynchronizationContext.Current;
+        Projects = projects;
+        ProjectTree = projectTree;
+        ExternalChanges = [];
+        Themes =
+        [
+            new ThemeOptionViewModel("empty", "Empty", "quiet white ceramic, lowest distraction"),
+            new ThemeOptionViewModel("dark", "Dark", "low-glare neutral dark, balanced contrast"),
+            new ThemeOptionViewModel("matrix", "Matrix", "green phosphor mode for late-night focus")
+        ];
+        SyntaxThemes =
+        [
+            new ThemeOptionViewModel("adaptive", "Adaptive", "matches the selected IDE theme"),
+            new ThemeOptionViewModel("a11y-dark", "A11y Dark", "high-contrast dark palette with balanced hue separation"),
+            new ThemeOptionViewModel("empty-light", "Empty Light", "clean light palette for bright rooms"),
+            new ThemeOptionViewModel("github-dark", "GitHub Dark", "familiar industry standard contrast"),
+            new ThemeOptionViewModel("one-dark", "One Dark", "Atom-style warm dark palette"),
+            new ThemeOptionViewModel("nord", "Nord", "low-saturation cool dark palette"),
+            new ThemeOptionViewModel("monokai", "Monokai", "classic high-separation editor colors"),
+            new ThemeOptionViewModel("dracula", "Dracula", "bright dark palette with strong token contrast"),
+            new ThemeOptionViewModel("solarized-light", "Solarized Light", "low-glare light palette"),
+            new ThemeOptionViewModel("solarized-dark", "Solarized Dark", "low-glare dark palette"),
+            new ThemeOptionViewModel("high-contrast-dark", "High Contrast", "maximum token separation")
+        ];
+        _selectedTheme = Themes[0];
+        _selectedSyntaxTheme = SyntaxThemes[0];
+        _historyByPath = historyByPath;
+        foreach (var project in projects)
+        {
+            var rules = fileRules ?? ProjectFileRules.Load(project.ProjectRoot);
+            rules.Save();
+            _workspaceByProjectId[project.Id] = new ProjectWorkspaceState(
+                CloneTree(projectTree),
+                new Dictionary<string, FileHistoryViewModel>(historyByPath),
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+                new ObservableCollection<ExternalChangeItemViewModel>(),
+                rules);
+        }
+
+        SelectProjectCommand = new RelayCommand<ProjectTabViewModel>(SelectProject);
+        ToggleNodeCommand = new RelayCommand<ProjectNodeViewModel>(ToggleNode, node => node?.HasChildren == true);
+        IncludeExternalNodeCommand = new RelayCommand<ProjectNodeViewModel>(node => _ = IncludeExternalNodeAsync(node), node => node?.CanIncludeExternal == true);
+        OpenVersionCommand = new RelayCommand<VersionEntryViewModel>(
+            OpenVersion,
+            version => !string.IsNullOrWhiteSpace(version?.SnapshotPath)
+                || !string.IsNullOrWhiteSpace(version?.CurrentFilePath));
+        OpenHistoryCommand = new RelayCommand<object>(_ => OpenHistory());
+        CloseHistoryCommand = new RelayCommand<object>(_ => CloseHistory());
+        ToggleProjectInfoModeCommand = new RelayCommand<object>(_ => IsProjectInfoHistoryMode = !IsProjectInfoHistoryMode);
+        AcceptAllExternalChangesCommand = new RelayCommand<object>(_ => AcceptAllExternalChanges());
+        AcceptFinalExternalChangesCommand = new RelayCommand<object>(_ => AcceptFinalExternalChanges());
+        AcceptSelectedExternalChangesCommand = new RelayCommand<object>(_ => AcceptSelectedExternalChanges());
+        DismissSelectedExternalChangesCommand = new RelayCommand<object>(_ => DismissSelectedExternalChanges());
+        ToggleExternalChangeCommand = new RelayCommand<ExternalChangeItemViewModel>(ToggleExternalChange);
+        OpenExternalChangeCommand = new RelayCommand<ExternalChangeItemViewModel>(OpenExternalChange);
+
+        PrepareTree();
+        RefreshVisibleProjectNodes();
+        SelectProject(projects.FirstOrDefault());
+        foreach (var project in projects)
+        {
+            StartExternalTracker(project);
+        }
+
+        ActiveDocument = EditorDocumentViewModel.Empty();
+        _externalScanTimer = new Timer(_ => PostToUi(ScanExternalChangesNow), null, TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(750));
+    }
+
+    public ObservableCollection<ProjectTabViewModel> Projects { get; }
+    public ObservableCollection<ProjectNodeViewModel> ProjectTree { get; }
+    public ObservableCollection<ProjectNodeViewModel> VisibleProjectNodes { get; } = [];
+    public ObservableCollection<TreeRowViewModel> VisibleTreeRows { get; } = [];
+    public ObservableCollection<ExternalChangeItemViewModel> ExternalChanges { get; }
+    public ObservableCollection<ThemeOptionViewModel> Themes { get; }
+    public ObservableCollection<ThemeOptionViewModel> SyntaxThemes { get; }
+    public ICommand SelectProjectCommand { get; }
+    public ICommand ToggleNodeCommand { get; }
+    public ICommand IncludeExternalNodeCommand { get; }
+    public ICommand OpenVersionCommand { get; }
+    public ICommand OpenHistoryCommand { get; }
+    public ICommand CloseHistoryCommand { get; }
+    public ICommand ToggleProjectInfoModeCommand { get; }
+    public ICommand AcceptAllExternalChangesCommand { get; }
+    public ICommand AcceptFinalExternalChangesCommand { get; }
+    public ICommand AcceptSelectedExternalChangesCommand { get; }
+    public ICommand DismissSelectedExternalChangesCommand { get; }
+    public ICommand ToggleExternalChangeCommand { get; }
+    public ICommand OpenExternalChangeCommand { get; }
+
+    public ThemeOptionViewModel SelectedTheme
+    {
+        get => _selectedTheme;
+        set
+        {
+            if (value is null)
+            {
+                return;
+            }
+
+            if (SetProperty(ref _selectedTheme, value))
+            {
+                OnPropertyChanged(nameof(ThemeKey));
+                OnPropertyChanged(nameof(SyntaxThemeKey));
+            }
+        }
+    }
+
+    public string ThemeKey => SelectedTheme.Key;
+
+    public ThemeOptionViewModel SelectedSyntaxTheme
+    {
+        get => _selectedSyntaxTheme;
+        set
+        {
+            if (value is null)
+            {
+                return;
+            }
+
+            if (SetProperty(ref _selectedSyntaxTheme, value))
+            {
+                OnPropertyChanged(nameof(SyntaxThemeKey));
+            }
+        }
+    }
+
+    public string SyntaxThemeKey => SelectedSyntaxTheme.Key;
+
+    public ProjectTabViewModel? CurrentProject
+    {
+        get => _currentProject;
+        private set
+        {
+            if (SetProperty(ref _currentProject, value))
+            {
+                OnPropertyChanged(nameof(ProjectInfoTitle));
+                OnPropertyChanged(nameof(ProjectInfoSwitchLabel));
+            }
+        }
+    }
+
+    public ProjectNodeViewModel? SelectedNode
+    {
+        get => _selectedNode;
+        set
+        {
+            var previous = _selectedNode;
+            if (!SetProperty(ref _selectedNode, value))
+            {
+                if (value is { IsFile: true })
+                {
+                    SelectFileNode(value);
+                }
+
+                return;
+            }
+
+            if (previous is not null)
+            {
+                previous.IsCurrent = false;
+            }
+
+            if (value is not null)
+            {
+                value.IsCurrent = true;
+            }
+
+            RefreshCurrentRowHighlights(previous, value);
+
+            if (value is null || value.IsFolder)
+            {
+                return;
+            }
+
+            SelectFileNode(value);
+        }
+    }
+
+    public TreeRowViewModel? SelectedTreeRow
+    {
+        get => _selectedTreeRow;
+        set
+        {
+            if (value?.Node is not { } node)
+            {
+                SetProperty(ref _selectedTreeRow, null);
+                return;
+            }
+
+            SelectTreeRow(value, false);
+        }
+    }
+
+    public FileHistoryViewModel? SelectedHistory
+    {
+        get => _selectedHistory;
+        private set => SetProperty(ref _selectedHistory, value);
+    }
+
+    public EditorDocumentViewModel? ActiveDocument
+    {
+        get => _activeDocument;
+        private set
+        {
+            if (SetProperty(ref _activeDocument, value))
+            {
+                OnPropertyChanged(nameof(HasActiveDocument));
+            }
+        }
+    }
+
+    public bool HasActiveDocument => ActiveDocument is not null;
+    public bool HasExternalChanges => ExternalChanges.Count > 0;
+    public string ExternalQueueTitle => HasExternalChanges ? $"External updates ({ExternalChanges.Count})" : "External updates";
+
+    public string SupportedFileTypesLabel
+    {
+        get => _supportedFileTypesLabel;
+        private set => SetProperty(ref _supportedFileTypesLabel, value);
+    }
+
+    public string IgnoredFileTypesLabel
+    {
+        get => _ignoredFileTypesLabel;
+        private set => SetProperty(ref _ignoredFileTypesLabel, value);
+    }
+
+    public string FileRulesPath
+    {
+        get => _fileRulesPath;
+        private set => SetProperty(ref _fileRulesPath, value);
+    }
+
+    public bool IsHistoryOpen
+    {
+        get => _isHistoryOpen;
+        private set => SetProperty(ref _isHistoryOpen, value);
+    }
+
+    public bool IsProjectInfoHistoryMode
+    {
+        get => _isProjectInfoHistoryMode;
+        set
+        {
+            if (SetProperty(ref _isProjectInfoHistoryMode, value))
+            {
+                OnPropertyChanged(nameof(IsProjectInfoProjectMode));
+                OnPropertyChanged(nameof(ProjectInfoTitle));
+                OnPropertyChanged(nameof(ProjectInfoSwitchLabel));
+            }
+        }
+    }
+
+    public bool IsProjectInfoProjectMode => !IsProjectInfoHistoryMode;
+
+    public string ProjectInfoTitle => IsProjectInfoHistoryMode
+        ? "Update history"
+        : CurrentProject?.Name ?? "Project";
+
+    public string ProjectInfoSwitchLabel => IsProjectInfoHistoryMode
+        ? CurrentProject?.Name ?? "Project"
+        : HasExternalChanges ? "Updates detected" : "Updates history";
+
+    public double HistoryWidth
+    {
+        get => _historyWidth;
+        private set => SetProperty(ref _historyWidth, value);
+    }
+
+    public double HistoryOpacity
+    {
+        get => _historyOpacity;
+        private set => SetProperty(ref _historyOpacity, value);
+    }
+
+    public double HistoryGutter
+    {
+        get => _historyGutter;
+        private set => SetProperty(ref _historyGutter, value);
+    }
+
+    public static WorkbenchViewModel Create()
+    {
+        var defaultRoot = FindDefaultContextControlRoot();
+        if (defaultRoot is not null)
+        {
+            try
+            {
+                var loaded = ProjectLoader.Load(defaultRoot);
+                return new WorkbenchViewModel([loaded.Project], loaded.Tree, loaded.HistoryByPath, loaded.FileRules);
+            }
+            catch
+            {
+                // Fall back to the small design-time shell if local scanning fails.
+            }
+        }
+
+        var projects = new ObservableCollection<ProjectTabViewModel>
+        {
+            new("cc", "CC", "Context Control", "18,284 LOC", "601", "239", "b9ef261", @"D:\Projects\vulkanas\contextcontrol"),
+            new("vx", "VX", "VulkanVX", "open to scan", "project", "project", "linked", @"D:\Projects\vulkanas"),
+            new("ide", "IDE", "Workbench", "native shell", "app", "native", "b9ef261", @"contextcontrol\ide"),
+            new("ps", "PS", "PowerShell Core", "script core", "32", "3", "b9ef261", @"contextcontrol\lib")
+        };
+
+        return new WorkbenchViewModel(projects, BuildProjectTree(), BuildHistory());
+    }
+
+    public void Dispose()
+    {
+        _externalScanTimer.Dispose();
+
+        foreach (var tracker in _trackersByProjectId.Values)
+        {
+            tracker.Dispose();
+        }
+
+        _trackersByProjectId.Clear();
+    }
+
+    private static string? FindDefaultContextControlRoot()
+    {
+        return FindContextRoot(Directory.GetCurrentDirectory())
+            ?? FindContextRoot(AppContext.BaseDirectory);
+    }
+
+    private static string? FindContextRoot(string startPath)
+    {
+        var directory = new DirectoryInfo(startPath);
+        while (directory is not null)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "ccStart.ps1"))
+                && File.Exists(Path.Combine(directory.FullName, "ccDir.ps1"))
+                && File.Exists(Path.Combine(directory.FullName, "cc.ps1"))
+                && File.Exists(Path.Combine(directory.FullName, "ccReplace.ps1")))
+            {
+                return directory.FullName;
+            }
+
+            directory = directory.Parent;
+        }
+
+        return null;
+    }
+
+    private void SelectProject(ProjectTabViewModel? project)
+    {
+        if (project is null)
+        {
+            return;
+        }
+
+        foreach (var item in Projects)
+        {
+            item.IsActive = ReferenceEquals(item, project);
+        }
+
+        CurrentProject = project;
+        if (_workspaceByProjectId.TryGetValue(project.Id, out var workspace))
+        {
+            LoadWorkspace(workspace);
+        }
+
+        StartExternalTracker(project);
+    }
+
+    private void OpenHistory()
+    {
+        if (SelectedNode is { IsFile: true })
+        {
+            OpenHistory(SelectedNode.Path);
+            return;
+        }
+
+        OpenHistory("ide/ContextControl.Workbench/Views/MainWindow.axaml");
+    }
+
+    public void OpenHistory(string path)
+    {
+        SelectHistory(path);
+        ShowHistory();
+    }
+
+    public void SelectTreeRow(TreeRowViewModel row, bool toggleHistory)
+    {
+        if (row.Node is not { } node)
+        {
+            return;
+        }
+
+        SetProperty(ref _selectedTreeRow, row, nameof(SelectedTreeRow));
+        SelectedNode = node;
+
+        if (toggleHistory)
+        {
+            ToggleHistoryForNode(node);
+        }
+    }
+
+    public void OpenVersionFromHistory(VersionEntryViewModel version)
+    {
+        OpenVersion(version);
+    }
+
+    public void OpenExternalChange(ExternalChangeItemViewModel? item)
+    {
+        if (item is null || CurrentProject is null)
+        {
+            return;
+        }
+
+        var node = FindProjectNodeByPath(ProjectTree, item.RelativePath);
+        if (node is not null)
+        {
+            SelectedNode = node;
+            SelectHistory(node.Path);
+            OpenDocument(node);
+            ShowHistory();
+            return;
+        }
+
+        SelectHistory(item.RelativePath);
+        ShowHistory();
+
+        var fullPath = Path.Combine(CurrentProject.ProjectRoot, item.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+        if (File.Exists(fullPath))
+        {
+            ClearActiveVersion();
+            ActiveDocument = EditorDocumentViewModel.Load(fullPath, item.RelativePath, $"v{item.Change.VersionAfter}", item.Change.Loc);
+        }
+    }
+
+    public void ToggleHistoryForNode(ProjectNodeViewModel node)
+    {
+        if (IsHistoryOpen)
+        {
+            CloseHistory();
+            return;
+        }
+
+        if (!node.IsFile)
+        {
+            return;
+        }
+
+        SelectHistory(node.Path);
+        ShowHistory();
+    }
+
+    private void ShowHistory()
+    {
+        IsHistoryOpen = true;
+        HistoryWidth = 330;
+        HistoryOpacity = 1;
+        HistoryGutter = 8;
+    }
+
+    public void CloseHistory()
+    {
+        IsHistoryOpen = false;
+        HistoryWidth = 0;
+        HistoryOpacity = 0;
+        HistoryGutter = 0;
+    }
+
+    public void ScanExternalChangesNow()
+    {
+        if (CurrentProject is null)
+        {
+            return;
+        }
+
+        StartExternalTracker(CurrentProject);
+        if (_trackersByProjectId.TryGetValue(CurrentProject.Id, out var tracker))
+        {
+            tracker.ForceScanNow();
+        }
+    }
+
+    public async Task LoadProjectAsync(string folderPath)
+    {
+        var loadedProject = await ProjectLoader.LoadAsync(folderPath);
+        var existing = Projects.FirstOrDefault(project =>
+            string.Equals(project.ProjectRoot, loadedProject.Project.ProjectRoot, StringComparison.OrdinalIgnoreCase));
+
+        if (existing is not null)
+        {
+            var existingIndex = Projects.IndexOf(existing);
+            Projects[existingIndex] = loadedProject.Project;
+            if (_trackersByProjectId.Remove(existing.Id, out var oldTracker))
+            {
+                oldTracker.Dispose();
+            }
+        }
+        else
+        {
+            Projects.Add(loadedProject.Project);
+        }
+
+        _workspaceByProjectId[loadedProject.Project.Id] = new ProjectWorkspaceState(
+            loadedProject.Tree,
+            loadedProject.HistoryByPath,
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+            new ObservableCollection<ExternalChangeItemViewModel>(),
+            loadedProject.FileRules);
+        SelectProject(loadedProject.Project);
+    }
+
+    private async Task IncludeExternalNodeAsync(ProjectNodeViewModel? node)
+    {
+        if (CurrentProject is null
+            || node is not { CanIncludeExternal: true }
+            || string.IsNullOrWhiteSpace(CurrentProject.ProjectRoot)
+            || !_workspaceByProjectId.TryGetValue(CurrentProject.Id, out var workspace))
+        {
+            return;
+        }
+
+        var includedPaths = workspace.IncludedExternalPaths.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        includedPaths.Add(node.Path);
+
+        var loadedProject = await ProjectLoader.LoadAsync(CurrentProject.ProjectRoot, includedPaths);
+        var existingIndex = Projects.IndexOf(CurrentProject);
+        if (existingIndex >= 0)
+        {
+            Projects[existingIndex] = loadedProject.Project;
+        }
+
+        _workspaceByProjectId[loadedProject.Project.Id] = new ProjectWorkspaceState(
+            loadedProject.Tree,
+            loadedProject.HistoryByPath,
+            includedPaths,
+            workspace.ExternalChanges,
+            loadedProject.FileRules);
+        SelectProject(loadedProject.Project);
+    }
+
+    private void ToggleNode(ProjectNodeViewModel? node)
+    {
+        if (node?.HasChildren != true)
+        {
+            return;
+        }
+
+        node.IsExpanded = !node.IsExpanded;
+        RefreshVisibleProjectNodes();
+    }
+
+    private void RefreshVisibleProjectNodes()
+    {
+        VisibleProjectNodes.Clear();
+        VisibleTreeRows.Clear();
+
+        foreach (var node in ProjectTree)
+        {
+            AddVisibleNode(node);
+        }
+    }
+
+    private void RefreshCurrentRowHighlights(ProjectNodeViewModel? previous, ProjectNodeViewModel? current)
+    {
+        foreach (var row in VisibleTreeRows)
+        {
+            if (ReferenceEquals(row.Node, previous) || ReferenceEquals(row.Node, current))
+            {
+                row.RefreshCurrentState();
+            }
+        }
+    }
+
+    private void AddVisibleNode(ProjectNodeViewModel node)
+    {
+        VisibleProjectNodes.Add(node);
+        VisibleTreeRows.Add(TreeRowViewModel.ForNode(node));
+
+        if (!node.IsExpanded)
+        {
+            return;
+        }
+
+        foreach (var child in node.Children)
+        {
+            VisibleTreeRows.Add(TreeRowViewModel.ForSpacer(child));
+            AddVisibleNode(child);
+        }
+    }
+
+    private void PrepareTree()
+    {
+        for (var index = 0; index < ProjectTree.Count; index++)
+        {
+            PrepareNode(ProjectTree[index], 0, index == ProjectTree.Count - 1, []);
+        }
+    }
+
+    private static void PrepareNode(
+        ProjectNodeViewModel node,
+        int depth,
+        bool isLast,
+        IReadOnlyList<bool> ancestorContinues)
+    {
+        node.SetTreeState(depth, isLast, ancestorContinues);
+        if (depth == 0)
+        {
+            node.IsExpanded = true;
+        }
+
+        for (var index = 0; index < node.Children.Count; index++)
+        {
+            var child = node.Children[index];
+            var childIsLast = index == node.Children.Count - 1;
+            var childAncestors = ancestorContinues.Concat([!childIsLast]).ToArray();
+
+            PrepareNode(child, depth + 1, childIsLast, childAncestors);
+        }
+    }
+
+    private void LoadWorkspace(ProjectWorkspaceState workspace)
+    {
+        ProjectTree.Clear();
+        foreach (var node in workspace.ProjectTree)
+        {
+            ProjectTree.Add(node);
+        }
+
+        _historyByPath = workspace.HistoryByPath;
+        ExternalChanges.Clear();
+        foreach (var change in workspace.ExternalChanges)
+        {
+            RegisterExternalChangeItem(change);
+            ExternalChanges.Add(change);
+        }
+
+        SelectedNode = null;
+        SelectedTreeRow = null;
+        SelectedHistory = null;
+        ClearActiveVersion();
+        ActiveDocument = EditorDocumentViewModel.Empty();
+        SupportedFileTypesLabel = workspace.FileRules.SupportedLabel;
+        IgnoredFileTypesLabel = workspace.FileRules.IgnoredLabel;
+        FileRulesPath = workspace.FileRules.RulesPath;
+        CloseHistory();
+        PrepareTree();
+        RefreshVisibleProjectNodes();
+        RefreshExternalChangeLabels();
+        RecalculateExternalChangeFlows(workspace.ExternalChanges);
+    }
+
+    private void OpenDocument(ProjectNodeViewModel node)
+    {
+        var path = ResolveNodePath(node);
+        ActiveDocument = path is null
+            ? EditorDocumentViewModel.Empty()
+            : EditorDocumentViewModel.Load(path, node.Path, node.VersionLabel, node.Loc);
+    }
+
+    private void SelectFileNode(ProjectNodeViewModel node)
+    {
+        ClearActiveVersion();
+        SelectHistory(node.Path);
+        OpenDocument(node);
+    }
+
+    private void SelectHistory(string path)
+    {
+        SelectedHistory = _historyByPath.TryGetValue(path, out var history)
+            ? history
+            : new FileHistoryViewModel(
+                Path.GetFileName(path),
+                path,
+                [new VersionEntryViewModel(
+                    "v1",
+                    "2026-05-10",
+                    CurrentProject?.Commit ?? "local",
+                    "tracked by Context Control",
+                    Path.GetFileName(path),
+                    path,
+                    currentFilePath: SelectedNode is { } selectedNode
+                        ? ResolveNodePath(selectedNode) ?? ""
+                        : "")]);
+        SelectedHistory.EnsureStatsLoaded();
+    }
+
+    private void OpenVersion(VersionEntryViewModel? version)
+    {
+        if (version is null)
+        {
+            return;
+        }
+
+        ClearActiveVersion();
+        SelectedHistory?.EnsureStatsLoaded();
+        version.IsActive = true;
+        _selectedVersion = version;
+        ActiveDocument = EditorDocumentViewModel.LoadVersion(version);
+        IsHistoryOpen = true;
+        HistoryWidth = 330;
+        HistoryOpacity = 1;
+        HistoryGutter = 8;
+    }
+
+    private void ClearActiveVersion()
+    {
+        if (_selectedVersion is not null)
+        {
+            _selectedVersion.IsActive = false;
+            _selectedVersion = null;
+        }
+    }
+
+    private string? ResolveNodePath(ProjectNodeViewModel node)
+    {
+        if (string.IsNullOrWhiteSpace(node.Path))
+        {
+            return null;
+        }
+
+        if (Path.IsPathRooted(node.Path))
+        {
+            return node.Path;
+        }
+
+        return string.IsNullOrWhiteSpace(CurrentProject?.ProjectRoot)
+            ? null
+            : Path.Combine(CurrentProject.ProjectRoot, node.Path);
+    }
+
+    private void StartExternalTracker(ProjectTabViewModel project)
+    {
+        if (_trackersByProjectId.ContainsKey(project.Id)
+            || string.IsNullOrWhiteSpace(project.ProjectRoot)
+            || !Directory.Exists(project.ProjectRoot))
+        {
+            return;
+        }
+
+        var tracker = new ExternalChangeTracker(project.ProjectRoot);
+        tracker.ChangeCaptured += (_, change) => PostToUi(() => OnExternalChangeCaptured(project.Id, change));
+        _trackersByProjectId[project.Id] = tracker;
+
+        if (_workspaceByProjectId.TryGetValue(project.Id, out var workspace))
+        {
+            workspace.FileRules = tracker.FileRules;
+            if (ReferenceEquals(CurrentProject, project))
+            {
+                SupportedFileTypesLabel = tracker.FileRules.SupportedLabel;
+                IgnoredFileTypesLabel = tracker.FileRules.IgnoredLabel;
+                FileRulesPath = tracker.FileRules.RulesPath;
+            }
+        }
+    }
+
+    private void PostToUi(Action action)
+    {
+        if (_uiContext is null)
+        {
+            action();
+            return;
+        }
+
+        _uiContext.Post(_ => action(), null);
+    }
+
+    private void OnExternalChangeCaptured(string projectId, ExternalFileChange change)
+    {
+        if (!_workspaceByProjectId.TryGetValue(projectId, out var workspace))
+        {
+            return;
+        }
+
+        if (workspace.ExternalChanges.Any(item => item.QueueId.Equals($"{change.RelativePath}|{change.VersionAfter}", StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        var item = new ExternalChangeItemViewModel(change);
+        RegisterExternalChangeItem(item);
+        workspace.ExternalChanges.Add(item);
+
+        if (CurrentProject?.Id == projectId)
+        {
+            ExternalChanges.Add(item);
+            RefreshExternalChangeLabels();
+            ReloadActiveDocumentIfChanged(change);
+        }
+
+        RecalculateExternalChangeFlows(workspace.ExternalChanges);
+    }
+
+
+    private void ReloadActiveDocumentIfChanged(ExternalFileChange change)
+    {
+        if (SelectedNode is not { IsFile: true })
+        {
+            return;
+        }
+
+        if (!string.Equals(NormalizeProjectPath(SelectedNode.Path), NormalizeProjectPath(change.RelativePath), StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        ClearActiveVersion();
+        SelectHistory(SelectedNode.Path);
+        OpenDocument(SelectedNode);
+    }
+
+    private static string NormalizeProjectPath(string path)
+    {
+        return (path ?? string.Empty).Replace('\\', '/').TrimStart('.', '/');
+    }
+
+    private void RegisterExternalChangeItem(ExternalChangeItemViewModel item)
+    {
+        item.SelectionChanged -= OnExternalChangeSelectionChanged;
+        item.SelectionChanged += OnExternalChangeSelectionChanged;
+    }
+
+    private void OnExternalChangeSelectionChanged(object? sender, EventArgs e)
+    {
+        if (CurrentProject is not null && _workspaceByProjectId.TryGetValue(CurrentProject.Id, out var workspace))
+        {
+            RecalculateExternalChangeFlows(workspace.ExternalChanges);
+        }
+    }
+
+    private void ToggleExternalChange(ExternalChangeItemViewModel? item)
+    {
+        if (item is null)
+        {
+            return;
+        }
+
+        item.IsSelected = !item.IsSelected;
+    }
+
+    private void AcceptAllExternalChanges()
+    {
+        foreach (var item in ExternalChanges)
+        {
+            item.IsSelected = true;
+        }
+
+        AcceptSelectedExternalChanges();
+    }
+
+    private void AcceptFinalExternalChanges()
+    {
+        if (CurrentProject is null || !_workspaceByProjectId.TryGetValue(CurrentProject.Id, out var workspace))
+        {
+            return;
+        }
+
+        var queued = workspace.ExternalChanges.ToArray();
+        if (queued.Length == 0)
+        {
+            return;
+        }
+
+        ExternalVersionQueueStore.AcceptOnlyFinal(CurrentProject.ProjectRoot, queued.Select(item => item.Change));
+        RemoveExternalChanges(workspace, item => queued.Contains(item));
+        _ = RefreshCurrentProjectFromDiskAsync();
+    }
+
+    private void AcceptSelectedExternalChanges()
+    {
+        if (CurrentProject is null || !_workspaceByProjectId.TryGetValue(CurrentProject.Id, out var workspace))
+        {
+            return;
+        }
+
+        RemoveExternalChanges(workspace, item => item.IsSelected);
+        _ = RefreshCurrentProjectFromDiskAsync();
+    }
+
+    private void DismissSelectedExternalChanges()
+    {
+        if (CurrentProject is null || !_workspaceByProjectId.TryGetValue(CurrentProject.Id, out var workspace))
+        {
+            return;
+        }
+
+        RemoveExternalChanges(workspace, item => item.IsSelected);
+    }
+
+    private void RemoveExternalChanges(ProjectWorkspaceState workspace, Func<ExternalChangeItemViewModel, bool> predicate)
+    {
+        var toRemove = workspace.ExternalChanges.Where(predicate).ToArray();
+        foreach (var item in toRemove)
+        {
+            item.SelectionChanged -= OnExternalChangeSelectionChanged;
+            workspace.ExternalChanges.Remove(item);
+            ExternalChanges.Remove(item);
+        }
+
+        RecalculateExternalChangeFlows(workspace.ExternalChanges);
+        RefreshExternalChangeLabels();
+    }
+
+    private async Task RefreshCurrentProjectFromDiskAsync()
+    {
+        if (CurrentProject is null || !_workspaceByProjectId.TryGetValue(CurrentProject.Id, out var currentWorkspace))
+        {
+            return;
+        }
+
+        var projectRoot = CurrentProject.ProjectRoot;
+        var projectId = CurrentProject.Id;
+        var loadedProject = await ProjectLoader.LoadAsync(projectRoot, currentWorkspace.IncludedExternalPaths);
+        var existingIndex = Projects.IndexOf(CurrentProject);
+        if (existingIndex >= 0)
+        {
+            Projects[existingIndex] = loadedProject.Project;
+        }
+
+        _workspaceByProjectId[loadedProject.Project.Id] = new ProjectWorkspaceState(
+            loadedProject.Tree,
+            loadedProject.HistoryByPath,
+            currentWorkspace.IncludedExternalPaths,
+            currentWorkspace.ExternalChanges,
+            loadedProject.FileRules);
+
+        if (loadedProject.Project.Id != projectId && _trackersByProjectId.Remove(projectId, out var tracker))
+        {
+            _trackersByProjectId[loadedProject.Project.Id] = tracker;
+        }
+
+        SelectProject(loadedProject.Project);
+    }
+
+    private void RecalculateExternalChangeFlows(IEnumerable<ExternalChangeItemViewModel> changes)
+    {
+        foreach (var group in changes.GroupBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase))
+        {
+            var ordered = group.OrderBy(item => item.Change.VersionAfter).ToArray();
+            var baseVersion = ordered.FirstOrDefault()?.Change.VersionBefore ?? 0;
+            var baseSnapshot = ordered.FirstOrDefault()?.Change.PreviousSnapshotPath ?? "";
+
+            foreach (var item in ordered)
+            {
+                item.SetEffectiveBase(baseVersion, baseSnapshot);
+                if (item.IsSelected)
+                {
+                    baseVersion = item.Change.VersionAfter;
+                    baseSnapshot = item.Change.SnapshotPath;
+                }
+            }
+        }
+    }
+
+    private void RefreshExternalChangeLabels()
+    {
+        OnPropertyChanged(nameof(HasExternalChanges));
+        OnPropertyChanged(nameof(ExternalQueueTitle));
+        OnPropertyChanged(nameof(ProjectInfoSwitchLabel));
+    }
+
+    private static ProjectNodeViewModel? FindProjectNodeByPath(IEnumerable<ProjectNodeViewModel> nodes, string path)
+    {
+        var normalized = NormalizeProjectPath(path);
+        foreach (var node in nodes)
+        {
+            if (node.IsFile && string.Equals(NormalizeProjectPath(node.Path), normalized, StringComparison.OrdinalIgnoreCase))
+            {
+                return node;
+            }
+
+            var child = FindProjectNodeByPath(node.Children, normalized);
+            if (child is not null)
+            {
+                return child;
+            }
+        }
+
+        return null;
+    }
+
+    private static ObservableCollection<ProjectNodeViewModel> CloneTree(IEnumerable<ProjectNodeViewModel> nodes)
+    {
+        return new ObservableCollection<ProjectNodeViewModel>(nodes.Select(CloneNode));
+    }
+
+    private static ProjectNodeViewModel CloneNode(ProjectNodeViewModel node)
+    {
+        var clone = new ProjectNodeViewModel(
+            node.Name,
+            node.Path,
+            node.IsFolder,
+            node.VersionLabel,
+            node.Children.Select(CloneNode),
+            node.IsExternal,
+            node.CanIncludeExternal,
+            node.Loc);
+        clone.IsExpanded = node.IsExpanded;
+        return clone;
+    }
+
+    private static ObservableCollection<ProjectNodeViewModel> BuildProjectTree()
+    {
+        return
+        [
+            new ProjectNodeViewModel("contextcontrol", "", true, "root",
+            [
+                new ProjectNodeViewModel("ide", "ide", true, "v2",
+                [
+                    new ProjectNodeViewModel("ContextControl.Workbench", "ide/ContextControl.Workbench", true, "v1",
+                    [
+                        new ProjectNodeViewModel("Views", "ide/ContextControl.Workbench/Views", true, "v1",
+                        [
+                            new ProjectNodeViewModel("MainWindow.axaml", "ide/ContextControl.Workbench/Views/MainWindow.axaml", false, "v1"),
+                            new ProjectNodeViewModel("MainWindow.axaml.cs", "ide/ContextControl.Workbench/Views/MainWindow.axaml.cs", false, "v1")
+                        ]),
+                        new ProjectNodeViewModel("ViewModels", "ide/ContextControl.Workbench/ViewModels", true, "v1",
+                        [
+                            new ProjectNodeViewModel("WorkbenchViewModel.cs", "ide/ContextControl.Workbench/ViewModels/WorkbenchViewModel.cs", false, "v1"),
+                            new ProjectNodeViewModel("ProjectNodeViewModel.cs", "ide/ContextControl.Workbench/ViewModels/ProjectNodeViewModel.cs", false, "v1")
+                        ]),
+                        new ProjectNodeViewModel("ContextControl.Workbench.csproj", "ide/ContextControl.Workbench/ContextControl.Workbench.csproj", false, "v1")
+                    ]),
+                    new ProjectNodeViewModel("PHASELIST.md", "ide/PHASELIST.md", false, "v1")
+                ]),
+                new ProjectNodeViewModel("lib", "lib", true, "v10",
+                [
+                    new ProjectNodeViewModel("export", "lib/export", true, "v7",
+                    [
+                        new ProjectNodeViewModel("Cc.Export.Source.ps1", "lib/export/Cc.Export.Source.ps1", false, "v7"),
+                        new ProjectNodeViewModel("Cc.Export.FileBlocks.ps1", "lib/export/Cc.Export.FileBlocks.ps1", false, "v4")
+                    ]),
+                    new ProjectNodeViewModel("replace", "lib/replace", true, "v10",
+                    [
+                        new ProjectNodeViewModel("Cc.Replace.Apply.ps1", "lib/replace/Cc.Replace.Apply.ps1", false, "v10"),
+                        new ProjectNodeViewModel("Cc.Replace.Versioning.ps1", "lib/replace/Cc.Replace.Versioning.ps1", false, "v10")
+                    ]),
+                    new ProjectNodeViewModel("shared", "lib/shared", true, "v3",
+                    [
+                        new ProjectNodeViewModel("Cc.Settings.ps1", "lib/shared/Cc.Settings.ps1", false, "v3"),
+                        new ProjectNodeViewModel("Cc.Clipboard.ps1", "lib/shared/Cc.Clipboard.ps1", false, "v2")
+                    ])
+                ]),
+                new ProjectNodeViewModel("ccStart.ps1", "ccStart.ps1", false, "v3"),
+                new ProjectNodeViewModel("ccDir.ps1", "ccDir.ps1", false, "v4"),
+                new ProjectNodeViewModel("cc.ps1", "cc.ps1", false, "v6"),
+                new ProjectNodeViewModel("ccReplace.ps1", "ccReplace.ps1", false, "v10"),
+                new ProjectNodeViewModel("README.md", "README.md", false, "v1")
+            ])
+        ];
+    }
+
+    private static Dictionary<string, FileHistoryViewModel> BuildHistory()
+    {
+        static FileHistoryViewModel History(string name, string path, params VersionEntryViewModel[] versions)
+        {
+            return new FileHistoryViewModel(name, path, versions);
+        }
+
+        static VersionEntryViewModel Version(
+            string label,
+            string date,
+            string commit,
+            string reason,
+            string fileName,
+            string path)
+        {
+            return new VersionEntryViewModel(
+                label,
+                date,
+                commit,
+                reason,
+                fileName,
+                path,
+                currentFilePath: "");
+        }
+
+        var items = new[]
+        {
+            History("MainWindow.axaml", "ide/ContextControl.Workbench/Views/MainWindow.axaml",
+                Version("v1", "2026-05-10", "b9ef261", "native ceramic shell", "MainWindow.axaml", "ide/ContextControl.Workbench/Views/MainWindow.axaml")),
+            History("MainWindow.axaml.cs", "ide/ContextControl.Workbench/Views/MainWindow.axaml.cs",
+                Version("v1", "2026-05-10", "b9ef261", "history drift behavior", "MainWindow.axaml.cs", "ide/ContextControl.Workbench/Views/MainWindow.axaml.cs")),
+            History("WorkbenchViewModel.cs", "ide/ContextControl.Workbench/ViewModels/WorkbenchViewModel.cs",
+                Version("v1", "2026-05-10", "b9ef261", "project and history state", "WorkbenchViewModel.cs", "ide/ContextControl.Workbench/ViewModels/WorkbenchViewModel.cs")),
+            History("PHASELIST.md", "ide/PHASELIST.md",
+                Version("v1", "2026-05-10", "b9ef261", "native IDE phase plan", "PHASELIST.md", "ide/PHASELIST.md")),
+            History("ccReplace.ps1", "ccReplace.ps1",
+                Version("v10", "2026-05-07", "b9ef261", "applied function", "ccReplace.ps1", "ccReplace.ps1"),
+                Version("v9", "2026-05-05", "b9ef261", "applied function", "ccReplace.ps1", "ccReplace.ps1"),
+                Version("v8", "2026-05-05", "b9ef261", "applied function", "ccReplace.ps1", "ccReplace.ps1")),
+            History("cc.ps1", "cc.ps1",
+                Version("v6", "2026-05-08", "b9ef261", "source export update", "cc.ps1", "cc.ps1"),
+                Version("v5", "2026-05-07", "b9ef261", "function extraction update", "cc.ps1", "cc.ps1"),
+                Version("v4", "2026-05-04", "b9ef261", "baseline", "cc.ps1", "cc.ps1")),
+            History("ccDir.ps1", "ccDir.ps1",
+                Version("v4", "2026-05-08", "b9ef261", "profile tree filtering", "ccDir.ps1", "ccDir.ps1"),
+                Version("v3", "2026-05-07", "b9ef261", "launcher parity", "ccDir.ps1", "ccDir.ps1"),
+                Version("v2", "2026-05-04", "b9ef261", "project map export", "ccDir.ps1", "ccDir.ps1"))
+        };
+
+        return items.ToDictionary(item => item.Path, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private sealed class ProjectWorkspaceState(
+        ObservableCollection<ProjectNodeViewModel> projectTree,
+        Dictionary<string, FileHistoryViewModel> historyByPath,
+        IReadOnlySet<string> includedExternalPaths,
+        ObservableCollection<ExternalChangeItemViewModel> externalChanges,
+        ProjectFileRules fileRules)
+    {
+        public ObservableCollection<ProjectNodeViewModel> ProjectTree { get; } = projectTree;
+        public Dictionary<string, FileHistoryViewModel> HistoryByPath { get; } = historyByPath;
+        public IReadOnlySet<string> IncludedExternalPaths { get; } = includedExternalPaths;
+        public ObservableCollection<ExternalChangeItemViewModel> ExternalChanges { get; } = externalChanges;
+        public ProjectFileRules FileRules { get; set; } = fileRules;
+    }
+}

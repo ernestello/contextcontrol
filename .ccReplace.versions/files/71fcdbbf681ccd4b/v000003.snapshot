@@ -1,0 +1,491 @@
+// GPT-DESC: Provides voxel terrain material overlay lookup and procedural material color sampling.
+
+struct MaterialOverlayCell {
+    int x;
+    int y;
+    int z;
+    uint face;
+    uint material;
+};
+
+// Sparse LOD0 voxel-face material edits. Capacity is a power-of-two open
+// addressing table built on the CPU; material == 0 marks an empty slot.
+layout(std430, set = 0, binding = 10) readonly buffer MaterialOverlayData {
+    uint capacityMask;
+    uint count;
+    uint maxProbe;
+    uint _pad;
+    MaterialOverlayCell cells[];
+} materialOverlay;
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Shared includes: dither/hash/noise utilities, lighting, shadow sampling
+// ═══════════════════════════════════════════════════════════════════════════
+#include "../common/dither_utils.glsl"
+#include "../common/shadow_sampling.glsl"
+#include "../common/clustered_lighting.glsl"
+#include "../common/sky_enclosure.glsl"
+
+const uint MATERIAL_PACKED_BIT = 0x80000000u;
+const uint MATERIAL_LAYOUT_V2_BIT = 0x00001000u;
+
+vec3 materialBase(uint type) {
+    if (type == 1u) return vec3(0.29, 0.19, 0.15); // mud
+    if (type == 2u) return vec3(0.56, 0.46, 0.33); // drysand
+    if (type == 3u) return vec3(0.78, 0.62, 0.40); // sand
+    if (type == 4u) return vec3(0.38, 0.24, 0.14); // dirt
+    return vec3(0.25, 0.46, 0.13);                 // grass
+}
+
+vec3 materialHi(uint type) {
+    if (type == 1u) return vec3(0.54, 0.42, 0.32);
+    if (type == 2u) return vec3(0.76, 0.64, 0.46);
+    if (type == 3u) return vec3(0.96, 0.84, 0.58);
+    if (type == 4u) return vec3(0.56, 0.36, 0.20);
+    return vec3(0.58, 0.80, 0.25);
+}
+
+vec3 materialLo(uint type) {
+    if (type == 1u) return vec3(0.11, 0.075, 0.060);
+    if (type == 2u) return vec3(0.31, 0.24, 0.17);
+    if (type == 3u) return vec3(0.55, 0.41, 0.25);
+    if (type == 4u) return vec3(0.18, 0.10, 0.055);
+    return vec3(0.11, 0.23, 0.055);
+}
+
+vec3 materialAccent(uint type) {
+    if (type == 1u) return vec3(0.39, 0.29, 0.23);
+    if (type == 2u) return vec3(0.63, 0.52, 0.38);
+    if (type == 3u) return vec3(0.86, 0.70, 0.45);
+    if (type == 4u) return vec3(0.46, 0.30, 0.17);
+    return vec3(0.40, 0.67, 0.18);
+}
+
+vec2 materialHash22(vec2 p) {
+    return vec2(
+        hash12(p),
+        hash12(p + vec2(37.71, 17.17)));
+}
+
+float materialSignedNoise(vec2 p) {
+    return hash12(p) * 2.0 - 1.0;
+}
+
+vec2 materialRotate(vec2 p, float a) {
+    float c = cos(a);
+    float s = sin(a);
+    return mat2(c, -s, s, c) * p;
+}
+
+vec2 materialNaturalCoord(vec2 materialPx, vec2 voxelCoord, uint type, uint variant) {
+    float angleSeed = hash12(voxelCoord + vec2(float(type) * 23.7, float(variant) * 11.3));
+    float angle = (angleSeed - 0.5) * 1.35 + float(variant) * 0.23;
+    vec2 centered = materialPx - (voxelCoord + vec2(0.5)) * 16.0;
+    vec2 rotated = materialRotate(centered, angle);
+    return rotated + (voxelCoord + vec2(0.5)) * 16.0;
+}
+
+float materialPixelLine(vec2 p, float period, float skew, float phase) {
+    float v = fract((p.x + p.y * skew + phase) / max(period, 0.001));
+    return 1.0 - abs(v - 0.5) * 2.0;
+}
+
+float materialBrokenLine(vec2 p, float period, float skew, float phase, vec2 breakSeed) {
+    float line = materialPixelLine(p, period, skew, phase);
+    float broken = hash12(floor(p * 0.25) + breakSeed);
+    return line * smoothstep(0.22, 0.78, broken);
+}
+
+float materialDryCrackMask(vec2 pixelCoord, float variantPhase) {
+    // Voronoi-boundary cracks. The feature grid is not used as color blocks;
+    // only cell borders become thin dry crack lines.
+    vec2 p = pixelCoord * 0.105;
+    vec2 baseCell = floor(p);
+    vec2 f = fract(p);
+
+    float nearest = 16.0;
+    float secondNearest = 16.0;
+
+    for (int cy = -1; cy <= 1; ++cy) {
+        for (int cx = -1; cx <= 1; ++cx) {
+            vec2 g = vec2(float(cx), float(cy));
+            vec2 o = materialHash22(baseCell + g + vec2(variantPhase, variantPhase * 0.37));
+            o = o * 0.80 + vec2(0.10);
+            vec2 r = g + o - f;
+            float d = dot(r, r);
+            if (d < nearest) {
+                secondNearest = nearest;
+                nearest = d;
+            } else if (d < secondNearest) {
+                secondNearest = d;
+            }
+        }
+    }
+
+    float border = secondNearest - nearest;
+    return 1.0 - smoothstep(0.016, 0.086, border);
+}
+
+float materialBranchCrack(vec2 p, uint variant, uint face) {
+    vec2 q = materialNaturalCoord(p, floor(p / 16.0), 2u, variant);
+    float a = materialPixelLine(q, 19.0, 0.70, float(variant) * 7.0 + float(face) * 3.0);
+    float b = materialPixelLine(q.yx, 23.0, -0.52, float(variant) * 11.0);
+    float c = materialPixelLine(q + vec2(9.0, 3.0), 31.0, 0.18, float(face) * 5.0);
+    return max(smoothstep(0.972, 0.998, a), max(smoothstep(0.975, 0.998, b), smoothstep(0.986, 0.999, c)));
+}
+
+uint materialDefaultEdge(uint type) {
+    if (type == 0u) return 1u; // leafy grass
+    if (type == 1u) return 2u; // sloppy mud
+    return 3u;                 // dry dirt/sand/drysand
+}
+
+uint packVoxelMaterial(uint type, uint variant, uint edge, uint resLog2) {
+    return MATERIAL_PACKED_BIT |
+           MATERIAL_LAYOUT_V2_BIT |
+           (type & 0x7u) |
+           ((variant & 0x7u) << 3u) |
+           ((edge & 0x3u) << 6u) |
+           ((resLog2 & 0xFu) << 8u);
+}
+
+void unpackVoxelMaterial(uint material,
+                         out uint type,
+                         out uint variant,
+                         out uint edge,
+                         out uint resLog2) {
+    if ((material & MATERIAL_LAYOUT_V2_BIT) != 0u) {
+        type = material & 0x7u;
+        variant = (material >> 3u) & 0x7u;
+        edge = (material >> 6u) & 0x3u;
+        resLog2 = clamp((material >> 8u) & 0xFu, 1u, 10u);
+    } else {
+        // Backward-compatible read for already-baked 4-type materials.
+        // Old type 2 is intentionally interpreted as DrySand after the split.
+        type = material & 0x3u;
+        variant = (material >> 2u) & 0x7u;
+        edge = (material >> 5u) & 0x3u;
+        resLog2 = clamp((material >> 7u) & 0xFu, 1u, 10u);
+    }
+}
+
+uint hashMaterialOverlayKey(ivec3 voxel, uint face) {
+    uint h = uint(voxel.x) * 0x9E3779B9u;
+    h ^= uint(voxel.y) * 0x85EBCA6Bu;
+    h ^= uint(voxel.z) * 0xC2B2AE35u;
+    h ^= (face & 0x7u) * 0x27D4EB2Du;
+    h ^= h >> 16;
+    h *= 0x7FEB352Du;
+    h ^= h >> 15;
+    return h;
+}
+
+uint lookupMaterialOverlay(vec3 worldPos, vec3 normal, uint face, uint fallbackMaterial) {
+    const uint MATERIAL_OVERLAY_CHUNK_HINT_BIT = 0x40000000u;
+    const uint MATERIAL_LIVE_STAMP_CAPACITY = 64u;
+    const uint MATERIAL_LIVE_STAMP_CELL_STRIDE = 3u;
+    const uint MATERIAL_LIVE_STAMP_CELL_CAPACITY =
+        MATERIAL_LIVE_STAMP_CAPACITY * MATERIAL_LIVE_STAMP_CELL_STRIDE;
+
+    uint cleanFallbackMaterial = fallbackMaterial & ~MATERIAL_OVERLAY_CHUNK_HINT_BIT;
+
+    uint baselineMaterial = cleanFallbackMaterial;
+    if ((baselineMaterial & MATERIAL_PACKED_BIT) == 0u) {
+        uint type = (face == 3u) ? 0u : 4u; // top grass, side/bottom minecraftish dirt
+
+        float h = worldPos.y;
+        float biomeNoise = hash12(floor(worldPos.xz * 0.0625));
+        if (face == 3u) {
+            if (h < 5.0) {
+                type = 3u;
+            } else if (biomeNoise > 0.82) {
+                type = 1u;
+            }
+        }
+
+        uint variant = uint(hash12(floor(worldPos.xz * 0.25) + vec2(float(face) * 13.0, 71.0)) * 8.0) & 0x7u;
+        uint edge = 0u;
+        uint resLog2 = 4u;
+        baselineMaterial = packVoxelMaterial(type, variant, edge, resLog2);
+    }
+
+    // Instant texture-brush path:
+    // Binding 10 still has the old layout, but cells[] may begin with a tiny
+    // fixed live-stamp prefix. The final material-bake path normally returns
+    // zero live stamps, but this path stays layout-correct for diagnostics.
+    const uint liveStampCount = min(materialOverlay._pad, MATERIAL_LIVE_STAMP_CAPACITY);
+    if (liveStampCount > 0u) {
+        ivec3 voxel = ivec3(floor(worldPos * 4.0 - normal * 0.01));
+
+        const uint queryFace = face & 0x7u;
+        const uint queryAxis = queryFace / 2u;
+        const float querySign = ((queryFace & 1u) != 0u) ? 1.0 : -1.0;
+
+        vec3 faceCenter = vec3(voxel) + vec3(0.5);
+        faceCenter[int(queryAxis)] += querySign * 0.5;
+
+        for (uint reverseIdx = 0u; reverseIdx < liveStampCount; ++reverseIdx) {
+            const uint stampIdx = liveStampCount - 1u - reverseIdx;
+            const uint cellBase = stampIdx * MATERIAL_LIVE_STAMP_CELL_STRIDE;
+
+            MaterialOverlayCell c0 = materialOverlay.cells[cellBase + 0u];
+            MaterialOverlayCell c1 = materialOverlay.cells[cellBase + 1u];
+            MaterialOverlayCell c2 = materialOverlay.cells[cellBase + 2u];
+
+            ivec3 bboxMin = ivec3(c1.x, c1.y, c1.z);
+            ivec3 bboxMax = ivec3(c2.x, c2.y, c2.z);
+            if (voxel.x < bboxMin.x || voxel.y < bboxMin.y || voxel.z < bboxMin.z ||
+                voxel.x > bboxMax.x || voxel.y > bboxMax.y || voxel.z > bboxMax.z) {
+                continue;
+            }
+
+            vec3 center = vec3(
+                intBitsToFloat(c0.x),
+                intBitsToFloat(c0.y),
+                intBitsToFloat(c0.z));
+            float radius = uintBitsToFloat(c0.face) + 1.0;
+
+            vec3 d = faceCenter - center;
+            bool boxStamp = (c1.face & 0xFFu) != 0u;
+            bool inside = false;
+            float edgeDistance = 9999.0;
+            if (!boxStamp) {
+                float dist = length(d);
+                inside = dist <= radius;
+                edgeDistance = radius - dist;
+            } else {
+                float boxDist = max(max(abs(d.x), abs(d.y)), abs(d.z));
+                inside = boxDist <= radius;
+                edgeDistance = radius - boxDist;
+            }
+
+            if (!inside) {
+                continue;
+            }
+
+            uint type = c2.face & 0x7u;
+            uint variantSeed = c2.material & 0x7u;
+            uint variant = (variantSeed + (hashMaterialOverlayKey(voxel, queryFace) & 0x7u)) & 0x7u;
+            uint edge = (edgeDistance <= 2.25) ? materialDefaultEdge(type) : 0u;
+            uint resLog2 = 4u;
+            return packVoxelMaterial(type, variant, edge, resLog2);
+        }
+    }
+
+    if (materialOverlay.count == 0u || materialOverlay.capacityMask == 0u) {
+        return baselineMaterial;
+    }
+
+    uint capacity = materialOverlay.capacityMask + 1u;
+
+    if ((materialOverlay.count * 4u) > (capacity * 3u)) {
+        return baselineMaterial;
+    }
+
+    if ((fallbackMaterial & MATERIAL_OVERLAY_CHUNK_HINT_BIT) == 0u) {
+        return baselineMaterial;
+    }
+
+    const uint probeLimit = min(materialOverlay.maxProbe, 8u);
+
+    ivec3 voxel = ivec3(floor(worldPos * 4.0 - normal * 0.01));
+    uint idx = hashMaterialOverlayKey(voxel, face) & materialOverlay.capacityMask;
+
+    for (uint probe = 0u; probe <= probeLimit; ++probe) {
+        MaterialOverlayCell cell =
+            materialOverlay.cells[MATERIAL_LIVE_STAMP_CELL_CAPACITY + idx];
+
+        if (cell.material == 0u) {
+            return baselineMaterial;
+        }
+
+        if (cell.x == voxel.x &&
+            cell.y == voxel.y &&
+            cell.z == voxel.z &&
+            (cell.face & 0x7u) == (face & 0x7u)) {
+            return cell.material;
+        }
+
+        uint residentIdeal = hashMaterialOverlayKey(
+            ivec3(cell.x, cell.y, cell.z),
+            cell.face & 0x7u) & materialOverlay.capacityMask;
+        uint residentProbe = (idx - residentIdeal) & materialOverlay.capacityMask;
+        if (residentProbe < probe) {
+            return baselineMaterial;
+        }
+
+        idx = (idx + 1u) & materialOverlay.capacityMask;
+    }
+
+    return baselineMaterial;
+}
+
+vec3 sampleVoxelMaterial(vec3 worldPos, uint face, uint material, vec3 fallbackColor) {
+    if ((material & MATERIAL_PACKED_BIT) == 0u) {
+        return fallbackColor;
+    }
+
+    uint type;
+    uint variant;
+    uint edge;
+    uint resLog2;
+    unpackVoxelMaterial(material, type, variant, edge, resLog2);
+    float res = float(1u << resLog2);
+
+    vec2 faceCoord = faceCell(worldPos * 4.0 + vec3(0.0001), face);
+    vec2 voxelCoord = floor(faceCoord);
+    vec2 uv = fract(faceCoord);
+    vec2 texel = floor(uv * res);
+    vec2 materialPx = floor(faceCoord * res);
+    vec2 naturalPx = materialNaturalCoord(materialPx, voxelCoord, type, variant);
+    vec2 seed = materialPx
+              + vec2(float(variant) * 19.0 + float(type) * 113.0,
+                     float(face) * 29.0);
+
+    float n0 = hash12(seed);
+    float n1 = hash12(seed + vec2(13.7, 91.3));
+    float n2 = hash12(seed * vec2(0.73, 1.19) + vec2(47.3, 11.5));
+    float n3 = hash12(seed + vec2(211.0, 53.0));
+
+    vec3 base = materialBase(type);
+    vec3 hi = materialHi(type);
+    vec3 lo = materialLo(type);
+    vec3 accent = materialAccent(type);
+    vec3 color = base;
+
+    if (type == 0u) {
+        // Grass: multidirectional clusters. It still reads as blades, but the
+        // dominant direction changes per voxel so it no longer forms long lines.
+        float clump = hash12(voxelCoord + vec2(float(variant) * 7.0, float(face) * 5.0));
+        float bladeA = materialBrokenLine(naturalPx + vec2(n2 * 4.0, 0.0),
+                                          3.0 + clump * 3.0,
+                                          0.30 + materialSignedNoise(voxelCoord) * 0.32,
+                                          float(variant) * 5.0,
+                                          voxelCoord + vec2(17.0, 41.0));
+        float bladeB = materialBrokenLine(naturalPx.yx + vec2(n0 * 3.0, 0.0),
+                                          5.0 + n1 * 4.0,
+                                          -0.24 + clump * 0.32,
+                                          float(variant) * 9.0 + 3.0,
+                                          voxelCoord + vec2(59.0, 23.0));
+        float leafy = smoothstep(0.48, 0.93, max(bladeA, bladeB)) * step(0.14, n0);
+        float darkGap = step(0.70, n1) * (1.0 - leafy * 0.55);
+        color = mix(color, hi, leafy * 0.48);
+        color = mix(color, lo, darkGap * 0.36);
+        color = mix(color, accent, step(0.93, n3) * 0.22);
+        color += vec3(materialSignedNoise(seed + vec2(9.0)) * 0.035);
+    } else if (type == 1u) {
+        // Mud: organic liquid ridges. A single dominant wavy flow is varied per
+        // voxel; the cross-flow is weak, so the old rhombus look disappears.
+        float flow = hash12(voxelCoord + vec2(float(variant) * 3.0, 71.0));
+        vec2 mudPx = materialRotate(materialPx, (flow - 0.5) * 1.05 + float(variant) * 0.17);
+        mudPx.x += sin(mudPx.y * 0.15 + flow * 6.2831) * 2.0;
+        float ridge = materialBrokenLine(mudPx,
+                                         8.0 + flow * 7.0,
+                                         0.12 + flow * 0.18,
+                                         float(variant) * 11.0,
+                                         voxelCoord + vec2(31.0, 7.0));
+        float secondary = materialBrokenLine(mudPx.yx,
+                                             18.0 + n2 * 5.0,
+                                             -0.10,
+                                             float(variant) * 4.0,
+                                             voxelCoord + vec2(3.0, 97.0));
+        float ridgeMask = smoothstep(0.62, 0.94, ridge);
+        float trough = smoothstep(0.54, 0.98, 1.0 - ridge) * smoothstep(0.34, 0.86, n2);
+        float wet = max(trough, step(0.93, n0) * 0.65);
+        color = mix(color, lo, wet * 0.50);
+        color = mix(color, hi, ridgeMask * 0.27);
+        color = mix(color, accent, smoothstep(0.83, 0.98, secondary) * 0.15);
+        color = mix(color, vec3(0.075, 0.055, 0.045), step(0.965, n3) * wet * 0.45);
+    } else if (type == 2u) {
+        // DrySand: old dry/cracked material split away from Dirt, with more
+        // crack-scale variation and dusty plate color shifts.
+        float crackA = materialDryCrackMask(naturalPx, float(variant) * 13.0 + float(face) * 2.0);
+        float crackB = materialDryCrackMask(naturalPx * 1.37 + vec2(19.0, 7.0), float(variant) * 5.0 + 21.0) * 0.65;
+        float branch = materialBranchCrack(materialPx, variant, face) * 0.55;
+        float cracks = clamp(max(crackA, crackB) + branch, 0.0, 1.0);
+        float dust = materialSignedNoise(seed + vec2(5.0, 19.0)) * 0.105;
+        float palePlate = step(0.72, hash12(floor(naturalPx * 0.125) + vec2(float(variant))));
+        color += vec3(dust);
+        color = mix(color, hi, palePlate * 0.13);
+        color = mix(color, accent, step(0.90, n1) * (1.0 - cracks) * 0.16);
+        color = mix(color, lo * 0.68, cracks * 0.82);
+    } else if (type == 3u) {
+        // Sand: wind waves whose direction varies by voxel and subtly curves,
+        // avoiding one global diagonal while preserving the wavy sand identity.
+        float flow = hash12(voxelCoord + vec2(float(variant) * 4.0, 19.0));
+        vec2 sandPx = materialRotate(materialPx, (flow - 0.5) * 0.95 + float(variant) * 0.11);
+        sandPx.x += sin(sandPx.y * 0.10 + flow * 6.2831) * (1.5 + flow * 2.2);
+        float waveA = materialBrokenLine(sandPx,
+                                         9.0 + flow * 7.0,
+                                         0.06 + flow * 0.12,
+                                         float(variant) * 9.0,
+                                         voxelCoord + vec2(61.0, 11.0));
+        float waveB = materialBrokenLine(sandPx + vec2(5.0, 13.0),
+                                         17.0 + n2 * 4.0,
+                                         -0.08,
+                                         float(variant) * 4.0,
+                                         voxelCoord + vec2(29.0, 83.0));
+        float duneHi = smoothstep(0.55, 0.92, waveA);
+        float duneLo = smoothstep(0.66, 0.98, 1.0 - waveB);
+        float fine = materialSignedNoise(seed + vec2(17.0, 43.0)) * 0.085;
+        color += vec3(fine);
+        color = mix(color, hi, duneHi * 0.23);
+        color = mix(color, lo, duneLo * 0.15);
+        color = mix(color, accent, step(0.965, n3) * 0.18);
+        color = mix(color, lo, step(0.92, n1) * 0.13);
+    } else {
+        // Dirt: minecraftish side-face dirt. Brown, blocky, granular, and close
+        // to mud in palette, but not liquid and not cracked like DrySand.
+        vec2 block2 = floor(materialPx * 0.5);
+        vec2 block4 = floor(materialPx * 0.25);
+        float coarse = hash12(block2 + vec2(float(variant) * 13.0, float(face) * 3.0));
+        float pebble = hash12(seed + vec2(73.0, 29.0));
+        float clod = hash12(block4 + voxelCoord + vec2(9.0, float(variant) * 5.0));
+        float blockShade = (coarse - 0.5) * 0.22 + materialSignedNoise(seed) * 0.055;
+        color += vec3(blockShade);
+        color = mix(color, hi, step(0.66, coarse) * 0.20);
+        color = mix(color, lo, step(coarse, 0.22) * 0.32);
+        color = mix(color, accent, step(0.88, pebble) * 0.24);
+        color = mix(color, materialLo(1u), step(0.93, clod) * 0.20);
+        color = floor(color * 26.0 + 0.5) / 26.0;
+    }
+
+    if (edge != 0u) {
+        float d = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+        float edgeBand = 1.0 - smoothstep(0.025, 0.18, d);
+        float edgeNoise = hash12(materialPx + vec2(211.0, 53.0));
+        float ragged = step(0.42, edgeNoise);
+
+        if (edge == 1u) {          // leafy grass transition
+            float leafSpike = smoothstep(0.40, 0.94,
+                materialBrokenLine(naturalPx + vec2(edgeNoise * 3.0, 0.0),
+                                   4.0 + edgeNoise * 2.5,
+                                   0.45,
+                                   float(variant) * 7.0,
+                                   voxelCoord + vec2(5.0, 89.0)));
+            vec3 leafColor = mix(materialLo(0u), materialHi(0u), 0.65 + 0.25 * n0);
+            color = mix(color, materialLo(0u), edgeBand * step(0.78, edgeNoise) * 0.22);
+            color = mix(color, leafColor, edgeBand * ragged * leafSpike * 0.58);
+        } else if (edge == 2u) {   // sloppy/liquid mud transition
+            float smear = smoothstep(0.36, 0.96,
+                materialBrokenLine(naturalPx.yx,
+                                   6.0 + edgeNoise * 4.0,
+                                   -0.16,
+                                   float(variant) * 9.0,
+                                   voxelCoord + vec2(41.0, 2.0)));
+            color = mix(color, materialLo(1u), edgeBand * (0.38 + 0.36 * n1));
+            color = mix(color, materialHi(1u), edgeBand * smear * 0.22);
+            color = mix(color, vec3(0.070, 0.050, 0.042), edgeBand * step(0.90, n2) * 0.36);
+        } else {                   // dry crumble / cracked sand-dirt transition
+            float crumb = step(0.55, edgeNoise);
+            float crack = materialDryCrackMask(naturalPx + vec2(float(variant) * 3.0), float(face) + 5.0);
+            vec3 dryHi = (type == 3u) ? materialHi(3u) : materialHi(2u);
+            vec3 dryLo = (type == 4u) ? materialLo(4u) : materialLo(2u);
+            color = mix(color, dryHi, edgeBand * crumb * 0.26);
+            color = mix(color, dryLo, edgeBand * step(0.72, n1) * 0.30);
+            color = mix(color, materialLo(2u) * 0.64, edgeBand * crack * 0.40);
+        }
+    }
+
+    return clamp(color, vec3(0.02), vec3(1.0));
+}

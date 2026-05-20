@@ -1,0 +1,80 @@
+<Window
+    x:Class="ContextControl.Workbench.Views.ThemeSettingsWindow"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
+    Width="420"
+    Height="276"
+    MinWidth="360"
+    MinHeight="230"
+    CanResize="False"
+    WindowStartupLocation="CenterOwner"
+    Title="Settings"
+    Background="{DynamicResource AppBackgroundBrush}">
+
+  <Window.Styles>
+    <Style Selector="Border.settings-panel">
+      <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="8" />
+      <Setter Property="Padding" Value="16" />
+    </Style>
+
+    <Style Selector="TextBlock.title">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontSize" Value="16" />
+      <Setter Property="FontWeight" Value="ExtraBold" />
+    </Style>
+
+    <Style Selector="TextBlock.muted">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontSize" Value="11" />
+    </Style>
+
+    <Style Selector="ComboBox.theme-picker">
+      <Setter Property="MinHeight" Value="34" />
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+    </Style>
+  </Window.Styles>
+
+  <Border Classes="settings-panel" Margin="10">
+    <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto" RowSpacing="12">
+      <TextBlock Classes="title" Text="Appearance" />
+      <TextBlock Grid.Row="1" Classes="muted" Text="Choose the visual mode for the IDE and code renderer." />
+
+      <ComboBox
+          Grid.Row="2"
+          Classes="theme-picker"
+          ItemsSource="{Binding Themes}"
+          SelectedItem="{Binding SelectedTheme, Mode=TwoWay}">
+        <ComboBox.ItemTemplate>
+          <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+            <StackPanel>
+              <TextBlock Text="{Binding Name}" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
+              <TextBlock Text="{Binding Description}" FontSize="10" Foreground="{DynamicResource TextMutedBrush}" />
+            </StackPanel>
+          </DataTemplate>
+        </ComboBox.ItemTemplate>
+      </ComboBox>
+
+      <TextBlock Grid.Row="3" Classes="muted" Text="Syntax colors" />
+      <ComboBox
+          Grid.Row="4"
+          Classes="theme-picker"
+          ItemsSource="{Binding SyntaxThemes}"
+          SelectedItem="{Binding SelectedSyntaxTheme, Mode=TwoWay}">
+        <ComboBox.ItemTemplate>
+          <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+            <StackPanel>
+              <TextBlock Text="{Binding Name}" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
+              <TextBlock Text="{Binding Description}" FontSize="10" Foreground="{DynamicResource TextMutedBrush}" />
+            </StackPanel>
+          </DataTemplate>
+        </ComboBox.ItemTemplate>
+      </ComboBox>
+    </Grid>
+  </Border>
+</Window>

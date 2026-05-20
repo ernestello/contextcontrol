@@ -1,0 +1,40 @@
+# Context Control IDE Architecture
+
+## Stack Decision
+
+The IDE shell uses Avalonia on .NET as a native desktop application.
+
+Rejected for this project:
+
+- Electron
+- Tauri
+- WebView shells
+- browser-hosted HTML prototypes
+
+Reasons:
+
+- The current Context Control core is already cross-platform through `pwsh`.
+- Avalonia ships one desktop UI codebase across Windows, Linux, and macOS.
+- The app can call the existing PowerShell scripts as local child processes without changing their behavior.
+- Native controls avoid the memory and process overhead of a browser runtime.
+- The UI can stay data-driven and virtualized for large project trees and histories.
+
+## Performance Rules
+
+- Prefer native list/tree controls with virtualization.
+- Keep the main work area empty until the core project shell is stable.
+- Avoid blur, live transparency, shader-heavy decoration, and expensive animated layout.
+- Use short, transform/opacity or single-panel width transitions only where they materially improve navigation.
+- Load project trees and version histories asynchronously once real data wiring begins.
+- Keep PowerShell execution off the UI thread.
+
+## Backend Contract
+
+The existing scripts remain the source of truth:
+
+- `ccDir.ps1` exports project structure.
+- `cc.ps1` exports selected context.
+- `ccReplace.ps1` applies patch blocks and writes version cache snapshots.
+- `ccStart.ps1` remains the terminal agent-mode entry point.
+
+The desktop app is a native orchestration layer over that core, not a replacement for it.

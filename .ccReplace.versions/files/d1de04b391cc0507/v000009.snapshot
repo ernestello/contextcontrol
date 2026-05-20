@@ -1,0 +1,857 @@
+// CC-DESC: Main window event bridge plus project-info-card external-update integration.
+
+using Avalonia;
+using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
+using Avalonia.Input;
+using Avalonia.Layout;
+using Avalonia.Media;
+using Avalonia.Platform.Storage;
+using Avalonia.Threading;
+using Avalonia.VisualTree;
+using System.Collections.Specialized;
+using System.ComponentModel;
+using System.Linq;
+using ContextControl.Workbench.Services;
+using ContextControl.Workbench.ViewModels;
+
+namespace ContextControl.Workbench.Views;
+
+public sealed partial class MainWindow : Window
+{
+    private static readonly IBrush PositiveBrush = Brush.Parse("#178A42");
+    private static readonly IBrush NegativeBrush = Brush.Parse("#B42318");
+    private static readonly IBrush QueueRowSelectedBrush = Brush.Parse("#10000000");
+    private static readonly IBrush QueueRowSkippedBrush = Brush.Parse("#08FF7A00");
+
+    private readonly DispatcherTimer _closeHistoryTimer;
+    private WorkbenchViewModel? _subscribedViewModel;
+    private ThemeSettingsWindow? _themeSettingsWindow;
+
+    private Control? _projectInfoHost;
+    private object? _projectInfoOriginalContent;
+    private List<Control>? _projectInfoOriginalChildren;
+    private bool _projectInfoCaptured;
+
+    private StackPanel? _externalHeaderButtons;
+    private StackPanel? _externalHeaderQueueItems;
+    private Control? _externalHeaderContentRoot;
+    private Button? _infoExternalButton;
+    private Button? _scanExternalButton;
+    private Button? _acceptAllExternalButton;
+    private Button? _acceptSelectedExternalButton;
+    private Button? _dismissSelectedExternalButton;
+
+    public MainWindow()
+    {
+        InitializeComponent();
+
+        _closeHistoryTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(520)
+        };
+        _closeHistoryTimer.Tick += (_, _) =>
+        {
+            _closeHistoryTimer.Stop();
+            ViewModel?.CloseHistory();
+        };
+
+        WorkbenchThemeResources.Apply(this, "empty");
+    }
+
+    private WorkbenchViewModel? ViewModel => DataContext as WorkbenchViewModel;
+
+    protected override void OnOpened(EventArgs e)
+    {
+        base.OnOpened(e);
+        AttachViewModelHandler();
+        ApplySelectedTheme();
+        RefreshWindowTitle();
+        RefreshProjectInfoHeader();
+        ScheduleUiPolish();
+        FitToWorkingArea();
+    }
+
+    protected override void OnDataContextChanged(EventArgs e)
+    {
+        base.OnDataContextChanged(e);
+        AttachViewModelHandler();
+        ApplySelectedTheme();
+        RefreshWindowTitle();
+        RefreshProjectInfoHeader();
+        ScheduleUiPolish();
+    }
+
+    private async void OnOpenProjectClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        await PickAndLoadProjectAsync("Open Project");
+    }
+
+    private async void OnNewProjectClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        await PickAndLoadProjectAsync("Add Project");
+    }
+
+    private void OnSettingsClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if (ViewModel is null)
+        {
+            return;
+        }
+
+        if (_themeSettingsWindow is null)
+        {
+            _themeSettingsWindow = new ThemeSettingsWindow
+            {
+                DataContext = ViewModel
+            };
+            _themeSettingsWindow.Closed += (_, _) => _themeSettingsWindow = null;
+        }
+
+        _themeSettingsWindow.ApplyTheme(ViewModel.ThemeKey);
+        if (!_themeSettingsWindow.IsVisible)
+        {
+            _themeSettingsWindow.Show(this);
+        }
+
+        _themeSettingsWindow.Activate();
+    }
+
+    private async Task PickAndLoadProjectAsync(string title)
+    {
+        var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            Title = title,
+            AllowMultiple = false
+        });
+
+        var folder = folders.Count > 0 ? folders[0].TryGetLocalPath() : null;
+        if (string.IsNullOrWhiteSpace(folder) || ViewModel is null)
+        {
+            return;
+        }
+
+        await ViewModel.LoadProjectAsync(folder);
+        ResetProjectInfoHeaderBinding();
+        RefreshWindowTitle();
+        RefreshProjectInfoHeader();
+        ScheduleUiPolish();
+    }
+
+    private void OnKeyDown(object? sender, KeyEventArgs e)
+    {
+        _closeHistoryTimer.Stop();
+        ViewModel?.ScanExternalChangesNow();
+        RefreshProjectInfoHeader();
+        ScheduleUiPolish();
+    }
+
+    private void OnWorkspacePointerMoved(object? sender, PointerEventArgs e)
+    {
+        _closeHistoryTimer.Stop();
+    }
+
+    private void AttachViewModelHandler()
+    {
+        if (ReferenceEquals(_subscribedViewModel, ViewModel))
+        {
+            return;
+        }
+
+        if (_subscribedViewModel is not null)
+        {
+            _subscribedViewModel.PropertyChanged -= OnViewModelPropertyChanged;
+            _subscribedViewModel.ExternalChanges.CollectionChanged -= OnExternalChangesCollectionChanged;
+        }
+
+        _subscribedViewModel = ViewModel;
+        if (_subscribedViewModel is not null)
+        {
+            _subscribedViewModel.PropertyChanged += OnViewModelPropertyChanged;
+            _subscribedViewModel.ExternalChanges.CollectionChanged += OnExternalChangesCollectionChanged;
+        }
+    }
+
+    private void OnExternalChangesCollectionChanged(object? sender, NotifyCollectionChangedEventArgs e)
+    {
+        RefreshWindowTitle();
+        RefreshProjectInfoHeader();
+    }
+
+    private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName == nameof(WorkbenchViewModel.ThemeKey))
+        {
+            ApplySelectedTheme();
+        }
+
+        if (e.PropertyName == nameof(WorkbenchViewModel.ExternalQueueTitle)
+            || e.PropertyName == nameof(WorkbenchViewModel.HasExternalChanges)
+            || e.PropertyName == nameof(WorkbenchViewModel.CurrentProject))
+        {
+            if (e.PropertyName == nameof(WorkbenchViewModel.CurrentProject))
+            {
+                ResetProjectInfoHeaderBinding();
+            }
+
+            RefreshWindowTitle();
+            RefreshProjectInfoHeader();
+        }
+    }
+
+    private void ApplySelectedTheme()
+    {
+        var key = ViewModel?.ThemeKey ?? "empty";
+        WorkbenchThemeResources.Apply(this, key);
+        _themeSettingsWindow?.ApplyTheme(key);
+    }
+
+    private void RefreshWindowTitle()
+    {
+        var projectName = ViewModel?.CurrentProject?.Name;
+        var queueLabel = ViewModel?.HasExternalChanges == true
+            ? $" - {ViewModel.ExternalQueueTitle}"
+            : "";
+        Title = string.IsNullOrWhiteSpace(projectName)
+            ? $"Context Control{queueLabel}"
+            : $"Context Control - {projectName}{queueLabel}";
+    }
+
+    private void RefreshProjectInfoHeader()
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            var viewModel = ViewModel;
+            if (viewModel is null || !viewModel.HasExternalChanges)
+            {
+                RestoreProjectInfoHeader();
+                HideExternalHeaderButtons();
+                return;
+            }
+
+            var host = _projectInfoHost ?? FindProjectInfoHost();
+            if (host is null)
+            {
+                // Do not add another floating update window. If the exact project-info
+                // card cannot be found, keep the window title as the fallback signal.
+                HideExternalHeaderButtons();
+                return;
+            }
+
+            _projectInfoHost = host;
+            EnsureExternalHeaderButtonsNear(host);
+            SetProjectInfoHostContent(host, BuildExternalHeaderContent(viewModel));
+            ScheduleUiPolish();
+        });
+    }
+
+    private void ResetProjectInfoHeaderBinding()
+    {
+        RestoreProjectInfoHeader();
+        _projectInfoHost = null;
+        _externalHeaderContentRoot = null;
+        _externalHeaderQueueItems = null;
+        HideExternalHeaderButtons();
+    }
+
+    private void RestoreProjectInfoHeader()
+    {
+        if (!_projectInfoCaptured || _projectInfoHost is null)
+        {
+            return;
+        }
+
+        if (_projectInfoHost is Border border)
+        {
+            border.Child = _projectInfoOriginalContent as Control;
+        }
+        else if (_projectInfoHost is ContentControl contentControl)
+        {
+            contentControl.Content = _projectInfoOriginalContent;
+        }
+        else if (_projectInfoHost is Panel panel && _projectInfoOriginalChildren is not null)
+        {
+            panel.Children.Clear();
+            foreach (var child in _projectInfoOriginalChildren)
+            {
+                panel.Children.Add(child);
+            }
+        }
+
+        _projectInfoCaptured = false;
+        _projectInfoOriginalContent = null;
+        _projectInfoOriginalChildren = null;
+        _externalHeaderContentRoot = null;
+        _externalHeaderQueueItems = null;
+    }
+
+    private void CaptureProjectInfoHeader(Control host)
+    {
+        if (_projectInfoCaptured && ReferenceEquals(_projectInfoHost, host))
+        {
+            return;
+        }
+
+        if (_projectInfoCaptured)
+        {
+            RestoreProjectInfoHeader();
+        }
+
+        _projectInfoHost = host;
+        _projectInfoCaptured = true;
+        _projectInfoOriginalContent = null;
+        _projectInfoOriginalChildren = null;
+
+        if (host is Border border)
+        {
+            _projectInfoOriginalContent = border.Child;
+        }
+        else if (host is ContentControl contentControl)
+        {
+            _projectInfoOriginalContent = contentControl.Content;
+        }
+        else if (host is Panel panel)
+        {
+            _projectInfoOriginalChildren = panel.Children.OfType<Control>().ToList();
+        }
+    }
+
+    private void SetProjectInfoHostContent(Control host, Control content)
+    {
+        CaptureProjectInfoHeader(host);
+
+        if (host is Border border)
+        {
+            border.Child = content;
+        }
+        else if (host is ContentControl contentControl)
+        {
+            contentControl.Content = content;
+        }
+        else if (host is Panel panel)
+        {
+            panel.Children.Clear();
+            panel.Children.Add(content);
+        }
+    }
+
+    private Control? FindProjectInfoHost()
+    {
+        var viewModel = ViewModel;
+        var project = viewModel?.CurrentProject;
+        if (project is null)
+        {
+            return null;
+        }
+
+        var tokenTexts = new[]
+            {
+                project.Name,
+                project.Location,
+                project.FileCount,
+                project.DirectoryCount,
+                project.Commit
+            }
+            .Where(text => !string.IsNullOrWhiteSpace(text))
+            .ToArray();
+
+        if (tokenTexts.Length == 0)
+        {
+            return null;
+        }
+
+        var projectNameBlock = this.GetVisualDescendants()
+            .OfType<TextBlock>()
+            .FirstOrDefault(block => string.Equals((block.Text ?? string.Empty).Trim(), project.Name, StringComparison.OrdinalIgnoreCase));
+
+        if (projectNameBlock is not null)
+        {
+            foreach (var ancestor in projectNameBlock.GetVisualAncestors().OfType<Control>())
+            {
+                if (ReferenceEquals(ancestor, this))
+                {
+                    break;
+                }
+
+                var score = CountProjectInfoTokens(ancestor, tokenTexts);
+                if (score >= Math.Min(3, tokenTexts.Length))
+                {
+                    return PreferCardContainer(ancestor);
+                }
+            }
+        }
+
+        return this.GetVisualDescendants()
+            .OfType<Control>()
+            .Where(control => control is Border or ContentControl or Panel)
+            .Select(control => new { Control = control, Score = CountProjectInfoTokens(control, tokenTexts) })
+            .Where(item => item.Score >= Math.Min(3, tokenTexts.Length))
+            .OrderBy(item => EstimateVisualArea(item.Control))
+            .Select(item => PreferCardContainer(item.Control))
+            .FirstOrDefault();
+    }
+
+    private static Control PreferCardContainer(Control control)
+    {
+        // When the token match lands on an inner StackPanel, prefer its card-like
+        // parent so the existing project-info window is replaced as a unit.
+        var parent = control.GetVisualAncestors().OfType<Border>().FirstOrDefault();
+        return parent ?? control;
+    }
+
+    private static int CountProjectInfoTokens(Control root, IReadOnlyList<string> tokens)
+    {
+        var texts = root.GetVisualDescendants()
+            .OfType<TextBlock>()
+            .Select(block => (block.Text ?? string.Empty).Trim())
+            .Where(text => !string.IsNullOrWhiteSpace(text))
+            .ToArray();
+
+        return tokens.Count(token => texts.Any(text => string.Equals(text, token, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static double EstimateVisualArea(Control control)
+    {
+        var width = Math.Max(1, control.Bounds.Width);
+        var height = Math.Max(1, control.Bounds.Height);
+        return width * height;
+    }
+
+    private Control BuildExternalHeaderContent(WorkbenchViewModel viewModel)
+    {
+        _externalHeaderQueueItems = new StackPanel
+        {
+            Spacing = 2
+        };
+
+        foreach (var item in viewModel.ExternalChanges)
+        {
+            _externalHeaderQueueItems.Children.Add(CreateExternalQueueRow(item));
+        }
+
+        _externalHeaderContentRoot = new Grid
+        {
+            RowDefinitions = new RowDefinitions("Auto,*"),
+            MinWidth = 360,
+            MaxWidth = 560,
+            Children =
+            {
+                new TextBlock
+                {
+                    Text = "Update detected",
+                    FontWeight = FontWeight.SemiBold,
+                    FontSize = 13,
+                    TextTrimming = TextTrimming.CharacterEllipsis,
+                    Margin = new Thickness(0, 0, 0, 4)
+                },
+                new ScrollViewer
+                {
+                    MaxHeight = 82,
+                    VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                    HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+                    Content = _externalHeaderQueueItems
+                }
+            }
+        };
+        Grid.SetRow(((Grid)_externalHeaderContentRoot).Children[1], 1);
+        return _externalHeaderContentRoot;
+    }
+
+    private void EnsureExternalHeaderButtonsNear(Control host)
+    {
+        if (_externalHeaderButtons is null)
+        {
+            _externalHeaderButtons = CreateExternalHeaderButtons();
+        }
+
+        var targetParent = host.Parent as Panel;
+        if (targetParent is null)
+        {
+            _externalHeaderButtons.IsVisible = false;
+            return;
+        }
+
+        if (_externalHeaderButtons.Parent is Panel currentParent && !ReferenceEquals(currentParent, targetParent))
+        {
+            currentParent.Children.Remove(_externalHeaderButtons);
+        }
+
+        if (!targetParent.Children.Contains(_externalHeaderButtons))
+        {
+            var hostIndex = targetParent.Children.IndexOf(host);
+            targetParent.Children.Insert(hostIndex >= 0 ? hostIndex : targetParent.Children.Count, _externalHeaderButtons);
+        }
+
+        _externalHeaderButtons.IsVisible = true;
+        RefreshExternalHeaderButtonState();
+    }
+
+    private StackPanel CreateExternalHeaderButtons()
+    {
+        _infoExternalButton = CreateHeaderUtilityButton("I");
+        ToolTip.SetTip(_infoExternalButton, "Project file rules: supported and ignored file types.");
+        _infoExternalButton.Click += (_, _) => ShowExternalInfoInTitle();
+
+        _scanExternalButton = CreateHeaderUtilityButton("UPD");
+        ToolTip.SetTip(_scanExternalButton, "Force-scan the selected project for external saves.");
+        _scanExternalButton.Click += (_, _) =>
+        {
+            ViewModel?.ScanExternalChangesNow();
+            RefreshProjectInfoHeader();
+            ScheduleUiPolish();
+        };
+
+        _acceptAllExternalButton = CreateHeaderActionButton("All");
+        ToolTip.SetTip(_acceptAllExternalButton, "Accept all queued external version updates.");
+        _acceptAllExternalButton.Click += (_, _) =>
+        {
+            ExecuteExternalCommand(ViewModel?.AcceptAllExternalChangesCommand);
+            RefreshProjectInfoHeader();
+        };
+
+        _acceptSelectedExternalButton = CreateHeaderActionButton("Sel");
+        ToolTip.SetTip(_acceptSelectedExternalButton, "Accept checked external version updates.");
+        _acceptSelectedExternalButton.Click += (_, _) =>
+        {
+            ExecuteExternalCommand(ViewModel?.AcceptSelectedExternalChangesCommand);
+            RefreshProjectInfoHeader();
+        };
+
+        _dismissSelectedExternalButton = CreateHeaderActionButton("Drop");
+        ToolTip.SetTip(_dismissSelectedExternalButton, "Dismiss checked external version updates.");
+        _dismissSelectedExternalButton.Click += (_, _) =>
+        {
+            ExecuteExternalCommand(ViewModel?.DismissSelectedExternalChangesCommand);
+            RefreshProjectInfoHeader();
+        };
+
+        return new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Top,
+            Spacing = 4,
+            Margin = new Thickness(0, 0, 8, 0),
+            IsVisible = false,
+            Children =
+            {
+                _infoExternalButton,
+                _scanExternalButton,
+                _acceptAllExternalButton,
+                _acceptSelectedExternalButton,
+                _dismissSelectedExternalButton
+            }
+        };
+    }
+
+    private void HideExternalHeaderButtons()
+    {
+        if (_externalHeaderButtons is not null)
+        {
+            _externalHeaderButtons.IsVisible = false;
+        }
+    }
+
+    private void RefreshExternalHeaderButtonState()
+    {
+        var hasChanges = ViewModel?.HasExternalChanges == true;
+        if (_infoExternalButton is not null)
+        {
+            _infoExternalButton.IsEnabled = ViewModel is not null;
+        }
+
+        if (_scanExternalButton is not null)
+        {
+            _scanExternalButton.IsEnabled = ViewModel is not null;
+        }
+
+        if (_acceptAllExternalButton is not null)
+        {
+            _acceptAllExternalButton.IsEnabled = hasChanges;
+        }
+
+        if (_acceptSelectedExternalButton is not null)
+        {
+            _acceptSelectedExternalButton.IsEnabled = hasChanges;
+        }
+
+        if (_dismissSelectedExternalButton is not null)
+        {
+            _dismissSelectedExternalButton.IsEnabled = hasChanges;
+        }
+    }
+
+    private static Button CreateHeaderUtilityButton(string text)
+    {
+        return new Button
+        {
+            Content = text,
+            MinWidth = text.Length <= 1 ? 26 : 40,
+            Height = 23,
+            Padding = new Thickness(7, 1),
+            FontSize = 11,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center
+        };
+    }
+
+    private static Button CreateHeaderActionButton(string text)
+    {
+        return new Button
+        {
+            Content = text,
+            MinWidth = text.Length <= 3 ? 36 : 46,
+            Height = 23,
+            Padding = new Thickness(7, 1),
+            FontSize = 11,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center
+        };
+    }
+
+    private void ShowExternalInfoInTitle()
+    {
+        var viewModel = ViewModel;
+        if (viewModel is null)
+        {
+            return;
+        }
+
+        var supported = string.IsNullOrWhiteSpace(viewModel.SupportedFileTypesLabel)
+            ? "supported: default source files"
+            : viewModel.SupportedFileTypesLabel;
+        var ignored = string.IsNullOrWhiteSpace(viewModel.IgnoredFileTypesLabel)
+            ? "ignored: generated/snapshot/binary files"
+            : viewModel.IgnoredFileTypesLabel;
+        Title = $"Context Control - {viewModel.CurrentProject?.Name ?? "project"} - {supported} | {ignored}";
+    }
+
+    private static void ExecuteExternalCommand(System.Windows.Input.ICommand? command)
+    {
+        if (command?.CanExecute(null) == true)
+        {
+            command.Execute(null);
+        }
+    }
+
+    private Control CreateExternalQueueRow(ExternalChangeItemViewModel item)
+    {
+        var check = new CheckBox
+        {
+            IsChecked = item.IsSelected,
+            Width = 20,
+            Height = 20,
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            HorizontalContentAlignment = HorizontalAlignment.Center,
+            VerticalContentAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 5, 0)
+        };
+        check.IsCheckedChanged += (_, _) =>
+        {
+            item.IsSelected = check.IsChecked == true;
+            RefreshProjectInfoHeader();
+        };
+
+        var fileName = new TextBlock
+        {
+            Text = item.FileName,
+            FontWeight = FontWeight.SemiBold,
+            Width = 138,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        ToolTip.SetTip(fileName, item.RelativePath);
+
+        var flow = new TextBlock
+        {
+            Text = item.VersionFlow,
+            Width = 86,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            Opacity = item.IsSelected ? 0.86 : 0.55,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        var added = new TextBlock
+        {
+            Text = item.AddedLabel,
+            Foreground = PositiveBrush,
+            Width = 42,
+            TextAlignment = TextAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        var removed = new TextBlock
+        {
+            Text = item.RemovedLabel,
+            Foreground = NegativeBrush,
+            Width = 42,
+            TextAlignment = TextAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        var date = new TextBlock
+        {
+            Text = item.Date,
+            Width = 118,
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            Opacity = 0.62,
+            FontSize = 11,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        return new Border
+        {
+            Padding = new Thickness(3, 1),
+            CornerRadius = new CornerRadius(5),
+            Background = item.IsSelected ? QueueRowSelectedBrush : QueueRowSkippedBrush,
+            Child = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                VerticalAlignment = VerticalAlignment.Center,
+                Children =
+                {
+                    check,
+                    fileName,
+                    flow,
+                    added,
+                    removed,
+                    date
+                }
+            }
+        };
+    }
+
+    private void ScheduleUiPolish()
+    {
+        Dispatcher.UIThread.Post(() =>
+        {
+            CenterSettingsButtons();
+            ColorizeSignedDeltaTextBlocks();
+        });
+    }
+
+    private void CenterSettingsButtons()
+    {
+        foreach (var button in this.GetVisualDescendants().OfType<Button>())
+        {
+            var label = GetButtonSearchText(button);
+            if (!label.Contains("settings", StringComparison.OrdinalIgnoreCase)
+                && !label.Contains("cog", StringComparison.OrdinalIgnoreCase)
+                && !label.Contains("gear", StringComparison.OrdinalIgnoreCase)
+                && !label.Contains("⚙", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            button.HorizontalContentAlignment = HorizontalAlignment.Center;
+            button.VerticalContentAlignment = VerticalAlignment.Center;
+            if (button.Padding.Left > 0 || button.Padding.Top > 0 || button.Padding.Right > 0 || button.Padding.Bottom > 0)
+            {
+                button.Padding = new Thickness(Math.Min(button.Padding.Left, 6), Math.Min(button.Padding.Top, 4), Math.Min(button.Padding.Right, 6), Math.Min(button.Padding.Bottom, 4));
+            }
+        }
+    }
+
+    private static string GetButtonSearchText(Button button)
+    {
+        var classText = button.Classes.Count == 0 ? "" : string.Join(" ", button.Classes);
+        return $"{button.Name} {classText} {button.Content}";
+    }
+
+    private void ColorizeSignedDeltaTextBlocks()
+    {
+        foreach (var textBlock in this.GetVisualDescendants().OfType<TextBlock>())
+        {
+            var text = (textBlock.Text ?? string.Empty).Trim();
+            if (LooksLikePositiveDelta(text))
+            {
+                textBlock.Foreground = PositiveBrush;
+            }
+            else if (LooksLikeNegativeDelta(text))
+            {
+                textBlock.Foreground = NegativeBrush;
+            }
+        }
+    }
+
+    private static bool LooksLikePositiveDelta(string text)
+    {
+        return text.Length > 1 && text[0] == '+' && text.Skip(1).Any(char.IsDigit);
+    }
+
+    private static bool LooksLikeNegativeDelta(string text)
+    {
+        return text.Length > 1 && text[0] == '-' && text.Skip(1).Any(char.IsDigit);
+    }
+
+    private void OnProjectTreeSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        if (ViewModel is null || e.AddedItems.Count == 0)
+        {
+            return;
+        }
+
+        if (e.AddedItems[0] is TreeRowViewModel row)
+        {
+            ViewModel.SelectedTreeRow = row;
+            ScheduleUiPolish();
+        }
+    }
+
+    private void OnProjectTreeRowPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (ViewModel is null || sender is not Control { DataContext: TreeRowViewModel row })
+        {
+            return;
+        }
+
+        ViewModel.SelectTreeRow(row, e.ClickCount >= 2);
+        ScheduleUiPolish();
+    }
+
+    private void OnHistoryVersionPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (ViewModel is null || sender is not Control { DataContext: VersionEntryViewModel version })
+        {
+            return;
+        }
+
+        ViewModel.OpenVersionFromHistory(version);
+        ScheduleUiPolish();
+        e.Handled = true;
+    }
+
+    private static bool ContainsPointer(Control control, PointerEventArgs e)
+    {
+        var point = e.GetPosition(control);
+        return point.X >= 0
+            && point.Y >= 0
+            && point.X <= control.Bounds.Width
+            && point.Y <= control.Bounds.Height;
+    }
+
+    private void FitToWorkingArea()
+    {
+        var screen = Screens.ScreenFromWindow(this) ?? Screens.Primary;
+        if (screen is null)
+        {
+            return;
+        }
+
+        var usableHeight = Math.Max(MinHeight, (screen.WorkingArea.Height / screen.Scaling) - 18);
+        MaxHeight = usableHeight;
+        if (Height > usableHeight)
+        {
+            Height = usableHeight;
+        }
+
+        var widthPixels = (int)Math.Ceiling(Math.Max(Width, MinWidth) * screen.Scaling);
+        var heightPixels = (int)Math.Ceiling(Height * screen.Scaling);
+        var maxX = Math.Max(screen.WorkingArea.X, screen.WorkingArea.X + screen.WorkingArea.Width - widthPixels);
+        var maxY = Math.Max(screen.WorkingArea.Y, screen.WorkingArea.Y + screen.WorkingArea.Height - heightPixels);
+        Position = new PixelPoint(
+            Math.Clamp(Position.X, screen.WorkingArea.X, maxX),
+            Math.Clamp(Position.Y, screen.WorkingArea.Y, maxY));
+    }
+}

@@ -1,0 +1,74 @@
+[1/213] Checking the git repository for changes...
+[2/175] Building CXX object overlay/CMakeFiles/overlay.dir/overlay-peers.cpp.o
+FAILED: [code=1] overlay/CMakeFiles/overlay.dir/overlay-peers.cpp.o 
+ccache /usr/bin/g++-14 -DSODIUM_STATIC -DTDDB_USE_ROCKSDB -D_FILE_OFFSET_BITS=64 -D_INTERNAL_COMPILE=1 -D_TONLIB_COMPILE=1 -I/home/a1/ton-testnet-current/overlay -I/home/a1/ton-testnet-current/overlay/.. -I/home/a1/ton-testnet-current/tdutils -I/home/a1/ton-testnet-current/build/tdutils -I/home/a1/ton-testnet-current/tdactor -I/home/a1/ton-testnet-current/adnl/.. -I/home/a1/ton-testnet-current/crypto -I/home/a1/ton-testnet-current/crypto/.. -I/home/a1/ton-testnet-current/build/third-party/secp256k1/include -I/home/a1/ton-testnet-current/build/third-party/sodium/include -I/home/a1/ton-testnet-current/tddb -I/home/a1/ton-testnet-current/crypto/block -I/home/a1/ton-testnet-current/tl -I/home/a1/ton-testnet-current/tl/.. -I/home/a1/ton-testnet-current/tl/../crypto -I/home/a1/ton-testnet-current/tl/generate -I/home/a1/ton-testnet-current/tdnet -I/home/a1/ton-testnet-current/third-party/rocksdb/include -I/home/a1/ton-testnet-current/keys/.. -I/home/a1/ton-testnet-current/tl-utils/.. -I/home/a1/ton-testnet-current/keyring/.. -I/home/a1/ton-testnet-current/common -I/home/a1/ton-testnet-current/common/.. -I/home/a1/ton-testnet-current/dht -I/home/a1/ton-testnet-current/dht/.. -I/home/a1/ton-testnet-current/fec -I/home/a1/ton-testnet-current/fec/.. -I/home/a1/ton-testnet-current/tdfec -I/home/a1/ton-testnet-current/tdfec/.. -isystem /home/a1/ton-testnet-current/build/third-party/openssl/include -isystem /home/a1/ton-testnet-current/third-party/abseil-cpp -march=native -fstrong-eval-order=some -fno-omit-frame-pointer -ffunction-sections -fdata-sections -O3 -DNDEBUG -std=c++20 -fPIC -fdiagnostics-color=always -Wall -Wextra -Wpointer-arith -Wcast-qual -Wsign-compare -Wvla -Wnon-virtual-dtor -Wconversion -Wno-tautological-compare -Wno-unused-parameter -Wno-sign-conversion -Wno-unused-private-field -Wno-redundant-move -Wimplicit-fallthrough=2 -Wduplicated-branches -Wduplicated-cond -Walloc-zero -Wlogical-op -MD -MT overlay/CMakeFiles/overlay.dir/overlay-peers.cpp.o -MF overlay/CMakeFiles/overlay.dir/overlay-peers.cpp.o.d -o overlay/CMakeFiles/overlay.dir/overlay-peers.cpp.o -c /home/a1/ton-testnet-current/overlay/overlay-peers.cpp
+In file included from /home/a1/ton-testnet-current/tddb/td/db/KeyValue.h:24,
+                 from /home/a1/ton-testnet-current/tddb/td/db/KeyValueAsync.h:24,
+                 from /home/a1/ton-testnet-current/overlay/../overlay/overlay-manager.h:27,
+                 from /home/a1/ton-testnet-current/overlay/../overlay/overlay.h:27,
+                 from /home/a1/ton-testnet-current/overlay/broadcast-fec.hpp:27,
+                 from /home/a1/ton-testnet-current/overlay/overlay.hpp:47,
+                 from /home/a1/ton-testnet-current/overlay/overlay-peers.cpp:29:
+/home/a1/ton-testnet-current/overlay/../overlay/overlay-id.hpp: In lambda function:
+/home/a1/ton-testnet-current/tdutils/td/utils/ThreadSafeCounter.h:243:99: warning: missing initializer for member ‘td::NamedPerfCounter::ScopedPerfCounterRef::td::NoCopyOrMove’ [-Wmissing-field-initializers]
+  243 |   auto scoped_perf_##name = td::NamedPerfCounter::ScopedPerfCounterRef{.perf_counter = perf_##name};
+      |                                                                                                   ^
+/home/a1/ton-testnet-current/overlay/../overlay/overlay-id.hpp:81:11: note: in expansion of macro ‘TD_PERF_COUNTER’
+   81 |           TD_PERF_COUNTER(check_signature_overlay_node);
+      |           ^~~~~~~~~~~~~~~
+/home/a1/ton-testnet-current/overlay/overlay-peers.cpp: In member function ‘td::Status ton::overlay::OverlayImpl::validate_peer_certificate(const ton::adnl::AdnlNodeIdShort&, const ton::overlay::OverlayMemberCertificate&, bool)’:
+/home/a1/ton-testnet-current/tdutils/td/utils/ThreadSafeCounter.h:243:99: warning: missing initializer for member ‘td::NamedPerfCounter::ScopedPerfCounterRef::td::NoCopyOrMove’ [-Wmissing-field-initializers]
+  243 |   auto scoped_perf_##name = td::NamedPerfCounter::ScopedPerfCounterRef{.perf_counter = perf_##name};
+      |                                                                                                   ^
+/home/a1/ton-testnet-current/overlay/overlay-peers.cpp:147:5: note: in expansion of macro ‘TD_PERF_COUNTER’
+  147 |     TD_PERF_COUNTER(check_signature_overlay_member_certificate);
+      |     ^~~~~~~~~~~~~~~
+/home/a1/ton-testnet-current/overlay/overlay-peers.cpp: In member function ‘td::actor::Task<td::Unit> ton::overlay::OverlayImpl::process_pending_peer(ton::overlay::OverlayNode)’:
+/home/a1/ton-testnet-current/overlay/overlay-peers.cpp:286:18: error: call of overloaded ‘return_value(<brace-enclosed initializer list>)’ is ambiguous
+  286 |       co_return {};
+      |                  ^
+In file included from /home/a1/ton-testnet-current/tdactor/td/actor/coro_utils.h:10,
+                 from /home/a1/ton-testnet-current/tddb/td/db/KeyValueAsync.h:23:
+/home/a1/ton-testnet-current/tdactor/td/actor/coro_task.h:147:8: note: candidate: ‘void td::actor::promise_value<ResultT>::return_value(ExternalResult&&) [with ResultT = td::Result<td::Unit>]’
+  147 |   void return_value(ExternalResult&&) noexcept {
+      |        ^~~~~~~~~~~~
+/home/a1/ton-testnet-current/tdactor/td/actor/coro_task.h:172:8: note: candidate: ‘void td::actor::promise_type<T>::return_value(T) [with T = td::Unit]’
+  172 |   void return_value(T v) noexcept {
+      |        ^~~~~~~~~~~~
+/home/a1/ton-testnet-current/overlay/overlay-peers.cpp:291:14: error: call of overloaded ‘return_value(<brace-enclosed initializer list>)’ is ambiguous
+  291 |   co_return {};
+      |              ^
+/home/a1/ton-testnet-current/tdactor/td/actor/coro_task.h:147:8: note: candidate: ‘void td::actor::promise_value<ResultT>::return_value(ExternalResult&&) [with ResultT = td::Result<td::Unit>]’
+  147 |   void return_value(ExternalResult&&) noexcept {
+      |        ^~~~~~~~~~~~
+/home/a1/ton-testnet-current/tdactor/td/actor/coro_task.h:172:8: note: candidate: ‘void td::actor::promise_type<T>::return_value(T) [with T = td::Unit]’
+  172 |   void return_value(T v) noexcept {
+      |        ^~~~~~~~~~~~
+At global scope:
+cc1plus: note: unrecognized command-line option ‘-Wno-unused-private-field’ may have been intended to silence earlier diagnostics
+[3/175] Building CXX object overlay/CMakeFiles/overlay.dir/overlay.cpp.o
+In file included from /home/a1/ton-testnet-current/tddb/td/db/KeyValue.h:24,
+                 from /home/a1/ton-testnet-current/tddb/td/db/KeyValueAsync.h:24,
+                 from /home/a1/ton-testnet-current/overlay/../overlay/overlay-manager.h:27,
+                 from /home/a1/ton-testnet-current/overlay/../overlay/overlay.h:27,
+                 from /home/a1/ton-testnet-current/overlay/broadcast-fec.hpp:27,
+                 from /home/a1/ton-testnet-current/overlay/overlay.hpp:47,
+                 from /home/a1/ton-testnet-current/overlay/overlay.cpp:32:
+/home/a1/ton-testnet-current/overlay/../overlay/overlay-id.hpp: In lambda function:
+/home/a1/ton-testnet-current/tdutils/td/utils/ThreadSafeCounter.h:243:99: warning: missing initializer for member ‘td::NamedPerfCounter::ScopedPerfCounterRef::td::NoCopyOrMove’ [-Wmissing-field-initializers]
+  243 |   auto scoped_perf_##name = td::NamedPerfCounter::ScopedPerfCounterRef{.perf_counter = perf_##name};
+      |                                                                                                   ^
+/home/a1/ton-testnet-current/overlay/../overlay/overlay-id.hpp:81:11: note: in expansion of macro ‘TD_PERF_COUNTER’
+   81 |           TD_PERF_COUNTER(check_signature_overlay_node);
+      |           ^~~~~~~~~~~~~~~
+/home/a1/ton-testnet-current/overlay/overlay.cpp: In member function ‘ton::overlay::BroadcastCheckResult ton::overlay::OverlayImpl::check_source_eligible(const ton::PublicKeyHash&, const ton::overlay::Certificate*, td::uint32, bool, ton::adnl::AdnlNodeIdShort)’:
+/home/a1/ton-testnet-current/tdutils/td/utils/ThreadSafeCounter.h:243:99: warning: missing initializer for member ‘td::NamedPerfCounter::ScopedPerfCounterRef::td::NoCopyOrMove’ [-Wmissing-field-initializers]
+  243 |   auto scoped_perf_##name = td::NamedPerfCounter::ScopedPerfCounterRef{.perf_counter = perf_##name};
+      |                                                                                                   ^
+/home/a1/ton-testnet-current/overlay/overlay.cpp:600:9: note: in expansion of macro ‘TD_PERF_COUNTER’
+  600 |         TD_PERF_COUNTER(check_signature_overlay_certificate);
+      |         ^~~~~~~~~~~~~~~
+At global scope:
+cc1plus: note: unrecognized command-line option ‘-Wno-unused-private-field’ may have been intended to silence earlier diagnostics
+ninja: build stopped: subcommand failed.
+PS1_NAT_BUILD_RC=1

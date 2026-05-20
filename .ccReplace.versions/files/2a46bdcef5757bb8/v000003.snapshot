@@ -1,0 +1,71 @@
+// GPT-DESC: Resolves baked material words for runtime edited terrain faces.
+#include "TerrainEditMesherInternal.h"
+
+namespace TerrainEdit {
+namespace {
+
+uint32_t textureResolutionLog2(uint16_t pixelsPerVoxel) {
+    const uint16_t clamped = static_cast<uint16_t>(std::clamp<int>(pixelsPerVoxel, 2, 1024));
+    uint32_t log2 = 1u;
+    uint32_t value = 2u;
+    while (value < clamped && log2 < 10u) {
+        value <<= 1u;
+        ++log2;
+    }
+    return log2;
+}
+
+} // namespace
+
+uint32_t MesherInternal::packTexturePaintMaterial(uint8_t type,
+                                                  uint8_t variant,
+                                                  uint8_t edgeMask,
+                                                  uint16_t pixelsPerVoxel) {
+    (void)variant;
+
+    constexpr uint32_t MATERIAL_PACKED_BIT = 0x80000000u;
+    constexpr uint32_t MATERIAL_LAYOUT_V2_BIT = 0x00001000u;
+
+    // Performance-critical: baked Vertex::material participates in greedy
+    // mesh merging. The texture design must get its pixel variation from the
+    // shader's world/voxel hash, not from a per-face baked variant value.
+    // Packing tex.getVariant() here makes adjacent painted faces differ even
+    // when they have the same texture type, edge style, and resolution; that
+    // explodes the mesh into tiny quads and makes the sun shadow depth pass
+    // rerender far too much geometry while moving.
+    constexpr uint32_t kMergeStableVariant = 0u;
+
+    const uint32_t resLog2 = textureResolutionLog2(pixelsPerVoxel);
+    return MATERIAL_PACKED_BIT |
+           MATERIAL_LAYOUT_V2_BIT |
+           (static_cast<uint32_t>(type) & 0x7u) |
+           ((kMergeStableVariant & 0x7u) << 3u) |
+           ((static_cast<uint32_t>(edgeMask) & 0x3u) << 6u) |
+           ((resLog2 & 0xFu) << 8u);
+}
+
+uint32_t MesherInternal::canonicalBlockMaterial(int wx, int wy, int wz, uint8_t face,
+                                       uint16_t pixelsPerVoxel)
+{
+    (void)wx;
+    (void)wy;
+    (void)wz;
+    (void)face;
+    (void)pixelsPerVoxel;
+
+    // IMPORTANT: 0 means "use the terrain shader's normal/default material path".
+    // Do not synthesize grass/mud/drysand/sand/dirt here for unpainted faces.
+    //
+    // Texture-paint material rebakes rebuild whole chunks. If every unpainted
+    // face receives a packed material word, partially-brush-touched chunks get
+    // their default terrain material replaced too, which is the visible
+    // "textures around the brush changed" bug. Painted faces still return a
+    // packed material from sampleFaceMaterial(); unpainted faces must stay 0 so
+    // the baked mesh renders exactly like normal terrain outside the brush.
+    return 0u;
+}
+
+// ---------------------------------------------------------------------------
+// AO (matches the offline tool: side + corner heuristic)
+
+} // namespace TerrainEdit

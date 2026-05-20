@@ -1,0 +1,507 @@
+// WorldChunkCRUD.cpp — Chunk creation, destruction, reset, terrain switching
+// Extracted from World.cpp to reduce god-file size without changing behavior.
+
+#include "world/World.h"
+#include "world/chunks/core/Chunk.h"
+#include "world/chunks/core/ChunkManager.h"
+#include "world/config/WorldConfig.h"
+#include "world/chunks/core/ChunkJobs.h"
+#include "physics/PhysicsWorld.h"
+#include "vulkan/BufferSuballocator.h"
+#include "rendering/culling/GPUCullingSystem.h"
+#include <iostream>
+#include <algorithm>
+#include <filesystem>
+
+// Helper: Calculate chunk AABB from chunk coordinate (same as in World.cpp)
+static AABB calculateChunkAABB(const glm::ivec3& chunkCoord) {
+    glm::vec3 minWorld = WorldConfig::microVoxelToWorld(WorldConfig::chunkToMicroVoxel(chunkCoord));
+    glm::vec3 maxWorld = minWorld + glm::vec3(WorldConfig::CHUNK_SIZE_M, WorldConfig::CHUNK_HEIGHT_M, WorldConfig::CHUNK_SIZE_M);
+    return AABB{minWorld, maxWorld};
+}
+
+entt::entity World::createChunk(const glm::ivec3& chunkCoord) {
+    // Check if chunk already exists
+    entt::entity existing = findChunk(chunkCoord);
+    if (existing != entt::null) {
+        return existing;
+    }
+
+    int desiredLod = getDesiredLODForChunk(chunkCoord);
+
+    // Create entity
+    entt::entity entity;
+    {
+        std::unique_lock lock(m_registryMutex);
+        entity = m_registry.create();
+
+        // Add components
+        m_registry.emplace<ChunkCoord>(entity, chunkCoord.x, chunkCoord.y, chunkCoord.z);
+        m_registry.emplace<ChunkState>(entity, ChunkState::State::Unloaded);
+
+        // Calculate and store AABB
+        AABB aabb = calculateChunkAABB(chunkCoord);
+        m_registry.emplace<AABB>(entity, aabb);
+
+        // PHASE 5A: Add Chunk component with metadata (isEmpty will be set after terrain generation)
+        auto& chunk = m_registry.emplace<Chunk>(entity, chunkCoord, static_cast<uint32_t>(entity));
+        chunk.lodLevel = desiredLod;
+    }
+
+    setChunkState(chunkCoord, ChunkState::State::Unloaded);
+    {
+        std::unique_lock setLock(m_chunkSetMutex);
+        m_existingChunkSet.insert(chunkCoord);
+    }
+    {
+        std::unique_lock mapLock(m_chunkStateMutex);
+        m_chunkEntityMap[chunkCoord] = entity;
+    }
+    m_streamingMetrics.chunksCreatedTotal.fetch_add(1, std::memory_order_relaxed);
+
+    return entity;
+}
+
+// OPTIMIZATION: Batch entity creation (1.5x speedup for bursts)
+// Creates multiple chunks under single registry lock, reducing lock overhead
+std::vector<entt::entity> World::createChunksBatch(const std::vector<glm::ivec3>& coords) {
+    std::vector<entt::entity> entities;
+    entities.reserve(coords.size());
+    
+    if (coords.empty()) {
+        return entities;
+    }
+    
+    // Pre-filter: remove from destroy queue and check existing
+    std::vector<glm::ivec3> toCreate;
+    toCreate.reserve(coords.size());
+    
+    for (const auto& coord : coords) {
+        // Check if chunk already exists
+        entt::entity existing = findChunk(coord);
+        if (existing != entt::null) {
+            entities.push_back(existing);
+        } else {
+            toCreate.push_back(coord);
+            entities.push_back(entt::null); // Placeholder, will be filled
+        }
+    }
+    
+    if (toCreate.empty()) {
+        return entities;
+    }
+    
+    // OPTIMIZATION: Single registry lock for all entity creations
+    std::vector<std::pair<entt::entity, glm::ivec3>> created;
+    created.reserve(toCreate.size());
+    std::vector<int> desiredLods;
+    desiredLods.reserve(toCreate.size());
+    for (const auto& coord : toCreate) {
+        desiredLods.push_back(getDesiredLODForChunk(coord));
+    }
+
+    {
+        std::unique_lock lock(m_registryMutex);
+        for (size_t idx = 0; idx < toCreate.size(); ++idx) {
+            const auto& coord = toCreate[idx];
+            int desiredLod = desiredLods[idx];
+            entt::entity entity = m_registry.create();
+            m_registry.emplace<ChunkCoord>(entity, coord.x, coord.y, coord.z);
+            m_registry.emplace<ChunkState>(entity, ChunkState::State::Unloaded);
+            AABB aabb = calculateChunkAABB(coord);
+            m_registry.emplace<AABB>(entity, aabb);
+            // PHASE 5A: Add Chunk component with metadata (isEmpty will be set after terrain generation)
+            auto& chunk = m_registry.emplace<Chunk>(entity, coord, static_cast<uint32_t>(entity));
+            chunk.lodLevel = desiredLod;
+            created.emplace_back(entity, coord);
+        }
+    }
+
+    if (!created.empty()) {
+        std::unique_lock setLock(m_chunkSetMutex);
+        for (const auto& entry : created) {
+            m_existingChunkSet.insert(entry.second);
+        }
+    }
+    
+    // Update state maps and metrics (outside registry lock)
+    {
+        std::unique_lock mapLock(m_chunkStateMutex);
+        for (const auto& [entity, coord] : created) {
+            m_chunkStateMap[coord] = ChunkState::State::Unloaded;
+            m_chunkEntityMap[coord] = entity;
+        }
+    }
+    
+    m_streamingMetrics.chunksCreatedTotal.fetch_add(
+        static_cast<uint32_t>(created.size()), std::memory_order_relaxed);
+    
+    // Fill in entities vector with created entities
+    size_t createdIdx = 0;
+    for (size_t i = 0; i < entities.size(); ++i) {
+        if (entities[i] == entt::null) {
+            entities[i] = created[createdIdx++].first;
+        }
+    }
+    
+    return entities;
+}
+
+bool World::tryDestroyChunk(const glm::ivec3& coord) {
+    entt::entity entity = findChunk(coord);
+    if (entity == entt::null) {
+        // Chunk doesn't exist, clean up tracking state
+        clearChunkPending(coord);
+        removeChunkState(coord);
+        return true;
+    }
+
+    // Cancel any in-flight jobs by incrementing version and clearing inFlight.
+    // The version bump makes any stale pipeline discard its output, so it's
+    // safe to clear inFlight immediately — no new pipeline will be scheduled
+    // for a chunk being destroyed.
+    auto versionState = ensureChunkVersionState(this, entity);
+    if (versionState) {
+        versionState->version.fetch_add(1, std::memory_order_acq_rel);
+        versionState->inFlight.store(false, std::memory_order_release);
+        versionState->pending.store(false, std::memory_order_release);
+    }
+
+    // Safe to destroy - no jobs in flight
+    clearChunkPending(coord);
+    removeChunkState(coord);
+    m_lodSystem.clearDesiredLOD(coord);
+
+    bool removedRenderableMesh = false;
+
+    // Free GPU mesh buffers
+    {
+        std::unique_lock regLock(m_registryMutex);
+        if (m_registry.all_of<MeshHandle>(entity)) {
+            const auto& meshHandle = m_registry.get<MeshHandle>(entity);
+            removedRenderableMesh = true;
+            meshStatsSub(meshHandle);
+            if (meshHandle.vb.isValid() && m_vbAllocator) {
+                m_vbAllocator->free(meshHandle.vb);
+            }
+            if (meshHandle.ib.isValid() && m_ibAllocator) {
+                m_ibAllocator->free(meshHandle.ib);
+            }
+            if (m_gpuCulling && meshHandle.gpuCullingSlot != UINT32_MAX) {
+                m_gpuCulling->freeSlot(meshHandle.gpuCullingSlot);
+            }
+        }
+        if (m_registry.all_of<PendingMeshHandle>(entity)) {
+            const auto& pending = m_registry.get<PendingMeshHandle>(entity);
+            removedRenderableMesh = true;
+            if (pending.handle.vb.isValid() && m_vbAllocator) {
+                m_vbAllocator->free(pending.handle.vb);
+            }
+            if (pending.handle.ib.isValid() && m_ibAllocator) {
+                m_ibAllocator->free(pending.handle.ib);
+            }
+            if (m_gpuCulling && pending.handle.gpuCullingSlot != UINT32_MAX) {
+                m_gpuCulling->freeSlot(pending.handle.gpuCullingSlot);
+            }
+        }
+    }
+
+    // Clean up version state
+    removeChunkVersionState(this, entity);
+
+    m_lodSystem.clearPending(entity);
+
+    // Destroy entity
+    {
+        std::unique_lock regLock(m_registryMutex);
+        m_registry.destroy(entity);
+    }
+    if (removedRenderableMesh) {
+        recordMeshTopologyChange(coord);
+    }
+    m_streamingMetrics.chunksDestroyedTotal.fetch_add(1, std::memory_order_relaxed);
+    
+    return true;
+}
+
+// OPTIMIZATION: Batch destruction to reduce per-chunk lock overhead
+int World::tryDestroyChunksBatch(const std::vector<glm::ivec3>& coords) {
+    if (coords.empty()) return 0;
+    
+    int destroyed = 0;
+    std::vector<glm::ivec3> renderableChangedCoords;
+    std::vector<entt::entity> entitiesToDestroy;
+    std::vector<BufferSlice> buffersToFree;
+    std::vector<uint32_t> gpuCullingSlotsToFree;
+    
+    entitiesToDestroy.reserve(coords.size());
+    buffersToFree.reserve(coords.size() * 2); // VB + IB per chunk
+    gpuCullingSlotsToFree.reserve(coords.size());
+    
+    // Phase 1: Collect entities and their GPU resources under registry lock
+    for (const auto& coord : coords) {
+        entt::entity entity = findChunk(coord);
+        if (entity == entt::null) {
+            clearChunkPending(coord);
+            removeChunkState(coord);
+            destroyed++;
+            continue;
+        }
+
+        auto versionState = ensureChunkVersionState(this, entity);
+        if (versionState) {
+            // Version bump invalidates any stale pipeline output, so it's safe
+            // to clear inFlight and destroy immediately.
+            versionState->version.fetch_add(1, std::memory_order_acq_rel);
+            versionState->inFlight.store(false, std::memory_order_release);
+            versionState->pending.store(false, std::memory_order_release);
+        }
+
+        // Safe to destroy
+        clearChunkPending(coord);
+        removeChunkState(coord);
+        m_lodSystem.clearDesiredLOD(coord);
+        
+        // Collect buffers and GPU culling slots to free (under registry lock)
+        {
+            std::shared_lock regLock(m_registryMutex);
+            bool coordRemovedRenderable = false;
+            if (m_registry.valid(entity) && m_registry.all_of<MeshHandle>(entity)) {
+                const auto& meshHandle = m_registry.get<MeshHandle>(entity);
+                coordRemovedRenderable = true;
+                meshStatsSub(meshHandle);
+                if (meshHandle.vb.isValid()) buffersToFree.push_back(meshHandle.vb);
+                if (meshHandle.ib.isValid()) buffersToFree.push_back(meshHandle.ib);
+                if (meshHandle.gpuCullingSlot != UINT32_MAX) {
+                    gpuCullingSlotsToFree.push_back(meshHandle.gpuCullingSlot);
+                }
+            }
+            
+            // Also clean up staged PendingMeshHandle if present
+            if (m_registry.valid(entity) && m_registry.all_of<PendingMeshHandle>(entity)) {
+                const auto& pending = m_registry.get<PendingMeshHandle>(entity);
+                coordRemovedRenderable = true;
+                if (pending.handle.vb.isValid()) buffersToFree.push_back(pending.handle.vb);
+                if (pending.handle.ib.isValid()) buffersToFree.push_back(pending.handle.ib);
+                if (pending.handle.gpuCullingSlot != UINT32_MAX) {
+                    gpuCullingSlotsToFree.push_back(pending.handle.gpuCullingSlot);
+                }
+            }
+            
+            // Remove physics collider if present
+            if (m_physics && m_registry.valid(entity) && m_registry.all_of<ChunkCollider>(entity)) {
+                auto& collider = m_registry.get<ChunkCollider>(entity);
+                if (collider.isValid()) {
+                    m_physics->removeBodyByIndexSeq(collider.bodyIdIndex,
+                        static_cast<uint8_t>(collider.bodyIdSequence));
+                }
+            }
+            if (coordRemovedRenderable) {
+                renderableChangedCoords.push_back(coord);
+            }
+        }
+        
+        entitiesToDestroy.push_back(entity);
+        removeChunkVersionState(this, entity);
+        m_lodSystem.clearPending(entity);
+    }
+    
+    // Phase 2: Free all GPU buffers (batched — single lock per allocator)
+    if (m_vbAllocator && m_ibAllocator && !buffersToFree.empty()) {
+        std::vector<BufferSlice> vbSlices;
+        std::vector<BufferSlice> ibSlices;
+        vbSlices.reserve(buffersToFree.size());
+        ibSlices.reserve(buffersToFree.size());
+
+        for (const auto& slice : buffersToFree) {
+            if (slice.buffer == m_vbAllocator->getPrimaryBuffer()) {
+                vbSlices.push_back(slice);
+            } else if (slice.buffer == m_ibAllocator->getPrimaryBuffer()) {
+                ibSlices.push_back(slice);
+            }
+        }
+
+        if (!vbSlices.empty()) m_vbAllocator->freeBatch(vbSlices.data(), vbSlices.size());
+        if (!ibSlices.empty()) m_ibAllocator->freeBatch(ibSlices.data(), ibSlices.size());
+    }
+    
+    // Phase 2b: Free GPU culling slots (batched)
+    if (m_gpuCulling && !gpuCullingSlotsToFree.empty()) {
+        m_gpuCulling->freeSlots(
+            gpuCullingSlotsToFree.data(),
+            gpuCullingSlotsToFree.size());
+    }
+    
+    // Phase 3: Destroy all entities (under registry lock to prevent races
+    // with gatherDrawCommands and processUploads iterating the registry)
+    if (!entitiesToDestroy.empty()) {
+        std::unique_lock regLock(m_registryMutex);
+        m_registry.destroy(entitiesToDestroy.begin(), entitiesToDestroy.end());
+        regLock.unlock();
+        destroyed += static_cast<int>(entitiesToDestroy.size());
+        m_streamingMetrics.chunksDestroyedTotal.fetch_add(
+            static_cast<uint32_t>(entitiesToDestroy.size()), std::memory_order_relaxed);
+    }
+    if (!renderableChangedCoords.empty()) {
+        recordMeshTopologyChanges(renderableChangedCoords);
+    }
+    
+    return destroyed;
+}
+
+void World::resetChunkGeneration() {
+    std::cout << "[World] Reset starting..." << std::endl;
+    
+    // 1. Pause the background lifecycle thread and wait for any in-progress
+    //    batch to finish. This ensures no callbacks are running while we
+    //    tear down entities and GPU resources.
+    m_lifecycleManager.pauseAndDrain();
+    m_lifecycleManager.clearQueues();
+    
+    // 2. Clear the upload queue to drop any in-flight mesh data
+    m_uploadSystem.clearQueue();
+
+    // Flush old mesh buffers that were deliberately budgeted across frames.
+    // Reset is already a heavyweight path, so avoid carrying retired slices
+    // into the next generation.
+    processDeferredMeshBufferFrees(
+        m_vbAllocator,
+        m_ibAllocator,
+        m_pendingMeshBufferFrees.size());
+    
+    // 3. Invalidate ALL version states so any in-flight jobs become stale
+    {
+        std::scoped_lock versionLock(m_chunkVersionMutex);
+        for (auto& [entity, vs] : m_chunkVersionStates) {
+            if (vs) {
+                vs->version.fetch_add(1, std::memory_order_acq_rel);
+                vs->inFlight.store(false, std::memory_order_release);
+                vs->pending.store(false, std::memory_order_release);
+            }
+        }
+    }
+    
+    // 4. Collect ALL chunk entities for forced destruction
+    std::vector<entt::entity> entitiesToDestroy;
+    std::vector<BufferSlice> buffersToFree;
+    
+    {
+        std::unique_lock regLock(m_registryMutex);
+        auto view = m_registry.view<Chunk, ChunkCoord>();
+        entitiesToDestroy.reserve(view.size_hint());
+        buffersToFree.reserve(view.size_hint() * 2);
+        
+        for (auto entity : view) {
+            auto& coord = m_registry.get<ChunkCoord>(entity);
+            glm::ivec3 coordVec = coord.toVec3();
+            
+            clearChunkPending(coordVec);
+            removeChunkState(coordVec);
+            m_lodSystem.clearDesiredLOD(coordVec);
+            
+            // Collect GPU resources
+            if (m_registry.all_of<MeshHandle>(entity)) {
+                const auto& meshHandle = m_registry.get<MeshHandle>(entity);
+                if (meshHandle.vb.isValid()) buffersToFree.push_back(meshHandle.vb);
+                if (meshHandle.ib.isValid()) buffersToFree.push_back(meshHandle.ib);
+            }
+            
+            // Also collect PendingMeshHandle resources
+            if (m_registry.all_of<PendingMeshHandle>(entity)) {
+                const auto& pending = m_registry.get<PendingMeshHandle>(entity);
+                if (pending.handle.vb.isValid()) buffersToFree.push_back(pending.handle.vb);
+                if (pending.handle.ib.isValid()) buffersToFree.push_back(pending.handle.ib);
+            }
+            
+            // Remove physics collider
+            if (m_physics && m_registry.all_of<ChunkCollider>(entity)) {
+                auto& collider = m_registry.get<ChunkCollider>(entity);
+                if (collider.isValid()) {
+                    m_physics->removeBodyByIndexSeq(collider.bodyIdIndex,
+                        static_cast<uint8_t>(collider.bodyIdSequence));
+                }
+            }
+            
+            removeChunkVersionState(this, entity);
+            m_lodSystem.clearPending(entity);
+            entitiesToDestroy.push_back(entity);
+        }
+    }
+    
+    // 5. Free GPU buffers
+    if (m_vbAllocator && m_ibAllocator) {
+        for (const auto& slice : buffersToFree) {
+            if (slice.buffer == m_vbAllocator->getPrimaryBuffer()) {
+                m_vbAllocator->free(slice);
+            } else if (slice.buffer == m_ibAllocator->getPrimaryBuffer()) {
+                m_ibAllocator->free(slice);
+            }
+        }
+    }
+    
+    // 6. Free GPU culling slots — reset the entire slot allocator
+    //    since we're destroying everything. This also clears pending
+    //    invalidations and resets the high-water mark.
+    if (m_gpuCulling) {
+        m_gpuCulling->resetAllSlots();
+    }
+    
+    // 7. Destroy all entities
+    if (!entitiesToDestroy.empty()) {
+        std::unique_lock regLock(m_registryMutex);
+        m_registry.destroy(entitiesToDestroy.begin(), entitiesToDestroy.end());
+        m_streamingMetrics.chunksDestroyedTotal.fetch_add(
+            static_cast<uint32_t>(entitiesToDestroy.size()), std::memory_order_relaxed);
+        recordGlobalMeshTopologyChange();
+        std::cout << "[World] Force-destroyed " << entitiesToDestroy.size() << " chunks" << std::endl;
+    }
+    
+    // 8. Clear all tracking sets and reset counters
+    {
+        std::unique_lock lock(m_chunkSetMutex);
+        m_readyChunkSet.clear();
+        m_existingChunkSet.clear();
+    }
+    m_pendingChunks.clear();
+    m_loadingCount.store(0, std::memory_order_relaxed);
+    m_meshingCount.store(0, std::memory_order_relaxed);
+    m_readyCount.store(0, std::memory_order_relaxed);
+    
+    // 9. Clear remaining version states
+    {
+        std::scoped_lock versionLock(m_chunkVersionMutex);
+        m_chunkVersionStates.clear();
+    }
+    
+    // 10. Reset chunk manager
+    m_chunkManager->resetChunkGeneration();
+    m_highSpeedStreamingWasActive = false;
+    m_lastHighSpeedActiveDist = 0;
+    
+    // 11. Resume background lifecycle thread
+    m_lifecycleManager.resume();
+    
+    std::cout << "[World] Reset complete - all chunks cleared" << std::endl;
+}
+
+void World::switchTerrainFile(const std::string& newTerrainPath) {
+    std::cout << "[World] Switching terrain file to: " << newTerrainPath << std::endl;
+    
+    // 1. Destroy all existing chunks and GPU resources
+    resetChunkGeneration();
+    
+    // 2. Reload the terrain file loader with the new path
+    m_terrainLoader = std::make_unique<TerrainFileLoader>(newTerrainPath);
+    
+    if (m_terrainLoader->isLoaded()) {
+        // Update terrain center on ChunkManager based on new terrain dimensions
+        auto dims = m_terrainLoader->getDimensions();
+        if (dims.chunksX > 0 && dims.chunksZ > 0) {
+            m_chunkManager->setTerrainCenter(dims.chunksX, dims.chunksZ);
+        }
+        std::cout << "[World] New terrain loaded: " << dims.chunksX << "x" << dims.chunksZ 
+                  << " chunks, " << dims.lodLevels << " LOD levels" << std::endl;
+    } else {
+        std::cerr << "[World] WARNING: Failed to load terrain file: " << newTerrainPath << std::endl;
+    }
+}

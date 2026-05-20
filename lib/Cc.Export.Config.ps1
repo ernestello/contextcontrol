@@ -3,8 +3,9 @@
 # Files that may be explicitly exported if the user asks for them.
 $script:TextExtensions = @(
     ".h", ".hh", ".hpp", ".hxx", ".inl",
-    ".c", ".cc", ".cpp", ".cxx", ".ixx",
-    ".cmake", ".txt", ".md", ".json", ".ini", ".cfg", ".toml", ".yaml", ".yml",
+    ".c", ".cc", ".cpp", ".cxx", ".ixx", ".ipp", ".tpp",
+    ".cmake", ".txt", ".md", ".json", ".ini", ".cfg", ".fc", ".toml", ".yaml", ".yml",
+    ".tl", ".tlb", ".td",
     ".ps1", ".bat", ".cmd",
     ".glsl", ".vert", ".frag", ".comp", ".geom", ".tesc", ".tese", ".mesh", ".task", ".shader",
     ".gd", ".gdshader", ".tscn", ".tres",
@@ -15,9 +16,10 @@ $script:TextExtensions = @(
 # Intentional: excludes .md and normal .txt so generated Context Control exports do not recursively match.
 $script:CodeSearchExtensions = @(
     ".h", ".hh", ".hpp", ".hxx", ".inl",
-    ".c", ".cc", ".cpp", ".cxx", ".ixx",
+    ".c", ".cc", ".cpp", ".cxx", ".ixx", ".ipp", ".tpp",
     ".cmake",
-    ".json", ".ini", ".cfg", ".toml", ".yaml", ".yml",
+    ".tl", ".tlb", ".td",
+    ".json", ".ini", ".cfg", ".fc", ".toml", ".yaml", ".yml",
     ".ps1", ".bat", ".cmd",
     ".glsl", ".vert", ".frag", ".comp", ".geom", ".tesc", ".tese", ".mesh", ".task", ".shader",
     ".gd", ".gdshader", ".tscn", ".tres",
@@ -33,7 +35,8 @@ $script:ExcludeDirs = @(
     "CMakeFiles", "out", "bin", "obj", "x64",
     "Debug", "Release", "RelWithDebInfo", "MinSizeRel",
     "vcpkg_installed", "packages", "PackageCache",
-    "external", "extern", "third_party", "thirdparty", "vendor", "deps", "dependencies",
+    "external", "extern", "third_party", "third-party", "thirdparty", "vendor", "deps", "dependencies",
+    "contextcontrol",
     "__pycache__"
 )
 
@@ -45,8 +48,97 @@ $script:BinaryExtensions = @(
     ".db", ".opendb", ".sdf", ".ipch"
 )
 
+$script:IgnoredFiles = @()
+$script:DefaultCodeSearchExtensions = @($script:CodeSearchExtensions)
+$script:DefaultExcludeDirs = @($script:ExcludeDirs)
+$script:DefaultIgnoredFiles = @($script:IgnoredFiles)
+$script:SearchSupportedExtensions = @($script:CodeSearchExtensions)
+$script:SearchIgnoredExtensions = @()
+
 if ($null -eq $script:ExportedFileKeys) {
     $script:ExportedFileKeys = @{}
+}
+
+function Normalize-CcExportExtensionList {
+    param($Values)
+
+    $set = New-Object 'System.Collections.Generic.SortedSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($value in @($Values)) {
+        if ([string]::IsNullOrWhiteSpace([string]$value)) {
+            continue
+        }
+
+        $clean = ([string]$value).Trim().ToLowerInvariant()
+        if ($clean -notmatch '^\.') {
+            $clean = ".${clean}"
+        }
+
+        [void]$set.Add($clean)
+    }
+
+    return @($set)
+}
+
+function Normalize-CcExportNameList {
+    param($Values)
+
+    $set = New-Object 'System.Collections.Generic.SortedSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($value in @($Values)) {
+        if ([string]::IsNullOrWhiteSpace([string]$value)) {
+            continue
+        }
+
+        [void]$set.Add(([string]$value).Trim())
+    }
+
+    return @($set)
+}
+
+function Set-CcExportFilterRules {
+    param(
+        $Settings = $null,
+        $Rules = $null
+    )
+
+    $ignoreDirs = New-Object System.Collections.Generic.List[string]
+    $ignoreFiles = New-Object System.Collections.Generic.List[string]
+    $searchSupported = New-Object System.Collections.Generic.List[string]
+    $searchIgnored = New-Object System.Collections.Generic.List[string]
+
+    foreach ($value in @($script:DefaultExcludeDirs)) { [void]$ignoreDirs.Add([string]$value) }
+    foreach ($value in @($script:DefaultIgnoredFiles)) { [void]$ignoreFiles.Add([string]$value) }
+    foreach ($value in @($script:DefaultCodeSearchExtensions)) { [void]$searchSupported.Add([string]$value) }
+
+    if ($null -ne $Settings) {
+        if ($Settings.PSObject.Properties.Name -contains "IgnoredDirectories") {
+            foreach ($value in @($Settings.IgnoredDirectories)) { [void]$ignoreDirs.Add([string]$value) }
+        }
+        if ($Settings.PSObject.Properties.Name -contains "IgnoredFiles") {
+            foreach ($value in @($Settings.IgnoredFiles)) { [void]$ignoreFiles.Add([string]$value) }
+        }
+        if ($Settings.PSObject.Properties.Name -contains "IgnoredFileExtensions") {
+            foreach ($value in @($Settings.IgnoredFileExtensions)) { [void]$searchIgnored.Add([string]$value) }
+        }
+    }
+
+    if ($null -ne $Rules) {
+        if ($Rules.PSObject.Properties.Name -contains "IgnoredDirectories") {
+            foreach ($value in @($Rules.IgnoredDirectories)) { [void]$ignoreDirs.Add([string]$value) }
+        }
+        if ($Rules.PSObject.Properties.Name -contains "IgnoredFiles") {
+            foreach ($value in @($Rules.IgnoredFiles)) { [void]$ignoreFiles.Add([string]$value) }
+        }
+        if ($Rules.PSObject.Properties.Name -contains "IgnoredExtensions") {
+            foreach ($value in @($Rules.IgnoredExtensions)) { [void]$searchIgnored.Add([string]$value) }
+        }
+    }
+
+    $script:ExcludeDirs = @(Normalize-CcExportNameList $ignoreDirs.ToArray())
+    $script:IgnoredFiles = @(Normalize-CcExportNameList $ignoreFiles.ToArray())
+    $script:SearchSupportedExtensions = @(Normalize-CcExportExtensionList $searchSupported.ToArray())
+    $script:SearchIgnoredExtensions = @(Normalize-CcExportExtensionList $searchIgnored.ToArray())
+    $script:SearchCandidateFilesCacheRoot = $null
+    $script:SearchCandidateFilesCache = $null
 }
 
 function Get-NormalizedPathKey {
@@ -104,6 +196,61 @@ function Is-GptGeneratedExportFile {
     return $false
 }
 
+function Is-IgnoredFilePath {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+
+    if ($null -eq $script:IgnoredFiles -or $script:IgnoredFiles.Count -eq 0) {
+        return $false
+    }
+
+    $normalizedPath = ($Path -replace '\\', '/').Trim()
+    $normalizedPathLower = $normalizedPath.ToLowerInvariant()
+    $name = [System.IO.Path]::GetFileName($Path).ToLowerInvariant()
+
+    $relativePath = $null
+    if ($null -ne $script:CcProjectRoot -and -not [string]::IsNullOrWhiteSpace($script:CcProjectRoot)) {
+        try {
+            $root = ($script:CcProjectRoot -replace '\\', '/').TrimEnd('/')
+            if ($normalizedPathLower.StartsWith(($root.ToLowerInvariant() + '/'))) {
+                $relativePath = $normalizedPathLower.Substring($root.Length).TrimStart('/')
+            }
+        }
+        catch {
+        }
+    }
+
+    foreach ($entry in $script:IgnoredFiles) {
+        if ([string]::IsNullOrWhiteSpace($entry)) {
+            continue
+        }
+
+        $entryNorm = ($entry -replace '\\', '/').Trim().ToLowerInvariant()
+        if ($entryNorm -eq "") {
+            continue
+        }
+
+        if ($entryNorm -contains "/") {
+            if ($entryNorm -eq $normalizedPathLower) {
+                return $true
+            }
+            if ($null -ne $relativePath -and $entryNorm -eq $relativePath) {
+                return $true
+            }
+        }
+        else {
+            if ($entryNorm -eq $name) {
+                return $true
+            }
+        }
+    }
+
+    return $false
+}
+
 function Get-CodeFenceLanguage {
     param([string]$Path)
 
@@ -142,10 +289,10 @@ function Get-CodeFenceLanguage {
         ".tscn" { return "ini" }
         ".tres" { return "ini" }
         ".cfg" { return "ini" }
+        ".fc" { return "text" }
         ".ini" { return "ini" }
         ".toml" { return "toml" }
         ".yaml" { return "yaml" }
-        ".yml" { return "yaml" }
         ".ps1" { return "powershell" }
         ".bat" { return "batch" }
         ".cmd" { return "batch" }
@@ -213,11 +360,31 @@ function Is-ExcludedPath {
         return $true
     }
 
+    if (Is-IgnoredFilePath $Path) {
+        return $true
+    }
+
     if ($Path -like "*.ccbak.*") {
         return $true
     }
 
-    $parts = $Path -replace '\\', '/'
+    $parts = ($Path -replace '\\', '/').TrimEnd('/')
+
+    if ($null -ne $script:CcProjectRoot -and -not [string]::IsNullOrWhiteSpace($script:CcProjectRoot)) {
+        try {
+            $root = ($script:CcProjectRoot -replace '\\', '/').TrimEnd('/')
+            if ($parts.Equals($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+                return $false
+            }
+
+            if ($parts.StartsWith(($root + '/'), [System.StringComparison]::OrdinalIgnoreCase)) {
+                $parts = $parts.Substring($root.Length).TrimStart('/')
+            }
+        }
+        catch {
+        }
+    }
+
     $split = $parts -split '/'
 
     foreach ($part in $split) {
@@ -235,11 +402,15 @@ function Is-CodeSearchExtension {
     $name = [System.IO.Path]::GetFileName($Path).ToLowerInvariant()
     $ext = [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
 
+    if ($script:SearchIgnoredExtensions -contains $ext) {
+        return $false
+    }
+
     if ($name -eq "cmakelists.txt") {
         return $true
     }
 
-    return ($script:CodeSearchExtensions -contains $ext)
+    return ($script:SearchSupportedExtensions -contains $ext)
 }
 
 function Is-TextSearchCandidate {
@@ -276,11 +447,7 @@ function Is-TextSearchCandidate {
         return $false
     }
 
-    if (-not ($script:TextExtensions -contains $ext)) {
-        return $false
-    }
-
-    if ((-not $ForceLargeFiles) -and $File.Length -gt ($MaxFileKB * 1024)) {
+    if (-not (Is-CodeSearchExtension $File.FullName)) {
         return $false
     }
 

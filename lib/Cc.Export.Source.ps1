@@ -23,10 +23,18 @@ function Invoke-CcSourceExport {
     $script:ExportedFileKeys = @{}
     $script:FunctionSearchKeys = @{}
     $script:FindSearchKeys = @{}
+    $script:SearchCandidateFilesCacheRoot = $null
+    $script:SearchCandidateFilesCache = $null
+    $script:SearchTextCache = @{}
+    $script:SearchLineCache = @{}
+    $script:SearchFunctionRangeCache = @{}
+    $script:SearchRegexCache = @{}
 
     $script:CcSharedSettings = Read-CcSharedSettings
     $script:CcProjectRoot = Resolve-CcSharedProjectRoot $script:CcSharedSettings
     $script:CcOutputRoot = Resolve-CcSharedOutputRoot $script:CcSharedSettings
+    $script:CcProjectFileRules = Read-CcProjectFileRules $script:CcSharedSettings
+    Set-CcExportFilterRules -Settings $script:CcSharedSettings -Rules $script:CcProjectFileRules
 
     if (-not (Test-Path -LiteralPath $script:CcProjectRoot)) {
         throw "Configured ProjectRoot does not exist: $script:CcProjectRoot. Change it in contextcontrol/.ccReplace.settings.json or ccReplace Settings option 11."
@@ -48,7 +56,7 @@ function Invoke-CcSourceExport {
     Write-Host "Paste file/folder paths, one per line."
     Write-Host "Use FUNCTION src/path/File.cpp :: name to extract a specific function body."
     Write-Host "FUNCTION paths may use wildcards, e.g. FUNCTION src/world/World*.cpp :: World::foo."
-    Write-Host "Use FUNC: name to search all code files and extract matching function bodies."
+    Write-Host "Use FUNC: name or FUNCTION name to search all code files and extract matching function bodies."
     Write-Host "Use FIND: text to list matching files and line previews without exporting file contents."
     Write-Host "SYMBOL: is disabled because it exported whole matching files and caused token explosions."
     Write-Host "Auto-adds matching headers for .cpp and direct GLSL #includes for shaders."
@@ -129,6 +137,19 @@ function Invoke-CcSourceExport {
             continue
         }
 
+        # Lenient unscoped function search syntax:
+        # FUNCTION FunctionName / FUNC FunctionName
+        if ($clean -match '(?i)^\s*(FUNC|FUNCTION)\s+(.+?)\s*$') {
+            $requestSymbol = $Matches[2].Trim()
+
+            if ($requestSymbol -ne "" -and
+                $requestSymbol -notmatch '[\\/]' -and
+                $requestSymbol -notmatch '\s+::\s+') {
+                $InputFunctions += $requestSymbol
+                continue
+            }
+        }
+
         # Hard guard: never silently treat malformed FUNCTION/SYMBOL lines as file paths.
         if ($clean -match '(?i)^\s*(FUNC|FUNCTION|FIND|SYMBOL)\b') {
             throw "Malformed request: '$clean'. Use exact file paths, FIND: TextToLocate, FUNCTION: SymbolName, or FUNCTION src/path/File.cpp :: SymbolName."
@@ -178,8 +199,8 @@ function Invoke-CcSourceExport {
         Add-FunctionSearchExport $symbol
     }
 
-    foreach ($pattern in $InputFindSearches) {
-        Add-FindSearchExport $pattern
+    if ($InputFindSearches.Count -gt 0) {
+        Add-FindSearchExports $InputFindSearches
     }
 
     $SavedOutputFile = Save-OutputFile $OutputFile

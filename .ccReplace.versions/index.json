@@ -242,9 +242,9 @@
                   },
                   {
                       "Path":  "include/world/edit/TextureOverlayStore.h",
-                      "FullPath":  "D:\\projects\\vulkanas\\include\\world\\edit\\TextureOverlayStore.h",
+                      "FullPath":  "D:\\Projects\\vulkanas\\include\\world\\edit\\TextureOverlayStore.h",
                       "Key":  "a16596fb446d43e3",
-                      "CurrentVersion":  2,
+                      "CurrentVersion":  3,
                       "Versions":  [
                                        {
                                            "Version":  1,
@@ -256,6 +256,12 @@
                                            "Version":  2,
                                            "Timestamp":  "2026-05-05T21:00:39.4777478Z",
                                            "Snapshot":  "files\\a16596fb446d43e3\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-20T14:09:57.5421461Z",
+                                           "Snapshot":  "files\\a16596fb446d43e3\\v000003.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -1774,14 +1780,20 @@
                   },
                   {
                       "Path":  "src/world/edit/meshing/TerrainEditMesherInternal.h",
-                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\meshing\\TerrainEditMesherInternal.h",
+                      "FullPath":  "D:\\Projects\\vulkanas\\src\\world\\edit\\meshing\\TerrainEditMesherInternal.h",
                       "Key":  "6b4ec64e807706ee",
-                      "CurrentVersion":  1,
+                      "CurrentVersion":  2,
                       "Versions":  [
                                        {
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T11:21:53.2451536Z",
                                            "Snapshot":  "files\\6b4ec64e807706ee\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-20T14:09:57.6281615Z",
+                                           "Snapshot":  "files\\6b4ec64e807706ee\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -1830,15 +1842,27 @@
                   },
                   {
                       "Path":  "src/world/edit/meshing/TerrainEditMaterialResolve.cpp",
-                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\meshing\\TerrainEditMaterialResolve.cpp",
+                      "FullPath":  "D:\\Projects\\vulkanas\\src\\world\\edit\\meshing\\TerrainEditMaterialResolve.cpp",
                       "Key":  "2a46bdcef5757bb8",
-                      "CurrentVersion":  1,
+                      "CurrentVersion":  3,
                       "Versions":  [
                                        {
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T11:21:53.3145665Z",
                                            "Snapshot":  "files\\2a46bdcef5757bb8\\v000001.snapshot",
                                            "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-20T14:09:57.6701445Z",
+                                           "Snapshot":  "files\\2a46bdcef5757bb8\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-20T14:23:22.3326018Z",
+                                           "Snapshot":  "files\\2a46bdcef5757bb8\\v000003.snapshot",
+                                           "Reason":  "applied function"
                                        }
                                    ]
                   },
@@ -1982,14 +2006,26 @@
                   },
                   {
                       "Path":  "src/world/edit/texture/TextureBrushStyles.cpp",
-                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\texture\\TextureBrushStyles.cpp",
+                      "FullPath":  "D:\\Projects\\vulkanas\\src\\world\\edit\\texture\\TextureBrushStyles.cpp",
                       "Key":  "bbfe990a6ca9567f",
-                      "CurrentVersion":  1,
+                      "CurrentVersion":  3,
                       "Versions":  [
                                        {
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T11:36:14.0658310Z",
                                            "Snapshot":  "files\\bbfe990a6ca9567f\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-20T12:49:32.6326545Z",
+                                           "Snapshot":  "files\\bbfe990a6ca9567f\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-20T14:09:57.5878447Z",
+                                           "Snapshot":  "files\\bbfe990a6ca9567f\\v000003.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -2100,15 +2136,21 @@
                   },
                   {
                       "Path":  "src/world/edit/texture/TextureOverlayStamps.cpp",
-                      "FullPath":  "D:\\projects\\vulkanas\\src\\world\\edit\\texture\\TextureOverlayStamps.cpp",
+                      "FullPath":  "D:\\Projects\\vulkanas\\src\\world\\edit\\texture\\TextureOverlayStamps.cpp",
                       "Key":  "0f52181f06981eee",
-                      "CurrentVersion":  1,
+                      "CurrentVersion":  2,
                       "Versions":  [
                                        {
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T11:44:28.7973704Z",
                                            "Snapshot":  "files\\0f52181f06981eee\\v000001.snapshot",
                                            "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-20T14:09:57.8295595Z",
+                                           "Snapshot":  "files\\0f52181f06981eee\\v000002.snapshot",
+                                           "Reason":  "applied function"
                                        }
                                    ]
                   },
@@ -2280,15 +2322,21 @@
                   },
                   {
                       "Path":  "src/ui/debug_menu/world/texture_paint/TexturePaintToolUI.cpp",
-                      "FullPath":  "D:\\projects\\vulkanas\\src\\ui\\debug_menu\\world\\texture_paint\\TexturePaintToolUI.cpp",
+                      "FullPath":  "D:\\Projects\\vulkanas\\src\\ui\\debug_menu\\world\\texture_paint\\TexturePaintToolUI.cpp",
                       "Key":  "cd6787589d1137df",
-                      "CurrentVersion":  1,
+                      "CurrentVersion":  2,
                       "Versions":  [
                                        {
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T11:54:30.5907188Z",
                                            "Snapshot":  "files\\cd6787589d1137df\\v000001.snapshot",
                                            "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-20T14:09:57.8772154Z",
+                                           "Snapshot":  "files\\cd6787589d1137df\\v000002.snapshot",
+                                           "Reason":  "applied function"
                                        }
                                    ]
                   },
@@ -3234,14 +3282,26 @@
                   },
                   {
                       "Path":  "shaders/common/terrain_materials.glsl",
-                      "FullPath":  "D:\\projects\\vulkanas\\shaders\\common\\terrain_materials.glsl",
+                      "FullPath":  "D:\\Projects\\vulkanas\\shaders\\common\\terrain_materials.glsl",
                       "Key":  "71fcdbbf681ccd4b",
-                      "CurrentVersion":  1,
+                      "CurrentVersion":  3,
                       "Versions":  [
                                        {
                                            "Version":  1,
                                            "Timestamp":  "2026-05-08T13:20:04.6342009Z",
                                            "Snapshot":  "files\\71fcdbbf681ccd4b\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-20T12:49:32.6950234Z",
+                                           "Snapshot":  "files\\71fcdbbf681ccd4b\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-20T14:09:57.9310979Z",
+                                           "Snapshot":  "files\\71fcdbbf681ccd4b\\v000003.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]
@@ -3276,6 +3336,622 @@
                                            "Version":  2,
                                            "Timestamp":  "2026-05-08T13:20:04.7426778Z",
                                            "Snapshot":  "files\\1c135d65dda6e90c\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "contextcontrol/lib/Cc.Settings.ps1",
+                      "FullPath":  "D:\\Projects\\vulkanas\\contextcontrol\\lib\\Cc.Settings.ps1",
+                      "Key":  "25492cc6c8d0df31",
+                      "CurrentVersion":  3,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:04:32.2004344Z",
+                                           "Snapshot":  "files\\25492cc6c8d0df31\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:04:32.2425517Z",
+                                           "Snapshot":  "files\\25492cc6c8d0df31\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-11T07:04:32.2960581Z",
+                                           "Snapshot":  "files\\25492cc6c8d0df31\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "contextcontrol/lib/Cc.Dir.Export.ps1",
+                      "FullPath":  "D:\\Projects\\vulkanas\\contextcontrol\\lib\\Cc.Dir.Export.ps1",
+                      "Key":  "7143aba8b404c187",
+                      "CurrentVersion":  5,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:04:32.3346712Z",
+                                           "Snapshot":  "files\\7143aba8b404c187\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:04:32.3627679Z",
+                                           "Snapshot":  "files\\7143aba8b404c187\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-11T07:04:32.4396287Z",
+                                           "Snapshot":  "files\\7143aba8b404c187\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-11T07:04:32.5564097Z",
+                                           "Snapshot":  "files\\7143aba8b404c187\\v000004.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-11T07:04:32.6667807Z",
+                                           "Snapshot":  "files\\7143aba8b404c187\\v000005.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "contextcontrol/lib/Cc.Replace.Settings.ps1",
+                      "FullPath":  "D:\\Projects\\vulkanas\\contextcontrol\\lib\\Cc.Replace.Settings.ps1",
+                      "Key":  "77faad2420393e18",
+                      "CurrentVersion":  4,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:04:32.6934718Z",
+                                           "Snapshot":  "files\\77faad2420393e18\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:04:32.7370357Z",
+                                           "Snapshot":  "files\\77faad2420393e18\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-11T07:04:32.7981346Z",
+                                           "Snapshot":  "files\\77faad2420393e18\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-11T07:04:32.9058483Z",
+                                           "Snapshot":  "files\\77faad2420393e18\\v000004.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "contextcontrol/lib/Cc.Replace.Agent.ps1",
+                      "FullPath":  "D:\\Projects\\vulkanas\\contextcontrol\\lib\\Cc.Replace.Agent.ps1",
+                      "Key":  "f3ef857d5276c88a",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:04:32.9370081Z",
+                                           "Snapshot":  "files\\f3ef857d5276c88a\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:04:32.9675667Z",
+                                           "Snapshot":  "files\\f3ef857d5276c88a\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "contextcontrol/lib/Cc.Replace.Menu.ps1",
+                      "FullPath":  "D:\\Projects\\vulkanas\\contextcontrol\\lib\\Cc.Replace.Menu.ps1",
+                      "Key":  "3142fe66d2a1e6f9",
+                      "CurrentVersion":  3,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:04:32.9989401Z",
+                                           "Snapshot":  "files\\3142fe66d2a1e6f9\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:04:33.0310172Z",
+                                           "Snapshot":  "files\\3142fe66d2a1e6f9\\v000002.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-11T07:04:33.0907059Z",
+                                           "Snapshot":  "files\\3142fe66d2a1e6f9\\v000003.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "lib/shared/Cc.Settings.ps1",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\lib\\shared\\Cc.Settings.ps1",
+                      "Key":  "368620a7b4570055",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:48:37.0346621Z",
+                                           "Snapshot":  "files\\368620a7b4570055\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:48:37.0837928Z",
+                                           "Snapshot":  "files\\368620a7b4570055\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/Services/ProjectFileRules.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\Services\\ProjectFileRules.cs",
+                      "Key":  "95f959f948d56c89",
+                      "CurrentVersion":  3,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:48:37.1169266Z",
+                                           "Snapshot":  "files\\95f959f948d56c89\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:53:13.4889317Z",
+                                           "Snapshot":  "files\\95f959f948d56c89\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-12T14:56:53.7184520Z",
+                                           "Snapshot":  "files\\95f959f948d56c89\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/Services/ExternalChangeTracker.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\Services\\ExternalChangeTracker.cs",
+                      "Key":  "d5217363f9de4c99",
+                      "CurrentVersion":  5,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:48:37.1534539Z",
+                                           "Snapshot":  "files\\d5217363f9de4c99\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:48:37.1884016Z",
+                                           "Snapshot":  "files\\d5217363f9de4c99\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-11T08:02:41.5640741Z",
+                                           "Snapshot":  "files\\d5217363f9de4c99\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-11T08:09:34.3413432Z",
+                                           "Snapshot":  "files\\d5217363f9de4c99\\v000004.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-11T08:16:20.3408256Z",
+                                           "Snapshot":  "files\\d5217363f9de4c99\\v000005.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/Services/LoadedProject.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\Services\\LoadedProject.cs",
+                      "Key":  "10651209c3fd88b4",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:48:37.2265666Z",
+                                           "Snapshot":  "files\\10651209c3fd88b4\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:48:37.2516800Z",
+                                           "Snapshot":  "files\\10651209c3fd88b4\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/Services/ExternalFileChange.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\Services\\ExternalFileChange.cs",
+                      "Key":  "5046123cbe06a47a",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:48:37.2823645Z",
+                                           "Snapshot":  "files\\5046123cbe06a47a\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:48:37.3079320Z",
+                                           "Snapshot":  "files\\5046123cbe06a47a\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/ViewModels/ExternalChangeItemViewModel.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\ViewModels\\ExternalChangeItemViewModel.cs",
+                      "Key":  "d3b09fd2ff389327",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:48:37.3368413Z",
+                                           "Snapshot":  "files\\d3b09fd2ff389327\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:48:37.3614042Z",
+                                           "Snapshot":  "files\\d3b09fd2ff389327\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/Services/ProjectLoader.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\Services\\ProjectLoader.cs",
+                      "Key":  "75a5e92cd91cf2d4",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:48:37.4158910Z",
+                                           "Snapshot":  "files\\75a5e92cd91cf2d4\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:48:37.4461317Z",
+                                           "Snapshot":  "files\\75a5e92cd91cf2d4\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/ViewModels/WorkbenchViewModel.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\ViewModels\\WorkbenchViewModel.cs",
+                      "Key":  "c38cd5cc82eb0672",
+                      "CurrentVersion":  10,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:48:37.4842456Z",
+                                           "Snapshot":  "files\\c38cd5cc82eb0672\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:48:37.5139166Z",
+                                           "Snapshot":  "files\\c38cd5cc82eb0672\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-11T07:53:13.5214692Z",
+                                           "Snapshot":  "files\\c38cd5cc82eb0672\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-11T08:09:34.3798033Z",
+                                           "Snapshot":  "files\\c38cd5cc82eb0672\\v000004.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-11T08:16:20.3762414Z",
+                                           "Snapshot":  "files\\c38cd5cc82eb0672\\v000005.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-11T09:01:10.8072381Z",
+                                           "Snapshot":  "files\\c38cd5cc82eb0672\\v000006.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  7,
+                                           "Timestamp":  "2026-05-11T09:17:55.0467523Z",
+                                           "Snapshot":  "files\\c38cd5cc82eb0672\\v000007.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  8,
+                                           "Timestamp":  "2026-05-11T09:26:12.4174722Z",
+                                           "Snapshot":  "files\\c38cd5cc82eb0672\\v000008.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  9,
+                                           "Timestamp":  "2026-05-12T14:49:53.2926421Z",
+                                           "Snapshot":  "files\\c38cd5cc82eb0672\\v000009.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  10,
+                                           "Timestamp":  "2026-05-12T14:56:53.7530237Z",
+                                           "Snapshot":  "files\\c38cd5cc82eb0672\\v000010.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/Views/MainWindow.axaml.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\Views\\MainWindow.axaml.cs",
+                      "Key":  "d1de04b391cc0507",
+                      "CurrentVersion":  14,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T07:48:37.5463243Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T07:48:37.5816485Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-11T08:02:41.5969331Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-11T08:09:34.4133793Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000004.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-11T08:16:20.4101128Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000005.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-11T08:18:55.5703354Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000006.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  7,
+                                           "Timestamp":  "2026-05-11T08:32:15.2828827Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000007.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  8,
+                                           "Timestamp":  "2026-05-11T08:37:18.8766071Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000008.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  9,
+                                           "Timestamp":  "2026-05-11T08:46:39.8017488Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000009.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  10,
+                                           "Timestamp":  "2026-05-11T09:01:10.8673938Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000010.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  11,
+                                           "Timestamp":  "2026-05-11T09:05:50.8832745Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000011.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  12,
+                                           "Timestamp":  "2026-05-11T15:35:18.8160447Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000012.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  13,
+                                           "Timestamp":  "2026-05-12T14:49:53.0721516Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000013.snapshot",
+                                           "Reason":  "applied function"
+                                       },
+                                       {
+                                           "Version":  14,
+                                           "Timestamp":  "2026-05-12T14:49:53.2525583Z",
+                                           "Snapshot":  "files\\d1de04b391cc0507\\v000014.snapshot",
+                                           "Reason":  "applied function"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "cc.cmd",
+                      "FullPath":  "D:\\Projects\\vulkanas\\contextcontrol\\cc.cmd",
+                      "Key":  "fd42e12bc3b68503",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T08:46:57.2308694+00:00",
+                                           "Snapshot":  "files/fd42e12bc3b68503/v000001.snapshot",
+                                           "Reason":  "external file save"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/Services/ExternalVersionQueueStore.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\Services\\ExternalVersionQueueStore.cs",
+                      "Key":  "ecab7596c6656e78",
+                      "CurrentVersion":  1,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T09:01:10.7663573Z",
+                                           "Snapshot":  "files\\ecab7596c6656e78\\v000001.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/Views/MainWindow.axaml",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\Views\\MainWindow.axaml",
+                      "Key":  "bf5fb705ebd22a92",
+                      "CurrentVersion":  7,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-11T09:17:55.0781088Z",
+                                           "Snapshot":  "files\\bf5fb705ebd22a92\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-11T09:17:55.1062134Z",
+                                           "Snapshot":  "files\\bf5fb705ebd22a92\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-11T09:26:12.4540596Z",
+                                           "Snapshot":  "files\\bf5fb705ebd22a92\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-11T10:07:19.7783487Z",
+                                           "Snapshot":  "files\\bf5fb705ebd22a92\\v000004.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  5,
+                                           "Timestamp":  "2026-05-11T10:12:24.7389289Z",
+                                           "Snapshot":  "files\\bf5fb705ebd22a92\\v000005.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  6,
+                                           "Timestamp":  "2026-05-11T10:28:24.8312937Z",
+                                           "Snapshot":  "files\\bf5fb705ebd22a92\\v000006.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  7,
+                                           "Timestamp":  "2026-05-11T15:35:18.7825049Z",
+                                           "Snapshot":  "files\\bf5fb705ebd22a92\\v000007.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/ViewModels/VersionEntryViewModel.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\ViewModels\\VersionEntryViewModel.cs",
+                      "Key":  "a84c7ae5aac9b7ce",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-12T14:39:25.1378842Z",
+                                           "Snapshot":  "files\\a84c7ae5aac9b7ce\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-12T14:39:25.1680619Z",
+                                           "Snapshot":  "files\\a84c7ae5aac9b7ce\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "ide/ContextControl.Workbench/Views/ThemeSettingsWindow.axaml.cs",
+                      "FullPath":  "D:\\projects\\vulkanas\\contextcontrol\\ide\\ContextControl.Workbench\\Views\\ThemeSettingsWindow.axaml.cs",
+                      "Key":  "59c4243bdef6fd92",
+                      "CurrentVersion":  4,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-12T14:56:53.7844034Z",
+                                           "Snapshot":  "files\\59c4243bdef6fd92\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-12T14:56:53.8107118Z",
+                                           "Snapshot":  "files\\59c4243bdef6fd92\\v000002.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  3,
+                                           "Timestamp":  "2026-05-12T14:58:10.6703422Z",
+                                           "Snapshot":  "files\\59c4243bdef6fd92\\v000003.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       },
+                                       {
+                                           "Version":  4,
+                                           "Timestamp":  "2026-05-12T15:01:11.5032172Z",
+                                           "Snapshot":  "files\\59c4243bdef6fd92\\v000004.snapshot",
+                                           "Reason":  "applied whole_file"
+                                       }
+                                   ]
+                  },
+                  {
+                      "Path":  "src/world/edit/meshing/greedy/TerrainEditGreedyRegions.cpp",
+                      "FullPath":  "D:\\Projects\\vulkanas\\src\\world\\edit\\meshing\\greedy\\TerrainEditGreedyRegions.cpp",
+                      "Key":  "b2f79e89f785065c",
+                      "CurrentVersion":  2,
+                      "Versions":  [
+                                       {
+                                           "Version":  1,
+                                           "Timestamp":  "2026-05-20T14:09:57.7394698Z",
+                                           "Snapshot":  "files\\b2f79e89f785065c\\v000001.snapshot",
+                                           "Reason":  "baseline before first CC-REPLACE edit"
+                                       },
+                                       {
+                                           "Version":  2,
+                                           "Timestamp":  "2026-05-20T14:09:57.7786243Z",
+                                           "Snapshot":  "files\\b2f79e89f785065c\\v000002.snapshot",
                                            "Reason":  "applied whole_file"
                                        }
                                    ]

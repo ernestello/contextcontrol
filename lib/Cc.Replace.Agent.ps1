@@ -17,23 +17,29 @@ function Test-CcAgentConsoleKeyAvailable {
 }
 
 function Invoke-CcReplaceAgentMode {
+    function Initialize-CcAgentWatchFile {
+        param([string]$WatchPath)
+
+        $parent = Split-Path -Parent $WatchPath
+        if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
+            New-Item -ItemType Directory -Path $parent -Force | Out-Null
+        }
+
+        if (-not (Test-Path -LiteralPath $WatchPath)) {
+            Write-TextFileUtf8NoBom $WatchPath ""
+        }
+    }
+
     $settings = Read-CcReplaceSettings
     $path = Resolve-CcOutputPath $settings.DefaultPatchFile $settings
     $lastWrite = $null
 
-    $parent = Split-Path -Parent $path
-    if (-not [string]::IsNullOrWhiteSpace($parent) -and -not (Test-Path -LiteralPath $parent)) {
-        New-Item -ItemType Directory -Path $parent -Force | Out-Null
-    }
-
-    if (-not (Test-Path -LiteralPath $path)) {
-        Write-TextFileUtf8NoBom $path ""
-    }
+    Initialize-CcAgentWatchFile $path
 
     Write-Host ""
     Write-Host "Agent Mode active. Watching: $path"
     Write-Host "Update the patch file to trigger a run. Press Ctrl+C to stop."
-    Write-Host "Type DIR + Enter to run ccDir.ps1, CC + Enter to run cc.ps1, or GO + Enter to paste/apply a patch." -ForegroundColor DarkCyan
+    Write-Host "Type DIR + Enter to run ccDir.ps1, CC + Enter to run cc.ps1, GO + Enter to paste/apply a patch, or SS + Enter to open settings." -ForegroundColor DarkCyan
 
     while ($true) {
         try {
@@ -42,7 +48,16 @@ function Invoke-CcReplaceAgentMode {
                 Write-Host "Agent command: " -ForegroundColor Cyan -NoNewline
                 $agentCommand = [Console]::ReadLine()
                 if ($null -ne $agentCommand) {
-                    if (-not (Invoke-CcPipelineCommand $agentCommand)) {
+                    $normalizedCommand = $agentCommand.Trim()
+
+                    if ($normalizedCommand -ieq "SS") {
+                        $settings = Show-CcReplaceSettingsMenu
+                        $path = Resolve-CcOutputPath $settings.DefaultPatchFile $settings
+                        Initialize-CcAgentWatchFile $path
+                        $lastWrite = $null
+                        Write-Host "Agent settings updated. Watching: $path" -ForegroundColor DarkCyan
+                    }
+                    elseif (-not (Invoke-CcPipelineCommand $agentCommand)) {
                         Write-Host "Unknown agent command: $agentCommand" -ForegroundColor Yellow
                     }
                 }

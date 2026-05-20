@@ -1,0 +1,42 @@
+diff --git a/validator/net/download-state.cpp b/validator/net/download-state.cpp
+--- a/validator/net/download-state.cpp
++++ b/validator/net/download-state.cpp
+@@ -269,9 +269,21 @@ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 reques
+ }
+
+ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 requested_size) {
++  auto ps1_data_size = data.size();
++  auto ps1_sum_before = sum_;
+   bool last_part = data.size() < requested_size;
+   sum_ += data.size();
+   parts_.push_back(std::move(data));
++  if (ps1_data_size > 0 || requested_size > 0) {
++    LOG(ERROR) << "PS1_VICTIM part_received requested_size=" << requested_size
++               << " data_size=" << ps1_data_size
++               << " sum_before=" << ps1_sum_before
++               << " sum_after=" << sum_
++               << " parts=" << parts_.size()
++               << " total_size=" << total_size_
++               << " last_part=" << last_part
++               << " download_from=" << download_from_;
++  }
+   td::StringBuilder sb;
+   sb << "downloaded persistent state " << block_id_.to_str() << " " << masterchain_block_id_.to_str() << ": "
+      << td::format::as_size(sum_);
+@@ -296,6 +308,8 @@ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 reques
+   }
+
+   if (last_part) {
++    LOG(ERROR) << "PS1_VICTIM eof_copy sum=" << sum_
++               << " parts=" << parts_.size();
+     td::BufferSlice res{td::narrow_cast<std::size_t>(sum_)};
+     auto S = res.as_slice();
+     for (auto &p : parts_) {
+@@ -318,6 +332,8 @@ void DownloadState::got_block_state_part(td::BufferSlice data, td::uint32 reques
+       create_serialize_tl_object<ton_api::tonNode_downloadPersistentStateSliceV2>(
+           create_tl_block_id(block_id_), create_tl_block_id(masterchain_block_id_), state_type_to_tl(), sum_, part_size);
++  LOG(ERROR) << "PS1_VICTIM next_request offset=" << sum_
++             << " part_size=" << part_size << " peer=" << download_from_;
+   auto P = td::PromiseCreator::lambda(
+       [SelfId = actor_id(this), requested_size = part_size](td::Result<td::BufferSlice> R) {
+         if (R.is_error()) {

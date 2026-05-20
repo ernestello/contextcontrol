@@ -1,0 +1,802 @@
+<!-- CC-DESC: Defines the Context Control Workbench shell and project info header. -->
+<Window
+    x:Class="ContextControl.Workbench.Views.MainWindow"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls"
+    xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
+    Width="1280"
+    Height="800"
+    MinWidth="920"
+    MinHeight="620"
+    Title="Context Control"
+    Background="{DynamicResource AppBackgroundBrush}"
+    KeyDown="OnKeyDown">
+
+  <Window.Styles>
+    <Style Selector="Border.panel">
+      <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="8" />
+      <Setter Property="BoxShadow" Value="0 8 24 0 #14000000" />
+    </Style>
+
+    <Style Selector="Button.command">
+      <Setter Property="Height" Value="30" />
+      <Setter Property="Padding" Value="11,1,11,0" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="Button.command.primary">
+      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+    </Style>
+
+    <Style Selector="Button.icon">
+      <Setter Property="Width" Value="30" />
+      <Setter Property="Height" Value="30" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+    </Style>
+
+    <Style Selector="Button.project-tile">
+      <Setter Property="Width" Value="68" />
+      <Setter Property="Height" Value="74" />
+      <Setter Property="Margin" Value="0,0,7,0" />
+      <Setter Property="Padding" Value="5" />
+      <Setter Property="Background" Value="{DynamicResource ProjectTileBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="8" />
+      <Setter Property="Opacity" Value="0.62" />
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="VerticalContentAlignment" Value="Stretch" />
+      <Setter Property="Transitions">
+        <Transitions>
+          <DoubleTransition Property="Opacity" Duration="0:0:0.09" />
+        </Transitions>
+      </Setter>
+    </Style>
+
+    <Style Selector="Button.project-tile.active">
+      <Setter Property="Background" Value="{DynamicResource ProjectTileActiveBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+      <Setter Property="Opacity" Value="1" />
+    </Style>
+
+    <Style Selector="Button.project-info-switch">
+      <Setter Property="Height" Value="22" />
+      <Setter Property="Width" Value="112" />
+      <Setter Property="Padding" Value="8,0" />
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="Bold" />
+    </Style>
+
+    <Style Selector="Button.project-info-switch:pointerover">
+      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+    </Style>
+
+    <Style Selector="Button.header-mini">
+      <Setter Property="Height" Value="22" />
+      <Setter Property="Padding" Value="8,0" />
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="9.5" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="Button.header-mini.primary">
+      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+    </Style>
+
+    <Style Selector="Button.external-update-row">
+      <Setter Property="Height" Value="22" />
+      <Setter Property="Padding" Value="6,0" />
+      <Setter Property="Margin" Value="0,0,0,1" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="3" />
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="Button.external-update-row:pointerover">
+      <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.update-file">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="ExtraBold" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBlock.update-meta">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBlock.update-empty">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="TextAlignment" Value="Center" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="HorizontalAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="Border.project-stat">
+      <Setter Property="Height" Value="20" />
+      <Setter Property="Padding" Value="6,1" />
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+    </Style>
+
+    <Style Selector="TextBlock.project-stat-key">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="TextBlock.project-stat-value">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+      <Setter Property="TextAlignment" Value="Right" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="TextBlock.meta-key">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+    </Style>
+
+    <Style Selector="TextBlock.meta-value">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+      <Setter Property="TextAlignment" Value="Right" />
+    </Style>
+
+    <Style Selector="ListBox.project-tree">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Padding" Value="4,4,16,9" />
+    </Style>
+
+    <Style Selector="ListBox.project-tree ListBoxItem">
+      <Setter Property="MinHeight" Value="0" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="Margin" Value="0" />
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="IsHitTestVisible" Value="{Binding HasNode}" />
+      <Setter Property="Focusable" Value="{Binding HasNode}" />
+    </Style>
+
+    <Style Selector="Button.tree-toggle">
+      <Setter Property="Width" Value="11" />
+      <Setter Property="Height" Value="11" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="3" />
+      <Setter Property="MinWidth" Value="0" />
+      <Setter Property="MinHeight" Value="0" />
+      <Setter Property="Focusable" Value="False" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="Button.tree-toggle:pointerover">
+      <Setter Property="Background" Value="{DynamicResource HistoryActiveBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+    </Style>
+
+    <Style Selector="Border.dir-row-highlight">
+      <Setter Property="Background" Value="{DynamicResource DirectoryHighlightBrush}" />
+      <Setter Property="CornerRadius" Value="4" />
+    </Style>
+
+    <Style Selector="Border.current-row-highlight">
+      <Setter Property="Background" Value="{DynamicResource CurrentRowBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CurrentRowBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="4" />
+    </Style>
+
+    <Style Selector="TextBlock.node-type">
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="MinWidth" Value="34" />
+      <Setter Property="TextAlignment" Value="Right" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.node-type.dir">
+      <Setter Property="Foreground" Value="{DynamicResource NodeTextBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.node-type.obj">
+      <Setter Property="Foreground" Value="{DynamicResource NodeTextBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.node-type.skip">
+      <Setter Property="Foreground" Value="{DynamicResource SkipTextBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.node-version">
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="HorizontalAlignment" Value="Right" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="MinWidth" Value="28" />
+      <Setter Property="TextAlignment" Value="Right" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="controls|IncludeExternalButton.include-external">
+      <Setter Property="Width" Value="38" />
+      <Setter Property="Height" Value="15" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="CornerRadius" Value="4" />
+      <Setter Property="Background" Value="{DynamicResource IncludeBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource IncludeBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="7.5" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="Foreground" Value="{DynamicResource IncludeTextBrush}" />
+      <Setter Property="Transitions">
+        <Transitions>
+          <BrushTransition Property="Background" Duration="0:0:0.16" />
+          <BrushTransition Property="BorderBrush" Duration="0:0:0.16" />
+        </Transitions>
+      </Setter>
+    </Style>
+
+    <Style Selector="controls|IncludeExternalButton.include-external:pointerover">
+      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.folder-name">
+      <Setter Property="Foreground" Value="{DynamicResource FolderTextBrush}" />
+      <Setter Property="FontWeight" Value="ExtraBold" />
+    </Style>
+
+    <Style Selector="TextBlock.file-name">
+      <Setter Property="Foreground" Value="{DynamicResource FileTextBrush}" />
+      <Setter Property="FontWeight" Value="SemiBold" />
+    </Style>
+
+    <Style Selector="TextBlock.external-name">
+      <Setter Property="Foreground" Value="{DynamicResource ExternalTextBrush}" />
+      <Setter Property="FontStyle" Value="Italic" />
+    </Style>
+
+    <Style Selector="TextBlock.editor-meta">
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBlock.editor-line-number">
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="11" />
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="TextAlignment" Value="Right" />
+    </Style>
+
+    <Style Selector="TextBlock.editor-token">
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="12" />
+      <Setter Property="LineHeight" Value="17" />
+    </Style>
+
+    <Style Selector="Border.history-version">
+      <Setter Property="Height" Value="22" />
+      <Setter Property="Padding" Value="6,0" />
+      <Setter Property="Margin" Value="0,0,0,1" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="3" />
+    </Style>
+
+    <Style Selector="Border.history-version:pointerover">
+      <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+    </Style>
+
+    <Style Selector="Border.history-version.active">
+      <Setter Property="Background" Value="{DynamicResource HistoryActiveBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.history-meta">
+      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+  </Window.Styles>
+
+  <Grid RowDefinitions="108,*" RowSpacing="8" Margin="8">
+    <Border Classes="panel" Grid.Row="0" Padding="8">
+      <Grid ColumnDefinitions="260,*,310" ColumnSpacing="10">
+        <Grid RowDefinitions="Auto,*">
+          <StackPanel Grid.Row="0">
+            <TextBlock Text="Context Control" FontSize="19" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
+            <TextBlock Text="Native IDE shell over the PowerShell core" Margin="0,4,0,0" FontSize="12" Foreground="{DynamicResource TextMutedBrush}" TextTrimming="CharacterEllipsis" />
+          </StackPanel>
+
+          <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+            <Button Classes="command primary" Content="Open Project" Click="OnOpenProjectClick" />
+            <Button Classes="command" Content="New Project" Click="OnNewProjectClick" />
+            <Button Classes="icon" Content="⚙" Click="OnSettingsClick" />
+          </StackPanel>
+        </Grid>
+
+        <ScrollViewer Grid.Column="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+          <ItemsControl ItemsSource="{Binding Projects}" VerticalAlignment="Center">
+            <ItemsControl.ItemsPanel>
+              <ItemsPanelTemplate>
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" />
+              </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemTemplate>
+              <DataTemplate DataType="{x:Type vm:ProjectTabViewModel}">
+                <Button
+                    Classes="project-tile"
+                    Classes.active="{Binding IsActive}"
+                    Command="{Binding DataContext.SelectProjectCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                    CommandParameter="{Binding}">
+                  <Grid RowDefinitions="38,*" RowSpacing="4">
+                    <Border
+                        Width="38"
+                        Height="38"
+                        CornerRadius="7"
+                        HorizontalAlignment="Center"
+                        Background="{DynamicResource CommandBackgroundBrush}"
+                        BorderBrush="{DynamicResource PanelBorderBrush}"
+                        BorderThickness="1">
+                      <TextBlock
+                          Text="{Binding IconText}"
+                          HorizontalAlignment="Center"
+                          VerticalAlignment="Center"
+                          FontSize="12"
+                          FontWeight="Black"
+                          Foreground="{DynamicResource AccentBrush}" />
+                    </Border>
+
+                    <TextBlock
+                        Grid.Row="1"
+                        Text="{Binding Name}"
+                        TextWrapping="Wrap"
+                        TextAlignment="Center"
+                        FontSize="10"
+                        FontWeight="Bold"
+                        LineHeight="11" />
+                  </Grid>
+                </Button>
+              </DataTemplate>
+            </ItemsControl.ItemTemplate>
+          </ItemsControl>
+        </ScrollViewer>
+
+        <!-- CC-REPLACE-BEGIN: project_info_header_card -->
+        <Border
+            Grid.Column="2"
+            Background="{DynamicResource HeaderBackgroundBrush}"
+            BorderBrush="{DynamicResource PanelBorderBrush}"
+            BorderThickness="1"
+            CornerRadius="8"
+            Padding="9,6"
+            ClipToBounds="True"
+            HorizontalAlignment="Stretch"
+            VerticalAlignment="Stretch">
+          <Grid RowDefinitions="22,*" RowSpacing="5">
+            <Grid Grid.Row="0" ColumnDefinitions="*,Auto" ColumnSpacing="8" Height="22">
+              <TextBlock
+                  Text="{Binding ProjectInfoTitle}"
+                  HorizontalAlignment="Left"
+                  VerticalAlignment="Center"
+                  FontSize="13"
+                  FontWeight="ExtraBold"
+                  TextTrimming="CharacterEllipsis" />
+
+              <Button
+                  Grid.Column="1"
+                  Classes="project-info-switch"
+                  HorizontalAlignment="Right"
+                  VerticalAlignment="Center"
+                  Content="{Binding ProjectInfoSwitchLabel}"
+                  Command="{Binding ToggleProjectInfoModeCommand}" />
+            </Grid>
+
+            <Grid
+                Grid.Row="1"
+                IsVisible="{Binding IsProjectInfoProjectMode}"
+                ColumnDefinitions="*,*"
+                RowDefinitions="*,*"
+                ColumnSpacing="6"
+                RowSpacing="5"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Stretch">
+              <Border Classes="project-stat">
+                <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                  <TextBlock Classes="project-stat-key" Text="loc" />
+                  <TextBlock Classes="project-stat-value" Grid.Column="1" Text="{Binding CurrentProject.Location}" />
+                </Grid>
+              </Border>
+
+              <Border Classes="project-stat" Grid.Column="1">
+                <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                  <TextBlock Classes="project-stat-key" Text="files" />
+                  <TextBlock Classes="project-stat-value" Grid.Column="1" Text="{Binding CurrentProject.FileCount}" />
+                </Grid>
+              </Border>
+
+              <Border Classes="project-stat" Grid.Row="1">
+                <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                  <TextBlock Classes="project-stat-key" Text="dirs" />
+                  <TextBlock Classes="project-stat-value" Grid.Column="1" Text="{Binding CurrentProject.DirectoryCount}" />
+                </Grid>
+              </Border>
+
+              <Border Classes="project-stat" Grid.Row="1" Grid.Column="1">
+                <Grid ColumnDefinitions="Auto,*" ColumnSpacing="6">
+                  <TextBlock Classes="project-stat-key" Text="commit" />
+                  <TextBlock Classes="project-stat-value" Grid.Column="1" Text="{Binding CurrentProject.Commit}" />
+                </Grid>
+              </Border>
+            </Grid>
+
+            <Grid
+                Grid.Row="1"
+                IsVisible="{Binding IsProjectInfoHistoryMode}"
+                RowDefinitions="*,22"
+                RowSpacing="4"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Stretch">
+              <Border
+                  Background="{DynamicResource EditorSurfaceBrush}"
+                  BorderBrush="{DynamicResource PanelBorderBrush}"
+                  BorderThickness="1"
+                  CornerRadius="5"
+                  ClipToBounds="True">
+                <Grid>
+                  <TextBlock
+                      Classes="update-empty"
+                      Text="No external updates captured yet."
+                      IsVisible="{Binding !HasExternalChanges}" />
+
+                  <ScrollViewer
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      IsVisible="{Binding HasExternalChanges}">
+                    <ItemsControl ItemsSource="{Binding ExternalChanges}">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:ExternalChangeItemViewModel}">
+                          <Button
+                              Classes="external-update-row"
+                              Command="{Binding DataContext.OpenExternalChangeCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                              CommandParameter="{Binding}">
+                            <Grid ColumnDefinitions="14,*,32,32,38,58" ColumnSpacing="5">
+                              <CheckBox
+                                  IsChecked="{Binding IsSelected, Mode=TwoWay}"
+                                  Width="12"
+                                  Height="12"
+                                  VerticalAlignment="Center" />
+
+                              <TextBlock
+                                  Grid.Column="1"
+                                  Classes="update-file"
+                                  Text="{Binding FileName}" />
+
+                              <TextBlock Grid.Column="2" Classes="history-meta" Text="{Binding AddedLabel}" TextAlignment="Right" FontWeight="Black" Foreground="{DynamicResource GoodBrush}" />
+                              <TextBlock Grid.Column="3" Classes="history-meta" Text="{Binding RemovedLabel}" TextAlignment="Right" FontWeight="Black" Foreground="{DynamicResource BadBrush}" />
+                              <TextBlock Grid.Column="4" Classes="history-meta" Text="{Binding LocLabel}" TextAlignment="Right" FontWeight="Black" />
+                              <TextBlock Grid.Column="5" Classes="history-meta" Text="{Binding VersionFlow}" TextAlignment="Right" FontWeight="Black" Foreground="{DynamicResource AccentBrush}" />
+                            </Grid>
+                          </Button>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                </Grid>
+              </Border>
+
+              <Grid Grid.Row="1" ColumnDefinitions="*,*" ColumnSpacing="5" IsVisible="{Binding HasExternalChanges}">
+                <Button
+                    Classes="header-mini primary"
+                    Content="Accept all edits"
+                    Command="{Binding AcceptAllExternalChangesCommand}" />
+                <Button
+                    Grid.Column="1"
+                    Classes="header-mini"
+                    Content="Accept final edits"
+                    Command="{Binding AcceptFinalExternalChangesCommand}" />
+              </Grid>
+            </Grid>
+          </Grid>
+        </Border>
+        <!-- CC-REPLACE-END: project_info_header_card -->
+      </Grid>
+    </Border>
+
+    <Grid
+        x:Name="WorkspaceRoot"
+        Grid.Row="1"
+        ColumnDefinitions="300,*"
+        ColumnSpacing="8"
+        PointerMoved="OnWorkspacePointerMoved">
+      <Border x:Name="SidebarPane" Classes="panel" Grid.Column="0" ClipToBounds="True">
+        <Grid RowDefinitions="43,*">
+          <Border Grid.Row="0" Background="{DynamicResource HeaderBackgroundBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="0,0,0,1" Padding="12,0,9,0">
+            <Grid ColumnDefinitions="*">
+              <TextBlock
+                  Text="{Binding CurrentProject.Name}"
+                  VerticalAlignment="Center"
+                  FontSize="11"
+                  FontWeight="ExtraBold"
+                  Foreground="{DynamicResource TextMutedBrush}"
+                  LetterSpacing="0.8" />
+            </Grid>
+          </Border>
+
+          <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+            <ListBox
+                Classes="project-tree"
+                ItemsSource="{Binding VisibleTreeRows}"
+                SelectedItem="{Binding SelectedTreeRow, Mode=TwoWay}"
+                SelectionChanged="OnProjectTreeSelectionChanged"
+                SelectionMode="Single"
+                ScrollViewer.VerticalScrollBarVisibility="Auto"
+                ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+              <ListBox.ItemTemplate>
+                <DataTemplate DataType="{x:Type vm:TreeRowViewModel}">
+                  <Grid ColumnDefinitions="Auto,*,92" Height="{Binding RowHeight}" PointerPressed="OnProjectTreeRowPointerPressed">
+                    <Border
+                        Grid.Column="0"
+                        Grid.ColumnSpan="3"
+                        Classes="current-row-highlight"
+                        IsVisible="{Binding IsCurrent}"
+                        Margin="0,0,5,0" />
+                    <Border
+                        Grid.Column="1"
+                        Grid.ColumnSpan="2"
+                        Classes="dir-row-highlight"
+                        IsVisible="{Binding IsRegularFolder}"
+                        Margin="0,1,0,1" />
+                    <Grid
+                        Grid.Column="0"
+                        Width="{Binding RailWidth}"
+                        Height="{Binding RowHeight}">
+                      <controls:TreeLinesControl
+                          Width="{Binding RailWidth}"
+                          Height="{Binding RowHeight}"
+                          Depth="{Binding Depth}"
+                          IsLast="{Binding IsLast}"
+                          AncestorContinues="{Binding AncestorContinues}"
+                          HasExpandedChildren="{Binding HasExpandedChildren}"
+                          IsSpacer="{Binding IsSpacer}"
+                          ThemeKey="{Binding DataContext.ThemeKey, RelativeSource={RelativeSource AncestorType=Window}}" />
+                      <Button
+                          Classes="tree-toggle"
+                          HorizontalAlignment="Left"
+                          VerticalAlignment="Center"
+                          Margin="{Binding ToggleMargin}"
+                          IsVisible="{Binding ShowDisclosure}"
+                          Command="{Binding DataContext.ToggleNodeCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                          CommandParameter="{Binding Node}">
+                        <controls:DisclosureArrowControl
+                            Width="8"
+                            Height="8"
+                            Angle="{Binding ArrowAngle}"
+                            ThemeKey="{Binding DataContext.ThemeKey, RelativeSource={RelativeSource AncestorType=Window}}">
+                          <controls:DisclosureArrowControl.Transitions>
+                            <Transitions>
+                              <DoubleTransition Property="Angle" Duration="0:0:0.08" />
+                            </Transitions>
+                          </controls:DisclosureArrowControl.Transitions>
+                        </controls:DisclosureArrowControl>
+                      </Button>
+                    </Grid>
+                    <TextBlock
+                        Grid.Column="1"
+                        Classes.folder-name="{Binding IsFolder}"
+                        Classes.file-name="{Binding IsFile}"
+                        Classes.external-name="{Binding IsExternal}"
+                        IsVisible="{Binding HasNode}"
+                        Text="{Binding DisplayName}"
+                        VerticalAlignment="Center"
+                        Margin="3,0,0,0"
+                        FontSize="9.5"
+                        TextTrimming="CharacterEllipsis" />
+                    <Grid
+                        Grid.Column="2"
+                        ColumnDefinitions="Auto,Auto"
+                        ColumnSpacing="4"
+                        Margin="0,0,10,0"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Center"
+                        IsVisible="{Binding HasNode}">
+                      <TextBlock
+                          Grid.Column="0"
+                          Classes="node-type"
+                          Classes.dir="{Binding IsRegularFolder}"
+                          Classes.obj="{Binding IsFile}"
+                          Classes.skip="{Binding IsExternal}"
+                          IsVisible="{Binding ShowNodeTypeLabel}"
+                          FontWeight="Black"
+                          Text="{Binding NodeTypeLabel}" />
+                      <TextBlock
+                          Grid.Column="1"
+                          Classes="node-version"
+                          FontWeight="Black"
+                          Text="{Binding VersionLabel}"
+                          IsVisible="{Binding ShowVersionLabel}" />
+                      <controls:IncludeExternalButton
+                          Grid.Column="1"
+                          Classes="include-external"
+                          HorizontalAlignment="Right"
+                          VerticalAlignment="Center"
+                          IsVisible="{Binding CanIncludeExternal}"
+                          Command="{Binding DataContext.IncludeExternalNodeCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                          CommandParameter="{Binding Node}" />
+                    </Grid>
+                  </Grid>
+                </DataTemplate>
+              </ListBox.ItemTemplate>
+            </ListBox>
+          </ScrollViewer>
+        </Grid>
+      </Border>
+
+      <Grid Grid.Column="1" ColumnDefinitions="Auto,*" ColumnSpacing="{Binding HistoryGutter}">
+        <Border
+            x:Name="HistoryPane"
+            Classes="panel"
+            Grid.Column="0"
+            Width="{Binding HistoryWidth}"
+            Opacity="{Binding HistoryOpacity}"
+            IsHitTestVisible="{Binding IsHistoryOpen}"
+            ClipToBounds="True">
+          <Border.Transitions>
+            <Transitions>
+              <DoubleTransition Property="Width" Duration="0:0:0.12" />
+              <DoubleTransition Property="Opacity" Duration="0:0:0.12" />
+            </Transitions>
+          </Border.Transitions>
+
+          <Grid RowDefinitions="*">
+            <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="4">
+              <ItemsControl ItemsSource="{Binding SelectedHistory.Versions}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate DataType="{x:Type vm:VersionEntryViewModel}">
+                    <Border
+                        Classes="history-version"
+                        Classes.active="{Binding IsActive}"
+                        PointerPressed="OnHistoryVersionPointerPressed">
+                      <Grid ColumnDefinitions="34,*,44,44,44" ColumnSpacing="6">
+                        <TextBlock
+                            Text="{Binding Version}"
+                            VerticalAlignment="Center"
+                            TextAlignment="Center"
+                            FontFamily="Consolas, Menlo, monospace"
+                            FontSize="10"
+                            FontWeight="Black"
+                            Foreground="{DynamicResource AccentBrush}" />
+
+                        <TextBlock
+                            Grid.Column="1"
+                            Text="{Binding Date}"
+                            VerticalAlignment="Center"
+                            FontSize="10"
+                            FontWeight="ExtraBold"
+                            Foreground="{DynamicResource TextPrimaryBrush}"
+                            TextTrimming="CharacterEllipsis" />
+                        <TextBlock Grid.Column="2" Text="{Binding AddedLabel}" Classes="history-meta" TextAlignment="Right" FontWeight="Black" Foreground="{DynamicResource GoodBrush}" />
+                        <TextBlock Grid.Column="3" Text="{Binding RemovedLabel}" Classes="history-meta" TextAlignment="Right" FontWeight="Black" Foreground="{DynamicResource BadBrush}" />
+                        <TextBlock Grid.Column="4" Text="{Binding LocLabel}" Classes="history-meta" TextAlignment="Right" FontWeight="Black" />
+                      </Grid>
+                    </Border>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </ScrollViewer>
+          </Grid>
+        </Border>
+
+        <Border Grid.Column="1" Background="{DynamicResource EditorSurfaceBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="1" CornerRadius="8" ClipToBounds="True">
+          <Grid RowDefinitions="43,*">
+            <Border Grid.Row="0" Background="{DynamicResource HeaderBackgroundBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="0,0,0,1" Padding="12,0">
+              <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="12">
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="{Binding ActiveDocument.Name}" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" TextTrimming="CharacterEllipsis" />
+                  <TextBlock Text="{Binding ActiveDocument.Path}" Classes="editor-meta" Margin="0,2,0,0" />
+                </StackPanel>
+                <TextBlock Grid.Column="1" Text="{Binding ActiveDocument.Loc}" Classes="editor-meta" VerticalAlignment="Center" FontWeight="Bold" />
+                <TextBlock Grid.Column="2" Text="{Binding ActiveDocument.Language}" Classes="editor-meta" VerticalAlignment="Center" FontWeight="Bold" />
+                <TextBlock Grid.Column="3" Text="{Binding ActiveDocument.Version}" Classes="editor-meta" VerticalAlignment="Center" FontWeight="Bold" />
+                <TextBlock Grid.Column="4" Text="{Binding ActiveDocument.AddedChangeLabel}" Classes="editor-meta" IsVisible="{Binding ActiveDocument.HasChangeLabels}" VerticalAlignment="Center" FontWeight="Black" Foreground="{DynamicResource GoodBrush}" />
+                <TextBlock Grid.Column="5" Text="{Binding ActiveDocument.RemovedChangeLabel}" Classes="editor-meta" IsVisible="{Binding ActiveDocument.HasChangeLabels}" VerticalAlignment="Center" FontWeight="Black" Foreground="{DynamicResource BadBrush}" />
+                <TextBlock Grid.Column="6" Text="{Binding ActiveDocument.Status}" Classes="editor-meta" VerticalAlignment="Center" />
+              </Grid>
+            </Border>
+
+            <controls:CodeEditor
+                x:Name="FileEditor"
+                Grid.Row="1"
+                Background="{DynamicResource EditorSurfaceBrush}"
+                DocumentPath="{Binding ActiveDocument.Path}"
+                DocumentText="{Binding ActiveDocument.Text}"
+                LineChanges="{Binding ActiveDocument.LineChanges}"
+                ThemeKey="{Binding ThemeKey}"
+                SyntaxThemeKey="{Binding SyntaxThemeKey}" />
+          </Grid>
+        </Border>
+      </Grid>
+    </Grid>
+  </Grid>
+</Window>
