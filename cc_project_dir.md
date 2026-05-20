@@ -48,9 +48,9 @@ Map-stage reminders:
 vulkanas/
 ├── assets/
 │   ├── fonts/
+│   │   ├── inter.zip
 │   │   ├── Inter-Medium.ttf
-│   │   ├── Inter-Regular.ttf
-│   │   └── inter.zip
+│   │   └── Inter-Regular.ttf
 │   ├── img/
 │   │   ├── cursor16x16.aseprite
 │   │   └── vulkanvx.ico
@@ -262,6 +262,30 @@ vulkanas/
 │   │   └── snapshot.meta
 │   ├── snapshot_20260520_152936/
 │   │   └── snapshot.meta
+│   ├── snapshot_20260520_155042/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_171439/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_185926/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_191537/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_192223/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_193232/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_194847/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_195340/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_200040/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_200846/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_203158/
+│   │   └── snapshot.meta
+│   ├── snapshot_20260520_203959/
+│   │   └── snapshot.meta
 │   ├── heightmap.csv
 │   └── heightmap.hbin
 ├── shaders/
@@ -298,11 +322,11 @@ vulkanas/
 │   │   ├── star.frag
 │   │   └── star.vert
 │   ├── terrain/
+│   │   ├── cube.frag
+│   │   ├── cube.vert
 │   │   ├── cube_debug.frag
 │   │   ├── cube_debug.vert
 │   │   ├── cube_zonly.vert
-│   │   ├── cube.frag
-│   │   ├── cube.vert
 │   │   ├── dccm_terrain.frag
 │   │   └── dccm_terrain.vert
 │   └── tjunctionfix/
@@ -443,9 +467,9 @@ vulkanas/
 │   │   │   │   ├── ChunkHolesWindow.cpp
 │   │   │   │   ├── ChunkMinimapCullingOverlay.cpp
 │   │   │   │   ├── ChunkMinimapWindow.cpp
+│   │   │   │   ├── ChunkVramWindow.cpp
 │   │   │   │   ├── ChunkVramWindow_Internal.h
 │   │   │   │   ├── ChunkVramWindow_Text.cpp
-│   │   │   │   ├── ChunkVramWindow.cpp
 │   │   │   │   ├── MinimapCullingReadback.cpp
 │   │   │   │   ├── ObjectManagerWindow.cpp
 │   │   │   │   └── TerrainEditTool.cpp
