@@ -14,9 +14,16 @@ namespace ContextControl.Workbench.Services;
 public static class ProjectLoader
 {
     private const int MaxDepth = 20;
+    private const int DefaultExpandedDepth = 2;
     private const long MaxExactLineCountBytes = 512 * 1024;
     private const long EstimatedBytesPerLine = 44;
     private static readonly StringComparer PathComparer = StringComparer.OrdinalIgnoreCase;
+    private static readonly EnumerationOptions SafeEnumerationOptions = new()
+    {
+        AttributesToSkip = FileAttributes.Hidden | FileAttributes.System,
+        IgnoreInaccessible = true,
+        RecurseSubdirectories = false
+    };
     private static readonly HashSet<string> AlwaysIgnoredDirectories = new(PathComparer)
     {
         ".git",
@@ -113,6 +120,7 @@ public static class ProjectLoader
         var directoryCount = 0;
         var lineCount = 0L;
         var rootNode = BuildNode(root, root.FullName, 0, profile, includedSet, versionData.CurrentVersions, fileRules, ref fileCount, ref directoryCount, ref lineCount);
+        PrepareTree([rootNode]);
         var id = StableId(root.FullName);
         var icon = BuildIcon(root.Name);
         var project = new ProjectTabViewModel(
@@ -125,7 +133,7 @@ public static class ProjectLoader
             commit,
             root.FullName);
 
-        return new LoadedProject(project, [rootNode], versionData.HistoryByPath, fileRules);
+        return new LoadedProject(project, [rootNode], versionData.HistoryByPath, fileRules, isTreePrepared: true);
     }
 
     private static DirectoryInfo? FindContextControlDirectory(DirectoryInfo root)
@@ -192,14 +200,16 @@ public static class ProjectLoader
                 lineCount += fileLoc;
                 var relativePath = NormalizePath(Path.GetRelativePath(rootPath, file.FullName));
                 var version = FindVersion(currentVersions, relativePath, directory.Name);
-                children.Add(new ProjectNodeViewModel(file.Name, relativePath, false, version is null ? "v1" : $"v{version.Value}", loc: fileLoc));
+                children.Add(new ProjectNodeViewModel(file.Name, relativePath, false, version is null ? "v1" : $"v{version.Value}", loc: fileLoc, fileCount: 1));
             }
         }
 
         var nodePath = depth == 0 ? "" : NormalizePath(Path.GetRelativePath(rootPath, directory.FullName));
         var label = depth == 0 ? "root" : "/";
-        var directoryLoc = children.Where(child => !child.IsExternal).Sum(child => child.Loc);
-        return new ProjectNodeViewModel(directory.Name, nodePath, true, label, children, loc: directoryLoc);
+        var activeChildren = children.Where(child => !child.IsExternal).ToArray();
+        var directoryLoc = activeChildren.Sum(child => child.Loc);
+        var directoryFileCount = activeChildren.Sum(child => child.FileCount);
+        return new ProjectNodeViewModel(directory.Name, nodePath, true, label, children, loc: directoryLoc, fileCount: directoryFileCount);
     }
 
     private static ProjectNodeViewModel BuildSkippedDirectoryNode(
@@ -216,7 +226,7 @@ public static class ProjectLoader
     {
         try
         {
-            return directory.EnumerateDirectories()
+            return directory.EnumerateDirectories("*", SafeEnumerationOptions)
                 .OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
@@ -280,13 +290,42 @@ public static class ProjectLoader
         return top is not null && VulkanVxTopLevelAllowList.Contains(top);
     }
 
+    private static void PrepareTree(IReadOnlyList<ProjectNodeViewModel> roots)
+    {
+        for (var index = 0; index < roots.Count; index++)
+        {
+            PrepareNode(roots[index], 0, index == roots.Count - 1, []);
+        }
+    }
+
+    private static void PrepareNode(
+        ProjectNodeViewModel node,
+        int depth,
+        bool isLast,
+        IReadOnlyList<bool> ancestorContinues)
+    {
+        node.SetTreeState(depth, isLast, ancestorContinues);
+        if (depth <= DefaultExpandedDepth && !node.IsExternal)
+        {
+            node.IsExpanded = true;
+        }
+
+        for (var index = 0; index < node.Children.Count; index++)
+        {
+            var child = node.Children[index];
+            var childIsLast = index == node.Children.Count - 1;
+            var childAncestors = ancestorContinues.Concat([!childIsLast]).ToArray();
+
+            PrepareNode(child, depth + 1, childIsLast, childAncestors);
+        }
+    }
+
     private static IEnumerable<FileInfo> EnumerateFiles(DirectoryInfo directory, ProjectFileRules fileRules)
     {
         try
         {
-            return directory.EnumerateFiles()
-                .Where(item => !item.Attributes.HasFlag(FileAttributes.Hidden))
-                .Where(item => fileRules.GetTrackDecision(item.FullName).ShouldTrack)
+            return directory.EnumerateFiles("*", SafeEnumerationOptions)
+                .Where(item => fileRules.ShouldTrackFileName(item.Name, item.Extension))
                 .OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }

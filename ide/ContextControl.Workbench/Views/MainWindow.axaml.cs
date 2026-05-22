@@ -13,6 +13,7 @@ using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Globalization;
 using System.Linq;
+using System.Text;
 using ContextControl.Workbench.Services;
 using ContextControl.Workbench.ViewModels;
 
@@ -20,10 +21,10 @@ namespace ContextControl.Workbench.Views;
 
 public sealed partial class MainWindow : Window
 {
-    private static readonly IBrush PositiveBrush = Brush.Parse("#178A42");
-    private static readonly IBrush NegativeBrush = Brush.Parse("#B42318");
-    private static readonly IBrush QueueRowSelectedBrush = Brush.Parse("#10000000");
-    private static readonly IBrush QueueRowSkippedBrush = Brush.Parse("#08FF7A00");
+    private static readonly IBrush PositiveFallbackBrush = Brush.Parse("#1E7F57");
+    private static readonly IBrush NegativeFallbackBrush = Brush.Parse("#B24A42");
+    private static readonly IBrush QueueRowSelectedFallbackBrush = Brush.Parse("#DCEBE8");
+    private static readonly IBrush QueueRowSkippedFallbackBrush = Brush.Parse("#FFF7E2");
 
     private readonly DispatcherTimer _closeHistoryTimer;
     private WorkbenchViewModel? _subscribedViewModel;
@@ -37,6 +38,12 @@ public sealed partial class MainWindow : Window
     private StackPanel? _externalHeaderQueueItems;
     private Control? _externalHeaderContentRoot;
     private bool _showExternalUpdatesInProjectInfo;
+    private bool _contextParseMode;
+
+    private IBrush PositiveBrush => ThemeBrush("GoodBrush", PositiveFallbackBrush);
+    private IBrush NegativeBrush => ThemeBrush("BadBrush", NegativeFallbackBrush);
+    private IBrush QueueRowSelectedBrush => ThemeBrush("HistoryActiveBrush", QueueRowSelectedFallbackBrush);
+    private IBrush QueueRowSkippedBrush => ThemeBrush("IncludeBackgroundBrush", QueueRowSkippedFallbackBrush);
 
 public MainWindow()
 {
@@ -57,6 +64,55 @@ public MainWindow()
 }
 
     private WorkbenchViewModel? ViewModel => DataContext as WorkbenchViewModel;
+
+    private IBrush ThemeBrush(string key, IBrush fallback)
+    {
+        return Resources.TryGetValue(key, out var value) && value is IBrush brush
+            ? brush
+            : fallback;
+    }
+
+    private void OnTitleBarPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (e.ClickCount == 2)
+        {
+            ToggleMaximizeRestore();
+            return;
+        }
+
+        if (e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+        {
+            BeginMoveDrag(e);
+        }
+    }
+
+    private void OnMinimizeClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        WindowState = WindowState.Minimized;
+    }
+
+    private void OnMaximizeRestoreClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        ToggleMaximizeRestore();
+    }
+
+    private void OnCloseClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        Close();
+    }
+
+    private void ToggleMaximizeRestore()
+    {
+        if (WindowState == WindowState.Maximized)
+        {
+            WindowState = WindowState.Normal;
+            FitToWorkingArea();
+            return;
+        }
+
+        FitMaximizedWindowToWorkingArea();
+        WindowState = WindowState.Maximized;
+    }
 
     protected override void OnOpened(EventArgs e)
     {
@@ -112,6 +168,201 @@ public MainWindow()
         }
 
         _themeSettingsWindow.Activate();
+    }
+
+    private void OnContextParseToggleClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        _contextParseMode = !_contextParseMode;
+        ContextParseToggleButton.Opacity = _contextParseMode ? 1 : 0.72;
+
+        foreach (var button in ContextParseScopeButtons())
+        {
+            button.IsVisible = _contextParseMode;
+        }
+    }
+
+    private async void OnContextParseScopeClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    {
+        if (sender is not Control { Tag: string scope } || ViewModel is not { } viewModel)
+        {
+            return;
+        }
+
+        var payload = BuildContextParsePayload(viewModel, scope);
+        var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+        if (clipboard is not null)
+        {
+            await clipboard.SetTextAsync(payload);
+        }
+
+        Title = $"Context Control - copied {scope}";
+    }
+
+    private Button[] ContextParseScopeButtons()
+    {
+        return
+        [
+            ParseHeaderButton,
+            ParseProjectsButton,
+            ParseProjectInfoButton,
+            ParseProjectLocButton,
+            ParseProjectFilesButton,
+            ParseProjectDirsButton,
+            ParseProjectCommitButton,
+            ParseUpdatesButton,
+            ParseTreeHeaderButton,
+            ParseTreeButton,
+            ParseHistoryButton,
+            ParseEditorButton,
+            ParseEditorHeaderButton,
+            ParseCodePreviewButton
+        ];
+    }
+
+    private static string BuildContextParsePayload(WorkbenchViewModel viewModel, string scope)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine($"Context Control scope: {scope}");
+        builder.AppendLine($"Project: {viewModel.CurrentProject?.Name ?? "none"}");
+        builder.AppendLine($"Project root: {viewModel.CurrentProject?.ProjectRoot ?? ""}");
+        builder.AppendLine($"Selected node: {viewModel.SelectedNode?.Path ?? ""}");
+        builder.AppendLine($"Active document: {viewModel.ActiveDocument?.Path ?? ""}");
+        builder.AppendLine();
+
+        switch (scope)
+        {
+            case "main.header":
+                builder.AppendLine("Element: main command header");
+                builder.AppendLine("Visible commands: Open Project, New Project, Context Parse, Settings");
+                builder.AppendLine("Primary files: Views/MainWindow.axaml, Views/MainWindow.axaml.cs, ViewModels/WorkbenchViewModel.cs");
+                break;
+            case "main.projects":
+                builder.AppendLine("Element: project switcher");
+                foreach (var project in viewModel.Projects)
+                {
+                    builder.AppendLine($"- {project.Name}: root={project.ProjectRoot}; files={project.FileCount}; dirs={project.DirectoryCount}; loc={project.Location}; commit={project.Commit}");
+                }
+                builder.AppendLine("Primary files: ViewModels/ProjectTabViewModel.cs, ViewModels/WorkbenchViewModel.cs, Services/ProjectLoader.cs");
+                break;
+            case "main.projectInfo":
+                builder.AppendLine("Element: project info / external update queue");
+                builder.AppendLine($"External updates: {viewModel.ExternalChanges.Count}");
+                foreach (var change in viewModel.ExternalChanges.Take(40))
+                {
+                    builder.AppendLine($"- {change.RelativePath}: {change.VersionFlow}, {change.AddedLabel}/{change.RemovedLabel}, selected={change.IsSelected}");
+                }
+                builder.AppendLine("Primary files: Services/ExternalChangeTracker.cs, Services/ExternalVersionQueueStore.cs, ViewModels/ExternalChangeItemViewModel.cs");
+                break;
+            case "main.projectStat.loc":
+                builder.AppendLine("Element: project LOC stat");
+                builder.AppendLine($"Value: {viewModel.CurrentProject?.Location ?? ""}");
+                builder.AppendLine("Primary files: ViewModels/ProjectTabViewModel.cs, Services/ProjectLoader.cs, Views/MainWindow.axaml");
+                break;
+            case "main.projectStat.files":
+                builder.AppendLine("Element: project file-count stat");
+                builder.AppendLine($"Value: {viewModel.CurrentProject?.FileCount ?? ""}");
+                builder.AppendLine("Primary files: ViewModels/ProjectTabViewModel.cs, Services/ProjectLoader.cs, Views/MainWindow.axaml");
+                break;
+            case "main.projectStat.dirs":
+                builder.AppendLine("Element: project directory-count stat");
+                builder.AppendLine($"Value: {viewModel.CurrentProject?.DirectoryCount ?? ""}");
+                builder.AppendLine("Primary files: ViewModels/ProjectTabViewModel.cs, Services/ProjectLoader.cs, Views/MainWindow.axaml");
+                break;
+            case "main.projectStat.commit":
+                builder.AppendLine("Element: project commit stat");
+                builder.AppendLine($"Value: {viewModel.CurrentProject?.Commit ?? ""}");
+                builder.AppendLine("Primary files: ViewModels/ProjectTabViewModel.cs, Services/ProjectLoader.cs, Views/MainWindow.axaml");
+                break;
+            case "main.updates":
+                builder.AppendLine("Element: external updates list");
+                builder.AppendLine($"Queued updates: {viewModel.ExternalChanges.Count}");
+                foreach (var change in viewModel.ExternalChanges.Take(60))
+                {
+                    builder.AppendLine($"- {change.RelativePath}: {change.VersionFlow}, {change.AddedLabel}/{change.RemovedLabel}, selected={change.IsSelected}, snapshot={change.SnapshotPath}");
+                }
+                builder.AppendLine("Primary files: Services/ExternalChangeTracker.cs, ViewModels/ExternalChangeItemViewModel.cs, Views/MainWindow.axaml");
+                break;
+            case "main.treeHeader":
+                builder.AppendLine("Element: project tree header");
+                builder.AppendLine($"Current project: {viewModel.CurrentProject?.Name ?? ""}");
+                builder.AppendLine($"Visible tree rows: {viewModel.VisibleTreeRows.Count}");
+                builder.AppendLine("Primary files: Views/MainWindow.axaml, ViewModels/WorkbenchViewModel.cs");
+                break;
+            case "main.tree":
+                builder.AppendLine("Element: project tree");
+                foreach (var row in viewModel.VisibleTreeRows.Where(row => row.Node is not null).Take(120))
+                {
+                    var node = row.Node!;
+                    var indent = new string(' ', Math.Min(32, row.Depth * 2));
+                    var statsLabel = node.IsRegularFolder ? node.DirectoryStatsLabel : node.LocMetricLabel;
+                    builder.AppendLine($"{indent}- {(node.IsFolder ? "dir" : "file")} {node.Path} {node.VersionLabel} {statsLabel}");
+                }
+                builder.AppendLine("Primary files: ViewModels/ProjectNodeViewModel.cs, ViewModels/TreeRowViewModel.cs, Services/ProjectLoader.cs");
+                break;
+            case "main.history":
+                builder.AppendLine("Element: selected file history");
+                if (viewModel.SelectedHistory is { } history)
+                {
+                    builder.AppendLine($"History path: {history.Path}");
+                    foreach (var version in history.Versions.Take(80))
+                    {
+                        builder.AppendLine($"- {version.Version}: {version.Date}; {version.AddedLabel}/{version.RemovedLabel}; loc={version.LocLabel}; snapshot={version.SnapshotPath}");
+                    }
+                }
+                builder.AppendLine("Primary files: ViewModels/FileHistoryViewModel.cs, ViewModels/VersionEntryViewModel.cs, Services/ExternalChangeTracker.cs");
+                break;
+            case "main.editorHeader":
+                builder.AppendLine("Element: editor metadata header");
+                if (viewModel.ActiveDocument is { } headerDocument)
+                {
+                    builder.AppendLine($"Name: {headerDocument.Name}");
+                    builder.AppendLine($"Path: {headerDocument.Path}");
+                    builder.AppendLine($"Language: {headerDocument.Language}");
+                    builder.AppendLine($"Version: {headerDocument.Version}");
+                    builder.AppendLine($"Status: {headerDocument.Status}");
+                    builder.AppendLine($"Change labels: {headerDocument.AddedChangeLabel} {headerDocument.RemovedChangeLabel}".Trim());
+                }
+                builder.AppendLine("Primary files: Views/MainWindow.axaml, ViewModels/EditorDocumentViewModel.cs");
+                break;
+            case "main.editor":
+                builder.AppendLine("Element: editor");
+                if (viewModel.ActiveDocument is { } document)
+                {
+                    builder.AppendLine($"Name: {document.Name}");
+                    builder.AppendLine($"Path: {document.Path}");
+                    builder.AppendLine($"Language: {document.Language}");
+                    builder.AppendLine($"Version: {document.Version}");
+                    builder.AppendLine($"Status: {document.Status}");
+                    builder.AppendLine($"LOC: {document.Loc}");
+                    builder.AppendLine("Preview excerpt:");
+                    foreach (var line in document.Text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n').Take(60))
+                    {
+                        builder.AppendLine(line);
+                    }
+                }
+                builder.AppendLine("Primary files: Controls/CodeEditor.cs, ViewModels/EditorDocumentViewModel.cs, Views/MainWindow.axaml");
+                break;
+            case "main.codePreview":
+                builder.AppendLine("Element: code preview body");
+                if (viewModel.ActiveDocument is { } previewDocument)
+                {
+                    builder.AppendLine($"Path: {previewDocument.Path}");
+                    builder.AppendLine($"Language: {previewDocument.Language}");
+                    builder.AppendLine($"Status: {previewDocument.Status}");
+                    builder.AppendLine("Preview excerpt:");
+                    foreach (var line in previewDocument.Text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n').Take(80))
+                    {
+                        builder.AppendLine(line);
+                    }
+                }
+                builder.AppendLine("Primary files: Controls/CodeEditor.cs, ViewModels/EditorDocumentViewModel.cs");
+                break;
+            default:
+                builder.AppendLine("No dedicated parser exists for this scope yet.");
+                break;
+        }
+
+        return builder.ToString();
     }
 
     private async Task PickAndLoadProjectAsync(string title)
@@ -603,6 +854,7 @@ public MainWindow()
             HorizontalContentAlignment = HorizontalAlignment.Center,
             VerticalContentAlignment = VerticalAlignment.Center
         };
+        button.Classes.Add("inline-action");
         button.Click += (_, _) =>
         {
             ExecuteExternalCommand(command);
@@ -872,19 +1124,37 @@ private void OnProjectTreeRowPointerPressed(object? sender, PointerPressedEventA
             return;
         }
 
-        var usableHeight = Math.Max(MinHeight, (screen.WorkingArea.Height / screen.Scaling) - 18);
+        var usableWidth = Math.Max(MinWidth, screen.WorkingArea.Width / screen.Scaling);
+        var usableHeight = Math.Max(MinHeight, screen.WorkingArea.Height / screen.Scaling);
+        MaxWidth = usableWidth;
         MaxHeight = usableHeight;
-        if (Height > usableHeight)
+
+        if (WindowState == WindowState.Maximized)
         {
-            Height = usableHeight;
+            return;
         }
 
-        var widthPixels = (int)Math.Ceiling(Math.Max(Width, MinWidth) * screen.Scaling);
+        Width = Math.Min(Math.Max(Width, MinWidth), usableWidth);
+        Height = Math.Min(Math.Max(Height, MinHeight), usableHeight);
+
+        var widthPixels = (int)Math.Ceiling(Width * screen.Scaling);
         var heightPixels = (int)Math.Ceiling(Height * screen.Scaling);
         var maxX = Math.Max(screen.WorkingArea.X, screen.WorkingArea.X + screen.WorkingArea.Width - widthPixels);
         var maxY = Math.Max(screen.WorkingArea.Y, screen.WorkingArea.Y + screen.WorkingArea.Height - heightPixels);
         Position = new PixelPoint(
             Math.Clamp(Position.X, screen.WorkingArea.X, maxX),
             Math.Clamp(Position.Y, screen.WorkingArea.Y, maxY));
+    }
+
+    private void FitMaximizedWindowToWorkingArea()
+    {
+        var screen = Screens.ScreenFromWindow(this) ?? Screens.Primary;
+        if (screen is null)
+        {
+            return;
+        }
+
+        MaxWidth = Math.Max(MinWidth, screen.WorkingArea.Width / screen.Scaling);
+        MaxHeight = Math.Max(MinHeight, screen.WorkingArea.Height / screen.Scaling);
     }
 }

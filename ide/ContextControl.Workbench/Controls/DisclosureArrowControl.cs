@@ -12,9 +12,9 @@ public sealed class DisclosureArrowControl : Control
     public static readonly StyledProperty<string> ThemeKeyProperty =
         AvaloniaProperty.Register<DisclosureArrowControl, string>(nameof(ThemeKey), "empty");
 
-    private static readonly IBrush EmptyArrowBrush = new SolidColorBrush(Color.FromRgb(82, 88, 98));
-    private static readonly IBrush DarkArrowBrush = new SolidColorBrush(Color.FromRgb(190, 199, 214));
-    private static readonly IBrush MatrixArrowBrush = new SolidColorBrush(Color.FromRgb(129, 255, 154));
+    private static readonly IBrush EmptyArrowBrush = new SolidColorBrush(Color.FromRgb(83, 97, 102));
+    private static readonly IBrush DarkArrowBrush = new SolidColorBrush(Color.FromRgb(183, 199, 203));
+    private static readonly IBrush MatrixArrowBrush = new SolidColorBrush(Color.FromRgb(150, 255, 195));
 
     public double Angle
     {

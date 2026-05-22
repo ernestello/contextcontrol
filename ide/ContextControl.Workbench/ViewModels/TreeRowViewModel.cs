@@ -47,8 +47,13 @@ public sealed class TreeRowViewModel : ObservableObject
     public bool IsLast => Node?.IsLast == true;
     public IReadOnlyList<bool> AncestorContinues => Node?.AncestorContinues ?? _spacerAncestorContinues;
     public string NodeBadgeText => Node?.NodeBadgeText ?? "";
+    public string FileCountLabel => Node?.FileCountLabel ?? "";
+    public string DirectoryStatsLabel => Node?.DirectoryStatsLabel ?? "";
+    public bool ShowFileCountLabel => HasNode && IsRegularFolder && !string.IsNullOrWhiteSpace(FileCountLabel);
+    public string LocMetricLabel => Node?.LocMetricLabel ?? "";
+    public bool ShowLocMetricLabel => HasNode && !IsExternal && !string.IsNullOrWhiteSpace(LocMetricLabel);
     public string NodeTypeLabel => Node?.NodeRoleLabel ?? "";
-    public bool ShowNodeTypeLabel => HasNode && !string.IsNullOrWhiteSpace(NodeTypeLabel) && !CanIncludeExternal;
+    public bool ShowNodeTypeLabel => HasNode && IsExternal && !string.IsNullOrWhiteSpace(NodeTypeLabel) && !CanIncludeExternal;
     public string DisplayName => Node?.DisplayName ?? "";
     public string VersionLabel => Node?.VersionLabel ?? "";
     public bool ShowVersionLabel => HasNode && IsFile && !CanIncludeExternal;
@@ -74,7 +79,13 @@ public sealed class TreeRowViewModel : ObservableObject
 
     public void RefreshNodeMetrics()
     {
+        OnPropertyChanged(nameof(FileCountLabel));
+        OnPropertyChanged(nameof(ShowFileCountLabel));
+        OnPropertyChanged(nameof(LocMetricLabel));
+        OnPropertyChanged(nameof(ShowLocMetricLabel));
+        OnPropertyChanged(nameof(DirectoryStatsLabel));
         OnPropertyChanged(nameof(NodeTypeLabel));
+        OnPropertyChanged(nameof(ShowNodeTypeLabel));
         OnPropertyChanged(nameof(VersionLabel));
         OnPropertyChanged(nameof(ShowVersionLabel));
     }

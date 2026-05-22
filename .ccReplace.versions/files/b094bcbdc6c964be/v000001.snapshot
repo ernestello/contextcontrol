@@ -1,0 +1,199 @@
+using Avalonia.Controls;
+using Avalonia.Media;
+using Avalonia.Styling;
+
+namespace ContextControl.Workbench.Services;
+
+public static class WorkbenchThemeResources
+{
+    public static void Apply(Window window, string? themeKey)
+    {
+        var palette = ThemePalette.For(themeKey);
+        window.RequestedThemeVariant = palette.IsDark ? ThemeVariant.Dark : ThemeVariant.Light;
+
+        window.Resources["UiFontFamily"] = new FontFamily("Aptos, Segoe UI Variable Text, Segoe UI, sans-serif");
+        window.Resources["CodeFontFamily"] = new FontFamily("Cascadia Code, Cascadia Mono, Consolas, monospace");
+        Set(window, "AppBackgroundBrush", palette.AppBackground);
+        Set(window, "PanelBackgroundBrush", palette.PanelBackground);
+        Set(window, "PanelBorderBrush", palette.PanelBorder);
+        Set(window, "HeaderBackgroundBrush", palette.HeaderBackground);
+        Set(window, "TextPrimaryBrush", palette.TextPrimary);
+        Set(window, "TextMutedBrush", palette.TextMuted);
+        Set(window, "CommandBackgroundBrush", palette.CommandBackground);
+        Set(window, "CommandBorderBrush", palette.CommandBorder);
+        Set(window, "CommandPrimaryBackgroundBrush", palette.CommandPrimaryBackground);
+        Set(window, "AccentBrush", palette.Accent);
+        Set(window, "AccentBorderBrush", palette.AccentBorder);
+        Set(window, "ProjectTileBackgroundBrush", palette.ProjectTileBackground);
+        Set(window, "ProjectTileActiveBrush", palette.ProjectTileActive);
+        Set(window, "DirectoryHighlightBrush", palette.DirectoryHighlight);
+        Set(window, "CurrentRowBrush", palette.CurrentRow);
+        Set(window, "CurrentRowBorderBrush", palette.CurrentRowBorder);
+        Set(window, "FolderTextBrush", palette.FolderText);
+        Set(window, "FileTextBrush", palette.FileText);
+        Set(window, "ExternalTextBrush", palette.ExternalText);
+        Set(window, "NodeTextBrush", palette.NodeText);
+        Set(window, "SkipTextBrush", palette.SkipText);
+        Set(window, "EditorSurfaceBrush", palette.EditorSurface);
+        Set(window, "HistoryHoverBrush", palette.HistoryHover);
+        Set(window, "HistoryActiveBrush", palette.HistoryActive);
+        Set(window, "GoodBrush", palette.Good);
+        Set(window, "BadBrush", palette.Bad);
+        Set(window, "IncludeBackgroundBrush", palette.IncludeBackground);
+        Set(window, "IncludeBorderBrush", palette.IncludeBorder);
+        Set(window, "IncludeTextBrush", palette.IncludeText);
+        Set(window, "SettingsSurfaceBrush", palette.SettingsSurface);
+        Set(window, "ScopePinBackgroundBrush", palette.Accent);
+        Set(window, "ScopePinBorderBrush", palette.AccentBorder);
+        Set(window, "MetricFileBrush", palette.Accent);
+        Set(window, "MetricLocBrush", palette.IncludeText);
+    }
+
+    private static void Set(Window window, string key, string color)
+    {
+        window.Resources[key] = new SolidColorBrush(Color.Parse(color));
+    }
+
+    private sealed record ThemePalette(
+        bool IsDark,
+        string AppBackground,
+        string PanelBackground,
+        string PanelBorder,
+        string HeaderBackground,
+        string TextPrimary,
+        string TextMuted,
+        string CommandBackground,
+        string CommandBorder,
+        string CommandPrimaryBackground,
+        string Accent,
+        string AccentBorder,
+        string ProjectTileBackground,
+        string ProjectTileActive,
+        string DirectoryHighlight,
+        string CurrentRow,
+        string CurrentRowBorder,
+        string FolderText,
+        string FileText,
+        string ExternalText,
+        string NodeText,
+        string SkipText,
+        string EditorSurface,
+        string HistoryHover,
+        string HistoryActive,
+        string Good,
+        string Bad,
+        string IncludeBackground,
+        string IncludeBorder,
+        string IncludeText,
+        string SettingsSurface)
+    {
+        public static ThemePalette For(string? themeKey)
+        {
+            return themeKey?.ToLowerInvariant() switch
+            {
+                "dark" => Dark,
+                "matrix" => Matrix,
+                _ => Empty
+            };
+        }
+
+        private static readonly ThemePalette Empty = new(
+            false,
+            "#F3F0E8",
+            "#FBFAF6",
+            "#D7D1C2",
+            "#F7F4EC",
+            "#24262B",
+            "#747A84",
+            "#F8F5ED",
+            "#BDB5A4",
+            "#E8EDFF",
+            "#253F9C",
+            "#96A7DF",
+            "#EBE6DC",
+            "#FFFFFF",
+            "#F4EFE2",
+            "#E8EDFF",
+            "#AAB8E9",
+            "#171A20",
+            "#34363A",
+            "#8A7C5A",
+            "#4D5664",
+            "#A2761A",
+            "#FFFFFF",
+            "#F9F7F1",
+            "#EEF2FF",
+            "#247A59",
+            "#B04444",
+            "#FFF4D7",
+            "#D9B768",
+            "#8A6A23",
+            "#FFFFFF");
+
+        private static readonly ThemePalette Dark = new(
+            true,
+            "#111317",
+            "#181B20",
+            "#2B3038",
+            "#15181D",
+            "#D7DAE0",
+            "#8E96A3",
+            "#20242B",
+            "#3A414C",
+            "#1F2A44",
+            "#8AB4F8",
+            "#3B5F95",
+            "#20242B",
+            "#252A32",
+            "#20242A",
+            "#202B44",
+            "#3F5F9F",
+            "#F0F3F8",
+            "#D7DAE0",
+            "#A79B73",
+            "#B5BEC9",
+            "#D6AA5A",
+            "#101114",
+            "#20242A",
+            "#1F2A44",
+            "#62D596",
+            "#F07178",
+            "#2A2418",
+            "#7F6330",
+            "#E0B35D",
+            "#1E2228");
+
+        private static readonly ThemePalette Matrix = new(
+            true,
+            "#030905",
+            "#06110A",
+            "#123A22",
+            "#041007",
+            "#C8FFD5",
+            "#6FBF7C",
+            "#071A0E",
+            "#1F6B37",
+            "#0F2B16",
+            "#4AF36B",
+            "#2CAB55",
+            "#071A0E",
+            "#0C2111",
+            "#081A0D",
+            "#0D2A15",
+            "#2CAB55",
+            "#E2FFE8",
+            "#C8FFD5",
+            "#8DDC96",
+            "#A5F0B4",
+            "#D1FF72",
+            "#020604",
+            "#0B1C0F",
+            "#0F2B16",
+            "#4AFF71",
+            "#FF6C6C",
+            "#151F07",
+            "#5EA63A",
+            "#D1FF72",
+            "#06140A");
+    }
+}

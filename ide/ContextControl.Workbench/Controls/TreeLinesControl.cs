@@ -26,12 +26,12 @@ public sealed class TreeLinesControl : Control
 
     private const double RailStep = 9.0;
     private const double RailInset = 6.0;
-    private static readonly Pen EmptyRailPen = new(new SolidColorBrush(Color.FromRgb(178, 169, 151)), 1);
-    private static readonly Pen EmptyBranchPen = new(new SolidColorBrush(Color.FromRgb(151, 141, 122)), 1);
-    private static readonly Pen DarkRailPen = new(new SolidColorBrush(Color.FromRgb(73, 82, 96)), 1);
-    private static readonly Pen DarkBranchPen = new(new SolidColorBrush(Color.FromRgb(95, 106, 122)), 1);
-    private static readonly Pen MatrixRailPen = new(new SolidColorBrush(Color.FromRgb(38, 132, 68)), 1);
-    private static readonly Pen MatrixBranchPen = new(new SolidColorBrush(Color.FromRgb(75, 218, 111)), 1);
+    private static readonly Pen EmptyRailPen = new(new SolidColorBrush(Color.FromRgb(178, 195, 197)), 1);
+    private static readonly Pen EmptyBranchPen = new(new SolidColorBrush(Color.FromRgb(139, 188, 192)), 1);
+    private static readonly Pen DarkRailPen = new(new SolidColorBrush(Color.FromRgb(48, 67, 72)), 1);
+    private static readonly Pen DarkBranchPen = new(new SolidColorBrush(Color.FromRgb(79, 139, 143)), 1);
+    private static readonly Pen MatrixRailPen = new(new SolidColorBrush(Color.FromRgb(42, 118, 91)), 1);
+    private static readonly Pen MatrixBranchPen = new(new SolidColorBrush(Color.FromRgb(101, 240, 178)), 1);
 
     public int Depth
     {

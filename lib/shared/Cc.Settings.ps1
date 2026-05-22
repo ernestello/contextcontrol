@@ -33,7 +33,9 @@ function New-CcSharedDefaultSettings {
             "CMakeFiles", "Debug", "dist", "external", "extern", "node_modules", "obj", "out",
             "packages", "Release", "third_party", "thirdparty", "vendor", "vcpkg_installed", "x64"
         )
-        IgnoredFiles = @()
+        IgnoredFiles = @(
+            ".ccFileRules.json", ".ccWorkbench.settings.json", ".DS_Store", "desktop.ini", "Thumbs.db"
+        )
     }
 }
 
@@ -374,6 +376,11 @@ function Read-CcProjectFileRules {
             }
         }
 
+        if (($loaded.PSObject.Properties.Name -contains "IgnoredFileNames") -and
+            ((-not ($loaded.PSObject.Properties.Name -contains "IgnoredFiles")) -or $null -eq $loaded.IgnoredFiles)) {
+            $defaults.IgnoredFiles = $loaded.IgnoredFileNames
+        }
+
         $defaults.IgnoredDirectories = Normalize-CcSharedNameList $defaults.IgnoredDirectories
         $defaults.IgnoredExtensions = Normalize-CcSharedExtensionList $defaults.IgnoredExtensions
         $defaults.SupportedExtensions = Normalize-CcSharedExtensionList $defaults.SupportedExtensions
@@ -398,11 +405,13 @@ function Save-CcProjectFileRules {
         New-Item -ItemType Directory -Path $parent -Force | Out-Null
     }
 
+    $ignoredFiles = Normalize-CcSharedNameList $Rules.IgnoredFiles
     $normalized = [pscustomobject]@{
         IgnoredDirectories = Normalize-CcSharedNameList $Rules.IgnoredDirectories
         IgnoredExtensions = Normalize-CcSharedExtensionList $Rules.IgnoredExtensions
         SupportedExtensions = Normalize-CcSharedExtensionList $Rules.SupportedExtensions
-        IgnoredFiles = Normalize-CcSharedNameList $Rules.IgnoredFiles
+        IgnoredFiles = $ignoredFiles
+        IgnoredFileNames = $ignoredFiles
     }
 
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)

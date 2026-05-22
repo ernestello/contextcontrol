@@ -9,382 +9,33 @@
     Height="800"
     MinWidth="920"
     MinHeight="620"
+    SystemDecorations="None"
     Title="Context Control"
     Background="{DynamicResource AppBackgroundBrush}"
     KeyDown="OnKeyDown">
+<Grid RowDefinitions="31,*">
+    <Border Classes="custom-titlebar" PointerPressed="OnTitleBarPointerPressed">
+      <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+        <Border Classes="title-icon">
+          <TextBlock
+              Classes="title-icon-glyph"
+              Text="▣"
+              />
+        </Border>
+        <TextBlock
+            Grid.Column="1"
+            Classes="window-title"
+            Text="Context Control"
+            />
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="2">
+          <Button Classes="window-control" Content="-" Click="OnMinimizeClick" />
+          <Button Classes="window-control" Content="□" Click="OnMaximizeRestoreClick" />
+          <Button Classes="window-control close" Content="x" Click="OnCloseClick" />
+        </StackPanel>
+      </Grid>
+    </Border>
 
-  <Window.Styles>
-    <Style Selector="Border.panel">
-      <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="8" />
-      <Setter Property="BoxShadow" Value="0 8 24 0 #14000000" />
-    </Style>
-
-    <Style Selector="Button.command">
-      <Setter Property="Height" Value="30" />
-      <Setter Property="Padding" Value="11,1,11,0" />
-      <Setter Property="FontSize" Value="12" />
-      <Setter Property="FontWeight" Value="Bold" />
-      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="6" />
-      <Setter Property="HorizontalContentAlignment" Value="Center" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
-    </Style>
-
-    <Style Selector="Button.command.primary">
-      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
-    </Style>
-
-    <Style Selector="Button.icon">
-      <Setter Property="Width" Value="30" />
-      <Setter Property="Height" Value="30" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontWeight" Value="Bold" />
-      <Setter Property="FontSize" Value="12" />
-      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="6" />
-    </Style>
-
-    <Style Selector="Button.project-tile">
-      <Setter Property="Width" Value="68" />
-      <Setter Property="Height" Value="74" />
-      <Setter Property="Margin" Value="0,0,7,0" />
-      <Setter Property="Padding" Value="5" />
-      <Setter Property="Background" Value="{DynamicResource ProjectTileBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="8" />
-      <Setter Property="Opacity" Value="0.62" />
-      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-      <Setter Property="VerticalContentAlignment" Value="Stretch" />
-      <Setter Property="Transitions">
-        <Transitions>
-          <DoubleTransition Property="Opacity" Duration="0:0:0.09" />
-        </Transitions>
-      </Setter>
-    </Style>
-
-    <Style Selector="Button.project-tile.active">
-      <Setter Property="Background" Value="{DynamicResource ProjectTileActiveBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-      <Setter Property="Opacity" Value="1" />
-    </Style>
-
-    <Style Selector="Button.project-info-switch">
-      <Setter Property="Height" Value="19" />
-      <Setter Property="MinHeight" Value="19" />
-      <Setter Property="Width" Value="112" />
-      <Setter Property="Padding" Value="7,0" />
-      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="6" />
-      <Setter Property="HorizontalContentAlignment" Value="Center" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="9.5" />
-      <Setter Property="FontWeight" Value="Bold" />
-    </Style>
-
-    <Style Selector="Button.project-info-switch:pointerover">
-      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
-    </Style>
-
-    <Style Selector="Button.header-mini">
-      <Setter Property="Height" Value="20" />
-      <Setter Property="MinHeight" Value="20" />
-      <Setter Property="Padding" Value="6,0" />
-      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="5" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="9" />
-      <Setter Property="FontWeight" Value="Bold" />
-      <Setter Property="HorizontalContentAlignment" Value="Center" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
-    </Style>
-
-    <Style Selector="Button.header-mini.primary">
-      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
-    </Style>
-
-    <Style Selector="Button.external-update-row">
-      <Setter Property="Height" Value="18" />
-      <Setter Property="MinHeight" Value="18" />
-      <Setter Property="Padding" Value="4,0" />
-      <Setter Property="Margin" Value="0,0,0,1" />
-      <Setter Property="Background" Value="Transparent" />
-      <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="3" />
-      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
-    </Style>
-
-    <Style Selector="Button.external-update-row:pointerover">
-      <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.update-file">
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="FontWeight" Value="ExtraBold" />
-      <Setter Property="VerticalAlignment" Value="Center" />
-      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
-    </Style>
-
-    <Style Selector="TextBlock.update-meta">
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="FontWeight" Value="Black" />
-      <Setter Property="VerticalAlignment" Value="Center" />
-      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
-    </Style>
-
-    <Style Selector="TextBlock.update-empty">
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="TextAlignment" Value="Center" />
-      <Setter Property="VerticalAlignment" Value="Center" />
-      <Setter Property="HorizontalAlignment" Value="Center" />
-    </Style>
-
-    <Style Selector="Border.project-stat">
-      <Setter Property="Height" Value="14" />
-      <Setter Property="MinHeight" Value="14" />
-      <Setter Property="Padding" Value="5,0" />
-      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="4" />
-    </Style>
-
-    <Style Selector="TextBlock.project-stat-key">
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="9" />
-      <Setter Property="FontWeight" Value="Black" />
-      <Setter Property="VerticalAlignment" Value="Center" />
-    </Style>
-
-    <Style Selector="TextBlock.project-stat-value">
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="9" />
-      <Setter Property="FontWeight" Value="Black" />
-      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
-      <Setter Property="TextAlignment" Value="Right" />
-      <Setter Property="VerticalAlignment" Value="Center" />
-    </Style>
-
-    <Style Selector="TextBlock.meta-key">
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-    </Style>
-
-    <Style Selector="TextBlock.meta-value">
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
-      <Setter Property="TextAlignment" Value="Right" />
-    </Style>
-
-    <Style Selector="ListBox.project-tree">
-      <Setter Property="Background" Value="Transparent" />
-      <Setter Property="BorderThickness" Value="0" />
-      <Setter Property="Padding" Value="4,4,16,9" />
-    </Style>
-
-    <Style Selector="ListBox.project-tree ListBoxItem">
-      <Setter Property="MinHeight" Value="0" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="Margin" Value="0" />
-      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-      <Setter Property="IsHitTestVisible" Value="{Binding HasNode}" />
-      <Setter Property="Focusable" Value="{Binding HasNode}" />
-    </Style>
-
-    <Style Selector="Button.tree-toggle">
-      <Setter Property="Width" Value="11" />
-      <Setter Property="Height" Value="11" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="3" />
-      <Setter Property="MinWidth" Value="0" />
-      <Setter Property="MinHeight" Value="0" />
-      <Setter Property="Focusable" Value="False" />
-      <Setter Property="HorizontalContentAlignment" Value="Center" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
-    </Style>
-
-    <Style Selector="Button.tree-toggle:pointerover">
-      <Setter Property="Background" Value="{DynamicResource HistoryActiveBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-    </Style>
-
-    <Style Selector="Border.dir-row-highlight">
-      <Setter Property="Background" Value="{DynamicResource DirectoryHighlightBrush}" />
-      <Setter Property="CornerRadius" Value="4" />
-    </Style>
-
-    <Style Selector="Border.current-row-highlight">
-      <Setter Property="Background" Value="{DynamicResource CurrentRowBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CurrentRowBorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="4" />
-    </Style>
-
-    <Style Selector="TextBlock.node-type">
-      <Setter Property="VerticalAlignment" Value="Center" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="FontWeight" Value="Black" />
-      <Setter Property="MinWidth" Value="34" />
-      <Setter Property="TextAlignment" Value="Right" />
-      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.node-type.dir">
-      <Setter Property="Foreground" Value="{DynamicResource NodeTextBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.node-type.obj">
-      <Setter Property="Foreground" Value="{DynamicResource NodeTextBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.node-type.skip">
-      <Setter Property="Foreground" Value="{DynamicResource SkipTextBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.node-version">
-      <Setter Property="VerticalAlignment" Value="Center" />
-      <Setter Property="HorizontalAlignment" Value="Right" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="FontWeight" Value="Black" />
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="MinWidth" Value="28" />
-      <Setter Property="TextAlignment" Value="Right" />
-      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
-    </Style>
-
-    <Style Selector="controls|IncludeExternalButton.include-external">
-      <Setter Property="Width" Value="38" />
-      <Setter Property="Height" Value="15" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="CornerRadius" Value="4" />
-      <Setter Property="Background" Value="{DynamicResource IncludeBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource IncludeBorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="7.5" />
-      <Setter Property="FontWeight" Value="Bold" />
-      <Setter Property="Foreground" Value="{DynamicResource IncludeTextBrush}" />
-      <Setter Property="Transitions">
-        <Transitions>
-          <BrushTransition Property="Background" Duration="0:0:0.16" />
-          <BrushTransition Property="BorderBrush" Duration="0:0:0.16" />
-        </Transitions>
-      </Setter>
-    </Style>
-
-    <Style Selector="controls|IncludeExternalButton.include-external:pointerover">
-      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.folder-name">
-      <Setter Property="Foreground" Value="{DynamicResource FolderTextBrush}" />
-      <Setter Property="FontWeight" Value="ExtraBold" />
-    </Style>
-
-    <Style Selector="TextBlock.file-name">
-      <Setter Property="Foreground" Value="{DynamicResource FileTextBrush}" />
-      <Setter Property="FontWeight" Value="SemiBold" />
-    </Style>
-
-    <Style Selector="TextBlock.external-name">
-      <Setter Property="Foreground" Value="{DynamicResource ExternalTextBrush}" />
-      <Setter Property="FontStyle" Value="Italic" />
-    </Style>
-
-    <Style Selector="TextBlock.editor-meta">
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
-    </Style>
-
-    <Style Selector="TextBlock.editor-line-number">
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="11" />
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="TextAlignment" Value="Right" />
-    </Style>
-
-    <Style Selector="TextBlock.editor-token">
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="12" />
-      <Setter Property="LineHeight" Value="17" />
-    </Style>
-
-    <Style Selector="Border.history-version">
-      <Setter Property="Height" Value="22" />
-      <Setter Property="Padding" Value="6,0" />
-      <Setter Property="Margin" Value="0,0,0,1" />
-      <Setter Property="Background" Value="Transparent" />
-      <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="3" />
-    </Style>
-
-    <Style Selector="Border.history-version:pointerover">
-      <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-    </Style>
-
-    <Style Selector="Border.history-version.active">
-      <Setter Property="Background" Value="{DynamicResource HistoryActiveBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.history-meta">
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="VerticalAlignment" Value="Center" />
-    </Style>
-  </Window.Styles>
-
-  <Grid RowDefinitions="108,*" RowSpacing="8" Margin="8">
+    <Grid Grid.Row="1" RowDefinitions="108,*" RowSpacing="8" Margin="8">
     <Border Classes="panel" Grid.Row="0" Padding="8">
       <Grid ColumnDefinitions="260,*,310" ColumnSpacing="10">
         <Grid RowDefinitions="Auto,*">
@@ -396,56 +47,74 @@
           <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
             <Button Classes="command primary" Content="Open Project" Click="OnOpenProjectClick" />
             <Button Classes="command" Content="New Project" Click="OnNewProjectClick" />
+            <Button
+                x:Name="ContextParseToggleButton"
+                Classes="icon"
+                Content="◉▤"
+                Click="OnContextParseToggleClick"
+                ToolTip.Tip="Context parse mode" />
             <Button Classes="icon" Content="⚙" Click="OnSettingsClick" />
           </StackPanel>
         </Grid>
 
-        <ScrollViewer Grid.Column="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
-          <ItemsControl ItemsSource="{Binding Projects}" VerticalAlignment="Center">
-            <ItemsControl.ItemsPanel>
-              <ItemsPanelTemplate>
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" />
-              </ItemsPanelTemplate>
-            </ItemsControl.ItemsPanel>
-            <ItemsControl.ItemTemplate>
-              <DataTemplate DataType="{x:Type vm:ProjectTabViewModel}">
-                <Button
-                    Classes="project-tile"
-                    Classes.active="{Binding IsActive}"
-                    Command="{Binding DataContext.SelectProjectCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                    CommandParameter="{Binding}">
-                  <Grid RowDefinitions="38,*" RowSpacing="4">
-                    <Border
-                        Width="38"
-                        Height="38"
-                        CornerRadius="7"
-                        HorizontalAlignment="Center"
-                        Background="{DynamicResource CommandBackgroundBrush}"
-                        BorderBrush="{DynamicResource PanelBorderBrush}"
-                        BorderThickness="1">
-                      <TextBlock
-                          Text="{Binding IconText}"
+        <Grid Grid.Column="1">
+          <ScrollViewer HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+            <ItemsControl ItemsSource="{Binding Projects}" VerticalAlignment="Center">
+              <ItemsControl.ItemsPanel>
+                <ItemsPanelTemplate>
+                  <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" />
+                </ItemsPanelTemplate>
+              </ItemsControl.ItemsPanel>
+              <ItemsControl.ItemTemplate>
+                <DataTemplate DataType="{x:Type vm:ProjectTabViewModel}">
+                  <Button
+                      Classes="project-tile"
+                      Classes.active="{Binding IsActive}"
+                      Command="{Binding DataContext.SelectProjectCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                      CommandParameter="{Binding}">
+                    <Grid RowDefinitions="38,*" RowSpacing="4">
+                      <Border
+                          Width="38"
+                          Height="38"
+                          CornerRadius="7"
                           HorizontalAlignment="Center"
-                          VerticalAlignment="Center"
-                          FontSize="12"
-                          FontWeight="Black"
-                          Foreground="{DynamicResource AccentBrush}" />
-                    </Border>
+                          Background="{DynamicResource CommandBackgroundBrush}"
+                          BorderBrush="{DynamicResource PanelBorderBrush}"
+                          BorderThickness="1">
+                        <TextBlock
+                            Text="{Binding IconText}"
+                            HorizontalAlignment="Center"
+                            VerticalAlignment="Center"
+                            FontSize="12"
+                            FontWeight="Black"
+                            Foreground="{DynamicResource AccentBrush}" />
+                      </Border>
 
-                    <TextBlock
-                        Grid.Row="1"
-                        Text="{Binding Name}"
-                        TextWrapping="Wrap"
-                        TextAlignment="Center"
-                        FontSize="10"
-                        FontWeight="Bold"
-                        LineHeight="11" />
-                  </Grid>
-                </Button>
-              </DataTemplate>
-            </ItemsControl.ItemTemplate>
-          </ItemsControl>
-        </ScrollViewer>
+                      <TextBlock
+                          Grid.Row="1"
+                          Text="{Binding Name}"
+                          TextWrapping="Wrap"
+                          TextAlignment="Center"
+                          FontSize="10"
+                          FontWeight="Bold"
+                          LineHeight="11" />
+                    </Grid>
+                  </Button>
+                </DataTemplate>
+              </ItemsControl.ItemTemplate>
+            </ItemsControl>
+          </ScrollViewer>
+
+          <Button
+              x:Name="ParseProjectsButton"
+              Classes="scope-pin"
+              Content=""
+              HorizontalAlignment="Right"
+              VerticalAlignment="Top"
+              IsVisible="False"
+              Tag="main.projects"
+              Click="OnContextParseScopeClick" />
+        </Grid>
 
         <Border
             Grid.Column="2"
@@ -486,30 +155,34 @@
                 HorizontalAlignment="Stretch"
                 VerticalAlignment="Top">
               <Border Classes="project-stat" HorizontalAlignment="Stretch">
-                <Grid ColumnDefinitions="52,*" ColumnSpacing="8">
+                <Grid ColumnDefinitions="52,*,Auto" ColumnSpacing="5">
                   <TextBlock Classes="project-stat-key" Text="loc" />
                   <TextBlock Classes="project-stat-value" Grid.Column="1" Text="{Binding CurrentProject.Location}" />
+                  <Button x:Name="ParseProjectLocButton" Grid.Column="2" Classes="scope-pin" Content="" IsVisible="False" Tag="main.projectStat.loc" Click="OnContextParseScopeClick" />
                 </Grid>
               </Border>
 
               <Border Classes="project-stat" HorizontalAlignment="Stretch">
-                <Grid ColumnDefinitions="52,*" ColumnSpacing="8">
+                <Grid ColumnDefinitions="52,*,Auto" ColumnSpacing="5">
                   <TextBlock Classes="project-stat-key" Text="files" />
                   <TextBlock Classes="project-stat-value" Grid.Column="1" Text="{Binding CurrentProject.FileCount}" />
+                  <Button x:Name="ParseProjectFilesButton" Grid.Column="2" Classes="scope-pin" Content="" IsVisible="False" Tag="main.projectStat.files" Click="OnContextParseScopeClick" />
                 </Grid>
               </Border>
 
               <Border Classes="project-stat" HorizontalAlignment="Stretch">
-                <Grid ColumnDefinitions="52,*" ColumnSpacing="8">
+                <Grid ColumnDefinitions="52,*,Auto" ColumnSpacing="5">
                   <TextBlock Classes="project-stat-key" Text="dirs" />
                   <TextBlock Classes="project-stat-value" Grid.Column="1" Text="{Binding CurrentProject.DirectoryCount}" />
+                  <Button x:Name="ParseProjectDirsButton" Grid.Column="2" Classes="scope-pin" Content="" IsVisible="False" Tag="main.projectStat.dirs" Click="OnContextParseScopeClick" />
                 </Grid>
               </Border>
 
               <Border Classes="project-stat" HorizontalAlignment="Stretch">
-                <Grid ColumnDefinitions="52,*" ColumnSpacing="8">
+                <Grid ColumnDefinitions="52,*,Auto" ColumnSpacing="5">
                   <TextBlock Classes="project-stat-key" Text="commit" />
                   <TextBlock Classes="project-stat-value" Grid.Column="1" Text="{Binding CurrentProject.Commit}" />
+                  <Button x:Name="ParseProjectCommitButton" Grid.Column="2" Classes="scope-pin" Content="" IsVisible="False" Tag="main.projectStat.commit" Click="OnContextParseScopeClick" />
                 </Grid>
               </Border>
             </StackPanel>
@@ -580,9 +253,39 @@
                     Content="Accept final edits"
                     Command="{Binding AcceptFinalExternalChangesCommand}" />
               </Grid>
+
+              <Button
+                  x:Name="ParseUpdatesButton"
+                  Classes="scope-pin"
+                  Content=""
+                  HorizontalAlignment="Right"
+                  VerticalAlignment="Top"
+                  IsVisible="False"
+                  Tag="main.updates"
+                  Click="OnContextParseScopeClick" />
             </Grid>
+
+            <Button
+                x:Name="ParseProjectInfoButton"
+                Classes="scope-pin"
+                Content=""
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                IsVisible="False"
+                Tag="main.projectInfo"
+                Click="OnContextParseScopeClick" />
           </Grid>
         </Border>
+
+        <Button
+            x:Name="ParseHeaderButton"
+            Classes="scope-pin"
+            Content=""
+            HorizontalAlignment="Right"
+            VerticalAlignment="Top"
+            IsVisible="False"
+            Tag="main.header"
+            Click="OnContextParseScopeClick" />
       </Grid>
     </Border>
 
@@ -594,8 +297,8 @@
         PointerMoved="OnWorkspacePointerMoved">
       <Border x:Name="SidebarPane" Classes="panel" Grid.Column="0" ClipToBounds="True">
         <Grid RowDefinitions="43,*">
-          <Border Grid.Row="0" Background="{DynamicResource HeaderBackgroundBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="0,0,0,1" Padding="12,0,9,0">
-            <Grid ColumnDefinitions="*">
+          <Border Grid.Row="0" Classes="pane-header" Padding="12,0,9,0">
+            <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="6">
               <TextBlock
                   Text="{Binding CurrentProject.Name}"
                   VerticalAlignment="Center"
@@ -603,6 +306,20 @@
                   FontWeight="ExtraBold"
                   Foreground="{DynamicResource TextMutedBrush}"
                   LetterSpacing="0.8" />
+              <Button
+                  Grid.Column="1"
+                  Classes="tree-detail-toggle"
+                  Classes.active="{Binding ShowFileDetails}"
+                  Content="{Binding FileDetailsToggleLabel}"
+                  Command="{Binding ToggleFileDetailsCommand}" />
+              <Button
+                  x:Name="ParseTreeHeaderButton"
+                  Grid.Column="2"
+                  Classes="scope-pin"
+                  Content=""
+                  IsVisible="False"
+                  Tag="main.treeHeader"
+                  Click="OnContextParseScopeClick" />
             </Grid>
           </Border>
 
@@ -617,7 +334,7 @@
                 ScrollViewer.HorizontalScrollBarVisibility="Disabled">
               <ListBox.ItemTemplate>
                 <DataTemplate DataType="{x:Type vm:TreeRowViewModel}">
-                  <Grid ColumnDefinitions="Auto,*,92" Height="{Binding RowHeight}" PointerPressed="OnProjectTreeRowPointerPressed">
+                  <Grid ColumnDefinitions="Auto,*,Auto" Height="{Binding RowHeight}" PointerPressed="OnProjectTreeRowPointerPressed">
                     <Border
                         Grid.Column="0"
                         Grid.ColumnSpan="3"
@@ -677,14 +394,28 @@
                         TextTrimming="CharacterEllipsis" />
                     <Grid
                         Grid.Column="2"
-                        ColumnDefinitions="Auto,Auto"
+                        ColumnDefinitions="Auto,Auto,Auto"
                         ColumnSpacing="4"
                         Margin="0,0,10,0"
                         HorizontalAlignment="Right"
                         VerticalAlignment="Center"
                         IsVisible="{Binding HasNode}">
-                      <TextBlock
+                      <StackPanel
                           Grid.Column="0"
+                          Orientation="Horizontal"
+                          Spacing="4"
+                          IsVisible="{Binding DataContext.ShowFileDetails, RelativeSource={RelativeSource AncestorType=Window}}">
+                        <TextBlock
+                            Classes="node-file-count"
+                            Text="{Binding FileCountLabel}"
+                            IsVisible="{Binding ShowFileCountLabel}" />
+                        <TextBlock
+                            Classes="node-loc-count"
+                            Text="{Binding LocMetricLabel}"
+                            IsVisible="{Binding ShowLocMetricLabel}" />
+                      </StackPanel>
+                      <TextBlock
+                          Grid.Column="1"
                           Classes="node-type"
                           Classes.dir="{Binding IsRegularFolder}"
                           Classes.obj="{Binding IsFile}"
@@ -693,13 +424,13 @@
                           FontWeight="Black"
                           Text="{Binding NodeTypeLabel}" />
                       <TextBlock
-                          Grid.Column="1"
+                          Grid.Column="2"
                           Classes="node-version"
                           FontWeight="Black"
                           Text="{Binding VersionLabel}"
                           IsVisible="{Binding ShowVersionLabel}" />
                       <controls:IncludeExternalButton
-                          Grid.Column="1"
+                          Grid.Column="2"
                           Classes="include-external"
                           HorizontalAlignment="Right"
                           VerticalAlignment="Center"
@@ -712,6 +443,18 @@
               </ListBox.ItemTemplate>
             </ListBox>
           </ScrollViewer>
+
+          <Button
+              x:Name="ParseTreeButton"
+              Grid.RowSpan="2"
+              Classes="scope-pin"
+              Content=""
+              HorizontalAlignment="Right"
+              VerticalAlignment="Top"
+              Margin="0,4,6,0"
+              IsVisible="False"
+              Tag="main.tree"
+              Click="OnContextParseScopeClick" />
         </Grid>
       </Border>
 
@@ -745,7 +488,7 @@
                             Text="{Binding Version}"
                             VerticalAlignment="Center"
                             TextAlignment="Center"
-                            FontFamily="Consolas, Menlo, monospace"
+                            FontFamily="{DynamicResource CodeFontFamily}"
                             FontSize="10"
                             FontWeight="Black"
                             Foreground="{DynamicResource AccentBrush}" />
@@ -767,13 +510,24 @@
                 </ItemsControl.ItemTemplate>
               </ItemsControl>
             </ScrollViewer>
+
+            <Button
+                x:Name="ParseHistoryButton"
+                Classes="scope-pin"
+                Content=""
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                Margin="0,4,6,0"
+                IsVisible="False"
+                Tag="main.history"
+                Click="OnContextParseScopeClick" />
           </Grid>
         </Border>
 
         <Border Grid.Column="1" Background="{DynamicResource EditorSurfaceBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="1" CornerRadius="8" ClipToBounds="True">
           <Grid RowDefinitions="43,*">
-            <Border Grid.Row="0" Background="{DynamicResource HeaderBackgroundBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="0,0,0,1" Padding="12,0">
-              <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="12">
+            <Border Grid.Row="0" Classes="pane-header" Padding="12,0">
+              <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="10">
                 <StackPanel VerticalAlignment="Center">
                   <TextBlock Text="{Binding ActiveDocument.Name}" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" TextTrimming="CharacterEllipsis" />
                   <TextBlock Text="{Binding ActiveDocument.Path}" Classes="editor-meta" Margin="0,2,0,0" />
@@ -784,6 +538,7 @@
                 <TextBlock Grid.Column="4" Text="{Binding ActiveDocument.AddedChangeLabel}" Classes="editor-meta" IsVisible="{Binding ActiveDocument.HasChangeLabels}" VerticalAlignment="Center" FontWeight="Black" Foreground="{DynamicResource GoodBrush}" />
                 <TextBlock Grid.Column="5" Text="{Binding ActiveDocument.RemovedChangeLabel}" Classes="editor-meta" IsVisible="{Binding ActiveDocument.HasChangeLabels}" VerticalAlignment="Center" FontWeight="Black" Foreground="{DynamicResource BadBrush}" />
                 <TextBlock Grid.Column="6" Text="{Binding ActiveDocument.Status}" Classes="editor-meta" VerticalAlignment="Center" />
+                <Button x:Name="ParseEditorHeaderButton" Grid.Column="7" Classes="scope-pin" Content="" IsVisible="False" Tag="main.editorHeader" Click="OnContextParseScopeClick" />
               </Grid>
             </Border>
 
@@ -796,9 +551,35 @@
                 LineChanges="{Binding ActiveDocument.LineChanges}"
                 ThemeKey="{Binding ThemeKey}"
                 SyntaxThemeKey="{Binding SyntaxThemeKey}" />
+
+            <Button
+                x:Name="ParseEditorButton"
+                Grid.Row="0"
+                Classes="scope-pin"
+                Content=""
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                Margin="0,4,6,0"
+                IsVisible="False"
+                Tag="main.editor"
+                Click="OnContextParseScopeClick" />
+
+            <Button
+                x:Name="ParseCodePreviewButton"
+                Grid.Row="1"
+                Classes="scope-pin"
+                Content=""
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                Margin="0,4,6,0"
+                IsVisible="False"
+                Tag="main.codePreview"
+                Click="OnContextParseScopeClick" />
           </Grid>
         </Border>
       </Grid>
     </Grid>
   </Grid>
+  </Grid>
 </Window>
+

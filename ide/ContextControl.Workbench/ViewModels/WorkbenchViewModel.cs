@@ -9,8 +9,15 @@ namespace ContextControl.Workbench.ViewModels;
 
 public sealed class WorkbenchViewModel : ObservableObject, IDisposable
 {
+    public const string RuleKindIgnoredDirectories = "ignoredDirectories";
+    public const string RuleKindIgnoredFileNames = "ignoredFileNames";
+    public const string RuleKindIgnoredFileTypes = "ignoredFileTypes";
+    public const string RuleKindSupportedFileTypes = "supportedFileTypes";
+    private const int DefaultExpandedDepth = 2;
+
     private readonly Dictionary<string, ProjectWorkspaceState> _workspaceByProjectId = [];
     private readonly Dictionary<string, ExternalChangeTracker> _trackersByProjectId = [];
+    private readonly WorkbenchSettings _workbenchSettings;
     private readonly SynchronizationContext? _uiContext;
     private readonly Timer _externalScanTimer;
     private Dictionary<string, FileHistoryViewModel> _historyByPath;
@@ -24,6 +31,7 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
     private ThemeOptionViewModel _selectedSyntaxTheme;
     private bool _isHistoryOpen;
     private bool _isProjectInfoHistoryMode;
+    private bool _showFileDetails = true;
     private double _historyWidth;
     private double _historyOpacity;
     private double _historyGutter;
@@ -32,24 +40,36 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
     private string _fileRulesPath = "";
     private string _supportedFileTypesText = "";
     private string _ignoredFileTypesText = "";
+    private string _ignoredFileNamesText = "";
     private string _ignoredDirectoriesText = "";
+    private string _newIgnoredDirectoryRuleText = "";
+    private string _newIgnoredFileNameRuleText = "";
+    private string _newIgnoredFileTypeRuleText = "";
+    private string _newSupportedFileTypeRuleText = "";
     private string _fileRulesStatus = "";
 
     private WorkbenchViewModel(
         ObservableCollection<ProjectTabViewModel> projects,
         ObservableCollection<ProjectNodeViewModel> projectTree,
         Dictionary<string, FileHistoryViewModel> historyByPath,
-        ProjectFileRules? fileRules = null)
+        ProjectFileRules? fileRules = null,
+        bool treeStatePrepared = false,
+        WorkbenchSettings? workbenchSettings = null)
     {
         _uiContext = SynchronizationContext.Current;
+        _workbenchSettings = workbenchSettings ?? WorkbenchSettings.Load();
         Projects = projects;
         ProjectTree = projectTree;
         ExternalChanges = [];
+        IgnoredDirectoryRules = [];
+        IgnoredFileNameRules = [];
+        IgnoredFileTypeRules = [];
+        SupportedFileTypeRules = [];
         Themes =
         [
-            new ThemeOptionViewModel("empty", "Empty", "quiet white ceramic, lowest distraction"),
-            new ThemeOptionViewModel("dark", "Dark", "low-glare neutral dark, balanced contrast"),
-            new ThemeOptionViewModel("matrix", "Matrix", "green phosphor mode for late-night focus")
+            new ThemeOptionViewModel("empty", "Porcelain", "matte light workbench with precise teal state accents"),
+            new ThemeOptionViewModel("dark", "Graphite", "low-glare instrument panel using the same component language"),
+            new ThemeOptionViewModel("matrix", "Phosphor", "green phosphor variant with restrained IDE contrast")
         ];
         SyntaxThemes =
         [
@@ -65,8 +85,9 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
             new ThemeOptionViewModel("solarized-dark", "Solarized Dark", "low-glare dark palette"),
             new ThemeOptionViewModel("high-contrast-dark", "High Contrast", "maximum token separation")
         ];
-        _selectedTheme = Themes[0];
-        _selectedSyntaxTheme = SyntaxThemes[0];
+        _selectedTheme = FindOptionByKey(Themes, _workbenchSettings.ThemeKey, Themes[0]);
+        _selectedSyntaxTheme = FindOptionByKey(SyntaxThemes, _workbenchSettings.SyntaxThemeKey, SyntaxThemes[0]);
+        SaveAppearanceSettings();
         _historyByPath = historyByPath;
         foreach (var project in projects)
         {
@@ -77,7 +98,8 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
                 new Dictionary<string, FileHistoryViewModel>(historyByPath),
                 new HashSet<string>(StringComparer.OrdinalIgnoreCase),
                 new ObservableCollection<ExternalChangeItemViewModel>(),
-                rules);
+                rules,
+                treeStatePrepared);
         }
 
         SelectProjectCommand = new RelayCommand<ProjectTabViewModel>(SelectProject);
@@ -90,25 +112,29 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
         OpenHistoryCommand = new RelayCommand<object>(_ => OpenHistory());
         CloseHistoryCommand = new RelayCommand<object>(_ => CloseHistory());
         ToggleProjectInfoModeCommand = new RelayCommand<object>(_ => IsProjectInfoHistoryMode = !IsProjectInfoHistoryMode);
+        ToggleFileDetailsCommand = new RelayCommand<object>(_ => ShowFileDetails = !ShowFileDetails);
         AcceptAllExternalChangesCommand = new RelayCommand<object>(_ => AcceptAllExternalChanges());
         AcceptFinalExternalChangesCommand = new RelayCommand<object>(_ => AcceptFinalExternalChanges());
         AcceptSelectedExternalChangesCommand = new RelayCommand<object>(_ => AcceptSelectedExternalChanges());
         DismissSelectedExternalChangesCommand = new RelayCommand<object>(_ => DismissSelectedExternalChanges());
         ToggleExternalChangeCommand = new RelayCommand<ExternalChangeItemViewModel>(ToggleExternalChange);
         OpenExternalChangeCommand = new RelayCommand<ExternalChangeItemViewModel>(OpenExternalChange);
+        AddFileRuleEntryCommand = new RelayCommand<string>(AddFileRuleEntry);
+        RemoveFileRuleEntryCommand = new RelayCommand<FileRuleEntryViewModel>(RemoveFileRuleEntry);
         SaveFileRulesCommand = new RelayCommand<object>(_ => _ = SaveFileRulesAsync());
         ResetFileRulesCommand = new RelayCommand<object>(_ => _ = ResetFileRulesAsync());
 
-        PrepareTree();
-        RefreshVisibleProjectNodes();
-        SelectProject(projects.FirstOrDefault());
-        foreach (var project in projects)
+        if (!treeStatePrepared)
         {
-            StartExternalTracker(project);
+            PrepareTree();
         }
 
+        SelectProject(projects.FirstOrDefault());
+
         ActiveDocument = EditorDocumentViewModel.Empty();
-        _externalScanTimer = new Timer(_ => PostToUi(ScanExternalChangesNow), null, TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(750));
+        // FileSystemWatcher plus the tracker's own background poll handles changes.
+        // A UI-thread full-scan timer made medium projects feel frozen.
+        _externalScanTimer = new Timer(_ => PostToUi(ScanExternalChangesNow), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
     }
 
     public ObservableCollection<ProjectTabViewModel> Projects { get; }
@@ -116,6 +142,10 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
     public ObservableCollection<ProjectNodeViewModel> VisibleProjectNodes { get; } = [];
     public ObservableCollection<TreeRowViewModel> VisibleTreeRows { get; } = [];
     public ObservableCollection<ExternalChangeItemViewModel> ExternalChanges { get; }
+    public ObservableCollection<FileRuleEntryViewModel> IgnoredDirectoryRules { get; }
+    public ObservableCollection<FileRuleEntryViewModel> IgnoredFileNameRules { get; }
+    public ObservableCollection<FileRuleEntryViewModel> IgnoredFileTypeRules { get; }
+    public ObservableCollection<FileRuleEntryViewModel> SupportedFileTypeRules { get; }
     public ObservableCollection<ThemeOptionViewModel> Themes { get; }
     public ObservableCollection<ThemeOptionViewModel> SyntaxThemes { get; }
     public ICommand SelectProjectCommand { get; }
@@ -125,12 +155,15 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
     public ICommand OpenHistoryCommand { get; }
     public ICommand CloseHistoryCommand { get; }
     public ICommand ToggleProjectInfoModeCommand { get; }
+    public ICommand ToggleFileDetailsCommand { get; }
     public ICommand AcceptAllExternalChangesCommand { get; }
     public ICommand AcceptFinalExternalChangesCommand { get; }
     public ICommand AcceptSelectedExternalChangesCommand { get; }
     public ICommand DismissSelectedExternalChangesCommand { get; }
     public ICommand ToggleExternalChangeCommand { get; }
     public ICommand OpenExternalChangeCommand { get; }
+    public ICommand AddFileRuleEntryCommand { get; }
+    public ICommand RemoveFileRuleEntryCommand { get; }
     public ICommand SaveFileRulesCommand { get; }
     public ICommand ResetFileRulesCommand { get; }
 
@@ -148,6 +181,7 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
             {
                 OnPropertyChanged(nameof(ThemeKey));
                 OnPropertyChanged(nameof(SyntaxThemeKey));
+                SaveAppearanceSettings();
             }
         }
     }
@@ -167,11 +201,13 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
             if (SetProperty(ref _selectedSyntaxTheme, value))
             {
                 OnPropertyChanged(nameof(SyntaxThemeKey));
+                SaveAppearanceSettings();
             }
         }
     }
 
     public string SyntaxThemeKey => SelectedSyntaxTheme.Key;
+    public string AppearanceSettingsPath => _workbenchSettings.SettingsPath;
 
     public ProjectTabViewModel? CurrentProject
     {
@@ -281,20 +317,80 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
     public string SupportedFileTypesText
     {
         get => _supportedFileTypesText;
-        set => SetProperty(ref _supportedFileTypesText, value ?? "");
+        set
+        {
+            if (SetProperty(ref _supportedFileTypesText, value ?? ""))
+            {
+                OnPropertyChanged(nameof(FileRulesSummary));
+            }
+        }
     }
 
     public string IgnoredFileTypesText
     {
         get => _ignoredFileTypesText;
-        set => SetProperty(ref _ignoredFileTypesText, value ?? "");
+        set
+        {
+            if (SetProperty(ref _ignoredFileTypesText, value ?? ""))
+            {
+                OnPropertyChanged(nameof(FileRulesSummary));
+            }
+        }
+    }
+
+    public string IgnoredFileNamesText
+    {
+        get => _ignoredFileNamesText;
+        set
+        {
+            if (SetProperty(ref _ignoredFileNamesText, value ?? ""))
+            {
+                OnPropertyChanged(nameof(FileRulesSummary));
+            }
+        }
     }
 
     public string IgnoredDirectoriesText
     {
         get => _ignoredDirectoriesText;
-        set => SetProperty(ref _ignoredDirectoriesText, value ?? "");
+        set
+        {
+            if (SetProperty(ref _ignoredDirectoriesText, value ?? ""))
+            {
+                OnPropertyChanged(nameof(FileRulesSummary));
+            }
+        }
     }
+
+    public string NewIgnoredDirectoryRuleText
+    {
+        get => _newIgnoredDirectoryRuleText;
+        set => SetProperty(ref _newIgnoredDirectoryRuleText, value ?? "");
+    }
+
+    public string NewIgnoredFileNameRuleText
+    {
+        get => _newIgnoredFileNameRuleText;
+        set => SetProperty(ref _newIgnoredFileNameRuleText, value ?? "");
+    }
+
+    public string NewIgnoredFileTypeRuleText
+    {
+        get => _newIgnoredFileTypeRuleText;
+        set => SetProperty(ref _newIgnoredFileTypeRuleText, value ?? "");
+    }
+
+    public string NewSupportedFileTypeRuleText
+    {
+        get => _newSupportedFileTypeRuleText;
+        set => SetProperty(ref _newSupportedFileTypeRuleText, value ?? "");
+    }
+
+    public string FileRulesSummary =>
+        $"{SupportedFileTypeRules.Count} allowed types | "
+        + $"{IgnoredFileTypeRules.Count} skipped types | "
+        + $"{IgnoredFileNameRules.Count} skipped files | "
+        + $"{IgnoredDirectoryRules.Count} skipped folders";
 
     public string FileRulesStatus
     {
@@ -323,6 +419,20 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
     }
 
     public bool IsProjectInfoProjectMode => !IsProjectInfoHistoryMode;
+
+    public bool ShowFileDetails
+    {
+        get => _showFileDetails;
+        set
+        {
+            if (SetProperty(ref _showFileDetails, value))
+            {
+                OnPropertyChanged(nameof(FileDetailsToggleLabel));
+            }
+        }
+    }
+
+    public string FileDetailsToggleLabel => ShowFileDetails ? "File Details" : "Details Off";
 
     public string ProjectInfoTitle => IsProjectInfoHistoryMode
         ? "Update history"
@@ -358,7 +468,7 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
             try
             {
                 var loaded = ProjectLoader.Load(defaultRoot);
-                return new WorkbenchViewModel([loaded.Project], loaded.Tree, loaded.HistoryByPath, loaded.FileRules);
+                return new WorkbenchViewModel([loaded.Project], loaded.Tree, loaded.HistoryByPath, loaded.FileRules, loaded.IsTreePrepared);
             }
             catch
             {
@@ -375,6 +485,31 @@ public sealed class WorkbenchViewModel : ObservableObject, IDisposable
         };
 
         return new WorkbenchViewModel(projects, BuildProjectTree(), BuildHistory());
+    }
+
+    private static ThemeOptionViewModel FindOptionByKey(
+        IEnumerable<ThemeOptionViewModel> options,
+        string? key,
+        ThemeOptionViewModel fallback)
+    {
+        return options.FirstOrDefault(option => string.Equals(option.Key, key, StringComparison.OrdinalIgnoreCase))
+            ?? fallback;
+    }
+
+    private void SaveAppearanceSettings()
+    {
+        _workbenchSettings.ThemeKey = ThemeKey;
+        _workbenchSettings.SyntaxThemeKey = SyntaxThemeKey;
+
+        try
+        {
+            _workbenchSettings.Save();
+        }
+        catch
+        {
+            // Appearance changes should never take the editor down if the settings
+            // file is temporarily unavailable.
+        }
     }
 
     public void Dispose()
@@ -546,7 +681,8 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
         }
 
         var rules = workspace.FileRules;
-        rules.UpdateRules(IgnoredDirectoriesText, IgnoredFileTypesText, SupportedFileTypesText);
+        SyncFileRuleTextsFromEntries();
+        rules.UpdateRules(IgnoredDirectoriesText, IgnoredFileNamesText, IgnoredFileTypesText, SupportedFileTypesText);
         rules.Save();
         var status = $"Saved file rules to {rules.RulesPath}";
         ApplyFileRulesToEditor(rules, status);
@@ -582,8 +718,195 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
         FileRulesPath = rules.RulesPath;
         SupportedFileTypesText = rules.SupportedExtensionsText;
         IgnoredFileTypesText = rules.IgnoredExtensionsText;
+        IgnoredFileNamesText = rules.IgnoredFileNamesText;
         IgnoredDirectoriesText = rules.IgnoredDirectoriesText;
+        ReplaceRuleEntries(IgnoredDirectoryRules, RuleKindIgnoredDirectories, rules.IgnoredDirectories);
+        ReplaceRuleEntries(IgnoredFileNameRules, RuleKindIgnoredFileNames, rules.IgnoredFileNames);
+        ReplaceRuleEntries(IgnoredFileTypeRules, RuleKindIgnoredFileTypes, rules.IgnoredExtensions);
+        ReplaceRuleEntries(SupportedFileTypeRules, RuleKindSupportedFileTypes, rules.SupportedExtensions);
         FileRulesStatus = status;
+        RefreshFileRuleSummary();
+    }
+
+    public IReadOnlyList<string> GetFileRuleEntries(string kind)
+    {
+        return GetRuleCollection(kind)
+            .Select(entry => entry.Value)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .ToArray();
+    }
+
+    public void ReplaceFileRuleEntries(string kind, IEnumerable<string> values)
+    {
+        ReplaceRuleEntries(GetRuleCollection(kind), kind, NormalizeRuleEntries(values));
+        SyncFileRuleTextsFromEntries();
+        FileRulesStatus = "File rules changed. Save to apply.";
+        RefreshFileRuleSummary();
+    }
+
+    public string GetFileRuleTitle(string kind)
+    {
+        return kind switch
+        {
+            RuleKindIgnoredDirectories => "Skipped folders",
+            RuleKindIgnoredFileNames => "Skipped files",
+            RuleKindIgnoredFileTypes => "Skipped file types",
+            RuleKindSupportedFileTypes => "Allowed file types",
+            _ => "File rules"
+        };
+    }
+
+    public string GetFileRuleWatermark(string kind)
+    {
+        return kind switch
+        {
+            RuleKindIgnoredDirectories => "bin, obj, node_modules",
+            RuleKindIgnoredFileNames => ".DS_Store, CMakeCache.txt",
+            RuleKindIgnoredFileTypes => ".dll, .png, .tmp",
+            RuleKindSupportedFileTypes => ".cs, .cpp, .ps1",
+            _ => "new entry"
+        };
+    }
+
+    private void AddFileRuleEntry(string? kind)
+    {
+        if (string.IsNullOrWhiteSpace(kind))
+        {
+            return;
+        }
+
+        var text = GetNewRuleText(kind);
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return;
+        }
+
+        AddRuleEntries(GetRuleCollection(kind), kind, SplitRuleText(text));
+        SetNewRuleText(kind, "");
+        SyncFileRuleTextsFromEntries();
+        FileRulesStatus = "File rules changed. Save to apply.";
+        RefreshFileRuleSummary();
+    }
+
+    private void RemoveFileRuleEntry(FileRuleEntryViewModel? entry)
+    {
+        if (entry is null)
+        {
+            return;
+        }
+
+        GetRuleCollection(entry.Kind).Remove(entry);
+        SyncFileRuleTextsFromEntries();
+        FileRulesStatus = "File rules changed. Save to apply.";
+        RefreshFileRuleSummary();
+    }
+
+    private ObservableCollection<FileRuleEntryViewModel> GetRuleCollection(string kind)
+    {
+        return kind switch
+        {
+            RuleKindIgnoredDirectories => IgnoredDirectoryRules,
+            RuleKindIgnoredFileNames => IgnoredFileNameRules,
+            RuleKindIgnoredFileTypes => IgnoredFileTypeRules,
+            RuleKindSupportedFileTypes => SupportedFileTypeRules,
+            _ => IgnoredDirectoryRules
+        };
+    }
+
+    private string GetNewRuleText(string kind)
+    {
+        return kind switch
+        {
+            RuleKindIgnoredDirectories => NewIgnoredDirectoryRuleText,
+            RuleKindIgnoredFileNames => NewIgnoredFileNameRuleText,
+            RuleKindIgnoredFileTypes => NewIgnoredFileTypeRuleText,
+            RuleKindSupportedFileTypes => NewSupportedFileTypeRuleText,
+            _ => ""
+        };
+    }
+
+    private void SetNewRuleText(string kind, string value)
+    {
+        switch (kind)
+        {
+            case RuleKindIgnoredDirectories:
+                NewIgnoredDirectoryRuleText = value;
+                break;
+            case RuleKindIgnoredFileNames:
+                NewIgnoredFileNameRuleText = value;
+                break;
+            case RuleKindIgnoredFileTypes:
+                NewIgnoredFileTypeRuleText = value;
+                break;
+            case RuleKindSupportedFileTypes:
+                NewSupportedFileTypeRuleText = value;
+                break;
+        }
+    }
+
+    private static void ReplaceRuleEntries(
+        ObservableCollection<FileRuleEntryViewModel> target,
+        string kind,
+        IEnumerable<string> values)
+    {
+        target.Clear();
+        AddRuleEntries(target, kind, values);
+    }
+
+    private static void AddRuleEntries(
+        ObservableCollection<FileRuleEntryViewModel> target,
+        string kind,
+        IEnumerable<string> values)
+    {
+        var existing = target
+            .Select(entry => entry.Value)
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var value in NormalizeRuleEntries(values))
+        {
+            if (existing.Add(value))
+            {
+                target.Add(new FileRuleEntryViewModel(kind, value));
+            }
+        }
+    }
+
+    private void SyncFileRuleTextsFromEntries()
+    {
+        SupportedFileTypesText = JoinRuleEntries(SupportedFileTypeRules);
+        IgnoredFileTypesText = JoinRuleEntries(IgnoredFileTypeRules);
+        IgnoredFileNamesText = JoinRuleEntries(IgnoredFileNameRules);
+        IgnoredDirectoriesText = JoinRuleEntries(IgnoredDirectoryRules);
+    }
+
+    private void RefreshFileRuleSummary()
+    {
+        OnPropertyChanged(nameof(FileRulesSummary));
+    }
+
+    private static string JoinRuleEntries(IEnumerable<FileRuleEntryViewModel> entries)
+    {
+        return string.Join(Environment.NewLine, NormalizeRuleEntries(entries.Select(entry => entry.Value)));
+    }
+
+    private static IEnumerable<string> NormalizeRuleEntries(IEnumerable<string> values)
+    {
+        return values
+            .SelectMany(SplitRuleText)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .OrderBy(value => value, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static IEnumerable<string> SplitRuleText(string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return [];
+        }
+
+        return value
+            .Split(['\r', '\n', ',', ';', '\t', ' '], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(item => !string.IsNullOrWhiteSpace(item));
     }
 
     private void ReloadTrackerRules(ProjectTabViewModel project)
@@ -633,7 +956,8 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
             loadedProject.HistoryByPath,
             new HashSet<string>(StringComparer.OrdinalIgnoreCase),
             new ObservableCollection<ExternalChangeItemViewModel>(),
-            loadedProject.FileRules);
+            loadedProject.FileRules,
+            loadedProject.IsTreePrepared);
         SelectProject(loadedProject.Project);
     }
 
@@ -662,7 +986,8 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
             loadedProject.HistoryByPath,
             includedPaths,
             workspace.ExternalChanges,
-            loadedProject.FileRules);
+            loadedProject.FileRules,
+            loadedProject.IsTreePrepared);
         SelectProject(loadedProject.Project);
     }
 
@@ -731,7 +1056,7 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
         IReadOnlyList<bool> ancestorContinues)
     {
         node.SetTreeState(depth, isLast, ancestorContinues);
-        if (depth == 0)
+        if (depth <= DefaultExpandedDepth && !node.IsExternal)
         {
             node.IsExpanded = true;
         }
@@ -769,7 +1094,12 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
         ActiveDocument = EditorDocumentViewModel.Empty();
         ApplyFileRulesToEditor(workspace.FileRules, "");
         CloseHistory();
-        PrepareTree();
+        if (!workspace.TreeStatePrepared)
+        {
+            PrepareTree();
+            workspace.TreeStatePrepared = true;
+        }
+
         RefreshVisibleProjectNodes();
         RefreshExternalChangeLabels();
         RecalculateExternalChangeFlows(workspace.ExternalChanges);
@@ -1045,7 +1375,8 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
             loadedProject.HistoryByPath,
             currentWorkspace.IncludedExternalPaths,
             currentWorkspace.ExternalChanges,
-            loadedProject.FileRules);
+            loadedProject.FileRules,
+            loadedProject.IsTreePrepared);
 
         if (loadedProject.Project.Id != projectId && _trackersByProjectId.Remove(projectId, out var tracker))
         {
@@ -1117,8 +1448,10 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
             node.Children.Select(CloneNode),
             node.IsExternal,
             node.CanIncludeExternal,
-            node.Loc);
+            node.Loc,
+            node.FileCount);
         clone.IsExpanded = node.IsExpanded;
+        clone.SetTreeState(node.Depth, node.IsLast, node.AncestorContinues);
         return clone;
     }
 
@@ -1230,12 +1563,14 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
         Dictionary<string, FileHistoryViewModel> historyByPath,
         IReadOnlySet<string> includedExternalPaths,
         ObservableCollection<ExternalChangeItemViewModel> externalChanges,
-        ProjectFileRules fileRules)
+        ProjectFileRules fileRules,
+        bool treeStatePrepared = false)
     {
         public ObservableCollection<ProjectNodeViewModel> ProjectTree { get; } = projectTree;
         public Dictionary<string, FileHistoryViewModel> HistoryByPath { get; } = historyByPath;
         public IReadOnlySet<string> IncludedExternalPaths { get; } = includedExternalPaths;
         public ObservableCollection<ExternalChangeItemViewModel> ExternalChanges { get; } = externalChanges;
         public ProjectFileRules FileRules { get; set; } = fileRules;
+        public bool TreeStatePrepared { get; set; } = treeStatePrepared;
     }
 }

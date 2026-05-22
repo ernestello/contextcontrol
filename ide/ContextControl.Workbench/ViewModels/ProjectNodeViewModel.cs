@@ -11,7 +11,8 @@ public sealed class ProjectNodeViewModel(
     IEnumerable<ProjectNodeViewModel>? children = null,
     bool isExternal = false,
     bool canIncludeExternal = false,
-    long loc = 0) : ObservableObject
+    long loc = 0,
+    int fileCount = 0) : ObservableObject
 {
     private bool _isExpanded;
     private bool _isCurrent;
@@ -20,6 +21,7 @@ public sealed class ProjectNodeViewModel(
     private IReadOnlyList<bool> _ancestorContinues = [];
     private string _versionLabel = versionLabel;
     private long _loc = loc;
+    private int _fileCount = fileCount;
     private const double IndentStep = 8.0;
     private const double ArrowColumnWidth = 15.0;
     private const double ConnectorTail = 3.0;
@@ -35,9 +37,15 @@ public sealed class ProjectNodeViewModel(
     public bool HasExpandedChildren => HasChildren && IsExpanded;
     public string VersionLabel => _versionLabel;
     public long Loc => _loc;
+    public int FileCount => _fileCount;
     public string LocLabel => Loc > 0 ? Loc.ToString("N0") : "";
+    public string LocMetricLabel => Loc > 0 ? $"LOC {Loc:N0}" : "";
+    public string FileCountLabel => IsRegularFolder ? $"F {FileCount:N0}" : "";
+    public string DirectoryStatsLabel => IsRegularFolder
+        ? string.IsNullOrWhiteSpace(LocMetricLabel) ? FileCountLabel : $"{FileCountLabel} {LocMetricLabel}"
+        : "";
     public string DisplayName => IsFolder ? $"{Name}/" : Name;
-    public string NodeRoleLabel => IsExternal ? "skip" : LocLabel;
+    public string NodeRoleLabel => IsExternal ? "skip" : LocMetricLabel;
     public string NodeBadgeText => $"[{NodeRoleLabel.PadRight(4)[..4]}]";
     public string ConnectorText => BuildConnectorText();
     public string SpacerText => BuildSpacerText();
@@ -127,6 +135,8 @@ public sealed class ProjectNodeViewModel(
         if (SetProperty(ref _loc, loc, nameof(Loc)))
         {
             OnPropertyChanged(nameof(LocLabel));
+            OnPropertyChanged(nameof(LocMetricLabel));
+            OnPropertyChanged(nameof(DirectoryStatsLabel));
             OnPropertyChanged(nameof(NodeRoleLabel));
             OnPropertyChanged(nameof(NodeBadgeText));
         }
@@ -139,12 +149,22 @@ public sealed class ProjectNodeViewModel(
             return Loc;
         }
 
-        var total = Children.Where(child => !child.IsExternal).Sum(child => child.RecalculateDirectoryLoc());
+        var activeChildren = Children.Where(child => !child.IsExternal).ToArray();
+        var total = activeChildren.Sum(child => child.RecalculateDirectoryLoc());
+        var fileTotal = activeChildren.Sum(child => child.FileCount);
         if (SetProperty(ref _loc, total, nameof(Loc)))
         {
             OnPropertyChanged(nameof(LocLabel));
+            OnPropertyChanged(nameof(LocMetricLabel));
+            OnPropertyChanged(nameof(DirectoryStatsLabel));
             OnPropertyChanged(nameof(NodeRoleLabel));
             OnPropertyChanged(nameof(NodeBadgeText));
+        }
+
+        if (SetProperty(ref _fileCount, fileTotal, nameof(FileCount)))
+        {
+            OnPropertyChanged(nameof(FileCountLabel));
+            OnPropertyChanged(nameof(DirectoryStatsLabel));
         }
 
         return total;
@@ -153,7 +173,7 @@ public sealed class ProjectNodeViewModel(
     private static IEnumerable<ProjectNodeViewModel> SortChildren(IEnumerable<ProjectNodeViewModel> nodes)
     {
         return nodes
-            .OrderByDescending(node => node.IsFolder)
+            .OrderBy(node => node.IsFolder)
             .ThenBy(node => node.Name, StringComparer.OrdinalIgnoreCase);
     }
 

@@ -1053,7 +1053,7 @@ public sealed class CodeEditor : UserControl
     {
         private static PaletteSet _current = CreateEmpty();
 
-        public static readonly FontFamily CodeFont = new("Cascadia Mono, Consolas, Menlo, monospace");
+        public static readonly FontFamily CodeFont = new("Cascadia Code, Cascadia Mono, Consolas, monospace");
         public static readonly Typeface CodeTypeface = new(CodeFont);
 
         public static IBrush Background => _current.Background;
@@ -1102,41 +1102,41 @@ public sealed class CodeEditor : UserControl
             return new PaletteSet
             {
                 Background = Brush(255, 255, 255),
-                GutterBackground = Brush(248, 249, 250),
-                GutterRule = Brush(225, 228, 232),
-                LineNumber = Brush(150, 145, 134),
-                FoldArrow = Brush(83, 86, 92),
-                Code = Brush(48, 51, 57),
-                Keyword = Brush(31, 76, 176),
-                Type = Brush(38, 122, 92),
-                String = Brush(161, 75, 31),
-                Number = Brush(116, 83, 178),
-                Comment = Brush(119, 126, 132),
-                Variable = Brush(128, 83, 34),
-                Function = Brush(111, 86, 33),
+                GutterBackground = Brush(245, 248, 247),
+                GutterRule = Brush(213, 223, 224),
+                LineNumber = Brush(140, 153, 157),
+                FoldArrow = Brush(83, 97, 102),
+                Code = Brush(39, 48, 52),
+                Keyword = Brush(13, 107, 114),
+                Type = Brush(43, 122, 104),
+                String = Brush(155, 92, 36),
+                Number = Brush(107, 94, 183),
+                Comment = Brush(122, 133, 136),
+                Variable = Brush(135, 90, 37),
+                Function = Brush(113, 93, 31),
                 Brackets =
                 [
-                    Brush(198, 135, 0),
-                    Brush(43, 116, 196),
-                    Brush(152, 82, 190),
-                    Brush(38, 145, 107),
-                    Brush(193, 76, 71),
-                    Brush(98, 105, 184)
+                    Brush(198, 143, 26),
+                    Brush(13, 107, 114),
+                    Brush(132, 91, 183),
+                    Brush(43, 122, 104),
+                    Brush(178, 74, 66),
+                    Brush(71, 113, 161)
                 ],
-                MinimapShell = Brush(238, 241, 246, 248),
+                MinimapShell = Brush(234, 240, 240, 248),
                 MinimapCanvas = Brush(255, 255, 255, 255),
-                MinimapBorder = Brush(191, 197, 207, 190),
-                MinimapCode = Brush(72, 77, 86, 148),
-                MinimapKeyword = Brush(31, 76, 176, 168),
-                MinimapComment = Brush(119, 126, 132, 110),
-                MinimapAdd = Brush(44, 137, 79, 160),
-                MinimapDelete = Brush(179, 68, 68, 160),
-                MinimapViewport = Brush(37, 56, 99, 38),
-                MinimapViewportBorder = Brush(37, 56, 99, 96),
-                AddLineBackground = Brush(52, 145, 88, 34),
-                DeleteLineBackground = Brush(190, 72, 72, 34),
-                AddStripe = Brush(44, 137, 79, 130),
-                DeleteStripe = Brush(179, 68, 68, 130)
+                MinimapBorder = Brush(184, 197, 199, 190),
+                MinimapCode = Brush(64, 76, 80, 148),
+                MinimapKeyword = Brush(13, 107, 114, 168),
+                MinimapComment = Brush(122, 133, 136, 110),
+                MinimapAdd = Brush(30, 127, 87, 160),
+                MinimapDelete = Brush(178, 74, 66, 160),
+                MinimapViewport = Brush(13, 107, 114, 38),
+                MinimapViewportBorder = Brush(13, 107, 114, 96),
+                AddLineBackground = Brush(30, 127, 87, 34),
+                DeleteLineBackground = Brush(178, 74, 66, 34),
+                AddStripe = Brush(30, 127, 87, 130),
+                DeleteStripe = Brush(178, 74, 66, 130)
             };
         }
 
@@ -1144,42 +1144,42 @@ public sealed class CodeEditor : UserControl
         {
             return new PaletteSet
             {
-                Background = Brush(16, 17, 20),
-                GutterBackground = Brush(21, 23, 27),
-                GutterRule = Brush(43, 48, 56),
-                LineNumber = Brush(118, 126, 138),
-                FoldArrow = Brush(171, 180, 194),
-                Code = Brush(212, 216, 225),
-                Keyword = Brush(120, 168, 255),
-                Type = Brush(121, 192, 170),
-                String = Brush(230, 177, 126),
-                Number = Brush(197, 165, 255),
-                Comment = Brush(126, 135, 147),
-                Variable = Brush(224, 181, 127),
-                Function = Brush(220, 210, 138),
+                Background = Brush(11, 14, 16),
+                GutterBackground = Brush(17, 22, 24),
+                GutterRule = Brush(42, 54, 58),
+                LineNumber = Brush(126, 140, 145),
+                FoldArrow = Brush(183, 199, 203),
+                Code = Brush(221, 228, 230),
+                Keyword = Brush(107, 211, 209),
+                Type = Brush(127, 205, 184),
+                String = Brush(230, 183, 116),
+                Number = Brush(200, 176, 255),
+                Comment = Brush(132, 146, 151),
+                Variable = Brush(226, 184, 124),
+                Function = Brush(226, 212, 127),
                 Brackets =
                 [
-                    Brush(238, 205, 122),
-                    Brush(111, 177, 255),
-                    Brush(205, 153, 255),
-                    Brush(113, 212, 174),
-                    Brush(242, 132, 130),
-                    Brush(160, 170, 246)
+                    Brush(230, 191, 92),
+                    Brush(107, 211, 209),
+                    Brush(200, 176, 255),
+                    Brush(127, 205, 184),
+                    Brush(255, 123, 114),
+                    Brush(130, 170, 222)
                 ],
-                MinimapShell = Brush(27, 32, 40, 248),
-                MinimapCanvas = Brush(17, 20, 26, 255),
-                MinimapBorder = Brush(64, 72, 84, 210),
-                MinimapCode = Brush(201, 207, 218, 120),
-                MinimapKeyword = Brush(120, 168, 255, 150),
-                MinimapComment = Brush(126, 135, 147, 105),
-                MinimapAdd = Brush(69, 186, 122, 155),
-                MinimapDelete = Brush(228, 105, 105, 155),
-                MinimapViewport = Brush(138, 180, 248, 34),
-                MinimapViewportBorder = Brush(138, 180, 248, 100),
-                AddLineBackground = Brush(69, 186, 122, 34),
-                DeleteLineBackground = Brush(228, 105, 105, 34),
-                AddStripe = Brush(69, 186, 122, 150),
-                DeleteStripe = Brush(228, 105, 105, 150)
+                MinimapShell = Brush(22, 29, 32, 248),
+                MinimapCanvas = Brush(11, 14, 16, 255),
+                MinimapBorder = Brush(65, 80, 85, 210),
+                MinimapCode = Brush(221, 228, 230, 120),
+                MinimapKeyword = Brush(107, 211, 209, 150),
+                MinimapComment = Brush(132, 146, 151, 105),
+                MinimapAdd = Brush(115, 213, 155, 155),
+                MinimapDelete = Brush(255, 123, 114, 155),
+                MinimapViewport = Brush(107, 211, 209, 34),
+                MinimapViewportBorder = Brush(107, 211, 209, 100),
+                AddLineBackground = Brush(115, 213, 155, 34),
+                DeleteLineBackground = Brush(255, 123, 114, 34),
+                AddStripe = Brush(115, 213, 155, 150),
+                DeleteStripe = Brush(255, 123, 114, 150)
             };
         }
 
@@ -1188,41 +1188,41 @@ public sealed class CodeEditor : UserControl
             return new PaletteSet
             {
                 Background = Brush(2, 6, 4),
-                GutterBackground = Brush(4, 14, 8),
-                GutterRule = Brush(18, 58, 34),
-                LineNumber = Brush(84, 150, 96),
-                FoldArrow = Brush(122, 255, 151),
-                Code = Brush(212, 216, 225),
-                Keyword = Brush(120, 168, 255),
-                Type = Brush(121, 192, 170),
-                String = Brush(230, 177, 126),
-                Number = Brush(197, 165, 255),
-                Comment = Brush(77, 143, 92),
-                Variable = Brush(224, 181, 127),
-                Function = Brush(220, 210, 138),
+                GutterBackground = Brush(6, 17, 15),
+                GutterRule = Brush(23, 55, 47),
+                LineNumber = Brush(103, 172, 143),
+                FoldArrow = Brush(150, 255, 195),
+                Code = Brush(220, 232, 226),
+                Keyword = Brush(101, 240, 178),
+                Type = Brush(129, 220, 188),
+                String = Brush(230, 183, 116),
+                Number = Brush(209, 247, 122),
+                Comment = Brush(92, 153, 126),
+                Variable = Brush(226, 184, 124),
+                Function = Brush(226, 212, 127),
                 Brackets =
                 [
-                    Brush(238, 205, 122),
-                    Brush(111, 177, 255),
-                    Brush(205, 153, 255),
-                    Brush(113, 212, 174),
-                    Brush(242, 132, 130),
-                    Brush(160, 170, 246)
+                    Brush(215, 247, 122),
+                    Brush(101, 240, 178),
+                    Brush(157, 205, 255),
+                    Brush(129, 220, 188),
+                    Brush(255, 121, 121),
+                    Brush(189, 162, 255)
                 ],
-                MinimapShell = Brush(5, 19, 8, 250),
+                MinimapShell = Brush(6, 20, 15, 250),
                 MinimapCanvas = Brush(2, 6, 4, 255),
-                MinimapBorder = Brush(34, 119, 62, 220),
-                MinimapCode = Brush(201, 207, 218, 120),
-                MinimapKeyword = Brush(120, 168, 255, 150),
-                MinimapComment = Brush(77, 143, 92, 120),
-                MinimapAdd = Brush(72, 255, 113, 155),
-                MinimapDelete = Brush(255, 108, 108, 155),
-                MinimapViewport = Brush(89, 255, 136, 36),
-                MinimapViewportBorder = Brush(89, 255, 136, 115),
-                AddLineBackground = Brush(72, 255, 113, 34),
-                DeleteLineBackground = Brush(255, 108, 108, 34),
-                AddStripe = Brush(72, 255, 113, 160),
-                DeleteStripe = Brush(255, 108, 108, 160)
+                MinimapBorder = Brush(42, 169, 121, 220),
+                MinimapCode = Brush(220, 232, 226, 120),
+                MinimapKeyword = Brush(101, 240, 178, 150),
+                MinimapComment = Brush(92, 153, 126, 120),
+                MinimapAdd = Brush(106, 255, 185, 155),
+                MinimapDelete = Brush(255, 121, 121, 155),
+                MinimapViewport = Brush(101, 240, 178, 36),
+                MinimapViewportBorder = Brush(101, 240, 178, 115),
+                AddLineBackground = Brush(106, 255, 185, 34),
+                DeleteLineBackground = Brush(255, 121, 121, 34),
+                AddStripe = Brush(106, 255, 185, 160),
+                DeleteStripe = Brush(255, 121, 121, 160)
             };
         }
 
@@ -1237,17 +1237,17 @@ public sealed class CodeEditor : UserControl
             var syntax = key switch
             {
                 "empty-light" => Syntax(
-                    Brush(48, 51, 57), Brush(31, 76, 176), Brush(38, 122, 92), Brush(161, 75, 31),
-                    Brush(116, 83, 178), Brush(119, 126, 132), Brush(128, 83, 34), Brush(111, 86, 33),
-                    [Brush(198, 135, 0), Brush(43, 116, 196), Brush(152, 82, 190), Brush(38, 145, 107), Brush(193, 76, 71), Brush(98, 105, 184)]),
+                    Brush(39, 48, 52), Brush(13, 107, 114), Brush(43, 122, 104), Brush(155, 92, 36),
+                    Brush(107, 94, 183), Brush(122, 133, 136), Brush(135, 90, 37), Brush(113, 93, 31),
+                    [Brush(198, 143, 26), Brush(13, 107, 114), Brush(132, 91, 183), Brush(43, 122, 104), Brush(178, 74, 66), Brush(71, 113, 161)]),
                 "solarized-light" => Syntax(
                     Brush(88, 110, 117), Brush(38, 139, 210), Brush(42, 161, 152), Brush(203, 75, 22),
                     Brush(108, 113, 196), Brush(147, 161, 161), Brush(181, 137, 0), Brush(133, 153, 0),
                     [Brush(181, 137, 0), Brush(38, 139, 210), Brush(211, 54, 130), Brush(42, 161, 152), Brush(220, 50, 47), Brush(108, 113, 196)]),
                 "a11y-dark" => Syntax(
-                    Brush(212, 216, 225), Brush(120, 168, 255), Brush(121, 192, 170), Brush(230, 177, 126),
-                    Brush(197, 165, 255), Brush(126, 135, 147), Brush(224, 181, 127), Brush(220, 210, 138),
-                    [Brush(238, 205, 122), Brush(111, 177, 255), Brush(205, 153, 255), Brush(113, 212, 174), Brush(242, 132, 130), Brush(160, 170, 246)]),
+                    Brush(221, 228, 230), Brush(107, 211, 209), Brush(127, 205, 184), Brush(230, 183, 116),
+                    Brush(200, 176, 255), Brush(132, 146, 151), Brush(226, 184, 124), Brush(226, 212, 127),
+                    [Brush(230, 191, 92), Brush(107, 211, 209), Brush(200, 176, 255), Brush(127, 205, 184), Brush(255, 123, 114), Brush(130, 170, 222)]),
                 "github-dark" => Syntax(
                     Brush(201, 209, 217), Brush(255, 123, 114), Brush(121, 192, 255), Brush(165, 214, 255),
                     Brush(121, 192, 255), Brush(139, 148, 158), Brush(255, 166, 87), Brush(210, 168, 255),

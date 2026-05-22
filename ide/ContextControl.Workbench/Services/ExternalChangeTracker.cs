@@ -12,10 +12,16 @@ namespace ContextControl.Workbench.Services;
 public sealed class ExternalChangeTracker : IDisposable
 {
     private const int DebounceMilliseconds = 90;
-    private const int PollIntervalMilliseconds = 650;
+    private const int PollIntervalMilliseconds = 5_000;
     private const int MaxExactDiffCells = 3_000_000;
     private static readonly StringComparer PathComparer = StringComparer.OrdinalIgnoreCase;
     private static readonly Encoding Utf8NoBom = new UTF8Encoding(false);
+    private static readonly EnumerationOptions SafeEnumerationOptions = new()
+    {
+        AttributesToSkip = FileAttributes.Hidden | FileAttributes.System,
+        IgnoreInaccessible = true,
+        RecurseSubdirectories = false
+    };
 
     private readonly string _projectRoot;
     private readonly string _versionRoot;
@@ -25,9 +31,12 @@ public sealed class ExternalChangeTracker : IDisposable
     private readonly ConcurrentDictionary<string, CancellationTokenSource> _pending = new(PathComparer);
     private readonly ConcurrentDictionary<string, FileFingerprint> _fingerprints = new(PathComparer);
     private readonly CancellationTokenSource _pollCancel = new();
+    private readonly SemaphoreSlim _scanGate = new(1, 1);
     private readonly object _saveGate = new();
     private ProjectFileRules _fileRules;
     private Task? _pollTask;
+    private int _forceScanQueued;
+    private bool _fingerprintsPrimed;
     private bool _disposed;
 
     public ExternalChangeTracker(string projectRoot)
@@ -40,7 +49,6 @@ public sealed class ExternalChangeTracker : IDisposable
         _fileRules.Save();
 
         Directory.CreateDirectory(_versionRoot);
-        PrimeFingerprints();
 
         _watcher = new FileSystemWatcher(_projectRoot)
         {
@@ -76,16 +84,22 @@ public sealed class ExternalChangeTracker : IDisposable
             return;
         }
 
-        try
+        if (Interlocked.Exchange(ref _forceScanQueued, 1) == 1)
         {
-            AppendWatchLog("force scan begin");
-            ScanForChangedFiles(CancellationToken.None);
-            AppendWatchLog("force scan end");
+            return;
         }
-        catch (Exception ex)
+
+        _ = Task.Run(async () =>
         {
-            AppendWatchLog($"force scan failed: {ex.Message}");
-        }
+            try
+            {
+                await PrimeOrScanAsync("force scan", CancellationToken.None).ConfigureAwait(false);
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _forceScanQueued, 0);
+            }
+        });
     }
 
     public void ReloadRules()
@@ -93,8 +107,9 @@ public sealed class ExternalChangeTracker : IDisposable
         _fileRules = ProjectFileRules.Load(_projectRoot);
         _fileRules.Save();
         _fingerprints.Clear();
-        PrimeFingerprints();
+        _fingerprintsPrimed = false;
         AppendWatchLog($"rules reloaded rules={_fileRules.RulesPath}");
+        ForceScanNow();
     }
 
     public void Dispose()
@@ -151,10 +166,11 @@ public sealed class ExternalChangeTracker : IDisposable
     {
         try
         {
+            await PrimeOrScanAsync("initial", token).ConfigureAwait(false);
             while (!token.IsCancellationRequested)
             {
                 await Task.Delay(PollIntervalMilliseconds, token).ConfigureAwait(false);
-                ScanForChangedFiles(token);
+                await PrimeOrScanAsync("poll", token).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException)
@@ -166,11 +182,57 @@ public sealed class ExternalChangeTracker : IDisposable
         }
     }
 
-    private void PrimeFingerprints()
+    private async Task PrimeOrScanAsync(string source, CancellationToken token)
+    {
+        if (_disposed)
+        {
+            return;
+        }
+
+        if (!await _scanGate.WaitAsync(0, token).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        try
+        {
+            if (!_fingerprintsPrimed)
+            {
+                var count = PrimeFingerprints(token);
+                if (!token.IsCancellationRequested && !_disposed)
+                {
+                    _fingerprintsPrimed = true;
+                    AppendWatchLog($"primed source={source} files={count}");
+                }
+
+                return;
+            }
+
+            ScanForChangedFiles(token);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            AppendWatchLog($"{source} failed: {ex.Message}");
+        }
+        finally
+        {
+            _scanGate.Release();
+        }
+    }
+
+    private int PrimeFingerprints(CancellationToken token)
     {
         var count = 0;
         foreach (var path in EnumerateCandidateFiles())
         {
+            if (token.IsCancellationRequested || _disposed)
+            {
+                return count;
+            }
+
             if (!ShouldTrack(path) || !TryGetFingerprint(path, out var fingerprint))
             {
                 continue;
@@ -180,7 +242,7 @@ public sealed class ExternalChangeTracker : IDisposable
             count++;
         }
 
-        AppendWatchLog($"primed files={count}");
+        return count;
     }
 
     private void ScanForChangedFiles(CancellationToken token)
@@ -238,12 +300,8 @@ public sealed class ExternalChangeTracker : IDisposable
             try
             {
                 var info = new DirectoryInfo(directory);
-                childDirectories = info.EnumerateDirectories()
-                    .Where(item => !item.Attributes.HasFlag(FileAttributes.Hidden))
-                    .ToArray();
-                files = info.EnumerateFiles()
-                    .Where(item => !item.Attributes.HasFlag(FileAttributes.Hidden))
-                    .ToArray();
+                childDirectories = info.EnumerateDirectories("*", SafeEnumerationOptions).ToArray();
+                files = info.EnumerateFiles("*", SafeEnumerationOptions).ToArray();
             }
             catch (IOException)
             {
@@ -264,7 +322,10 @@ public sealed class ExternalChangeTracker : IDisposable
 
             foreach (var file in files)
             {
-                yield return file.FullName;
+                if (_fileRules.ShouldTrackFileName(file.Name, file.Extension))
+                {
+                    yield return file.FullName;
+                }
             }
         }
     }

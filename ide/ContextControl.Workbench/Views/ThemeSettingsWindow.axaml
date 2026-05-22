@@ -2,79 +2,351 @@
     x:Class="ContextControl.Workbench.Views.ThemeSettingsWindow"
     xmlns="https://github.com/avaloniaui"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls"
     xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
-    Width="420"
-    Height="276"
-    MinWidth="360"
-    MinHeight="230"
-    CanResize="False"
+    Width="1080"
+    Height="640"
+    MinWidth="940"
+    MinHeight="560"
+    SystemDecorations="None"
     WindowStartupLocation="CenterOwner"
     Title="Settings"
     Background="{DynamicResource AppBackgroundBrush}">
+<Grid RowDefinitions="31,*">
+    <Border Classes="custom-titlebar" PointerPressed="OnTitleBarPointerPressed">
+      <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+        <Border Classes="title-icon">
+          <TextBlock
+              Classes="title-icon-glyph"
+              Text="▣"
+              />
+        </Border>
 
-  <Window.Styles>
-    <Style Selector="Border.settings-panel">
-      <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="8" />
-      <Setter Property="Padding" Value="16" />
-    </Style>
+        <TextBlock
+            Grid.Column="1"
+            Classes="window-title"
+            Text="Settings"
+            />
 
-    <Style Selector="TextBlock.title">
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="FontSize" Value="16" />
-      <Setter Property="FontWeight" Value="ExtraBold" />
-    </Style>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="2">
+          <Button Classes="window-control" Content="-" Click="OnMinimizeClick" />
+          <Button Classes="window-control" Content="□" Click="OnMaximizeRestoreClick" />
+          <Button Classes="window-control close" Content="x" Click="OnCloseClick" />
+        </StackPanel>
+      </Grid>
+    </Border>
 
-    <Style Selector="TextBlock.muted">
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="FontSize" Value="11" />
-    </Style>
+  <Border Grid.Row="1" Classes="settings-panel" Margin="10">
+    <Grid RowDefinitions="Auto,*" RowSpacing="8">
+      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+        <StackPanel Spacing="1">
+          <TextBlock Classes="settings-title" Text="Settings" />
+          <TextBlock Classes="muted" Text="{Binding CurrentProject.Name}" />
+        </StackPanel>
 
-    <Style Selector="ComboBox.theme-picker">
-      <Setter Property="MinHeight" Value="34" />
-      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-    </Style>
-  </Window.Styles>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Bottom">
+          <TextBlock
+              Classes="muted"
+              Text="{Binding FileRulesSummary}"
+              VerticalAlignment="Center"
+              TextTrimming="CharacterEllipsis" />
+          <Button
+              x:Name="SettingsContextToggleButton"
+              Classes="context-chip"
+              Content="◉▤"
+              Click="OnSettingsContextToggleClick"
+              ToolTip.Tip="Context parse mode" />
+        </StackPanel>
+      </Grid>
 
-  <Border Classes="settings-panel" Margin="10">
-    <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto" RowSpacing="12">
-      <TextBlock Classes="title" Text="Appearance" />
-      <TextBlock Grid.Row="1" Classes="muted" Text="Choose the visual mode for the IDE and code renderer." />
+      <Grid Grid.Row="1" ColumnDefinitions="152,*" ColumnSpacing="8">
+        <Border Classes="side-rail">
+          <StackPanel Spacing="6" HorizontalAlignment="Stretch">
+            <Button
+                x:Name="AppearanceNavButton"
+                Classes="settings-nav active"
+                Content="Appearance"
+                Click="OnAppearanceNavClick" />
+            <Button
+                x:Name="FileRulesNavButton"
+                Classes="settings-nav"
+                Content="File rules"
+                Click="OnFileRulesNavClick" />
+          </StackPanel>
+        </Border>
 
-      <ComboBox
-          Grid.Row="2"
-          Classes="theme-picker"
-          ItemsSource="{Binding Themes}"
-          SelectedItem="{Binding SelectedTheme, Mode=TwoWay}">
-        <ComboBox.ItemTemplate>
-          <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
-            <StackPanel>
-              <TextBlock Text="{Binding Name}" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
-              <TextBlock Text="{Binding Description}" FontSize="10" Foreground="{DynamicResource TextMutedBrush}" />
-            </StackPanel>
-          </DataTemplate>
-        </ComboBox.ItemTemplate>
-      </ComboBox>
+        <Grid Grid.Column="1">
+          <Grid x:Name="AppearancePage" RowDefinitions="Auto,Auto,Auto,Auto,*" RowSpacing="8">
+            <Button
+                x:Name="ParseAppearanceButton"
+                Classes="context-chip"
+                Content="CTX"
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                IsVisible="False"
+                Tag="settings.appearance"
+                Click="OnSettingsContextScopeClick" />
 
-      <TextBlock Grid.Row="3" Classes="muted" Text="Syntax colors" />
-      <ComboBox
-          Grid.Row="4"
-          Classes="theme-picker"
-          ItemsSource="{Binding SyntaxThemes}"
-          SelectedItem="{Binding SelectedSyntaxTheme, Mode=TwoWay}">
-        <ComboBox.ItemTemplate>
-          <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
-            <StackPanel>
-              <TextBlock Text="{Binding Name}" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
-              <TextBlock Text="{Binding Description}" FontSize="10" Foreground="{DynamicResource TextMutedBrush}" />
-            </StackPanel>
-          </DataTemplate>
-        </ComboBox.ItemTemplate>
-      </ComboBox>
+            <TextBlock Classes="field-label" Text="Theme" />
+            <ComboBox
+                x:Name="ThemePicker"
+                Grid.Row="1"
+                Classes="theme-picker"
+                ItemsSource="{Binding Themes}"
+                SelectedItem="{Binding SelectedTheme, Mode=TwoWay}"
+                SelectionChanged="OnThemeSelectionChanged">
+              <ComboBox.ItemContainerTheme>
+                <ControlTheme TargetType="ComboBoxItem">
+                  <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                </ControlTheme>
+              </ComboBox.ItemContainerTheme>
+              <ComboBox.ItemTemplate>
+                <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                  <Border
+                      Padding="4,3"
+                      Background="Transparent"
+                      HorizontalAlignment="Stretch"
+                      PointerEntered="OnThemeOptionPointerEntered"
+                      PointerExited="OnThemeOptionPointerExited">
+                    <StackPanel>
+                      <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                      <TextBlock Text="{Binding Description}" FontSize="10" Foreground="{DynamicResource TextMutedBrush}" />
+                    </StackPanel>
+                  </Border>
+                </DataTemplate>
+              </ComboBox.ItemTemplate>
+            </ComboBox>
+
+            <TextBlock Grid.Row="2" Classes="field-label" Text="Syntax colors" Margin="0,4,0,0" />
+            <ComboBox
+                x:Name="SyntaxThemePicker"
+                Grid.Row="3"
+                Classes="theme-picker"
+                ItemsSource="{Binding SyntaxThemes}"
+                SelectedItem="{Binding SelectedSyntaxTheme, Mode=TwoWay}"
+                SelectionChanged="OnSyntaxThemeSelectionChanged">
+              <ComboBox.ItemContainerTheme>
+                <ControlTheme TargetType="ComboBoxItem">
+                  <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                </ControlTheme>
+              </ComboBox.ItemContainerTheme>
+              <ComboBox.ItemTemplate>
+                <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                  <Border
+                      Padding="4,3"
+                      Background="Transparent"
+                      HorizontalAlignment="Stretch"
+                      PointerEntered="OnSyntaxThemeOptionPointerEntered"
+                      PointerExited="OnSyntaxThemeOptionPointerExited">
+                    <StackPanel>
+                      <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                      <TextBlock Text="{Binding Description}" FontSize="10" Foreground="{DynamicResource TextMutedBrush}" />
+                    </StackPanel>
+                  </Border>
+                </DataTemplate>
+              </ComboBox.ItemTemplate>
+            </ComboBox>
+
+            <Border Grid.Row="4" Classes="syntax-preview-card" Margin="0,4,0,0">
+              <Grid RowDefinitions="Auto,*" RowSpacing="6">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                  <TextBlock Classes="field-label" Text="Preview" />
+                  <TextBlock
+                      x:Name="PreviewCaption"
+                      Grid.Column="1"
+                      Classes="preview-caption"
+                      TextTrimming="CharacterEllipsis" />
+                </Grid>
+                <controls:SyntaxPreviewControl
+                    x:Name="AppearanceSyntaxPreview"
+                    Grid.Row="1" />
+              </Grid>
+            </Border>
+          </Grid>
+
+          <Grid x:Name="FileRulesPage" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="8" IsVisible="False">
+            <Button
+                x:Name="ParseFileRulesButton"
+                Classes="context-chip"
+                Content="CTX"
+                HorizontalAlignment="Right"
+                VerticalAlignment="Top"
+                IsVisible="False"
+                Tag="settings.fileRules"
+                Click="OnSettingsContextScopeClick" />
+
+            <TextBlock
+                Classes="muted"
+                Text="These lists decide what the IDE tree, history, and external-update tracker ignore. Use one entry per line or comma-separated values." />
+
+            <TextBlock
+                Grid.Row="1"
+                Classes="path-text"
+                Text="{Binding FileRulesPath}" />
+
+            <Grid
+                Grid.Row="2"
+                ColumnDefinitions="2*,2*,2*,2*"
+                ColumnSpacing="8">
+              <Border Classes="rule-card">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Classes="field-label" Text="Skipped folders" />
+                    <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="ignoredDirectories" Click="OnEditRuleListClick" />
+                  </Grid>
+                  <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <ItemsControl ItemsSource="{Binding IgnoredDirectoryRules}" Margin="0,0,12,0">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
+                          <Border Classes="rule-row" HorizontalAlignment="Stretch">
+                            <Grid ColumnDefinitions="*,17,15" ColumnSpacing="1">
+                              <TextBlock Classes="rule-value" Text="{Binding Value}" />
+                              <Button Grid.Column="1" Classes="rule-mini" Content="e" Tag="{Binding}" Click="OnEditRuleEntryClick" />
+                              <Button
+                                  Grid.Column="2"
+                                  Classes="rule-x"
+                                  Content="x"
+                                  Command="{Binding DataContext.RemoveFileRuleEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                  <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
+                    <TextBox Classes="rule-add" Watermark="bin, obj" Text="{Binding NewIgnoredDirectoryRuleText, Mode=TwoWay}" />
+                    <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="ignoredDirectories" />
+                  </Grid>
+                </Grid>
+              </Border>
+
+              <Border Grid.Column="1" Classes="rule-card">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Classes="field-label" Text="Skipped files" />
+                    <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="ignoredFileNames" Click="OnEditRuleListClick" />
+                  </Grid>
+                  <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <ItemsControl ItemsSource="{Binding IgnoredFileNameRules}" Margin="0,0,12,0">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
+                          <Border Classes="rule-row" HorizontalAlignment="Stretch">
+                            <Grid ColumnDefinitions="*,17,15" ColumnSpacing="1">
+                              <TextBlock Classes="rule-value" Text="{Binding Value}" />
+                              <Button Grid.Column="1" Classes="rule-mini" Content="e" Tag="{Binding}" Click="OnEditRuleEntryClick" />
+                              <Button
+                                  Grid.Column="2"
+                                  Classes="rule-x"
+                                  Content="x"
+                                  Command="{Binding DataContext.RemoveFileRuleEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                  <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
+                    <TextBox Classes="rule-add" Watermark=".DS_Store" Text="{Binding NewIgnoredFileNameRuleText, Mode=TwoWay}" />
+                    <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="ignoredFileNames" />
+                  </Grid>
+                </Grid>
+              </Border>
+
+              <Border Grid.Column="2" Classes="rule-card">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Classes="field-label" Text="Skipped file types" />
+                    <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="ignoredFileTypes" Click="OnEditRuleListClick" />
+                  </Grid>
+                  <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <ItemsControl ItemsSource="{Binding IgnoredFileTypeRules}" Margin="0,0,12,0">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
+                          <Border Classes="rule-row" HorizontalAlignment="Stretch">
+                            <Grid ColumnDefinitions="*,17,15" ColumnSpacing="1">
+                              <TextBlock Classes="rule-value" Text="{Binding Value}" />
+                              <Button Grid.Column="1" Classes="rule-mini" Content="e" Tag="{Binding}" Click="OnEditRuleEntryClick" />
+                              <Button
+                                  Grid.Column="2"
+                                  Classes="rule-x"
+                                  Content="x"
+                                  Command="{Binding DataContext.RemoveFileRuleEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                  <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
+                    <TextBox Classes="rule-add" Watermark=".dll, .tmp" Text="{Binding NewIgnoredFileTypeRuleText, Mode=TwoWay}" />
+                    <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="ignoredFileTypes" />
+                  </Grid>
+                </Grid>
+              </Border>
+
+              <Border Grid.Column="3" Classes="rule-card">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Classes="field-label" Text="Allowed file types" />
+                    <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="supportedFileTypes" Click="OnEditRuleListClick" />
+                  </Grid>
+                  <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <ItemsControl ItemsSource="{Binding SupportedFileTypeRules}" Margin="0,0,12,0">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
+                          <Border Classes="rule-row" HorizontalAlignment="Stretch">
+                            <Grid ColumnDefinitions="*,17,15" ColumnSpacing="1">
+                              <TextBlock Classes="rule-value" Text="{Binding Value}" />
+                              <Button Grid.Column="1" Classes="rule-mini" Content="e" Tag="{Binding}" Click="OnEditRuleEntryClick" />
+                              <Button
+                                  Grid.Column="2"
+                                  Classes="rule-x"
+                                  Content="x"
+                                  Command="{Binding DataContext.RemoveFileRuleEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                  <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
+                    <TextBox Classes="rule-add" Watermark=".cs, .cpp" Text="{Binding NewSupportedFileTypeRuleText, Mode=TwoWay}" />
+                    <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="supportedFileTypes" />
+                  </Grid>
+                </Grid>
+              </Border>
+            </Grid>
+
+            <Grid Grid.Row="3" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+              <TextBlock
+                  Classes="muted"
+                  Text="{Binding FileRulesStatus}"
+                  VerticalAlignment="Center"
+                  TextTrimming="CharacterEllipsis" />
+
+              <Button
+                  Grid.Column="1"
+                  Classes="rule-mini"
+                  MinHeight="28"
+                  Content="Reset defaults"
+                  Command="{Binding ResetFileRulesCommand}" />
+
+              <Button
+                  Grid.Column="2"
+                  Classes="rule-mini primary"
+                  MinHeight="28"
+                  Content="Save"
+                  Command="{Binding SaveFileRulesCommand}" />
+            </Grid>
+          </Grid>
+        </Grid>
+      </Grid>
     </Grid>
   </Border>
+  </Grid>
 </Window>
+

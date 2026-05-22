@@ -1,345 +1,273 @@
-using Avalonia;
 using Avalonia.Controls;
-using Avalonia.Controls.Primitives;
-using Avalonia.Data;
-using Avalonia.Layout;
-using Avalonia.Media;
+using Avalonia.Input;
+using Avalonia.Interactivity;
 using ContextControl.Workbench.Services;
+using ContextControl.Workbench.ViewModels;
 
 namespace ContextControl.Workbench.Views;
 
 public sealed partial class ThemeSettingsWindow : Window
 {
-    private bool _fileRulesSectionAttached;
+    private bool _contextParseMode;
+    private ThemeOptionViewModel? _hoveredTheme;
+    private ThemeOptionViewModel? _hoveredSyntaxTheme;
 
     public ThemeSettingsWindow()
     {
         InitializeComponent();
         WorkbenchThemeResources.Apply(this, "empty");
-    }
-
-    protected override void OnOpened(EventArgs e)
-    {
-        base.OnOpened(e);
-        AttachFileRulesSectionSafely();
+        ShowAppearancePage();
+        RefreshAppearancePreview();
     }
 
     public void ApplyTheme(string? themeKey)
     {
         WorkbenchThemeResources.Apply(this, themeKey);
+        RefreshAppearancePreview();
     }
 
-    private void AttachFileRulesSectionSafely()
+    private WorkbenchViewModel? ViewModel => DataContext as WorkbenchViewModel;
+
+    protected override void OnDataContextChanged(EventArgs e)
     {
-        if (_fileRulesSectionAttached)
+        base.OnDataContextChanged(e);
+        _hoveredTheme = null;
+        _hoveredSyntaxTheme = null;
+        RefreshAppearancePreview();
+    }
+
+    private void OnTitleBarPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (e.ClickCount == 2)
         {
+            ToggleMaximizeRestore();
             return;
         }
 
-        try
+        if (e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
         {
-            AttachFileRulesSection();
-        }
-        catch (Exception ex)
-        {
-            _fileRulesSectionAttached = true;
-            Console.Error.WriteLine($"Context Control settings file-rules section failed to attach: {ex}");
+            BeginMoveDrag(e);
         }
     }
 
-    private void AttachFileRulesSection()
+    private void OnMinimizeClick(object? sender, RoutedEventArgs e)
     {
-        var section = BuildFileRulesSection();
+        WindowState = WindowState.Minimized;
+    }
 
-        if (Content is ScrollViewer scrollViewer)
-        {
-            AttachInsideScrollViewer(scrollViewer, section);
-            _fileRulesSectionAttached = true;
-            return;
-        }
+    private void OnMaximizeRestoreClick(object? sender, RoutedEventArgs e)
+    {
+        ToggleMaximizeRestore();
+    }
 
-        if (Content is Border border)
-        {
-            AttachInsideBorder(border, section);
-            _fileRulesSectionAttached = true;
-            return;
-        }
+    private void OnCloseClick(object? sender, RoutedEventArgs e)
+    {
+        Close();
+    }
 
-        if (Content is Panel panel)
-        {
-            panel.Children.Add(section);
-            _fileRulesSectionAttached = true;
-            return;
-        }
+    private void ToggleMaximizeRestore()
+    {
+        WindowState = WindowState == WindowState.Maximized
+            ? WindowState.Normal
+            : WindowState.Maximized;
+    }
 
-        if (Content is Control existingContent)
-        {
-            // Important: detach first. Adding the current Window.Content into a new panel while
-            // it is still parented can terminate the settings window with no useful app-level report.
-            Content = null;
-            Content = WrapExistingContentWithFileRules(existingContent, section);
-            _fileRulesSectionAttached = true;
-            return;
-        }
+    private void OnAppearanceNavClick(object? sender, RoutedEventArgs e)
+    {
+        ShowAppearancePage();
+    }
 
-        Content = new ScrollViewer
+    private void OnFileRulesNavClick(object? sender, RoutedEventArgs e)
+    {
+        ShowFileRulesPage();
+    }
+
+    private void ShowAppearancePage()
+    {
+        AppearancePage.IsVisible = true;
+        FileRulesPage.IsVisible = false;
+        SetActive(AppearanceNavButton, true);
+        SetActive(FileRulesNavButton, false);
+    }
+
+    private void ShowFileRulesPage()
+    {
+        AppearancePage.IsVisible = false;
+        FileRulesPage.IsVisible = true;
+        SetActive(AppearanceNavButton, false);
+        SetActive(FileRulesNavButton, true);
+    }
+
+    private static void SetActive(Button button, bool active)
+    {
+        if (active)
         {
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-            Content = new StackPanel
+            if (!button.Classes.Contains("active"))
             {
-                Spacing = 10,
-                Margin = new Thickness(12),
-                Children =
-                {
-                    section
-                }
+                button.Classes.Add("active");
             }
-        };
-        _fileRulesSectionAttached = true;
+
+            return;
+        }
+
+        button.Classes.Remove("active");
     }
 
-    private static void AttachInsideScrollViewer(ScrollViewer scrollViewer, Control section)
+    private void OnThemeSelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
-        if (scrollViewer.Content is StackPanel stack)
-        {
-            stack.Children.Add(section);
-            return;
-        }
-
-        if (scrollViewer.Content is Panel panel)
-        {
-            panel.Children.Add(section);
-            return;
-        }
-
-        if (scrollViewer.Content is Control existingContent)
-        {
-            scrollViewer.Content = null;
-            scrollViewer.Content = new StackPanel
-            {
-                Spacing = 10,
-                Margin = new Thickness(12),
-                Children =
-                {
-                    existingContent,
-                    section
-                }
-            };
-            return;
-        }
-
-        scrollViewer.Content = new StackPanel
-        {
-            Spacing = 10,
-            Margin = new Thickness(12),
-            Children =
-            {
-                section
-            }
-        };
+        _hoveredTheme = null;
+        RefreshAppearancePreview();
     }
 
-    private static void AttachInsideBorder(Border border, Control section)
+    private void OnSyntaxThemeSelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
-        if (border.Child is StackPanel stack)
+        _hoveredSyntaxTheme = null;
+        RefreshAppearancePreview();
+    }
+
+    private void OnThemeOptionPointerEntered(object? sender, PointerEventArgs e)
+    {
+        if (sender is Control { DataContext: ThemeOptionViewModel option })
         {
-            stack.Children.Add(section);
+            _hoveredTheme = option;
+            RefreshAppearancePreview();
+        }
+    }
+
+    private void OnThemeOptionPointerExited(object? sender, PointerEventArgs e)
+    {
+        if (sender is Control { DataContext: ThemeOptionViewModel option }
+            && IsSameOption(_hoveredTheme, option))
+        {
+            _hoveredTheme = null;
+            RefreshAppearancePreview();
+        }
+    }
+
+    private void OnSyntaxThemeOptionPointerEntered(object? sender, PointerEventArgs e)
+    {
+        if (sender is Control { DataContext: ThemeOptionViewModel option })
+        {
+            _hoveredSyntaxTheme = option;
+            RefreshAppearancePreview();
+        }
+    }
+
+    private void OnSyntaxThemeOptionPointerExited(object? sender, PointerEventArgs e)
+    {
+        if (sender is Control { DataContext: ThemeOptionViewModel option }
+            && IsSameOption(_hoveredSyntaxTheme, option))
+        {
+            _hoveredSyntaxTheme = null;
+            RefreshAppearancePreview();
+        }
+    }
+
+    private void RefreshAppearancePreview()
+    {
+        var selectedTheme = ThemePicker?.SelectedItem as ThemeOptionViewModel ?? ViewModel?.SelectedTheme;
+        var selectedSyntaxTheme = SyntaxThemePicker?.SelectedItem as ThemeOptionViewModel ?? ViewModel?.SelectedSyntaxTheme;
+        var previewTheme = _hoveredTheme ?? selectedTheme;
+        var previewSyntaxTheme = _hoveredSyntaxTheme ?? selectedSyntaxTheme;
+
+        AppearanceSyntaxPreview.ThemeKey = previewTheme?.Key ?? "empty";
+        AppearanceSyntaxPreview.SyntaxThemeKey = previewSyntaxTheme?.Key ?? "adaptive";
+        PreviewCaption.Text = $"{previewTheme?.Name ?? "Porcelain"} + {previewSyntaxTheme?.Name ?? "Adaptive"}";
+    }
+
+    private static bool IsSameOption(ThemeOptionViewModel? left, ThemeOptionViewModel right)
+    {
+        return ReferenceEquals(left, right)
+            || string.Equals(left?.Key, right.Key, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async void OnEditRuleListClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Control { Tag: string kind })
+        {
             return;
         }
 
-        if (border.Child is Panel panel)
+        await OpenRuleListEditorAsync(kind, null);
+    }
+
+    private async void OnEditRuleEntryClick(object? sender, RoutedEventArgs e)
+    {
+        if (sender is not Control { Tag: FileRuleEntryViewModel entry })
         {
-            panel.Children.Add(section);
             return;
         }
 
-        if (border.Child is Control existingContent)
+        await OpenRuleListEditorAsync(entry.Kind, entry.Value);
+    }
+
+    private async Task OpenRuleListEditorAsync(string kind, string? focusValue)
+    {
+        if (ViewModel is not { } viewModel)
         {
-            border.Child = null;
-            border.Child = new StackPanel
-            {
-                Spacing = 10,
-                Children =
-                {
-                    existingContent,
-                    section
-                }
-            };
             return;
         }
 
-        border.Child = section;
+        var editor = new FileRuleListEditorWindow(
+            viewModel.GetFileRuleTitle(kind),
+            viewModel.GetFileRuleEntries(kind),
+            viewModel.GetFileRuleWatermark(kind),
+            focusValue);
+        editor.ApplyTheme(viewModel.ThemeKey);
+
+        var saved = await editor.ShowDialog<bool>(this);
+        if (saved)
+        {
+            viewModel.ReplaceFileRuleEntries(kind, editor.Values);
+        }
     }
 
-    private static Control WrapExistingContentWithFileRules(Control existingContent, Control section)
+    private void OnSettingsContextToggleClick(object? sender, RoutedEventArgs e)
     {
-        return new ScrollViewer
-        {
-            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-            Content = new StackPanel
-            {
-                Spacing = 10,
-                Margin = new Thickness(12),
-                Children =
-                {
-                    existingContent,
-                    section
-                }
-            }
-        };
+        _contextParseMode = !_contextParseMode;
+        ParseAppearanceButton.IsVisible = _contextParseMode;
+        ParseFileRulesButton.IsVisible = _contextParseMode;
     }
 
-    private static Control BuildFileRulesSection()
+    private async void OnSettingsContextScopeClick(object? sender, RoutedEventArgs e)
     {
-        var status = new TextBlock
+        if (sender is not Control { Tag: string scope } || ViewModel is not { } viewModel)
         {
-            FontSize = 11,
-            TextWrapping = TextWrapping.Wrap,
-            Opacity = 0.72
-        };
-        status.Bind(TextBlock.TextProperty, new Binding("FileRulesStatus"));
+            return;
+        }
 
-        var path = new TextBlock
+        var payload = BuildSettingsContextPayload(viewModel, scope);
+        var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+        if (clipboard is not null)
         {
-            FontSize = 10,
-            TextWrapping = TextWrapping.Wrap,
-            Opacity = 0.62
-        };
-        path.Bind(TextBlock.TextProperty, new Binding("FileRulesPath"));
+            await clipboard.SetTextAsync(payload);
+        }
 
-        var editorGrid = new Grid
-        {
-            ColumnDefinitions = new ColumnDefinitions("*,*,*"),
-            ColumnSpacing = 8,
-            MinHeight = 180
-        };
-        editorGrid.Children.Add(CreateRuleEditor(
-            "Allowed file types",
-            "SupportedFileTypesText",
-            "Extensions that CC may show, count, export, and track."));
-        var ignoredFiles = CreateRuleEditor(
-            "Unallowed file types",
-            "IgnoredFileTypesText",
-            "Extensions ignored even when they would otherwise be supported.");
-        Grid.SetColumn(ignoredFiles, 1);
-        editorGrid.Children.Add(ignoredFiles);
-
-        var ignoredDirectories = CreateRuleEditor(
-            "Unallowed folders",
-            "IgnoredDirectoriesText",
-            "Directory names ignored by the IDE tree and external update watcher.");
-        Grid.SetColumn(ignoredDirectories, 2);
-        editorGrid.Children.Add(ignoredDirectories);
-
-        var saveButton = new Button
-        {
-            Content = "Save file rules",
-            MinHeight = 30,
-            Padding = new Thickness(12, 2),
-            HorizontalContentAlignment = HorizontalAlignment.Center,
-            VerticalContentAlignment = VerticalAlignment.Center
-        };
-        saveButton.Bind(Button.CommandProperty, new Binding("SaveFileRulesCommand"));
-
-        var resetButton = new Button
-        {
-            Content = "Reset defaults",
-            MinHeight = 30,
-            Padding = new Thickness(12, 2),
-            HorizontalContentAlignment = HorizontalAlignment.Center,
-            VerticalContentAlignment = VerticalAlignment.Center
-        };
-        resetButton.Bind(Button.CommandProperty, new Binding("ResetFileRulesCommand"));
-
-        return new Border
-        {
-            Margin = new Thickness(0, 10, 0, 0),
-            Padding = new Thickness(12),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Child = new StackPanel
-            {
-                Spacing = 8,
-                Children =
-                {
-                    new TextBlock
-                    {
-                        Text = "File rules",
-                        FontSize = 14,
-                        FontWeight = FontWeight.Bold
-                    },
-                    new TextBlock
-                    {
-                        Text = "Configure what files the IDE tree, file history, and external-update tracker can read or must ignore. One entry per line or comma-separated.",
-                        FontSize = 11,
-                        TextWrapping = TextWrapping.Wrap,
-                        Opacity = 0.72
-                    },
-                    path,
-                    editorGrid,
-                    new StackPanel
-                    {
-                        Orientation = Orientation.Horizontal,
-                        Spacing = 8,
-                        HorizontalAlignment = HorizontalAlignment.Right,
-                        Children =
-                        {
-                            resetButton,
-                            saveButton
-                        }
-                    },
-                    status
-                }
-            }
-        };
+        Title = $"Settings - copied {scope}";
     }
 
-    private static Control CreateRuleEditor(string title, string bindingPath, string help)
+    private static string BuildSettingsContextPayload(WorkbenchViewModel viewModel, string scope)
     {
-        var textBox = new TextBox
+        return scope switch
         {
-            AcceptsReturn = true,
-            MinHeight = 128,
-            TextWrapping = TextWrapping.NoWrap,
-            Watermark = ".cs, .cpp, .ps1"
-        };
-        textBox.Bind(TextBox.TextProperty, new Binding(bindingPath) { Mode = BindingMode.TwoWay });
-
-        var titleBlock = new TextBlock
-        {
-            Text = title,
-            FontSize = 12,
-            FontWeight = FontWeight.Bold
-        };
-
-        var helpBlock = new TextBlock
-        {
-            Text = help,
-            FontSize = 10,
-            TextWrapping = TextWrapping.Wrap,
-            Opacity = 0.62
-        };
-        Grid.SetRow(helpBlock, 1);
-        Grid.SetRow(textBox, 2);
-
-        return new Border
-        {
-            Padding = new Thickness(8),
-            BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(6),
-            Child = new Grid
-            {
-                RowDefinitions = new RowDefinitions("Auto,Auto,*"),
-                RowSpacing = 5,
-                Children =
-                {
-                    titleBlock,
-                    helpBlock,
-                    textBox
-                }
-            }
+            "settings.appearance" =>
+                "Context Control settings scope: Appearance" + Environment.NewLine
+                + $"Settings file: {viewModel.AppearanceSettingsPath}" + Environment.NewLine
+                + $"Current IDE theme: {viewModel.SelectedTheme.Name} ({viewModel.SelectedTheme.Key})" + Environment.NewLine
+                + $"Current syntax theme: {viewModel.SelectedSyntaxTheme.Name} ({viewModel.SelectedSyntaxTheme.Key})" + Environment.NewLine
+                + "Available IDE themes: " + string.Join(", ", viewModel.Themes.Select(theme => $"{theme.Name}/{theme.Key}")) + Environment.NewLine
+                + "Available syntax themes: " + string.Join(", ", viewModel.SyntaxThemes.Select(theme => $"{theme.Name}/{theme.Key}")) + Environment.NewLine
+                + "Primary files: Views/ThemeSettingsWindow.axaml, Views/ThemeSettingsWindow.axaml.cs, Controls/SyntaxPreviewControl.cs, Services/WorkbenchThemeResources.cs, ViewModels/WorkbenchViewModel.cs",
+            "settings.fileRules" =>
+                "Context Control settings scope: File rules" + Environment.NewLine
+                + $"Rules file: {viewModel.FileRulesPath}" + Environment.NewLine
+                + $"Summary: {viewModel.FileRulesSummary}" + Environment.NewLine
+                + "Skipped folders: " + string.Join(", ", viewModel.GetFileRuleEntries(WorkbenchViewModel.RuleKindIgnoredDirectories)) + Environment.NewLine
+                + "Skipped files: " + string.Join(", ", viewModel.GetFileRuleEntries(WorkbenchViewModel.RuleKindIgnoredFileNames)) + Environment.NewLine
+                + "Skipped file types: " + string.Join(", ", viewModel.GetFileRuleEntries(WorkbenchViewModel.RuleKindIgnoredFileTypes)) + Environment.NewLine
+                + "Allowed file types: " + string.Join(", ", viewModel.GetFileRuleEntries(WorkbenchViewModel.RuleKindSupportedFileTypes)) + Environment.NewLine
+                + "Primary files: Services/ProjectFileRules.cs, ViewModels/WorkbenchViewModel.cs, Views/ThemeSettingsWindow.axaml, Views/FileRuleListEditorWindow.cs",
+            _ => "Context Control settings scope: " + scope
         };
     }
 }
