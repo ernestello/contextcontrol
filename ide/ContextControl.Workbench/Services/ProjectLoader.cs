@@ -42,10 +42,13 @@ public static class ProjectLoader
         "cmake-build-debug",
         "cmake-build-release",
         "CMakeFiles",
-        "Debug",
-        "MinSizeRel",
         "obj",
         "out",
+    };
+    private static readonly HashSet<string> TopLevelBuildConfigurationDirectories = new(PathComparer)
+    {
+        "Debug",
+        "MinSizeRel",
         "Release",
         "RelWithDebInfo",
         "x64"
@@ -92,14 +95,16 @@ public static class ProjectLoader
 
     public static Task<LoadedProject> LoadAsync(
         string folderPath,
-        IEnumerable<string>? includedExternalPaths = null)
+        IEnumerable<string>? includedExternalPaths = null,
+        bool showSkippedFiles = false)
     {
-        return Task.Run(() => Load(folderPath, includedExternalPaths));
+        return Task.Run(() => Load(folderPath, includedExternalPaths, showSkippedFiles));
     }
 
     public static LoadedProject Load(
         string folderPath,
-        IEnumerable<string>? includedExternalPaths = null)
+        IEnumerable<string>? includedExternalPaths = null,
+        bool showSkippedFiles = false)
     {
         var root = new DirectoryInfo(folderPath);
         if (!root.Exists)
@@ -119,7 +124,7 @@ public static class ProjectLoader
         var fileCount = 0;
         var directoryCount = 0;
         var lineCount = 0L;
-        var rootNode = BuildNode(root, root.FullName, 0, profile, includedSet, versionData.CurrentVersions, fileRules, ref fileCount, ref directoryCount, ref lineCount);
+        var rootNode = BuildNode(root, root.FullName, 0, profile, includedSet, versionData.CurrentVersions, fileRules, showSkippedFiles, ref fileCount, ref directoryCount, ref lineCount);
         PrepareTree([rootNode]);
         var id = StableId(root.FullName);
         var icon = BuildIcon(root.Name);
@@ -172,12 +177,14 @@ public static class ProjectLoader
         IReadOnlySet<string> includedExternalPaths,
         IReadOnlyDictionary<string, int> currentVersions,
         ProjectFileRules fileRules,
+        bool showSkippedFiles,
         ref int fileCount,
         ref int directoryCount,
         ref long lineCount)
     {
         directoryCount++;
         var children = new List<ProjectNodeViewModel>();
+        var allFiles = Array.Empty<FileInfo>();
 
         if (depth < MaxDepth)
         {
@@ -186,21 +193,36 @@ public static class ProjectLoader
                 var relativePath = NormalizePath(Path.GetRelativePath(rootPath, childDirectory.FullName));
                 if (ShouldSkipDirectory(childDirectory, relativePath, depth, profile, includedExternalPaths, fileRules))
                 {
-                    children.Add(BuildSkippedDirectoryNode(childDirectory, rootPath));
+                    if (showSkippedFiles)
+                    {
+                        children.Add(BuildSkippedDirectoryNode(childDirectory, rootPath, depth + 1));
+                    }
+
                     continue;
                 }
 
-                children.Add(BuildNode(childDirectory, rootPath, depth + 1, profile, includedExternalPaths, currentVersions, fileRules, ref fileCount, ref directoryCount, ref lineCount));
+                children.Add(BuildNode(childDirectory, rootPath, depth + 1, profile, includedExternalPaths, currentVersions, fileRules, showSkippedFiles, ref fileCount, ref directoryCount, ref lineCount));
             }
 
-            foreach (var file in EnumerateFiles(directory, fileRules))
+            allFiles = EnumerateAllFiles(directory).ToArray();
+            foreach (var file in allFiles)
             {
-                fileCount++;
-                var fileLoc = CountLoc(file, fileRules);
-                lineCount += fileLoc;
                 var relativePath = NormalizePath(Path.GetRelativePath(rootPath, file.FullName));
+                if (!fileRules.ShouldShowFile(relativePath, file.Name, file.Extension))
+                {
+                    if (showSkippedFiles)
+                    {
+                        children.Add(new ProjectNodeViewModel(file.Name, relativePath, false, "skip", isExternal: true, diskFileCount: 1));
+                    }
+
+                    continue;
+                }
+
+                fileCount++;
+                var fileLoc = fileRules.ShouldCountLocExtension(file.Extension) ? EstimateLoc(file) : 0;
+                lineCount += fileLoc;
                 var version = FindVersion(currentVersions, relativePath, directory.Name);
-                children.Add(new ProjectNodeViewModel(file.Name, relativePath, false, version is null ? "v1" : $"v{version.Value}", loc: fileLoc, fileCount: 1));
+                children.Add(new ProjectNodeViewModel(file.Name, relativePath, false, version is null ? "v1" : $"v{version.Value}", loc: fileLoc, fileCount: 1, diskFileCount: 1));
             }
         }
 
@@ -209,17 +231,42 @@ public static class ProjectLoader
         var activeChildren = children.Where(child => !child.IsExternal).ToArray();
         var directoryLoc = activeChildren.Sum(child => child.Loc);
         var directoryFileCount = activeChildren.Sum(child => child.FileCount);
-        return new ProjectNodeViewModel(directory.Name, nodePath, true, label, children, loc: directoryLoc, fileCount: directoryFileCount);
+        var directoryDiskFileCount = allFiles.Length + activeChildren
+            .Where(child => child.IsFolder)
+            .Sum(child => child.DiskFileCount);
+        return new ProjectNodeViewModel(directory.Name, nodePath, true, label, children, loc: directoryLoc, fileCount: directoryFileCount, diskFileCount: directoryDiskFileCount, directDiskFileCount: allFiles.Length);
     }
 
     private static ProjectNodeViewModel BuildSkippedDirectoryNode(
         DirectoryInfo directory,
-        string rootPath)
+        string rootPath,
+        int depth)
     {
         var includeable = IncludeableExternalDirectories.Contains(directory.Name);
         var relativePath = NormalizePath(Path.GetRelativePath(rootPath, directory.FullName));
         var label = includeable ? "dep" : "skip";
-        return new ProjectNodeViewModel(directory.Name, relativePath, true, label, null, true, includeable);
+        var children = new List<ProjectNodeViewModel>();
+        var allFiles = Array.Empty<FileInfo>();
+
+        if (depth < MaxDepth)
+        {
+            foreach (var childDirectory in EnumerateAllDirectories(directory))
+            {
+                children.Add(BuildSkippedDirectoryNode(childDirectory, rootPath, depth + 1));
+            }
+
+            allFiles = EnumerateAllFiles(directory).ToArray();
+            foreach (var file in allFiles)
+            {
+                var fileRelativePath = NormalizePath(Path.GetRelativePath(rootPath, file.FullName));
+                children.Add(new ProjectNodeViewModel(file.Name, fileRelativePath, false, "skip", isExternal: true, diskFileCount: 1));
+            }
+        }
+
+        var diskFileCount = allFiles.Length + children
+            .Where(child => child.IsFolder)
+            .Sum(child => child.DiskFileCount);
+        return new ProjectNodeViewModel(directory.Name, relativePath, true, label, children, true, includeable, diskFileCount: diskFileCount, directDiskFileCount: allFiles.Length);
     }
 
     private static IEnumerable<DirectoryInfo> EnumerateAllDirectories(DirectoryInfo directory)
@@ -253,7 +300,13 @@ public static class ProjectLoader
             return true;
         }
 
-        if (AlwaysIgnoredDirectories.Contains(directory.Name) || fileRules.ShouldSkipDirectory(directory.Name))
+        if (AlwaysIgnoredDirectories.Contains(directory.Name) || fileRules.ShouldSkipDirectory(directory.Name, relativePath))
+        {
+            return true;
+        }
+
+        if (TopLevelBuildConfigurationDirectories.Contains(directory.Name)
+            && IsTopLevelPath(relativePath))
         {
             return true;
         }
@@ -282,6 +335,13 @@ public static class ProjectLoader
         return includedExternalPaths.Any(path =>
             normalized.Equals(path, StringComparison.OrdinalIgnoreCase)
             || normalized.StartsWith(path + "/", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool IsTopLevelPath(string relativePath)
+    {
+        var normalized = NormalizePath(relativePath);
+        return !string.IsNullOrWhiteSpace(normalized)
+            && !normalized.Contains('/', StringComparison.Ordinal);
     }
 
     private static bool ShouldIncludeVulkanVxTopLevel(string relativePath)
@@ -320,12 +380,11 @@ public static class ProjectLoader
         }
     }
 
-    private static IEnumerable<FileInfo> EnumerateFiles(DirectoryInfo directory, ProjectFileRules fileRules)
+    private static IEnumerable<FileInfo> EnumerateAllFiles(DirectoryInfo directory)
     {
         try
         {
             return directory.EnumerateFiles("*", SafeEnumerationOptions)
-                .Where(item => fileRules.ShouldTrackFileName(item.Name, item.Extension))
                 .OrderBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
                 .ToArray();
         }
@@ -560,6 +619,12 @@ public static class ProjectLoader
 
     private static string? ReadGitCommit(string workingDirectory)
     {
+        var headCommit = ReadGitHeadCommit(workingDirectory);
+        if (!string.IsNullOrWhiteSpace(headCommit))
+        {
+            return headCommit;
+        }
+
         try
         {
             using var process = Process.Start(new ProcessStartInfo
@@ -578,8 +643,21 @@ public static class ProjectLoader
                 return null;
             }
 
-            process.WaitForExit(1200);
-            if (!process.HasExited || process.ExitCode != 0)
+            if (!process.WaitForExit(250))
+            {
+                try
+                {
+                    process.Kill(entireProcessTree: true);
+                }
+                catch
+                {
+                    // Best-effort cleanup; commit detection can safely fall back to "none".
+                }
+
+                return null;
+            }
+
+            if (process.ExitCode != 0)
             {
                 return null;
             }
@@ -593,9 +671,123 @@ public static class ProjectLoader
         }
     }
 
+    private static string? ReadGitHeadCommit(string workingDirectory)
+    {
+        try
+        {
+            var gitDirectory = FindGitDirectory(workingDirectory);
+            if (string.IsNullOrWhiteSpace(gitDirectory))
+            {
+                return null;
+            }
+
+            var headPath = Path.Combine(gitDirectory, "HEAD");
+            if (!File.Exists(headPath))
+            {
+                return null;
+            }
+
+            var head = File.ReadAllText(headPath).Trim();
+            if (head.StartsWith("ref:", StringComparison.OrdinalIgnoreCase))
+            {
+                var reference = head[4..].Trim().Replace('/', Path.DirectorySeparatorChar);
+                var refPath = Path.Combine(gitDirectory, reference);
+                if (File.Exists(refPath))
+                {
+                    return ShortCommit(File.ReadAllText(refPath).Trim());
+                }
+
+                return ReadPackedRef(gitDirectory, head[4..].Trim());
+            }
+
+            return ShortCommit(head);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string? FindGitDirectory(string workingDirectory)
+    {
+        var directory = new DirectoryInfo(workingDirectory);
+        while (directory is not null)
+        {
+            var dotGit = Path.Combine(directory.FullName, ".git");
+            if (Directory.Exists(dotGit))
+            {
+                return dotGit;
+            }
+
+            if (File.Exists(dotGit))
+            {
+                var content = File.ReadAllText(dotGit).Trim();
+                const string prefix = "gitdir:";
+                if (content.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                {
+                    var gitDir = content[prefix.Length..].Trim();
+                    return Path.IsPathRooted(gitDir)
+                        ? gitDir
+                        : Path.GetFullPath(Path.Combine(directory.FullName, gitDir));
+                }
+            }
+
+            directory = directory.Parent;
+        }
+
+        return null;
+    }
+
+    private static string? ReadPackedRef(string gitDirectory, string reference)
+    {
+        var packedRefsPath = Path.Combine(gitDirectory, "packed-refs");
+        if (!File.Exists(packedRefsPath))
+        {
+            return null;
+        }
+
+        foreach (var line in File.ReadLines(packedRefsPath))
+        {
+            if (line.Length == 0 || line[0] is '#' or '^')
+            {
+                continue;
+            }
+
+            var separator = line.IndexOf(' ');
+            if (separator <= 0)
+            {
+                continue;
+            }
+
+            if (string.Equals(line[(separator + 1)..].Trim(), reference, StringComparison.Ordinal))
+            {
+                return ShortCommit(line[..separator]);
+            }
+        }
+
+        return null;
+    }
+
+    private static string? ShortCommit(string commit)
+    {
+        var clean = commit.Trim();
+        if (clean.Length < 7 || clean.Any(value => !Uri.IsHexDigit(value)))
+        {
+            return null;
+        }
+
+        return clean[..7];
+    }
+
     private static string NormalizePath(string path)
     {
-        return path.Replace('\\', '/').TrimStart('.', '/');
+        var normalized = path.Replace('\\', '/');
+        while (normalized.StartsWith("./", StringComparison.Ordinal))
+        {
+            normalized = normalized[2..];
+        }
+
+        return normalized.TrimStart('/');
     }
 
     private static HashSet<string> NormalizeIncludedPaths(IEnumerable<string>? paths)
@@ -657,13 +849,8 @@ public static class ProjectLoader
         return "generic";
     }
 
-    private static long CountLoc(FileInfo file, ProjectFileRules fileRules)
+    public static long CountLoc(FileInfo file)
     {
-        if (!fileRules.IsSupportedExtension(file.Extension))
-        {
-            return 0;
-        }
-
         if (file.Length <= 0)
         {
             return 0;
@@ -708,6 +895,13 @@ public static class ProjectLoader
                 ArrayPool<byte>.Shared.Return(rented);
             }
         }
+    }
+
+    public static long EstimateLoc(FileInfo file)
+    {
+        return file.Length <= 0
+            ? 0
+            : Math.Max(1, file.Length / EstimatedBytesPerLine);
     }
 
     private static string FormatLoc(long lineCount)

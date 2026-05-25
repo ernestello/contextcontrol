@@ -47,18 +47,20 @@ Map-stage reminders:
 ```	ext
 vulkanas/
 ├── assets/
+│   ├── .ccReplace.versions/
 │   ├── fonts/
-│   │   ├── inter.zip
 │   │   ├── Inter-Medium.ttf
-│   │   └── Inter-Regular.ttf
+│   │   ├── Inter-Regular.ttf
+│   │   └── inter.zip
 │   ├── img/
 │   │   ├── cursor16x16.aseprite
 │   │   └── vulkanvx.ico
-│   └── sky/
-│       ├── moon_16.sprite
-│       ├── moon_32.sprite
-│       ├── sun_16.sprite
-│       └── sun_32.sprite
+│   ├── sky/
+│   │   ├── moon_16.sprite
+│   │   ├── moon_32.sprite
+│   │   ├── sun_16.sprite
+│   │   └── sun_32.sprite
+│   └── .ccFileRules.json
 ├── include/
 │   ├── core/
 │   │   ├── engine/
@@ -286,6 +288,8 @@ vulkanas/
 │   │   └── snapshot.meta
 │   ├── snapshot_20260520_203959/
 │   │   └── snapshot.meta
+│   ├── snapshot_20260520_211120/
+│   │   └── snapshot.meta
 │   ├── heightmap.csv
 │   └── heightmap.hbin
 ├── shaders/
@@ -322,11 +326,11 @@ vulkanas/
 │   │   ├── star.frag
 │   │   └── star.vert
 │   ├── terrain/
-│   │   ├── cube.frag
-│   │   ├── cube.vert
 │   │   ├── cube_debug.frag
 │   │   ├── cube_debug.vert
 │   │   ├── cube_zonly.vert
+│   │   ├── cube.frag
+│   │   ├── cube.vert
 │   │   ├── dccm_terrain.frag
 │   │   └── dccm_terrain.vert
 │   └── tjunctionfix/
@@ -467,9 +471,9 @@ vulkanas/
 │   │   │   │   ├── ChunkHolesWindow.cpp
 │   │   │   │   ├── ChunkMinimapCullingOverlay.cpp
 │   │   │   │   ├── ChunkMinimapWindow.cpp
-│   │   │   │   ├── ChunkVramWindow.cpp
 │   │   │   │   ├── ChunkVramWindow_Internal.h
 │   │   │   │   ├── ChunkVramWindow_Text.cpp
+│   │   │   │   ├── ChunkVramWindow.cpp
 │   │   │   │   ├── MinimapCullingReadback.cpp
 │   │   │   │   ├── ObjectManagerWindow.cpp
 │   │   │   │   └── TerrainEditTool.cpp

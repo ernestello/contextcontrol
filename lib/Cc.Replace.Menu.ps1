@@ -8,6 +8,8 @@ function Show-CcReplaceHelp {
     Write-Host "Usage:"
     Write-Host "  .\ccReplace.ps1 -InputFile .\patch.txt"
     Write-Host "  .\ccReplace.ps1 -InputFile .\patch.txt -DryRun"
+    Write-Host "  .\ccReplace.ps1 -InputFile .\patch.txt -PlanOnly -Json"
+    Write-Host "  .\ccReplace.ps1 -InputFile .\patch.txt -Apply effective"
     Write-Host "  .\ccReplace.ps1 -InputFile .\patch.txt -NoBackup"
     Write-Host "  .\ccReplace.ps1"
     Write-Host "  .\ccReplace.ps1 -AgentMode"

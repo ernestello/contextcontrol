@@ -14,10 +14,39 @@ public sealed class ProjectFileRules
     private static readonly string[] DefaultIgnoredDirectories =
     [
         ".ccReplace.versions",
+        ".ccWorkbench.browser-data",
+        ".angular",
+        ".claude",
+        ".conan",
+        ".conan2",
+        ".codex",
+        ".cursor",
+        ".dart_tool",
+        ".expo",
         ".git",
+        ".godot",
+        ".gptReplace.versions",
+        ".gradle",
         ".idea",
+        ".import",
+        ".m2",
+        ".next",
+        ".nuxt",
+        ".nuget",
+        ".parcel-cache",
+        ".pnpm-store",
+        ".serverless",
+        ".svelte-kit",
+        ".terraform",
+        ".tmp",
+        ".turbo",
+        ".venv",
         ".vs",
         ".vscode",
+        ".yarn",
+        "__pycache__",
+        "_build",
+        "_deps",
         "bin",
         "build",
         "build-debug",
@@ -25,7 +54,9 @@ public sealed class ProjectFileRules
         "cmake-build-debug",
         "cmake-build-release",
         "CMakeFiles",
-        "Debug",
+        "coverage",
+        "DerivedData",
+        "deps",
         "dist",
         "external",
         "extern",
@@ -33,12 +64,12 @@ public sealed class ProjectFileRules
         "obj",
         "out",
         "packages",
-        "Release",
+        "Pods",
         "third_party",
         "thirdparty",
         "vendor",
-        "vcpkg_installed",
-        "x64"
+        "venv",
+        "vcpkg_installed"
     ];
 
     private static readonly string[] DefaultIgnoredExtensions =
@@ -149,6 +180,8 @@ public sealed class ProjectFileRules
     private readonly HashSet<string> _ignoredDirectories;
     private readonly HashSet<string> _ignoredExtensions;
     private readonly HashSet<string> _ignoredFileNames;
+    private readonly HashSet<string> _shownFileNames;
+    private readonly HashSet<string> _locExtensions;
     private readonly HashSet<string> _supportedExtensions;
 
     private ProjectFileRules(
@@ -156,7 +189,9 @@ public sealed class ProjectFileRules
         string rulesPath,
         IEnumerable<string> ignoredDirectories,
         IEnumerable<string> ignoredFileNames,
+        IEnumerable<string> shownFileNames,
         IEnumerable<string> ignoredExtensions,
+        IEnumerable<string> locExtensions,
         IEnumerable<string> supportedExtensions)
     {
         ProjectRoot = Path.GetFullPath(projectRoot);
@@ -164,6 +199,8 @@ public sealed class ProjectFileRules
         _ignoredDirectories = NormalizeNames(ignoredDirectories).ToHashSet(NameComparer);
         _ignoredExtensions = NormalizeExtensions(ignoredExtensions).ToHashSet(NameComparer);
         _ignoredFileNames = NormalizeNames(ignoredFileNames).ToHashSet(NameComparer);
+        _shownFileNames = NormalizeNames(shownFileNames).ToHashSet(NameComparer);
+        _locExtensions = NormalizeExtensions(locExtensions).ToHashSet(NameComparer);
         _supportedExtensions = NormalizeExtensions(supportedExtensions).ToHashSet(NameComparer);
         RemoveSupportedExtensionsFromIgnored();
     }
@@ -173,13 +210,14 @@ public sealed class ProjectFileRules
     public IReadOnlyCollection<string> IgnoredDirectories => _ignoredDirectories.OrderBy(value => value, NameComparer).ToArray();
     public IReadOnlyCollection<string> IgnoredExtensions => _ignoredExtensions.OrderBy(value => value, NameComparer).ToArray();
     public IReadOnlyCollection<string> IgnoredFileNames => _ignoredFileNames.OrderBy(value => value, NameComparer).ToArray();
+    public IReadOnlyCollection<string> ShownFileNames => _shownFileNames.OrderBy(value => value, NameComparer).ToArray();
+    public IReadOnlyCollection<string> LocExtensions => _locExtensions.OrderBy(value => value, NameComparer).ToArray();
     public IReadOnlyCollection<string> SupportedExtensions => _supportedExtensions.OrderBy(value => value, NameComparer).ToArray();
     public string SupportedLabel => string.Join(", ", SupportedExtensions);
     public string IgnoredLabel => string.Join(", ", IgnoredExtensions);
-    public string IgnoredDirectoriesLabel => string.Join(", ", IgnoredDirectories);
-    public string IgnoredFileNamesLabel => string.Join(", ", IgnoredFileNames);
     public string SupportedExtensionsText => string.Join(Environment.NewLine, SupportedExtensions);
     public string IgnoredExtensionsText => string.Join(Environment.NewLine, IgnoredExtensions);
+    public string LocExtensionsText => string.Join(Environment.NewLine, LocExtensions);
     public string IgnoredFileNamesText => string.Join(Environment.NewLine, IgnoredFileNames);
     public string IgnoredDirectoriesText => string.Join(Environment.NewLine, IgnoredDirectories);
 
@@ -201,23 +239,23 @@ public sealed class ProjectFileRules
             }
         }
 
-        IEnumerable<string> ignoredFileNames = DefaultIgnoredFileNames;
-        if (data.IgnoredFileNames is not null)
-        {
-            ignoredFileNames = data.IgnoredFileNames;
-        }
-        else if (data.IgnoredFiles is not null)
-        {
-            ignoredFileNames = data.IgnoredFiles;
-        }
+        IEnumerable<string> supportedExtensions = data.SupportedExtensions is not null ? data.SupportedExtensions : DefaultSupportedExtensions;
+        IEnumerable<string> ignoredFileNames = data.IgnoredFileNames is not null
+            ? data.IgnoredFileNames
+            : data.IgnoredFiles is not null ? data.IgnoredFiles : DefaultIgnoredFileNames;
+        IEnumerable<string> shownFileNames = data.ShownFileNames is not null
+            ? data.ShownFileNames
+            : data.ShownFiles is not null ? data.ShownFiles : [];
 
         return new ProjectFileRules(
             fullProjectRoot,
             rulesPath,
             data.IgnoredDirectories is null ? DefaultIgnoredDirectories : data.IgnoredDirectories,
             ignoredFileNames,
+            shownFileNames,
             data.IgnoredExtensions is null ? DefaultIgnoredExtensions : data.IgnoredExtensions,
-            data.SupportedExtensions is null ? DefaultSupportedExtensions : data.SupportedExtensions);
+            data.LocExtensions ?? supportedExtensions,
+            supportedExtensions);
     }
 
     public void Save()
@@ -232,7 +270,9 @@ public sealed class ProjectFileRules
         {
             IgnoredDirectories = IgnoredDirectories.ToList(),
             IgnoredFileNames = IgnoredFileNames.ToList(),
+            ShownFileNames = ShownFileNames.ToList(),
             IgnoredExtensions = IgnoredExtensions.ToList(),
+            LocExtensions = LocExtensions.ToList(),
             SupportedExtensions = SupportedExtensions.ToList()
         };
         File.WriteAllText(RulesPath, JsonSerializer.Serialize(data, JsonOptions) + Environment.NewLine, Utf8NoBom);
@@ -242,22 +282,94 @@ public sealed class ProjectFileRules
         string ignoredDirectoriesText,
         string ignoredFileNamesText,
         string ignoredExtensionsText,
-        string supportedExtensionsText)
+        string supportedExtensionsText,
+        string locExtensionsText)
     {
         ReplaceSet(_ignoredDirectories, NormalizeNames(SplitRuleText(ignoredDirectoriesText)));
         ReplaceSet(_ignoredFileNames, NormalizeNames(SplitRuleText(ignoredFileNamesText)));
         ReplaceSet(_ignoredExtensions, NormalizeExtensions(SplitRuleText(ignoredExtensionsText)));
         ReplaceSet(_supportedExtensions, NormalizeExtensions(SplitRuleText(supportedExtensionsText)));
+        ReplaceSet(_locExtensions, NormalizeExtensions(SplitRuleText(locExtensionsText)));
         RemoveSupportedExtensionsFromIgnored();
+    }
+
+    public void ApplyCleanRules(
+        IEnumerable<string> ignoredDirectories,
+        IEnumerable<string> ignoredFileNames,
+        IEnumerable<string> ignoredExtensions,
+        IEnumerable<string> supportedExtensions,
+        IEnumerable<string> locExtensions)
+    {
+        ReplaceSet(_ignoredDirectories, NormalizeNames(ignoredDirectories));
+        ReplaceSet(_ignoredFileNames, NormalizeNames(ignoredFileNames));
+        _shownFileNames.Clear();
+        ReplaceSet(_ignoredExtensions, NormalizeExtensions(ignoredExtensions));
+        ReplaceSet(_supportedExtensions, NormalizeExtensions(supportedExtensions));
+        ReplaceSet(_locExtensions, NormalizeExtensions(locExtensions));
+        RemoveSupportedExtensionsFromIgnored();
+    }
+
+    public ProjectFileRules CreateSnapshot(
+        string ignoredDirectoriesText,
+        string ignoredFileNamesText,
+        string ignoredExtensionsText,
+        string supportedExtensionsText,
+        string locExtensionsText)
+    {
+        return new ProjectFileRules(
+            ProjectRoot,
+            RulesPath,
+            NormalizeNames(SplitRuleText(ignoredDirectoriesText)),
+            NormalizeNames(SplitRuleText(ignoredFileNamesText)),
+            _shownFileNames,
+            NormalizeExtensions(SplitRuleText(ignoredExtensionsText)),
+            NormalizeExtensions(SplitRuleText(locExtensionsText)),
+            NormalizeExtensions(SplitRuleText(supportedExtensionsText)));
     }
 
     public void ResetToDefaults()
     {
         ReplaceSet(_ignoredDirectories, NormalizeNames(DefaultIgnoredDirectories));
         ReplaceSet(_ignoredFileNames, NormalizeNames(DefaultIgnoredFileNames));
+        _shownFileNames.Clear();
         ReplaceSet(_ignoredExtensions, NormalizeExtensions(DefaultIgnoredExtensions));
         ReplaceSet(_supportedExtensions, NormalizeExtensions(DefaultSupportedExtensions));
+        ReplaceSet(_locExtensions, NormalizeExtensions(DefaultSupportedExtensions));
         RemoveSupportedExtensionsFromIgnored();
+    }
+
+    public ProjectFileVisibilityDecision GetVisibilityDecision(
+        string relativePath,
+        string fileName,
+        string extension)
+    {
+        var normalizedRelativePath = NormalizeRulePath(relativePath);
+        var cleanFileName = string.IsNullOrWhiteSpace(fileName)
+            ? GetLastPathPart(normalizedRelativePath)
+            : fileName.Trim();
+
+        if (MatchesShownFile(normalizedRelativePath, cleanFileName))
+        {
+            return ProjectFileVisibilityDecision.Show();
+        }
+
+        if (MatchesIgnoredFile(normalizedRelativePath, cleanFileName))
+        {
+            return ProjectFileVisibilityDecision.Skip($"ignored file: {cleanFileName}");
+        }
+
+        if (IsBackupOrTemporaryFile(cleanFileName))
+        {
+            return ProjectFileVisibilityDecision.Skip("backup/temp/snapshot file");
+        }
+
+        var normalizedExtension = NormalizeExtension(extension);
+        if (_ignoredExtensions.Contains(normalizedExtension))
+        {
+            return ProjectFileVisibilityDecision.Skip($"ignored extension: {normalizedExtension}");
+        }
+
+        return ProjectFileVisibilityDecision.Show();
     }
 
     public ProjectFileTrackDecision GetTrackDecision(string fullPath)
@@ -275,24 +387,16 @@ public sealed class ProjectFileRules
         }
 
         var fileName = Path.GetFileName(normalizedFullPath);
-        if (_ignoredFileNames.Contains(fileName))
+        var normalizedRelativePath = NormalizeRulePath(relativePath);
+        if (FindIgnoredDirectory(normalizedRelativePath) is { } ignoredDirectory)
         {
-            return ProjectFileTrackDecision.Ignore($"ignored file: {fileName}");
+            return ProjectFileTrackDecision.Ignore($"ignored directory: {ignoredDirectory}");
         }
 
-        if (fileName.Contains(".ccbak.", StringComparison.OrdinalIgnoreCase)
-            || fileName.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)
-            || fileName.EndsWith("~", StringComparison.Ordinal)
-            || fileName.EndsWith(".snapshot", StringComparison.OrdinalIgnoreCase))
+        var visibility = GetVisibilityDecision(normalizedRelativePath, fileName, Path.GetExtension(normalizedFullPath));
+        if (!visibility.ShouldShow)
         {
-            return ProjectFileTrackDecision.Ignore("backup/temp/snapshot file");
-        }
-
-        var parts = relativePath.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        var ignoredPart = parts.FirstOrDefault(part => _ignoredDirectories.Contains(part));
-        if (!string.IsNullOrWhiteSpace(ignoredPart))
-        {
-            return ProjectFileTrackDecision.Ignore($"ignored directory: {ignoredPart}");
+            return ProjectFileTrackDecision.Ignore(visibility.IgnoredReason);
         }
 
         var extension = NormalizeExtension(Path.GetExtension(normalizedFullPath));
@@ -309,22 +413,15 @@ public sealed class ProjectFileRules
         return ProjectFileTrackDecision.Track();
     }
 
-    public bool IsSupportedExtension(string extension)
+    public bool ShouldShowFile(string relativePath, string fileName, string extension)
     {
-        return _supportedExtensions.Contains(NormalizeExtension(extension));
+        return GetVisibilityDecision(relativePath, fileName, extension).ShouldShow;
     }
 
-    public bool ShouldTrackFileName(string fileName, string extension)
+    public bool ShouldTrackFile(string relativePath, string fileName, string extension)
     {
-        if (_ignoredFileNames.Contains(fileName))
-        {
-            return false;
-        }
-
-        if (fileName.Contains(".ccbak.", StringComparison.OrdinalIgnoreCase)
-            || fileName.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)
-            || fileName.EndsWith("~", StringComparison.Ordinal)
-            || fileName.EndsWith(".snapshot", StringComparison.OrdinalIgnoreCase))
+        var visibility = GetVisibilityDecision(relativePath, fileName, extension);
+        if (!visibility.ShouldShow)
         {
             return false;
         }
@@ -334,14 +431,120 @@ public sealed class ProjectFileRules
             && !_ignoredExtensions.Contains(normalizedExtension);
     }
 
-    public bool ShouldSkipDirectory(string directoryName)
+    public bool ShouldSkipExtension(string extension)
     {
-        return _ignoredDirectories.Contains(directoryName);
+        return _ignoredExtensions.Contains(NormalizeExtension(extension));
     }
 
-    public bool ShouldSkipFileName(string fileName)
+    public bool ShouldCountLocExtension(string extension)
     {
-        return _ignoredFileNames.Contains(fileName);
+        return _locExtensions.Contains(NormalizeExtension(extension));
+    }
+
+    public bool ShouldSkipDirectory(string directoryName, string relativePath = "")
+    {
+        var normalizedRelativePath = NormalizeRulePath(relativePath);
+        var cleanDirectoryName = string.IsNullOrWhiteSpace(directoryName)
+            ? GetLastPathPart(normalizedRelativePath)
+            : directoryName.Trim();
+
+        return MatchesIgnoredDirectory(normalizedRelativePath, cleanDirectoryName);
+    }
+
+    public bool SkipFile(string relativePath)
+    {
+        var normalizedPath = NormalizeRulePath(relativePath);
+        if (string.IsNullOrWhiteSpace(normalizedPath))
+        {
+            return false;
+        }
+
+        var changed = _ignoredFileNames.Add(normalizedPath);
+        changed |= _shownFileNames.Remove(normalizedPath);
+        var fileName = GetLastPathPart(normalizedPath);
+        if (!string.IsNullOrWhiteSpace(fileName))
+        {
+            changed |= _shownFileNames.Remove(fileName);
+        }
+
+        return changed;
+    }
+
+    public bool ShowFile(string relativePath)
+    {
+        var normalizedPath = NormalizeRulePath(relativePath);
+        if (string.IsNullOrWhiteSpace(normalizedPath))
+        {
+            return false;
+        }
+
+        var changed = _ignoredFileNames.Remove(normalizedPath);
+        changed |= _shownFileNames.Add(normalizedPath);
+        return changed;
+    }
+
+    public bool SkipExtension(string extension)
+    {
+        var normalizedExtension = NormalizeExtension(extension);
+        if (normalizedExtension.Length <= 1)
+        {
+            return false;
+        }
+
+        var changed = _ignoredExtensions.Add(normalizedExtension);
+        changed |= _supportedExtensions.Remove(normalizedExtension);
+        changed |= RemoveShownFileOverridesForExtension(normalizedExtension);
+        return changed;
+    }
+
+    public bool ShowExtension(string extension)
+    {
+        var normalizedExtension = NormalizeExtension(extension);
+        if (normalizedExtension.Length <= 1)
+        {
+            return false;
+        }
+
+        var changed = _ignoredExtensions.Remove(normalizedExtension);
+        changed |= _supportedExtensions.Add(normalizedExtension);
+        changed |= RemoveShownFileOverridesForExtension(normalizedExtension);
+        return changed;
+    }
+
+    public bool HideLocExtension(string extension)
+    {
+        var normalizedExtension = NormalizeExtension(extension);
+        return normalizedExtension.Length > 1 && _locExtensions.Remove(normalizedExtension);
+    }
+
+    public bool ShowLocExtension(string extension)
+    {
+        var normalizedExtension = NormalizeExtension(extension);
+        return normalizedExtension.Length > 1 && _locExtensions.Add(normalizedExtension);
+    }
+
+    public bool SkipDirectory(string relativePath)
+    {
+        var normalizedPath = NormalizeRulePath(relativePath);
+        return !string.IsNullOrWhiteSpace(normalizedPath) && _ignoredDirectories.Add(normalizedPath);
+    }
+
+    public bool ShowDirectory(string relativePath)
+    {
+        var normalizedPath = NormalizeRulePath(relativePath);
+        if (string.IsNullOrWhiteSpace(normalizedPath))
+        {
+            return false;
+        }
+
+        var changed = _ignoredDirectories.Remove(normalizedPath);
+        var directoryName = GetLastPathPart(normalizedPath);
+        if (!string.IsNullOrWhiteSpace(directoryName))
+        {
+            changed |= _ignoredDirectories.Remove(directoryName);
+        }
+
+        return changed;
     }
 
     private static IEnumerable<string> SplitRuleText(string value)
@@ -401,7 +604,8 @@ public sealed class ProjectFileRules
     {
         return values
             .Where(value => !string.IsNullOrWhiteSpace(value))
-            .Select(value => value.Trim())
+            .Select(NormalizeRulePath)
+            .Where(value => !string.IsNullOrWhiteSpace(value))
             .Distinct(NameComparer);
     }
 
@@ -419,6 +623,147 @@ public sealed class ProjectFileRules
         return clean.StartsWith(".", StringComparison.Ordinal) ? clean : "." + clean;
     }
 
+    private bool MatchesIgnoredFile(string relativePath, string fileName)
+    {
+        var normalizedRelativePath = NormalizeRulePath(relativePath);
+        var cleanFileName = string.IsNullOrWhiteSpace(fileName) ? GetLastPathPart(normalizedRelativePath) : fileName.Trim();
+        foreach (var ignoredFile in _ignoredFileNames)
+        {
+            if (IsPathRule(ignoredFile))
+            {
+                if (string.Equals(normalizedRelativePath, ignoredFile, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (string.Equals(cleanFileName, ignoredFile, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool MatchesShownFile(string relativePath, string fileName)
+    {
+        var normalizedRelativePath = NormalizeRulePath(relativePath);
+        var cleanFileName = string.IsNullOrWhiteSpace(fileName) ? GetLastPathPart(normalizedRelativePath) : fileName.Trim();
+        foreach (var shownFile in _shownFileNames)
+        {
+            if (IsPathRule(shownFile))
+            {
+                if (string.Equals(normalizedRelativePath, shownFile, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (string.Equals(cleanFileName, shownFile, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool RemoveShownFileOverridesForExtension(string extension)
+    {
+        var matchingOverrides = _shownFileNames
+            .Where(rule => string.Equals(NormalizeExtension(Path.GetExtension(GetLastPathPart(rule))), extension, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        foreach (var rule in matchingOverrides)
+        {
+            _shownFileNames.Remove(rule);
+        }
+
+        return matchingOverrides.Length > 0;
+    }
+
+    private bool MatchesIgnoredDirectory(string relativePath, string directoryName)
+    {
+        var normalizedRelativePath = NormalizeRulePath(relativePath);
+        var cleanDirectoryName = string.IsNullOrWhiteSpace(directoryName) ? GetLastPathPart(normalizedRelativePath) : directoryName.Trim();
+        foreach (var ignoredDirectory in _ignoredDirectories)
+        {
+            if (IsPathRule(ignoredDirectory))
+            {
+                if (PathMatchesDirectoryRule(normalizedRelativePath, ignoredDirectory))
+                {
+                    return true;
+                }
+
+                continue;
+            }
+
+            if (string.Equals(cleanDirectoryName, ignoredDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private string? FindIgnoredDirectory(string relativePath)
+    {
+        var normalizedRelativePath = NormalizeRulePath(relativePath);
+        foreach (var ignoredDirectory in _ignoredDirectories)
+        {
+            if (IsPathRule(ignoredDirectory) && PathMatchesDirectoryRule(normalizedRelativePath, ignoredDirectory))
+            {
+                return ignoredDirectory;
+            }
+        }
+
+        return normalizedRelativePath
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .FirstOrDefault(part => _ignoredDirectories.Contains(part));
+    }
+
+    private static bool PathMatchesDirectoryRule(string relativePath, string directoryRule)
+    {
+        return string.Equals(relativePath, directoryRule, StringComparison.OrdinalIgnoreCase)
+            || relativePath.StartsWith(directoryRule + "/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsPathRule(string rule)
+    {
+        return rule.Contains('/', StringComparison.Ordinal);
+    }
+
+    private static bool IsBackupOrTemporaryFile(string fileName)
+    {
+        return fileName.Contains(".ccbak.", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase)
+            || fileName.EndsWith("~", StringComparison.Ordinal)
+            || fileName.EndsWith(".snapshot", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string NormalizeRulePath(string value)
+    {
+        var normalized = (value ?? string.Empty).Trim().Replace('\\', '/');
+        while (normalized.StartsWith("./", StringComparison.Ordinal))
+        {
+            normalized = normalized[2..];
+        }
+
+        return normalized.Trim('/');
+    }
+
+    private static string GetLastPathPart(string path)
+    {
+        return NormalizeRulePath(path)
+            .Split('/', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .LastOrDefault() ?? "";
+    }
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -430,7 +775,10 @@ public sealed class ProjectFileRules
         public List<string>? IgnoredDirectories { get; set; }
         public List<string>? IgnoredFileNames { get; set; }
         public List<string>? IgnoredFiles { get; set; }
+        public List<string>? ShownFileNames { get; set; }
+        public List<string>? ShownFiles { get; set; }
         public List<string>? IgnoredExtensions { get; set; }
+        public List<string>? LocExtensions { get; set; }
         public List<string>? SupportedExtensions { get; set; }
     }
 }
@@ -439,4 +787,10 @@ public sealed record ProjectFileTrackDecision(bool ShouldTrack, string IgnoredRe
 {
     public static ProjectFileTrackDecision Track() => new(true, "");
     public static ProjectFileTrackDecision Ignore(string reason) => new(false, reason);
+}
+
+public sealed record ProjectFileVisibilityDecision(bool ShouldShow, string IgnoredReason)
+{
+    public static ProjectFileVisibilityDecision Show() => new(true, "");
+    public static ProjectFileVisibilityDecision Skip(string reason) => new(false, reason);
 }

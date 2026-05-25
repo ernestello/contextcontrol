@@ -21,7 +21,7 @@ public sealed class SyntaxPreviewControl : Control
     private const double LineNumberFontSize = 10.5;
     private const double CharWidth = 7.15;
 
-    private static readonly FontFamily CodeFont = new("Cascadia Code, Cascadia Mono, Consolas, monospace");
+    private static readonly FontFamily CodeFont = new("avares://ContextControl.Workbench/Assets/Fonts#Cascadia Code, Consolas");
     private static readonly Typeface CodeTypeface = new(CodeFont);
 
     private static readonly PreviewLine[] Lines =
@@ -167,7 +167,7 @@ public sealed class SyntaxPreviewControl : Control
                 : themeKey.ToLowerInvariant();
             var palette = normalizedTheme switch
             {
-                "dark" => CreateDark(),
+                "dark" or "nocturne" or "onyx" or "smoke" or "carbon" or "obsidian" or "ash" or "graphene" or "ruby" or "amethyst" or "ember" or "cobalt" or "contrast" => CreateDark(),
                 "matrix" => CreateMatrix(),
                 _ => CreateEmpty()
             };
@@ -281,11 +281,91 @@ public sealed class SyntaxPreviewControl : Control
             var key = syntaxThemeKey?.ToLowerInvariant();
             if (string.IsNullOrWhiteSpace(key) || key == "adaptive")
             {
-                key = themeKey == "empty" ? "empty-light" : "a11y-dark";
+                key = AdaptiveSyntaxKey(themeKey);
             }
 
             var syntax = key switch
             {
+                "porcelain-adaptive" => Syntax(
+                    Brush(38, 50, 55), Brush(0, 103, 122), Brush(40, 124, 104), Brush(154, 91, 33),
+                    Brush(111, 88, 176), Brush(112, 126, 130), Brush(133, 86, 41), Brush(93, 105, 34),
+                    [Brush(189, 134, 26), Brush(0, 103, 122), Brush(111, 88, 176), Brush(40, 124, 104), Brush(178, 74, 66), Brush(67, 109, 156)]),
+                "alabaster-adaptive" => Syntax(
+                    Brush(48, 58, 57), Brush(35, 111, 118), Brush(45, 123, 101), Brush(138, 91, 34),
+                    Brush(111, 90, 174), Brush(123, 130, 124), Brush(122, 91, 42), Brush(110, 104, 48),
+                    [Brush(184, 134, 33), Brush(35, 111, 118), Brush(124, 97, 178), Brush(45, 123, 101), Brush(170, 76, 73), Brush(73, 110, 156)]),
+                "pearl-adaptive" => Syntax(
+                    Brush(46, 58, 64), Brush(47, 111, 146), Brush(40, 125, 122), Brush(147, 97, 45),
+                    Brush(105, 91, 170), Brush(122, 133, 140), Brush(122, 92, 55), Brush(95, 110, 53),
+                    [Brush(176, 127, 34), Brush(47, 111, 146), Brush(125, 98, 180), Brush(40, 125, 122), Brush(168, 78, 82), Brush(74, 117, 160)]),
+                "opal-adaptive" => Syntax(
+                    Brush(48, 64, 72), Brush(61, 113, 139), Brush(60, 122, 104), Brush(139, 93, 66),
+                    Brush(116, 95, 166), Brush(120, 132, 135), Brush(125, 90, 74), Brush(101, 113, 48),
+                    [Brush(181, 135, 42), Brush(61, 113, 139), Brush(140, 102, 174), Brush(60, 122, 104), Brush(169, 80, 89), Brush(82, 117, 154)]),
+                "mist-adaptive" => Syntax(
+                    Brush(43, 57, 62), Brush(61, 119, 130), Brush(55, 126, 109), Brush(139, 95, 47),
+                    Brush(106, 94, 166), Brush(118, 130, 134), Brush(121, 91, 55), Brush(93, 112, 58),
+                    [Brush(174, 130, 39), Brush(61, 119, 130), Brush(126, 99, 174), Brush(55, 126, 109), Brush(169, 80, 82), Brush(76, 116, 158)]),
+                "limestone-adaptive" => Syntax(
+                    Brush(45, 58, 53), Brush(82, 111, 101), Brush(47, 124, 103), Brush(136, 94, 51),
+                    Brush(109, 93, 161), Brush(119, 128, 122), Brush(121, 91, 60), Brush(92, 116, 57),
+                    [Brush(172, 127, 38), Brush(82, 111, 101), Brush(126, 99, 171), Brush(47, 124, 103), Brush(169, 81, 76), Brush(77, 114, 153)]),
+                "graphite-adaptive" => Syntax(
+                    Brush(218, 224, 230), Brush(169, 183, 198), Brush(211, 178, 119), Brush(191, 160, 106),
+                    Brush(185, 155, 214), Brush(126, 137, 148), Brush(208, 167, 131), Brush(184, 201, 135),
+                    [Brush(218, 184, 111), Brush(169, 183, 198), Brush(185, 155, 214), Brush(184, 201, 135), Brush(226, 128, 120), Brush(141, 169, 203)]),
+                "nocturne-adaptive" => Syntax(
+                    Brush(225, 232, 235), Brush(134, 200, 216), Brush(146, 211, 180), Brush(230, 193, 126),
+                    Brush(182, 161, 240), Brush(132, 147, 160), Brush(224, 183, 139), Brush(216, 207, 138),
+                    [Brush(226, 195, 111), Brush(134, 200, 216), Brush(182, 161, 240), Brush(146, 211, 180), Brush(240, 128, 120), Brush(142, 174, 209)]),
+                "onyx-adaptive" => Syntax(
+                    Brush(234, 229, 219), Brush(208, 179, 107), Brush(146, 208, 176), Brush(232, 201, 132),
+                    Brush(200, 176, 240), Brush(143, 138, 128), Brush(217, 181, 142), Brush(216, 198, 125),
+                    [Brush(208, 179, 107), Brush(159, 211, 190), Brush(200, 176, 240), Brush(184, 212, 137), Brush(240, 122, 114), Brush(159, 181, 216)]),
+                "smoke-adaptive" => Syntax(
+                    Brush(226, 228, 230), Brush(164, 196, 175), Brush(142, 200, 193), Brush(219, 193, 124),
+                    Brush(196, 175, 234), Brush(138, 146, 153), Brush(211, 181, 138), Brush(204, 214, 131),
+                    [Brush(219, 193, 124), Brush(164, 196, 175), Brush(196, 175, 234), Brush(142, 200, 193), Brush(240, 122, 114), Brush(143, 170, 209)]),
+                "carbon-adaptive" => Syntax(
+                    Brush(227, 231, 233), Brush(142, 178, 188), Brush(147, 205, 178), Brush(220, 190, 122),
+                    Brush(190, 170, 230), Brush(137, 146, 153), Brush(211, 178, 137), Brush(206, 205, 132),
+                    [Brush(220, 190, 122), Brush(142, 178, 188), Brush(190, 170, 230), Brush(147, 205, 178), Brush(239, 122, 114), Brush(146, 172, 208)]),
+                "obsidian-adaptive" => Syntax(
+                    Brush(232, 235, 236), Brush(155, 176, 194), Brush(154, 210, 181), Brush(225, 197, 129),
+                    Brush(197, 178, 235), Brush(136, 146, 157), Brush(216, 182, 142), Brush(212, 203, 133),
+                    [Brush(225, 197, 129), Brush(155, 176, 194), Brush(197, 178, 235), Brush(154, 210, 181), Brush(241, 124, 116), Brush(155, 181, 215)]),
+                "ash-adaptive" => Syntax(
+                    Brush(225, 227, 227), Brush(157, 180, 158), Brush(144, 202, 191), Brush(219, 193, 125),
+                    Brush(196, 177, 229), Brush(140, 148, 148), Brush(211, 181, 139), Brush(203, 214, 132),
+                    [Brush(219, 193, 125), Brush(157, 180, 158), Brush(196, 177, 229), Brush(144, 202, 191), Brush(239, 123, 115), Brush(145, 171, 207)]),
+                "graphene-adaptive" => Syntax(
+                    Brush(225, 232, 234), Brush(127, 174, 176), Brush(146, 209, 181), Brush(220, 190, 122),
+                    Brush(190, 171, 230), Brush(134, 147, 151), Brush(211, 180, 138), Brush(205, 209, 132),
+                    [Brush(220, 190, 122), Brush(127, 174, 176), Brush(190, 171, 230), Brush(146, 209, 181), Brush(239, 122, 114), Brush(144, 173, 207)]),
+                "ruby-adaptive" => Syntax(
+                    Brush(242, 228, 229), Brush(255, 138, 145), Brush(215, 183, 255), Brush(255, 198, 109),
+                    Brush(240, 143, 181), Brush(153, 114, 122), Brush(232, 176, 154), Brush(255, 210, 138),
+                    [Brush(255, 198, 109), Brush(255, 138, 145), Brush(215, 183, 255), Brush(154, 215, 178), Brush(255, 111, 125), Brush(155, 188, 232)]),
+                "amethyst-adaptive" => Syntax(
+                    Brush(238, 231, 247), Brush(201, 167, 255), Brush(142, 200, 255), Brush(241, 199, 126),
+                    Brush(255, 147, 206), Brush(142, 128, 164), Brush(221, 187, 255), Brush(189, 229, 138),
+                    [Brush(241, 199, 126), Brush(201, 167, 255), Brush(255, 147, 206), Brush(142, 200, 255), Brush(255, 127, 146), Brush(189, 229, 138)]),
+                "ember-adaptive" => Syntax(
+                    Brush(240, 229, 215), Brush(255, 179, 107), Brush(157, 214, 176), Brush(255, 208, 135),
+                    Brush(211, 176, 255), Brush(140, 122, 106), Brush(240, 163, 108), Brush(233, 208, 120),
+                    [Brush(255, 208, 135), Brush(255, 179, 107), Brush(157, 214, 176), Brush(211, 176, 255), Brush(255, 132, 109), Brush(140, 190, 230)]),
+                "verdant-adaptive" => Syntax(
+                    Brush(33, 47, 37), Brush(44, 122, 67), Brush(46, 125, 130), Brush(154, 91, 27),
+                    Brush(123, 97, 184), Brush(114, 128, 111), Brush(122, 90, 21), Brush(93, 127, 31),
+                    [Brush(172, 124, 22), Brush(44, 122, 67), Brush(123, 97, 184), Brush(46, 125, 130), Brush(183, 76, 67), Brush(60, 112, 158)]),
+                "cobalt-adaptive" => Syntax(
+                    Brush(225, 234, 242), Brush(120, 199, 255), Brush(135, 221, 180), Brush(240, 200, 121),
+                    Brush(184, 164, 255), Brush(121, 141, 161), Brush(255, 176, 120), Brush(214, 223, 120),
+                    [Brush(240, 200, 121), Brush(120, 199, 255), Brush(184, 164, 255), Brush(135, 221, 180), Brush(255, 125, 125), Brush(130, 170, 222)]),
+                "phosphor-adaptive" => Syntax(
+                    Brush(223, 255, 239), Brush(101, 240, 178), Brush(129, 220, 188), Brush(230, 183, 116),
+                    Brush(215, 247, 122), Brush(92, 153, 126), Brush(226, 184, 124), Brush(157, 205, 255),
+                    [Brush(215, 247, 122), Brush(101, 240, 178), Brush(157, 205, 255), Brush(129, 220, 188), Brush(255, 121, 121), Brush(189, 162, 255)]),
                 "empty-light" => Syntax(
                     Brush(39, 48, 52), Brush(13, 107, 114), Brush(43, 122, 104), Brush(155, 92, 36),
                     Brush(107, 94, 183), Brush(122, 133, 136), Brush(135, 90, 37), Brush(113, 93, 31),
@@ -341,6 +421,35 @@ public sealed class SyntaxPreviewControl : Control
             palette.Variable = syntax.Variable;
             palette.Function = syntax.Function;
             palette.Brackets = syntax.Brackets;
+        }
+
+        private static string AdaptiveSyntaxKey(string? themeKey)
+        {
+            return themeKey switch
+            {
+                "alabaster" => "alabaster-adaptive",
+                "pearl" => "pearl-adaptive",
+                "opal" => "opal-adaptive",
+                "mist" => "mist-adaptive",
+                "limestone" => "limestone-adaptive",
+                "dark" => "graphite-adaptive",
+                "nocturne" => "nocturne-adaptive",
+                "onyx" => "onyx-adaptive",
+                "smoke" => "smoke-adaptive",
+                "carbon" => "carbon-adaptive",
+                "obsidian" => "obsidian-adaptive",
+                "ash" => "ash-adaptive",
+                "graphene" => "graphene-adaptive",
+                "ruby" => "ruby-adaptive",
+                "amethyst" => "amethyst-adaptive",
+                "ember" => "ember-adaptive",
+                "verdant" => "verdant-adaptive",
+                "cobalt" => "cobalt-adaptive",
+                "matrix" => "phosphor-adaptive",
+                "solarized" => "solarized-light",
+                "contrast" => "high-contrast-dark",
+                _ => "porcelain-adaptive"
+            };
         }
 
         private static SyntaxPalette Syntax(

@@ -28,6 +28,17 @@ Reasons:
 - Load project trees and version histories asynchronously once real data wiring begins.
 - Keep PowerShell execution off the UI thread.
 
+## Browser Mode
+
+Browser mode is an embedded native WebView surface.
+
+- Windows hosts Edge WebView2 directly through a thin Avalonia `NativeControlHost` bridge.
+- Other platforms keep the browser mode boundary but need their own native host implementation before the surface is enabled there.
+- The embedded browser stores its WebView2 user data under the local ContextControl root in `.ccWorkbench.browser-data/`.
+- The browser toolbar can open the current URL in detected external system browsers when the user wants existing browser sessions.
+- The app does not store DOM selectors or automate browser UI.
+- The editor, Context Control workflow, and browser surface stay separated through view models and window event bridges.
+
 ## Backend Contract
 
 The existing scripts remain the source of truth:

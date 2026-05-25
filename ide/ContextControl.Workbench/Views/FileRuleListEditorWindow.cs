@@ -4,17 +4,24 @@ using Avalonia.Controls.Primitives;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
+using Avalonia.Media.Imaging;
+using Avalonia.Platform;
 using Avalonia.Threading;
+using ContextControl.Workbench.Controls;
 using ContextControl.Workbench.Services;
 
 namespace ContextControl.Workbench.Views;
 
 public sealed class FileRuleListEditorWindow : Window
 {
+    private static readonly Uri AppIconUri = new("avares://ContextControl.Workbench/Assets/Icons/contextcontrol64x64.png");
+    private static readonly Uri MicroIconUri = new("avares://ContextControl.Workbench/Assets/Icons/contextcontrol32x32.png");
+
     private readonly StackPanel _itemsPanel;
     private readonly TextBox _newEntryBox;
     private readonly List<TextBox> _entryEditors = [];
     private readonly string _focusValue;
+    private Image? _titleIconImage;
 
     public FileRuleListEditorWindow(
         string title,
@@ -28,13 +35,15 @@ public sealed class FileRuleListEditorWindow : Window
         Height = 720;
         MinWidth = 380;
         MinHeight = 420;
+        CanResize = true;
         SystemDecorations = SystemDecorations.None;
         WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        Icon = new WindowIcon(AssetLoader.Open(AppIconUri));
 
         _itemsPanel = new StackPanel
         {
             Spacing = 1,
-            Margin = new Thickness(0, 0, 12, 0)
+            Margin = new Thickness(0)
         };
 
         _newEntryBox = new TextBox
@@ -59,9 +68,16 @@ public sealed class FileRuleListEditorWindow : Window
 
     public IReadOnlyList<string> Values { get; private set; } = [];
 
-    public void ApplyTheme(string? themeKey)
+    public void ApplyTheme(string? themeKey, string? uiFontFamily = null, string? codeFontFamily = null, string? skinKey = null)
     {
-        WorkbenchThemeResources.Apply(this, themeKey);
+        WorkbenchThemeResources.Apply(this, themeKey, uiFontFamily, codeFontFamily, skinKey: skinKey);
+        if (_titleIconImage is not null
+            && Resources.TryGetValue("AppMicroIconImage", out var icon)
+            && icon is IImage image)
+        {
+            _titleIconImage.Source = image;
+        }
+
         if (Resources.TryGetValue("AppBackgroundBrush", out var brush) && brush is IBrush background)
         {
             Background = background;
@@ -155,15 +171,57 @@ public sealed class FileRuleListEditorWindow : Window
         contentPanel.Classes.Add("settings-panel");
         Grid.SetRow(contentPanel, 1);
 
-        return new Grid
+        var root = new Grid
         {
             RowDefinitions = new RowDefinitions("31,*"),
-            Children =
-            {
-                BuildTitleBar(title),
-                contentPanel
-            }
         };
+        root.Children.Add(BuildTitleBar(title));
+        root.Children.Add(contentPanel);
+        AddResizeEdges(root);
+        return root;
+    }
+
+    private void AddResizeEdges(Grid root)
+    {
+        root.Children.Add(BuildResizeEdge(5, null, HorizontalAlignment.Left, VerticalAlignment.Stretch, StandardCursorType.SizeWestEast, OnResizeLeftPointerPressed));
+        root.Children.Add(BuildResizeEdge(5, null, HorizontalAlignment.Right, VerticalAlignment.Stretch, StandardCursorType.SizeWestEast, OnResizeRightPointerPressed));
+        root.Children.Add(BuildResizeEdge(null, 5, HorizontalAlignment.Stretch, VerticalAlignment.Top, StandardCursorType.SizeNorthSouth, OnResizeTopPointerPressed));
+        root.Children.Add(BuildResizeEdge(null, 5, HorizontalAlignment.Stretch, VerticalAlignment.Bottom, StandardCursorType.SizeNorthSouth, OnResizeBottomPointerPressed));
+        root.Children.Add(BuildResizeEdge(10, 10, HorizontalAlignment.Left, VerticalAlignment.Top, StandardCursorType.TopLeftCorner, OnResizeTopLeftPointerPressed));
+        root.Children.Add(BuildResizeEdge(10, 10, HorizontalAlignment.Right, VerticalAlignment.Top, StandardCursorType.TopRightCorner, OnResizeTopRightPointerPressed));
+        root.Children.Add(BuildResizeEdge(10, 10, HorizontalAlignment.Left, VerticalAlignment.Bottom, StandardCursorType.BottomLeftCorner, OnResizeBottomLeftPointerPressed));
+        root.Children.Add(BuildResizeEdge(10, 10, HorizontalAlignment.Right, VerticalAlignment.Bottom, StandardCursorType.BottomRightCorner, OnResizeBottomRightPointerPressed));
+    }
+
+    private static Border BuildResizeEdge(
+        double? width,
+        double? height,
+        HorizontalAlignment horizontalAlignment,
+        VerticalAlignment verticalAlignment,
+        StandardCursorType cursorType,
+        EventHandler<PointerPressedEventArgs> pointerPressed)
+    {
+        var edge = new Border
+        {
+            Cursor = new Cursor(cursorType),
+            HorizontalAlignment = horizontalAlignment,
+            VerticalAlignment = verticalAlignment
+        };
+
+        if (width.HasValue)
+        {
+            edge.Width = width.Value;
+        }
+
+        if (height.HasValue)
+        {
+            edge.Height = height.Value;
+        }
+
+        edge.Classes.Add("resize-edge");
+        edge.PointerPressed += pointerPressed;
+        Grid.SetRowSpan(edge, 2);
+        return edge;
     }
 
     private Control BuildTitleBar(string title)
@@ -196,19 +254,23 @@ public sealed class FileRuleListEditorWindow : Window
         return titleBar;
     }
 
-    private static Control BuildTitleIcon()
+    private Control BuildTitleIcon()
     {
+        _titleIconImage = new Image
+        {
+            Source = new Bitmap(AssetLoader.Open(MicroIconUri)),
+            Width = 13,
+            Height = 13,
+            Stretch = Stretch.Uniform,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
         var icon = new Border
         {
-            Child = new TextBlock
-            {
-                Text = "▤",
-                HorizontalAlignment = HorizontalAlignment.Center,
-                VerticalAlignment = VerticalAlignment.Center
-            }
+            Child = _titleIconImage
         };
         icon.Classes.Add("title-icon");
-        ((TextBlock)icon.Child!).Classes.Add("title-icon-glyph");
         return icon;
     }
 
@@ -298,6 +360,58 @@ public sealed class FileRuleListEditorWindow : Window
             : WindowState.Maximized;
     }
 
+    private void OnResizeLeftPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.West, e);
+    }
+
+    private void OnResizeRightPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.East, e);
+    }
+
+    private void OnResizeTopPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.North, e);
+    }
+
+    private void OnResizeBottomPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.South, e);
+    }
+
+    private void OnResizeTopLeftPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.NorthWest, e);
+    }
+
+    private void OnResizeTopRightPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.NorthEast, e);
+    }
+
+    private void OnResizeBottomLeftPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.SouthWest, e);
+    }
+
+    private void OnResizeBottomRightPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.SouthEast, e);
+    }
+
+    private void BeginWindowResize(WindowEdge edge, PointerPressedEventArgs e)
+    {
+        if (WindowState == WindowState.Maximized
+            || !e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+        {
+            return;
+        }
+
+        BeginResizeDrag(edge, e);
+        e.Handled = true;
+    }
+
     private Control BuildAddRow(Button addButton)
     {
         var row = new Grid
@@ -313,14 +427,18 @@ public sealed class FileRuleListEditorWindow : Window
 
     private Control BuildListHost()
     {
+        var scrollViewer = new ScrollViewer
+        {
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            Content = _itemsPanel
+        };
+        HoverScrollbarBehavior.SetIsEnabled(scrollViewer, true);
+        HoverScrollbarBehavior.SetReserveRight(scrollViewer, 12);
+
         var host = new Border
         {
-            Child = new ScrollViewer
-            {
-                HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
-                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                Content = _itemsPanel
-            }
+            Child = scrollViewer
         };
         host.Classes.Add("rule-list-host");
         return host;

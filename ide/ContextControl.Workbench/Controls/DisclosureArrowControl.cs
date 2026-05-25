@@ -15,6 +15,9 @@ public sealed class DisclosureArrowControl : Control
     private static readonly IBrush EmptyArrowBrush = new SolidColorBrush(Color.FromRgb(83, 97, 102));
     private static readonly IBrush DarkArrowBrush = new SolidColorBrush(Color.FromRgb(183, 199, 203));
     private static readonly IBrush MatrixArrowBrush = new SolidColorBrush(Color.FromRgb(150, 255, 195));
+    private StreamGeometry? _arrowGeometry;
+    private Size _arrowGeometrySize;
+    private double _arrowGeometryAngle = double.NaN;
 
     public double Angle
     {
@@ -43,8 +46,21 @@ public sealed class DisclosureArrowControl : Control
     {
         base.Render(context);
 
-        var center = new Point(Bounds.Width * 0.5, Bounds.Height * 0.5);
-        var size = Math.Min(Bounds.Width, Bounds.Height);
+        context.DrawGeometry(ArrowBrush, null, GetArrowGeometry());
+    }
+
+    private StreamGeometry GetArrowGeometry()
+    {
+        var boundsSize = Bounds.Size;
+        if (_arrowGeometry is not null
+            && _arrowGeometrySize == boundsSize
+            && Math.Abs(_arrowGeometryAngle - Angle) < 0.001)
+        {
+            return _arrowGeometry;
+        }
+
+        var center = new Point(boundsSize.Width * 0.5, boundsSize.Height * 0.5);
+        var size = Math.Min(boundsSize.Width, boundsSize.Height);
         var backX = size * 0.22;
         var halfHeight = size * 0.30;
         var tipX = size * 0.24;
@@ -61,15 +77,39 @@ public sealed class DisclosureArrowControl : Control
             stream.EndFigure(true);
         }
 
-        context.DrawGeometry(ArrowBrush, null, geometry);
+        _arrowGeometry = geometry;
+        _arrowGeometrySize = boundsSize;
+        _arrowGeometryAngle = Angle;
+        return geometry;
     }
 
-    private IBrush ArrowBrush => ThemeKey?.ToLowerInvariant() switch
+    private IBrush ArrowBrush => IsMatrixTheme(ThemeKey)
+        ? MatrixArrowBrush
+        : IsDarkArrowTheme(ThemeKey)
+            ? DarkArrowBrush
+            : EmptyArrowBrush;
+
+    private static bool IsMatrixTheme(string? themeKey)
     {
-        "dark" => DarkArrowBrush,
-        "matrix" => MatrixArrowBrush,
-        _ => EmptyArrowBrush
-    };
+        return string.Equals(themeKey, "matrix", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsDarkArrowTheme(string? themeKey)
+    {
+        return string.Equals(themeKey, "dark", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "nocturne", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "onyx", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "smoke", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "carbon", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "obsidian", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "ash", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "graphene", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "ruby", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "amethyst", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "ember", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "cobalt", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "contrast", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static Point Rotate(Point point, Point center, double degrees)
     {

@@ -153,19 +153,39 @@ public sealed class TreeLinesControl : Control
         context.DrawLine(RailPen, new Point(x, startY), new Point(x, endY));
     }
 
-    private Pen RailPen => ThemeKey?.ToLowerInvariant() switch
-    {
-        "dark" => DarkRailPen,
-        "matrix" => MatrixRailPen,
-        _ => EmptyRailPen
-    };
+    private Pen RailPen => IsMatrixTheme(ThemeKey)
+        ? MatrixRailPen
+        : IsDarkRailTheme(ThemeKey)
+            ? DarkRailPen
+            : EmptyRailPen;
 
-    private Pen BranchPen => ThemeKey?.ToLowerInvariant() switch
+    private Pen BranchPen => IsMatrixTheme(ThemeKey)
+        ? MatrixBranchPen
+        : IsDarkRailTheme(ThemeKey)
+            ? DarkBranchPen
+            : EmptyBranchPen;
+
+    private static bool IsMatrixTheme(string? themeKey)
     {
-        "dark" => DarkBranchPen,
-        "matrix" => MatrixBranchPen,
-        _ => EmptyBranchPen
-    };
+        return string.Equals(themeKey, "matrix", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsDarkRailTheme(string? themeKey)
+    {
+        return string.Equals(themeKey, "dark", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "nocturne", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "onyx", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "smoke", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "carbon", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "obsidian", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "ash", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "graphene", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "ruby", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "amethyst", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "ember", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "cobalt", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(themeKey, "contrast", StringComparison.OrdinalIgnoreCase);
+    }
 
     private static double RailX(int level)
     {

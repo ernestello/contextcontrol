@@ -1,289 +1,99 @@
+<!-- CC-DESC: Defines the Context Control Workbench shell and project info header. -->
 <Window
     x:Class="ContextControl.Workbench.Views.MainWindow"
     xmlns="https://github.com/avaloniaui"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:controls="clr-namespace:ContextControl.Workbench.Controls"
+    xmlns:svc="clr-namespace:ContextControl.Workbench.Services"
     xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
     Width="1280"
     Height="800"
-    MinWidth="920"
-    MinHeight="620"
+    MinWidth="720"
+    MinHeight="460"
+    CanResize="True"
+    SystemDecorations="None"
     Title="Context Control"
+    Icon="avares://ContextControl.Workbench/Assets/Icons/contextcontrol64x64.png"
     Background="{DynamicResource AppBackgroundBrush}"
     KeyDown="OnKeyDown">
+<Grid RowDefinitions="31,*">
+    <Border Classes="custom-titlebar" PointerPressed="OnTitleBarPointerPressed">
+      <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+        <StackPanel Orientation="Horizontal" Spacing="2">
+          <Button
+              x:Name="EditMenuButton"
+              Classes="edit-menu"
+              ToolTip.Tip="Project actions">
+            <Button.Flyout>
+              <Flyout Placement="BottomEdgeAlignedLeft">
+                <Border Classes="edit-dropdown">
+                  <StackPanel Spacing="1">
+                    <Button Classes="edit-dropdown-item" Content="Open Project" Click="OnEditOpenProjectClick" />
+                    <Button Classes="edit-dropdown-item" Content="New Project" Click="OnEditNewProjectClick" />
+                    <Button Classes="edit-dropdown-item" Content="Settings" Click="OnEditSettingsClick" />
+                  </StackPanel>
+                </Border>
+              </Flyout>
+            </Button.Flyout>
+            <Grid ColumnDefinitions="18,Auto" ColumnSpacing="6">
+              <Border Classes="edit-menu-icon">
+                <Image
+                    Source="{DynamicResource AppMicroIconImage}"
+                    Width="16"
+                    Height="16"
+                    Stretch="Uniform" />
+              </Border>
+              <TextBlock
+                  Grid.Column="1"
+                  Text="EDIT"
+                  VerticalAlignment="Center"
+                  FontSize="11"
+                  FontWeight="Black" />
+            </Grid>
+          </Button>
 
-  <Window.Styles>
-    <Style Selector="Border.panel">
-      <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="8" />
-      <Setter Property="BoxShadow" Value="0 8 24 0 #14000000" />
-    </Style>
+          <Button
+              x:Name="ViewMenuButton"
+              Classes="edit-menu"
+              ToolTip.Tip="View windows">
+            <Button.Flyout>
+              <Flyout Placement="BottomEdgeAlignedLeft">
+                <Border Classes="edit-dropdown view-dropdown">
+                  <StackPanel Spacing="1">
+                    <Button Classes="edit-dropdown-item" Content="{Binding ProjectFilesTreeViewLabel}" Command="{Binding ToggleProjectFilesPaneCommand}" />
+                    <Button Classes="edit-dropdown-item" Content="{Binding BrowserRoutingWindowViewLabel}" Command="{Binding ToggleBrowserRoutingPaneCommand}" />
+                    <Button Classes="edit-dropdown-item" Content="{Binding PromptWindowViewLabel}" Command="{Binding TogglePromptWindowCommand}" />
+                  </StackPanel>
+                </Border>
+              </Flyout>
+            </Button.Flyout>
+            <TextBlock
+                Text="VIEW"
+                VerticalAlignment="Center"
+                FontSize="11"
+                FontWeight="Black" />
+          </Button>
+        </StackPanel>
+        <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="2">
+          <Button Classes="window-control" Content="-" Click="OnMinimizeClick" />
+          <Button Classes="window-control" Content="□" Click="OnMaximizeRestoreClick" />
+          <Button Classes="window-control close" Content="x" Click="OnCloseClick" />
+        </StackPanel>
+      </Grid>
+    </Border>
 
-    <Style Selector="Button.command">
-      <Setter Property="Height" Value="30" />
-      <Setter Property="Padding" Value="11,1,11,0" />
-      <Setter Property="FontSize" Value="12" />
-      <Setter Property="FontWeight" Value="Bold" />
-      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="6" />
-      <Setter Property="HorizontalContentAlignment" Value="Center" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
-    </Style>
-
-    <Style Selector="Button.command.primary">
-      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
-    </Style>
-
-    <Style Selector="Button.icon">
-      <Setter Property="Width" Value="30" />
-      <Setter Property="Height" Value="30" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontWeight" Value="Bold" />
-      <Setter Property="FontSize" Value="12" />
-      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="6" />
-    </Style>
-
-    <Style Selector="Button.project-tile">
-      <Setter Property="Width" Value="68" />
-      <Setter Property="Height" Value="74" />
-      <Setter Property="Margin" Value="0,0,7,0" />
-      <Setter Property="Padding" Value="5" />
-      <Setter Property="Background" Value="{DynamicResource ProjectTileBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="8" />
-      <Setter Property="Opacity" Value="0.62" />
-      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-      <Setter Property="VerticalContentAlignment" Value="Stretch" />
-      <Setter Property="Transitions">
-        <Transitions>
-          <DoubleTransition Property="Opacity" Duration="0:0:0.09" />
-        </Transitions>
-      </Setter>
-    </Style>
-
-    <Style Selector="Button.project-tile.active">
-      <Setter Property="Background" Value="{DynamicResource ProjectTileActiveBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-      <Setter Property="Opacity" Value="1" />
-    </Style>
-
-    <Style Selector="TextBlock.meta-key">
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-    </Style>
-
-    <Style Selector="TextBlock.meta-value">
-      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
-      <Setter Property="TextAlignment" Value="Right" />
-    </Style>
-
-    <Style Selector="ListBox.project-tree">
-      <Setter Property="Background" Value="Transparent" />
-      <Setter Property="BorderThickness" Value="0" />
-      <Setter Property="Padding" Value="4,4,16,9" />
-    </Style>
-
-    <Style Selector="ListBox.project-tree ListBoxItem">
-      <Setter Property="MinHeight" Value="0" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="Margin" Value="0" />
-      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-      <Setter Property="IsHitTestVisible" Value="{Binding HasNode}" />
-      <Setter Property="Focusable" Value="{Binding HasNode}" />
-    </Style>
-
-    <Style Selector="Button.tree-toggle">
-      <Setter Property="Width" Value="11" />
-      <Setter Property="Height" Value="11" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="3" />
-      <Setter Property="MinWidth" Value="0" />
-      <Setter Property="MinHeight" Value="0" />
-      <Setter Property="Focusable" Value="False" />
-      <Setter Property="HorizontalContentAlignment" Value="Center" />
-      <Setter Property="VerticalContentAlignment" Value="Center" />
-    </Style>
-
-    <Style Selector="Button.tree-toggle:pointerover">
-      <Setter Property="Background" Value="{DynamicResource HistoryActiveBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-    </Style>
-
-    <Style Selector="Border.dir-row-highlight">
-      <Setter Property="Background" Value="{DynamicResource DirectoryHighlightBrush}" />
-      <Setter Property="CornerRadius" Value="4" />
-    </Style>
-
-    <Style Selector="Border.current-row-highlight">
-      <Setter Property="Background" Value="{DynamicResource CurrentRowBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource CurrentRowBorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="4" />
-    </Style>
-
-    <Style Selector="TextBlock.node-type">
-      <Setter Property="VerticalAlignment" Value="Center" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="9" />
-      <Setter Property="FontWeight" Value="Black" />
-      <Setter Property="MinWidth" Value="34" />
-      <Setter Property="TextAlignment" Value="Right" />
-      <Setter Property="Foreground" Value="{DynamicResource NodeTextBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.node-type.dir">
-      <Setter Property="Foreground" Value="{DynamicResource NodeTextBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.node-type.obj">
-      <Setter Property="Foreground" Value="{DynamicResource NodeTextBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.node-type.skip">
-      <Setter Property="Foreground" Value="{DynamicResource SkipTextBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.node-version">
-      <Setter Property="VerticalAlignment" Value="Center" />
-      <Setter Property="HorizontalAlignment" Value="Right" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="9" />
-      <Setter Property="FontWeight" Value="Black" />
-      <Setter Property="Foreground" Value="{DynamicResource NodeTextBrush}" />
-      <Setter Property="MinWidth" Value="24" />
-      <Setter Property="TextAlignment" Value="Right" />
-    </Style>
-
-    <Style Selector="controls|IncludeExternalButton.include-external">
-      <Setter Property="Width" Value="38" />
-      <Setter Property="Height" Value="15" />
-      <Setter Property="Padding" Value="0" />
-      <Setter Property="CornerRadius" Value="4" />
-      <Setter Property="Background" Value="{DynamicResource IncludeBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource IncludeBorderBrush}" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="7.5" />
-      <Setter Property="FontWeight" Value="Bold" />
-      <Setter Property="Foreground" Value="{DynamicResource IncludeTextBrush}" />
-      <Setter Property="Transitions">
-        <Transitions>
-          <BrushTransition Property="Background" Duration="0:0:0.16" />
-          <BrushTransition Property="BorderBrush" Duration="0:0:0.16" />
-        </Transitions>
-      </Setter>
-    </Style>
-
-    <Style Selector="controls|IncludeExternalButton.include-external:pointerover">
-      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.folder-name">
-      <Setter Property="Foreground" Value="{DynamicResource FolderTextBrush}" />
-      <Setter Property="FontWeight" Value="ExtraBold" />
-    </Style>
-
-    <Style Selector="TextBlock.file-name">
-      <Setter Property="Foreground" Value="{DynamicResource FileTextBrush}" />
-      <Setter Property="FontWeight" Value="SemiBold" />
-    </Style>
-
-    <Style Selector="TextBlock.external-name">
-      <Setter Property="Foreground" Value="{DynamicResource ExternalTextBrush}" />
-      <Setter Property="FontStyle" Value="Italic" />
-    </Style>
-
-    <Style Selector="TextBlock.editor-meta">
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
-    </Style>
-
-    <Style Selector="TextBlock.editor-line-number">
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="11" />
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="TextAlignment" Value="Right" />
-    </Style>
-
-    <Style Selector="TextBlock.editor-token">
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="12" />
-      <Setter Property="LineHeight" Value="17" />
-    </Style>
-
-    <Style Selector="Border.history-version">
-      <Setter Property="Height" Value="22" />
-      <Setter Property="Padding" Value="6,0" />
-      <Setter Property="Margin" Value="0,0,0,1" />
-      <Setter Property="Background" Value="Transparent" />
-      <Setter Property="BorderBrush" Value="Transparent" />
-      <Setter Property="BorderThickness" Value="1" />
-      <Setter Property="CornerRadius" Value="3" />
-    </Style>
-
-    <Style Selector="Border.history-version:pointerover">
-      <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-    </Style>
-
-    <Style Selector="Border.history-version.active">
-      <Setter Property="Background" Value="{DynamicResource HistoryActiveBrush}" />
-      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
-    </Style>
-
-    <Style Selector="TextBlock.history-meta">
-      <Setter Property="FontFamily" Value="Consolas, Menlo, monospace" />
-      <Setter Property="FontSize" Value="10" />
-      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
-      <Setter Property="VerticalAlignment" Value="Center" />
-    </Style>
-  </Window.Styles>
-
-  <Grid RowDefinitions="108,*" RowSpacing="8" Margin="8">
-    <Border Classes="panel" Grid.Row="0" Padding="8">
-      <Grid ColumnDefinitions="260,*,310" ColumnSpacing="10">
-        <Grid RowDefinitions="Auto,*">
-          <StackPanel Grid.Row="0">
-            <TextBlock Text="Context Control" FontSize="19" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
-            <TextBlock Text="Native IDE shell over the PowerShell core" Margin="0,4,0,0" FontSize="12" Foreground="{DynamicResource TextMutedBrush}" TextTrimming="CharacterEllipsis" />
-          </StackPanel>
-
-          <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
-            <Button Classes="command primary" Content="Open Project" Click="OnOpenProjectClick" />
-            <Button Classes="command" Content="New Project" Click="OnNewProjectClick" />
-            <Button Classes="icon" Content="⚙" Click="OnSettingsClick" />
-          </StackPanel>
-        </Grid>
-
-        <ScrollViewer Grid.Column="1" HorizontalScrollBarVisibility="Auto" VerticalScrollBarVisibility="Disabled">
+    <Grid Grid.Row="1" RowDefinitions="42,*" RowSpacing="8" Margin="8">
+    <Border Classes="panel" Grid.Row="0" Padding="6">
+      <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8" VerticalAlignment="Center">
+        <ScrollViewer
+            HorizontalScrollBarVisibility="Auto"
+            VerticalScrollBarVisibility="Disabled"
+            controls:HoverScrollbarBehavior.IsEnabled="True"
+            controls:HoverScrollbarBehavior.ReserveBottom="10">
           <ItemsControl ItemsSource="{Binding Projects}" VerticalAlignment="Center">
             <ItemsControl.ItemsPanel>
               <ItemsPanelTemplate>
-                <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" />
+                <StackPanel Orientation="Horizontal" HorizontalAlignment="Left" />
               </ItemsPanelTemplate>
             </ItemsControl.ItemsPanel>
             <ItemsControl.ItemTemplate>
@@ -293,32 +103,19 @@
                     Classes.active="{Binding IsActive}"
                     Command="{Binding DataContext.SelectProjectCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                     CommandParameter="{Binding}">
-                  <Grid RowDefinitions="38,*" RowSpacing="4">
-                    <Border
-                        Width="38"
-                        Height="38"
-                        CornerRadius="7"
-                        HorizontalAlignment="Center"
-                        Background="{DynamicResource CommandBackgroundBrush}"
-                        BorderBrush="{DynamicResource PanelBorderBrush}"
-                        BorderThickness="1">
-                      <TextBlock
-                          Text="{Binding IconText}"
-                          HorizontalAlignment="Center"
-                          VerticalAlignment="Center"
-                          FontSize="12"
-                          FontWeight="Black"
-                          Foreground="{DynamicResource AccentBrush}" />
+                  <Grid ColumnDefinitions="20,*" ColumnSpacing="6">
+                    <Border Classes="project-tile-icon">
+                      <Image
+                          Source="{DynamicResource AppMicroIconImage}"
+                          Width="16"
+                          Height="16"
+                          Stretch="Uniform" />
                     </Border>
 
                     <TextBlock
-                        Grid.Row="1"
-                        Text="{Binding Name}"
-                        TextWrapping="Wrap"
-                        TextAlignment="Center"
-                        FontSize="10"
-                        FontWeight="Bold"
-                        LineHeight="11" />
+                        Grid.Column="1"
+                        Classes="project-tab-name"
+                        Text="{Binding Name}" />
                   </Grid>
                 </Button>
               </DataTemplate>
@@ -326,157 +123,99 @@
           </ItemsControl>
         </ScrollViewer>
 
-        <Border Grid.Column="2" Background="{DynamicResource HeaderBackgroundBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="1" CornerRadius="8" Padding="9,6" ClipToBounds="True">
-          <Grid RowDefinitions="Auto,Auto" RowSpacing="4" VerticalAlignment="Center">
-            <Grid ColumnDefinitions="*,Auto">
-              <TextBlock Text="{Binding CurrentProject.Name}" FontSize="13" FontWeight="ExtraBold" TextTrimming="CharacterEllipsis" />
-              <TextBlock Grid.Column="1" Text="local" Foreground="{DynamicResource GoodBrush}" FontFamily="Consolas, Menlo, monospace" FontSize="11" />
-            </Grid>
-
-            <Grid Grid.Row="1" ColumnDefinitions="62,*" RowDefinitions="Auto,Auto,Auto,Auto" ColumnSpacing="9" RowSpacing="2">
-              <TextBlock Classes="meta-key" Text="loc" />
-              <TextBlock Classes="meta-value" Grid.Column="1" Text="{Binding CurrentProject.Location}" />
-
-              <TextBlock Classes="meta-key" Grid.Row="1" Text="files" />
-              <TextBlock Classes="meta-value" Grid.Row="1" Grid.Column="1" Text="{Binding CurrentProject.FileCount}" />
-
-              <TextBlock Classes="meta-key" Grid.Row="2" Text="dirs" />
-              <TextBlock Classes="meta-value" Grid.Row="2" Grid.Column="1" Text="{Binding CurrentProject.DirectoryCount}" />
-
-              <TextBlock Classes="meta-key" Grid.Row="3" Text="commit" />
-              <TextBlock Classes="meta-value" Grid.Row="3" Grid.Column="1" Text="{Binding CurrentProject.Commit}" />
-            </Grid>
-          </Grid>
-        </Border>
+        <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="5" VerticalAlignment="Center">
+          <Button
+              Classes="project-window-toggle"
+              Classes.active="{Binding IsProjectFilesPaneOpen}"
+              Command="{Binding ToggleProjectFilesPaneCommand}"
+              ToolTip.Tip="Project files tree" />
+          <Button
+              Classes="project-window-toggle"
+              Classes.active="{Binding IsBrowserRoutingPaneOpen}"
+              Command="{Binding ToggleBrowserRoutingPaneCommand}"
+              ToolTip.Tip="Browser routing window" />
+          <Button
+              Classes="project-window-toggle"
+              Classes.active="{Binding ContextControl.IsPromptOpen}"
+              Command="{Binding TogglePromptWindowCommand}"
+              ToolTip.Tip="Prompt window" />
+          <TextBlock
+              Classes="project-info-line"
+              Text="{Binding CurrentProject.CompactStatsLine}" />
+        </StackPanel>
       </Grid>
     </Border>
 
     <Grid
         x:Name="WorkspaceRoot"
         Grid.Row="1"
-        ColumnDefinitions="300,*"
+        Focusable="True"
         ColumnSpacing="8"
         PointerMoved="OnWorkspacePointerMoved">
-      <Border x:Name="SidebarPane" Classes="panel" Grid.Column="0" ClipToBounds="True">
+      <Grid.ColumnDefinitions>
+        <ColumnDefinition Width="{Binding ProjectFilesPaneWidth}" />
+        <ColumnDefinition Width="*" />
+        <ColumnDefinition Width="{Binding BrowserRoutingPaneWidth}" />
+      </Grid.ColumnDefinitions>
+      <Border
+          x:Name="SidebarPane"
+          Classes="panel"
+          Grid.Column="0"
+          ClipToBounds="True"
+          IsVisible="{Binding IsProjectFilesPaneOpen}"
+          IsHitTestVisible="{Binding IsProjectFilesPaneOpen}">
         <Grid RowDefinitions="43,*">
-          <Border Grid.Row="0" Background="{DynamicResource HeaderBackgroundBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="0,0,0,1" Padding="12,0,9,0">
-            <Grid ColumnDefinitions="*">
+          <Border Grid.Row="0" Classes="pane-header" Padding="12,0,9,0">
+            <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="6">
               <TextBlock
-                  Text="{Binding CurrentProject.Name}"
+                  Text="Project files"
                   VerticalAlignment="Center"
                   FontSize="11"
                   FontWeight="ExtraBold"
                   Foreground="{DynamicResource TextMutedBrush}"
                   LetterSpacing="0.8" />
+              <Button
+                  Grid.Column="1"
+                  Classes="tree-detail-toggle"
+                  Classes.active="{Binding ShowFileDetails}"
+                  Content="{Binding FileDetailsToggleLabel}"
+                  Command="{Binding ToggleFileDetailsCommand}" />
+              <Button
+                  Grid.Column="2"
+                  Classes="tree-detail-toggle"
+                  Classes.active="{Binding ShowSkippedFiles}"
+                  Content="{Binding SkippedFilesToggleLabel}"
+                  Command="{Binding ToggleSkippedFilesCommand}" />
+              <Button
+                  Grid.Column="3"
+                  Classes="tree-detail-toggle"
+                  Content="x"
+                  ToolTip.Tip="Close project files tree"
+                  Command="{Binding ToggleProjectFilesPaneCommand}" />
             </Grid>
           </Border>
 
-          <ScrollViewer Grid.Row="1" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
-            <ListBox
-                Classes="project-tree"
-                ItemsSource="{Binding VisibleTreeRows}"
-                SelectedItem="{Binding SelectedTreeRow, Mode=TwoWay}"
-                SelectionChanged="OnProjectTreeSelectionChanged"
-                SelectionMode="Single"
-                ScrollViewer.VerticalScrollBarVisibility="Auto"
-                ScrollViewer.HorizontalScrollBarVisibility="Disabled">
-              <ListBox.ItemTemplate>
-                <DataTemplate DataType="{x:Type vm:TreeRowViewModel}">
-                  <Grid ColumnDefinitions="Auto,*,92" Height="{Binding RowHeight}" PointerPressed="OnProjectTreeRowPointerPressed">
-                    <Border
-                        Grid.Column="0"
-                        Grid.ColumnSpan="3"
-                        Classes="current-row-highlight"
-                        IsVisible="{Binding IsCurrent}"
-                        Margin="0,0,5,0" />
-                    <Border
-                        Grid.Column="1"
-                        Grid.ColumnSpan="2"
-                        Classes="dir-row-highlight"
-                        IsVisible="{Binding IsRegularFolder}"
-                        Margin="0,1,0,1" />
-                    <Grid
-                        Grid.Column="0"
-                        Width="{Binding RailWidth}"
-                        Height="{Binding RowHeight}">
-                      <controls:TreeLinesControl
-                          Width="{Binding RailWidth}"
-                          Height="{Binding RowHeight}"
-                          Depth="{Binding Depth}"
-                          IsLast="{Binding IsLast}"
-                          AncestorContinues="{Binding AncestorContinues}"
-                          HasExpandedChildren="{Binding HasExpandedChildren}"
-                          IsSpacer="{Binding IsSpacer}"
-                          ThemeKey="{Binding DataContext.ThemeKey, RelativeSource={RelativeSource AncestorType=Window}}" />
-                      <Button
-                          Classes="tree-toggle"
-                          HorizontalAlignment="Left"
-                          VerticalAlignment="Center"
-                          Margin="{Binding ToggleMargin}"
-                          IsVisible="{Binding ShowDisclosure}"
-                          Command="{Binding DataContext.ToggleNodeCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                          CommandParameter="{Binding Node}">
-                        <controls:DisclosureArrowControl
-                            Width="8"
-                            Height="8"
-                            Angle="{Binding ArrowAngle}"
-                            ThemeKey="{Binding DataContext.ThemeKey, RelativeSource={RelativeSource AncestorType=Window}}">
-                          <controls:DisclosureArrowControl.Transitions>
-                            <Transitions>
-                              <DoubleTransition Property="Angle" Duration="0:0:0.08" />
-                            </Transitions>
-                          </controls:DisclosureArrowControl.Transitions>
-                        </controls:DisclosureArrowControl>
-                      </Button>
-                    </Grid>
-                    <TextBlock
-                        Grid.Column="1"
-                        Classes.folder-name="{Binding IsFolder}"
-                        Classes.file-name="{Binding IsFile}"
-                        Classes.external-name="{Binding IsExternal}"
-                        IsVisible="{Binding HasNode}"
-                        Text="{Binding DisplayName}"
-                        VerticalAlignment="Center"
-                        Margin="3,0,0,0"
-                        FontSize="9.5"
-                        TextTrimming="CharacterEllipsis" />
-                    <Grid
-                        Grid.Column="2"
-                        ColumnDefinitions="Auto,Auto"
-                        ColumnSpacing="4"
-                        Margin="0,0,10,0"
-                        HorizontalAlignment="Right"
-                        VerticalAlignment="Center"
-                        IsVisible="{Binding HasNode}">
-                      <TextBlock
-                          Grid.Column="0"
-                          Classes="node-type"
-                          Classes.dir="{Binding IsRegularFolder}"
-                          Classes.obj="{Binding IsFile}"
-                          Classes.skip="{Binding IsExternal}"
-                          IsVisible="{Binding ShowNodeTypeLabel}"
-                          FontWeight="Black"
-                          Text="{Binding NodeTypeLabel}" />
-                      <TextBlock
-                          Grid.Column="1"
-                          Classes="node-version"
-                          FontWeight="Black"
-                          Text="{Binding VersionLabel}"
-                          IsVisible="{Binding ShowVersionLabel}" />
-                      <controls:IncludeExternalButton
-                          Grid.Column="1"
-                          Classes="include-external"
-                          HorizontalAlignment="Right"
-                          VerticalAlignment="Center"
-                          IsVisible="{Binding CanIncludeExternal}"
-                          Command="{Binding DataContext.IncludeExternalNodeCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                          CommandParameter="{Binding Node}" />
-                    </Grid>
-                  </Grid>
-                </DataTemplate>
-              </ListBox.ItemTemplate>
-            </ListBox>
+          <ScrollViewer
+              x:Name="ProjectTreeList"
+              Grid.Row="1"
+              Classes="project-tree-scroll"
+              controls:HoverScrollbarBehavior.IsEnabled="True"
+              controls:HoverScrollbarBehavior.ReserveRight="12"
+              ScrollViewer.AllowAutoHide="True"
+              VerticalScrollBarVisibility="Auto"
+              HorizontalScrollBarVisibility="Disabled">
+            <controls:ProjectTreeRenderControl
+                x:Name="ProjectTreeView"
+                HorizontalAlignment="Stretch"
+                Items="{Binding VisibleTreeRows}"
+                ShowFileDetails="{Binding ShowFileDetails}"
+                ThemeKey="{Binding ThemeKey}"
+                UiFontFamily="{Binding UiFontFamily}"
+                CodeFontFamily="{Binding CodeFontFamily}"
+                PointerPressed="OnProjectTreeViewPointerPressed"
+                DoubleTapped="OnProjectTreeViewDoubleTapped" />
           </ScrollViewer>
+
         </Grid>
       </Border>
 
@@ -497,7 +236,13 @@
           </Border.Transitions>
 
           <Grid RowDefinitions="*">
-            <ScrollViewer Grid.Row="0" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Padding="4">
+            <ScrollViewer
+                Grid.Row="0"
+                VerticalScrollBarVisibility="Auto"
+                HorizontalScrollBarVisibility="Disabled"
+                Padding="4"
+                controls:HoverScrollbarBehavior.IsEnabled="True"
+                controls:HoverScrollbarBehavior.ReserveRight="12">
               <ItemsControl ItemsSource="{Binding SelectedHistory.Versions}">
                 <ItemsControl.ItemTemplate>
                   <DataTemplate DataType="{x:Type vm:VersionEntryViewModel}">
@@ -510,7 +255,7 @@
                             Text="{Binding Version}"
                             VerticalAlignment="Center"
                             TextAlignment="Center"
-                            FontFamily="Consolas, Menlo, monospace"
+                            FontFamily="{DynamicResource CodeFontFamily}"
                             FontSize="10"
                             FontWeight="Black"
                             Foreground="{DynamicResource AccentBrush}" />
@@ -535,10 +280,69 @@
           </Grid>
         </Border>
 
-        <Border Grid.Column="1" Background="{DynamicResource EditorSurfaceBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="1" CornerRadius="8" ClipToBounds="True">
-          <Grid RowDefinitions="43,*">
-            <Border Grid.Row="0" Background="{DynamicResource HeaderBackgroundBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="0,0,0,1" Padding="12,0">
-              <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="12">
+        <Border Grid.Column="1" Background="{DynamicResource PanelBackgroundBrush}" BorderBrush="{DynamicResource PanelBorderBrush}" BorderThickness="1" CornerRadius="8" ClipToBounds="True" Margin="0,0,1,0">
+          <Grid RowDefinitions="30,Auto,*,Auto">
+            <Border Grid.Row="0" Classes="workspace-mode-bar" Padding="6,0">
+              <Grid ColumnDefinitions="Auto,*" ColumnSpacing="10">
+                <ItemsControl ItemsSource="{Binding WorkspaceModes}" VerticalAlignment="Center">
+                  <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                      <StackPanel Orientation="Horizontal" Spacing="5" />
+                    </ItemsPanelTemplate>
+                  </ItemsControl.ItemsPanel>
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:WorkbenchModeOptionViewModel}">
+                      <Button
+                          Classes="workspace-mode-button"
+                          Classes.active="{Binding IsActive}"
+                          Content="{Binding Name}"
+                          Command="{Binding DataContext.SwitchWorkspaceModeCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                          CommandParameter="{Binding}" />
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+
+                <ScrollViewer
+                    Grid.Column="1"
+                    HorizontalScrollBarVisibility="Auto"
+                    VerticalScrollBarVisibility="Disabled"
+                    controls:HoverScrollbarBehavior.IsEnabled="True"
+                    controls:HoverScrollbarBehavior.ReserveBottom="10"
+                    IsVisible="{Binding IsBrowserMode}">
+                  <ItemsControl ItemsSource="{Binding BrowserPane.Tabs}" VerticalAlignment="Center">
+                    <ItemsControl.ItemsPanel>
+                      <ItemsPanelTemplate>
+                        <StackPanel Orientation="Horizontal" Spacing="4" />
+                      </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate DataType="{x:Type vm:BrowserTabViewModel}">
+                        <Border
+                            Classes="browser-tab"
+                            Classes.active="{Binding IsActive}"
+                            PointerPressed="OnBrowserTabPointerPressed">
+                          <Grid ColumnDefinitions="*,Auto" ColumnSpacing="5">
+                            <TextBlock
+                                Text="{Binding Title}"
+                                Classes="browser-tab-title"
+                                ToolTip.Tip="{Binding Url}" />
+                            <Button
+                                Grid.Column="1"
+                                Classes="browser-tab-close"
+                                Content="x"
+                                Click="OnBrowserTabCloseClick"
+                                ToolTip.Tip="Close tab" />
+                          </Grid>
+                        </Border>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </ScrollViewer>
+              </Grid>
+            </Border>
+
+            <Border Grid.Row="1" Classes="pane-header" Padding="12,0" IsVisible="{Binding IsCodeEditorMode}">
+              <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto,Auto,Auto" ColumnSpacing="10">
                 <StackPanel VerticalAlignment="Center">
                   <TextBlock Text="{Binding ActiveDocument.Name}" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" TextTrimming="CharacterEllipsis" />
                   <TextBlock Text="{Binding ActiveDocument.Path}" Classes="editor-meta" Margin="0,2,0,0" />
@@ -552,18 +356,668 @@
               </Grid>
             </Border>
 
-            <controls:CodeEditor
-                x:Name="FileEditor"
-                Grid.Row="1"
-                Background="{DynamicResource EditorSurfaceBrush}"
-                DocumentPath="{Binding ActiveDocument.Path}"
-                DocumentText="{Binding ActiveDocument.Text}"
-                LineChanges="{Binding ActiveDocument.LineChanges}"
-                ThemeKey="{Binding ThemeKey}"
-                SyntaxThemeKey="{Binding SyntaxThemeKey}" />
+            <Border Grid.Row="1" Classes="browser-nav-bar" Padding="6,2" IsVisible="{Binding IsBrowserMode}">
+              <Grid ColumnDefinitions="24,24,24,*,24,Auto" ColumnSpacing="4">
+                <Button
+                    Classes="browser-nav-button"
+                    Content="‹"
+                    IsEnabled="{Binding BrowserPane.CanGoBack}"
+                    Click="OnBrowserBackClick"
+                    ToolTip.Tip="Back" />
+                <Button
+                    Grid.Column="1"
+                    Classes="browser-nav-button"
+                    Content="›"
+                    IsEnabled="{Binding BrowserPane.CanGoForward}"
+                    Click="OnBrowserForwardClick"
+                    ToolTip.Tip="Forward" />
+                <Button
+                    Grid.Column="2"
+                    Classes="browser-nav-button"
+                    Content="↻"
+                    Click="OnBrowserRefreshClick"
+                    ToolTip.Tip="Reload" />
+                <TextBox
+                    Grid.Column="3"
+                    Classes="browser-url-input"
+                    Text="{Binding BrowserPane.UrlText, Mode=TwoWay}"
+                    Watermark="https://chatgpt.com"
+                    KeyDown="OnBrowserUrlKeyDown" />
+
+                <Button
+                    Grid.Column="4"
+                    Classes="browser-nav-button"
+                    Content="+"
+                    Click="OnBrowserNewTabClick"
+                    ToolTip.Tip="New tab" />
+
+                <Button
+                    Grid.Column="5"
+                    Classes="browser-open-button"
+                    Content="Go"
+                    Click="OnBrowserOpenClick" />
+              </Grid>
+            </Border>
+
+            <Border Grid.Row="1" Classes="pane-header" Padding="12,0" IsVisible="{Binding IsProjectGraphMode}">
+              <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="6">
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="Architecture graph" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                  <TextBlock Text="{Binding ProjectGraphSummary}" Classes="editor-meta" Margin="0,2,0,0" />
+                  <TextBlock Text="{Binding ProjectGraphSelectedLabel}" Classes="scanner-status" />
+                </StackPanel>
+                <Button
+                    Grid.Column="1"
+                    Classes="browser-open-button"
+                    Content="Fit Layout"
+                    Click="OnProjectGraphFitLayoutClick" />
+                <Button
+                    Grid.Column="2"
+                    Classes="browser-open-button"
+                    Content="{Binding ProjectGraphTreeToggleLabel}"
+                    Command="{Binding ToggleProjectGraphTreePaneCommand}" />
+                <Button
+                    Grid.Column="3"
+                    Classes="browser-open-button"
+                    Content="Copy Tree"
+                    Click="OnProjectGraphCopyTreeClick" />
+              </Grid>
+            </Border>
+
+            <Border Grid.Row="1" Classes="pane-header" Padding="12,0" IsVisible="{Binding IsProjectScannerMode}">
+              <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="6">
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="Project scanner" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                  <TextBlock Text="{Binding ProjectScanSummary}" Classes="editor-meta" Margin="0,2,0,0" />
+                  <TextBlock Text="{Binding ProjectScanAutoSetupStatus}" Classes="scanner-status" />
+                </StackPanel>
+                <Button
+                    Grid.Column="1"
+                    Classes="browser-open-button"
+                    Content="Copy"
+                    Click="OnProjectScannerCopyClick" />
+                <Button
+                    Grid.Column="2"
+                    Classes="browser-open-button"
+                    Content="{Binding ProjectScanButtonLabel}"
+                    Command="{Binding ScanProjectRulesCommand}"
+                    IsEnabled="{Binding CanScanProjectRules}" />
+                <Button
+                    Grid.Column="3"
+                    Classes="browser-open-button primary"
+                    Content="Autosetup"
+                    Command="{Binding AutoSetupProjectRulesCommand}"
+                    IsEnabled="{Binding CanAutoSetupProjectRules}" />
+              </Grid>
+            </Border>
+
+            <Border
+                Grid.Row="2"
+                Classes="editor-body"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsCodeEditorMode}">
+              <controls:CodeEditor
+                  x:Name="FileEditor"
+                  Background="{DynamicResource EditorSurfaceBrush}"
+                  DocumentPath="{Binding ActiveDocument.Path}"
+                  DocumentText="{Binding ActiveDocument.Text}"
+                  LineChanges="{Binding ActiveDocument.LineChanges}"
+                  ThemeKey="{Binding ThemeKey}"
+                  SyntaxThemeKey="{Binding SyntaxThemeKey}"
+                  CodeFontFamily="{Binding CodeFontFamily}"
+                  SkinKey="{Binding SkinKey}"
+                  ShowMinimap="{Binding ShowAppearanceCodePreview}"
+                  ShowFoldArrows="{Binding ShowFoldArrows}"
+                  ShowSummaryArrowBorders="{Binding ShowSummaryArrowBorders}"
+                  SummaryFoldKinds="{Binding SummaryFoldKinds}"
+                  FoldArrowsInCodeEditor="{Binding FoldArrowsInCodeEditor}"
+                  UseParentChildArrowIndentation="{Binding EffectiveUseParentChildArrowIndentation}"
+                  ShowVerticalScopeLines="{Binding ShowVerticalScopeLines}"
+                  UseColorfulFamilies="{Binding UseColorfulFamilies}" />
+            </Border>
+
+            <Border
+                Grid.Row="2"
+                Classes="browser-surface"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsBrowserMode}">
+              <controls:WebView2Host
+                  x:Name="BrowserWebView"
+                  UserDataFolder="{Binding BrowserPane.NativeUserDataFolder}"
+                  NavigationStarted="OnBrowserNavigationStarted"
+                  NavigationCompleted="OnBrowserNavigationCompleted"
+                  InitializationFailed="OnBrowserInitializationFailed" />
+            </Border>
+
+            <Border
+                Grid.Row="2"
+                Classes="editor-body graph-page"
+                Padding="6"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsProjectGraphMode}">
+              <Grid ColumnSpacing="{Binding ProjectGraphTreeColumnSpacing}" MinHeight="0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="{Binding ProjectGraphTreePaneWidth}" />
+                </Grid.ColumnDefinitions>
+                <Border Classes="graph-surface" ClipToBounds="True" MinHeight="0">
+                  <Grid ClipToBounds="True">
+                    <controls:ProjectGraphRenderControl
+                        x:Name="ProjectGraphView"
+                        Items="{Binding ProjectTree}"
+                        SelectedNode="{Binding ProjectGraphSelectedNode, Mode=TwoWay}"
+                        GraphVersion="{Binding ProjectGraphVersion}"
+                        CenterOnSelectedNodeVersion="{Binding ProjectGraphCenterVersion}"
+                        ThemeKey="{Binding ThemeKey}"
+                        UiFontFamily="{Binding UiFontFamily}"
+                        CodeFontFamily="{Binding CodeFontFamily}" />
+
+                    <Border
+                        Classes="graph-search-panel"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Top"
+                        Margin="0,8,0,0"
+                        IsVisible="{Binding IsProjectGraphSearchOpen}"
+                        IsHitTestVisible="{Binding IsProjectGraphSearchOpen}">
+                      <Grid RowDefinitions="Auto,Auto" Width="380">
+                        <TextBox
+                            x:Name="ProjectGraphSearchBox"
+                            Classes="graph-search-input"
+                            Watermark="Search graph"
+                            Text="{Binding ProjectGraphSearchText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                            KeyDown="OnProjectGraphSearchKeyDown" />
+
+                        <ItemsControl
+                            Grid.Row="1"
+                            Classes="graph-search-suggestions"
+                            ItemsSource="{Binding ProjectGraphSearchSuggestions}"
+                            IsVisible="{Binding HasProjectGraphSearchSuggestions}">
+                          <ItemsControl.ItemTemplate>
+                            <DataTemplate DataType="{x:Type vm:ProjectGraphSearchSuggestionViewModel}">
+                              <Button
+                                  Classes="graph-search-suggestion"
+                                  Command="{Binding DataContext.SelectProjectGraphSearchSuggestionCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}">
+                                <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" ColumnSpacing="8">
+                                  <TextBlock
+                                      Classes="graph-search-title"
+                                      Text="{Binding Title}" />
+                                  <TextBlock
+                                      Grid.Column="1"
+                                      Classes="graph-search-meta"
+                                      Text="{Binding Meta}" />
+                                  <TextBlock
+                                      Grid.Row="1"
+                                      Grid.ColumnSpan="2"
+                                      Classes="graph-search-detail"
+                                      Text="{Binding Detail}" />
+                                </Grid>
+                              </Button>
+                            </DataTemplate>
+                          </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                      </Grid>
+                    </Border>
+                  </Grid>
+                </Border>
+
+                <Border
+                    Grid.Column="1"
+                    Classes="graph-tree-sidebar"
+                    MinHeight="0"
+                    IsVisible="{Binding IsProjectGraphTreePaneOpen}"
+                    IsHitTestVisible="{Binding IsProjectGraphTreePaneOpen}">
+                  <Grid RowDefinitions="Auto,*" RowSpacing="6" MinHeight="0">
+                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                      <TextBlock Classes="graph-sidebar-title" Text="Current project tree" />
+                      <Button
+                          Grid.Column="1"
+                          Classes="browser-nav-button"
+                          Content="x"
+                          ToolTip.Tip="Close graph project tree"
+                          Command="{Binding ToggleProjectGraphTreePaneCommand}" />
+                    </Grid>
+                    <TextBox
+                        Grid.Row="1"
+                        Classes="graph-tree-text"
+                        AcceptsReturn="True"
+                        IsReadOnly="True"
+                        TextWrapping="NoWrap"
+                        Text="{Binding ProjectGraphTreeText}"
+                        ScrollViewer.AllowAutoHide="True"
+                        ScrollViewer.VerticalScrollBarVisibility="Auto"
+                        ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                        controls:HoverScrollbarBehavior.IsEnabled="True"
+                        controls:HoverScrollbarBehavior.ReserveRight="12" />
+                  </Grid>
+                </Border>
+              </Grid>
+            </Border>
+
+            <Border
+                Grid.Row="2"
+                Classes="editor-body scanner-page"
+                Padding="6"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsProjectScannerMode}">
+              <Grid RowDefinitions="Auto,*" RowSpacing="6">
+                <Border Classes="scanner-metric-strip">
+                  <ItemsControl ItemsSource="{Binding ProjectScanMetrics}">
+                    <ItemsControl.ItemsPanel>
+                      <ItemsPanelTemplate>
+                        <WrapPanel />
+                      </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate DataType="{x:Type svc:ProjectStackMetric}">
+                        <Border Classes="scanner-metric" ToolTip.Tip="{Binding Detail}">
+                          <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                            <TextBlock Classes="scanner-metric-key" Text="{Binding Key}" />
+                            <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding Value}" />
+                          </Grid>
+                        </Border>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </Border>
+
+                <ScrollViewer
+                    Grid.Row="1"
+                    VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled"
+                    controls:HoverScrollbarBehavior.IsEnabled="True"
+                    controls:HoverScrollbarBehavior.ReserveRight="12">
+                  <Grid ColumnDefinitions="1.25*,*" ColumnSpacing="6">
+                    <StackPanel Grid.Column="0" Spacing="6">
+                      <Border Classes="scanner-panel scanner-panel-primary">
+                        <Grid RowDefinitions="Auto,*" RowSpacing="5">
+                          <TextBlock Classes="scanner-panel-title" Text="Project Signature" />
+                          <ItemsControl Grid.Row="1" ItemsSource="{Binding ProjectScanIdentitySections}">
+                            <ItemsControl.ItemTemplate>
+                              <DataTemplate DataType="{x:Type svc:ProjectStackSection}">
+                                <StackPanel Classes="scanner-section-group">
+                                  <TextBlock Classes="scanner-section-title" Text="{Binding Title}" />
+                                  <ItemsControl ItemsSource="{Binding Items}">
+                                    <ItemsControl.ItemTemplate>
+                                      <DataTemplate>
+                                        <TextBlock Classes="scanner-section-item" Text="{Binding}" />
+                                      </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                  </ItemsControl>
+                                </StackPanel>
+                              </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                          </ItemsControl>
+                        </Grid>
+                      </Border>
+
+                      <Border Classes="scanner-panel">
+                        <Grid RowDefinitions="Auto,*" RowSpacing="5">
+                          <TextBlock Classes="scanner-panel-title" Text="Files" />
+                          <ItemsControl Grid.Row="1" ItemsSource="{Binding ProjectScanFileSections}">
+                            <ItemsControl.ItemTemplate>
+                              <DataTemplate DataType="{x:Type svc:ProjectStackSection}">
+                                <StackPanel Classes="scanner-section-group">
+                                  <TextBlock Classes="scanner-section-title" Text="{Binding Title}" />
+                                  <ItemsControl ItemsSource="{Binding Items}">
+                                    <ItemsControl.ItemTemplate>
+                                      <DataTemplate>
+                                        <TextBlock Classes="scanner-section-item" Text="{Binding}" />
+                                      </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                  </ItemsControl>
+                                </StackPanel>
+                              </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                          </ItemsControl>
+                        </Grid>
+                      </Border>
+                    </StackPanel>
+
+                    <StackPanel Grid.Column="1" Spacing="6">
+                      <Border Classes="scanner-panel">
+                        <Grid RowDefinitions="Auto,*" RowSpacing="5">
+                          <TextBlock Classes="scanner-panel-title" Text="Rule Fit" />
+                          <ItemsControl Grid.Row="1" ItemsSource="{Binding ProjectScanRuleSections}">
+                            <ItemsControl.ItemTemplate>
+                              <DataTemplate DataType="{x:Type svc:ProjectStackSection}">
+                                <StackPanel Classes="scanner-section-group">
+                                  <TextBlock Classes="scanner-section-title" Text="{Binding Title}" />
+                                  <ItemsControl ItemsSource="{Binding Items}">
+                                    <ItemsControl.ItemTemplate>
+                                      <DataTemplate>
+                                        <TextBlock Classes="scanner-section-item" Text="{Binding}" />
+                                      </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                  </ItemsControl>
+                                </StackPanel>
+                              </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                          </ItemsControl>
+                        </Grid>
+                      </Border>
+
+                      <Border Classes="scanner-panel">
+                        <Grid RowDefinitions="Auto,*" RowSpacing="5">
+                          <TextBlock Classes="scanner-panel-title" Text="Scan Notes" />
+                          <ItemsControl Grid.Row="1" ItemsSource="{Binding ProjectScanDiagnosticSections}">
+                            <ItemsControl.ItemTemplate>
+                              <DataTemplate DataType="{x:Type svc:ProjectStackSection}">
+                                <StackPanel Classes="scanner-section-group">
+                                  <TextBlock Classes="scanner-section-title" Text="{Binding Title}" />
+                                  <ItemsControl ItemsSource="{Binding Items}">
+                                    <ItemsControl.ItemTemplate>
+                                      <DataTemplate>
+                                        <TextBlock Classes="scanner-section-item" Text="{Binding}" />
+                                      </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                  </ItemsControl>
+                                </StackPanel>
+                              </DataTemplate>
+                            </ItemsControl.ItemTemplate>
+                          </ItemsControl>
+                        </Grid>
+                      </Border>
+                    </StackPanel>
+                  </Grid>
+                </ScrollViewer>
+              </Grid>
+            </Border>
+
+            <Border
+                x:Name="ContextPromptBar"
+                Grid.Row="3"
+                Classes="cc-prompt-bar"
+                Height="{Binding ContextControl.PromptBarHeight}"
+                Opacity="{Binding ContextControl.PromptBarOpacity}"
+                IsHitTestVisible="{Binding ContextControl.IsPromptOpen}"
+                ClipToBounds="True"
+                VerticalAlignment="Stretch"
+                Margin="0">
+              <Border.Transitions>
+                <Transitions>
+                  <DoubleTransition Property="Height" Duration="0:0:0.16" />
+                  <DoubleTransition Property="Opacity" Duration="0:0:0.12" />
+                </Transitions>
+              </Border.Transitions>
+              <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                <ProgressBar
+                    Classes="cc-prompt-progress"
+                    Minimum="0"
+                    Maximum="100"
+                    Value="0"
+                    Margin="0,0,0,7"
+                    IsVisible="{Binding ContextControl.IsBusy}"
+                    IsIndeterminate="{Binding ContextControl.IsBusy}" />
+
+                <Border x:Name="ContextPromptComposer" Grid.Row="1" Classes="cc-prompt-composer">
+                  <Grid RowDefinitions="Auto,*,Auto" RowSpacing="8">
+                    <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
+                      <Border Classes="cc-prompt-status-pill">
+                        <TextBlock Text="{Binding ContextControl.PhaseTitle}" Classes="cc-prompt-status" />
+                      </Border>
+                      <TextBlock Grid.Column="1" Text="{Binding ContextControl.PhaseDetail}" Classes="cc-prompt-detail" />
+                      <Button
+                          Grid.Column="2"
+                          Classes="cc-prompt-icon"
+                          Content="x"
+                          ToolTip.Tip="Close prompt"
+                          Command="{Binding ContextControl.ClosePromptCommand}" />
+                    </Grid>
+
+                    <TextBox
+                        x:Name="ContextPromptTextBox"
+                        Grid.Row="1"
+                        Classes="cc-prompt-input"
+                        AcceptsReturn="True"
+                        TextWrapping="Wrap"
+                        Watermark="Message Context Control..."
+                        GotFocus="OnPromptTextBoxGotFocus"
+                        LostFocus="OnPromptTextBoxLostFocus"
+                        KeyDown="OnPromptTextBoxKeyDown"
+                        TextChanged="OnPromptTextBoxTextChanged"
+                        ScrollViewer.AllowAutoHide="True"
+                        ScrollViewer.VerticalScrollBarVisibility="Auto"
+                        ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                        controls:HoverScrollbarBehavior.IsEnabled="True"
+                        controls:HoverScrollbarBehavior.ReserveRight="12"
+                        Text="{Binding ContextControl.PromptText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+
+                    <Grid Grid.Row="2" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="7">
+                      <StackPanel Orientation="Horizontal" Spacing="5">
+                        <Button Classes="cc-prompt-chip" Content="DIR" ToolTip.Tip="Create directory context" Command="{Binding ContextControl.RunDirCommand}" />
+                        <Button Classes="cc-prompt-chip" Content="CC" ToolTip.Tip="Create selected code context" Command="{Binding ContextControl.RunCcCommand}" />
+                        <Button Classes="cc-prompt-chip" Content="GO" ToolTip.Tip="Preview patch blocks" Command="{Binding ContextControl.RunGoCommand}" />
+                      </StackPanel>
+                      <TextBlock Grid.Column="1" Text="{Binding ContextControl.AttachmentSummary}" Classes="cc-prompt-meta" />
+                      <Button
+                          Grid.Column="2"
+                          Classes="cc-prompt-send"
+                          Content="Send"
+                          Command="{Binding ContextControl.SendCommand}" />
+                    </Grid>
+                  </Grid>
+                </Border>
+              </Grid>
+            </Border>
+
           </Grid>
         </Border>
       </Grid>
+
+      <Border
+          Grid.Column="2"
+          Classes="panel cc-dock"
+          ClipToBounds="True"
+          IsVisible="{Binding IsBrowserRoutingPaneOpen}"
+          IsHitTestVisible="{Binding IsBrowserRoutingPaneOpen}">
+        <Grid RowDefinitions="43,Auto,Auto,Auto,*" RowSpacing="8">
+          <Border Grid.Row="0" Classes="pane-header" Padding="12,0">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+              <StackPanel VerticalAlignment="Center">
+                <TextBlock Text="Context Control" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
+              </StackPanel>
+              <Button
+                  Grid.Column="1"
+                  Classes="tree-detail-toggle"
+                  Content="x"
+                  ToolTip.Tip="Close browser routing window"
+                  Command="{Binding ToggleBrowserRoutingPaneCommand}" />
+            </Grid>
+          </Border>
+
+          <Grid Grid.Row="1" Margin="10,0,10,0" ColumnDefinitions="*" ColumnSpacing="6">
+            <Button
+                Classes="cc-dock-tab"
+                Classes.active="{Binding ContextControl.IsLogPanelOpen}"
+                Content="LOG"
+                Command="{Binding ContextControl.ToggleLogPanelCommand}" />
+          </Grid>
+
+          <Grid Grid.Row="2" Margin="10,0,10,0" RowDefinitions="Auto,Auto,Auto" RowSpacing="6">
+            <ComboBox
+                Classes="cc-route-picker"
+                HorizontalAlignment="Stretch"
+                MaxDropDownHeight="180"
+                ItemsSource="{Binding ContextControl.RouteOptions}"
+                SelectedItem="{Binding ContextControl.SelectedRoute, Mode=TwoWay}">
+              <ComboBox.ItemTemplate>
+                <DataTemplate>
+                  <TextBlock Text="{Binding}" TextTrimming="CharacterEllipsis" />
+                </DataTemplate>
+              </ComboBox.ItemTemplate>
+            </ComboBox>
+
+            <Grid Grid.Row="1" ColumnDefinitions="*,Auto" ColumnSpacing="8">
+              <StackPanel>
+                <TextBlock Text="{Binding ContextControl.PhaseTitle}" Classes="cc-state-title" />
+                <TextBlock Text="{Binding ContextControl.PhaseDetail}" Classes="cc-state-detail" />
+              </StackPanel>
+              <TextBlock
+                  Grid.Column="1"
+                  Classes="cc-busy"
+                  Text="running"
+                  IsVisible="{Binding ContextControl.IsBusy}" />
+            </Grid>
+
+            <Border Grid.Row="2" Classes="cc-root-info">
+              <Grid ColumnDefinitions="38,*" ColumnSpacing="6">
+                <TextBlock Text="root" Classes="cc-log-level" />
+                <TextBlock
+                    Grid.Column="1"
+                    Text="{Binding ContextControl.ContextRootLabel}"
+                    Classes="path-text"
+                    ToolTip.Tip="{Binding ContextControl.ContextRootPath}" />
+              </Grid>
+            </Border>
+          </Grid>
+
+          <Grid Grid.Row="3" Margin="10,0,10,0" RowDefinitions="Auto,Auto,Auto" RowSpacing="5">
+            <TextBlock Text="{Binding ContextControl.PatchSummary}" Classes="cc-state-detail" />
+            <TextBlock Grid.Row="1" Text="{Binding ContextControl.LastExportPath}" Classes="path-text" />
+            <Grid Grid.Row="2" ColumnDefinitions="*" ColumnSpacing="6">
+              <Button
+                  Classes="header-mini primary"
+                  Content="Apply effective"
+                  Command="{Binding ContextControl.ApplyPatchCommand}" />
+            </Grid>
+          </Grid>
+
+          <Grid Grid.Row="4" Margin="10,0,10,10" RowDefinitions="Auto,*" RowSpacing="8" MinHeight="0">
+            <Border Grid.Row="0" Classes="cc-log-host" IsVisible="{Binding ContextControl.IsLogPanelOpen}">
+              <ScrollViewer
+                  VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled"
+                  controls:HoverScrollbarBehavior.IsEnabled="True"
+                  controls:HoverScrollbarBehavior.ReserveRight="12">
+                <ItemsControl ItemsSource="{Binding ContextControl.LogEntries}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ContextControlLogEntryViewModel}">
+                      <Grid ColumnDefinitions="42,34,*" ColumnSpacing="5" Margin="0,0,0,3">
+                        <TextBlock Text="{Binding Time}" Classes="history-meta" />
+                        <TextBlock Grid.Column="1" Text="{Binding Level}" Classes="cc-log-level" />
+                        <TextBlock Grid.Column="2" Text="{Binding Message}" Classes="cc-log-message" />
+                      </Grid>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </ScrollViewer>
+            </Border>
+
+            <Grid
+                x:Name="AttachmentRegion"
+                Grid.Row="1"
+                MinHeight="0"
+                ClipToBounds="True"
+                SizeChanged="OnAttachmentRegionSizeChanged">
+              <Grid RowDefinitions="Auto,Auto" RowSpacing="6" MinHeight="0" VerticalAlignment="Bottom" IsVisible="{Binding ContextControl.HasAttachments}">
+                <TextBlock Text="Attached Files:" Classes="cc-attachment-title" />
+                <Border x:Name="AttachmentListHost" Grid.Row="1" Classes="cc-attachment-host">
+                  <ListBox
+                      x:Name="AttachmentList"
+                      Classes="attachment-list"
+                      HorizontalAlignment="Stretch"
+                      Background="Transparent"
+                      BorderThickness="0"
+                      ItemsSource="{Binding ContextControl.Attachments}"
+                      SelectionMode="Single"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12"
+                      ScrollViewer.AllowAutoHide="True"
+                      ScrollViewer.VerticalScrollBarVisibility="Auto"
+                      ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                    <ListBox.Styles>
+                      <Style Selector="ListBox#AttachmentList > ListBoxItem">
+                        <Setter Property="Padding" Value="0" />
+                        <Setter Property="Margin" Value="0,0,0,4" />
+                        <Setter Property="Background" Value="Transparent" />
+                        <Setter Property="BorderBrush" Value="Transparent" />
+                        <Setter Property="BorderThickness" Value="0" />
+                        <Setter Property="HorizontalAlignment" Value="Stretch" />
+                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                      </Style>
+                      <Style Selector="ListBox#AttachmentList > ListBoxItem:selected">
+                        <Setter Property="Background" Value="Transparent" />
+                        <Setter Property="BorderBrush" Value="Transparent" />
+                      </Style>
+                      <Style Selector="ListBox#AttachmentList > ListBoxItem:pointerover">
+                        <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+                        <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+                      </Style>
+                    </ListBox.Styles>
+                    <ListBox.ItemTemplate>
+                      <DataTemplate DataType="{x:Type vm:ContextControlAttachmentViewModel}">
+                        <Border
+                            Classes="cc-attachment-row"
+                            HorizontalAlignment="Stretch"
+                            Tapped="OnAttachmentRowTapped"
+                            ToolTip.Tip="{Binding Path}">
+                          <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="7">
+                            <Border
+                                Classes="cc-attachment-ext-tag"
+                                Background="{Binding ExtensionTagBackground}"
+                                BorderBrush="{Binding ExtensionTagBorder}">
+                              <TextBlock
+                                  Text="{Binding ExtensionTagText}"
+                                  Foreground="{Binding ExtensionTagForeground}"
+                                  Classes="cc-attachment-ext-tag-text" />
+                            </Border>
+                            <TextBlock
+                                Grid.Column="1"
+                                Text="{Binding DisplayTitle}"
+                                Classes="path-text"
+                                VerticalAlignment="Center" />
+                            <Border
+                                Grid.Column="2"
+                                Classes="cc-attachment-remove"
+                                Tapped="OnAttachmentRemoveTapped"
+                                ToolTip.Tip="Remove attachment">
+                              <TextBlock Text="x" Classes="cc-attachment-remove-text" />
+                            </Border>
+                          </Grid>
+                        </Border>
+                      </DataTemplate>
+                    </ListBox.ItemTemplate>
+                  </ListBox>
+                </Border>
+              </Grid>
+            </Grid>
+          </Grid>
+        </Grid>
+      </Border>
     </Grid>
+    </Grid>
+    <Border
+        x:Name="PromptFileDropOverlay"
+        Grid.RowSpan="2"
+        Classes="cc-filedrop-overlay"
+        IsVisible="False"
+        IsHitTestVisible="False">
+      <Grid HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Border Classes="cc-filedrop-panel">
+          <StackPanel Spacing="10" HorizontalAlignment="Center">
+            <Border Classes="cc-filedrop-icon-host" HorizontalAlignment="Center">
+              <TextBlock Text="⇩" Classes="cc-filedrop-icon" />
+            </Border>
+            <TextBlock
+                Text="Drop your files to attach them to the prompt"
+                Classes="cc-filedrop-title"
+                TextAlignment="Center" />
+          </StackPanel>
+        </Border>
+      </Grid>
+    </Border>
+    <Border Classes="resize-edge resize-left" Grid.RowSpan="2" Width="8" HorizontalAlignment="Left" VerticalAlignment="Stretch" PointerPressed="OnResizeLeftPointerPressed" />
+    <Border Classes="resize-edge resize-right" Grid.RowSpan="2" Width="8" HorizontalAlignment="Right" VerticalAlignment="Stretch" PointerPressed="OnResizeRightPointerPressed" />
+    <Border Classes="resize-edge resize-top" Grid.RowSpan="2" Height="8" HorizontalAlignment="Stretch" VerticalAlignment="Top" PointerPressed="OnResizeTopPointerPressed" />
+    <Border Classes="resize-edge resize-bottom" Grid.RowSpan="2" Height="8" HorizontalAlignment="Stretch" VerticalAlignment="Bottom" PointerPressed="OnResizeBottomPointerPressed" />
+    <Border Classes="resize-edge resize-top-left" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Left" VerticalAlignment="Top" PointerPressed="OnResizeTopLeftPointerPressed" />
+    <Border Classes="resize-edge resize-top-right" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Right" VerticalAlignment="Top" PointerPressed="OnResizeTopRightPointerPressed" />
+    <Border Classes="resize-edge resize-bottom-left" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Left" VerticalAlignment="Bottom" PointerPressed="OnResizeBottomLeftPointerPressed" />
+    <Border Classes="resize-edge resize-bottom-right" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Right" VerticalAlignment="Bottom" PointerPressed="OnResizeBottomRightPointerPressed" />
   </Grid>
 </Window>

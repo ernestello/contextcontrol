@@ -1,6 +1,8 @@
+using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Threading;
 using ContextControl.Workbench.Services;
 using ContextControl.Workbench.ViewModels;
 
@@ -8,21 +10,58 @@ namespace ContextControl.Workbench.Views;
 
 public sealed partial class ThemeSettingsWindow : Window
 {
-    private bool _contextParseMode;
+    private const string AppearancePreviewSample = """
+        public sealed class ThemeProbe
+        {
+            private static readonly (string Background, string Border, string Foreground)[] ExtensionColors =
+            [
+                ("#203A5A", "#2B5E8C", "#D9ECFF"),
+                ("#2E4A2D", "#4D7A46", "#DEFFD9"),
+                ("#443123", "#7D5238", "#FFE8D9"),
+            ];
+
+            public void Render(int index)
+            {
+                if (index < 0 || index >= ExtensionColors.Length)
+                {
+                    return;
+                }
+
+                var selected = ExtensionColors[index];
+            }
+        }
+        """;
+
+    private bool _summaryArrowOptionsExpanded = true;
     private ThemeOptionViewModel? _hoveredTheme;
     private ThemeOptionViewModel? _hoveredSyntaxTheme;
+    private ThemeOptionViewModel? _hoveredCodeFont;
+    private string? _pendingThemeKey;
+    private string? _pendingUiFontFamily;
+    private string? _pendingCodeFontFamily;
+    private string? _pendingSkinKey;
 
     public ThemeSettingsWindow()
     {
         InitializeComponent();
         WorkbenchThemeResources.Apply(this, "empty");
         ShowAppearancePage();
+        InitializeAppearancePreview();
         RefreshAppearancePreview();
     }
 
-    public void ApplyTheme(string? themeKey)
+    public void ApplyTheme(string? themeKey, string? uiFontFamily = null, string? codeFontFamily = null, string? skinKey = null)
     {
-        WorkbenchThemeResources.Apply(this, themeKey);
+        if (IsAnyOptionPickerOpen())
+        {
+            _pendingThemeKey = themeKey;
+            _pendingUiFontFamily = uiFontFamily;
+            _pendingCodeFontFamily = codeFontFamily;
+            _pendingSkinKey = skinKey;
+            return;
+        }
+
+        WorkbenchThemeResources.Apply(this, themeKey, uiFontFamily, codeFontFamily, skinKey: skinKey);
         RefreshAppearancePreview();
     }
 
@@ -33,6 +72,7 @@ public sealed partial class ThemeSettingsWindow : Window
         base.OnDataContextChanged(e);
         _hoveredTheme = null;
         _hoveredSyntaxTheme = null;
+        _hoveredCodeFont = null;
         RefreshAppearancePreview();
     }
 
@@ -70,6 +110,58 @@ public sealed partial class ThemeSettingsWindow : Window
         WindowState = WindowState == WindowState.Maximized
             ? WindowState.Normal
             : WindowState.Maximized;
+    }
+
+    private void OnResizeLeftPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.West, e);
+    }
+
+    private void OnResizeRightPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.East, e);
+    }
+
+    private void OnResizeTopPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.North, e);
+    }
+
+    private void OnResizeBottomPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.South, e);
+    }
+
+    private void OnResizeTopLeftPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.NorthWest, e);
+    }
+
+    private void OnResizeTopRightPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.NorthEast, e);
+    }
+
+    private void OnResizeBottomLeftPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.SouthWest, e);
+    }
+
+    private void OnResizeBottomRightPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        BeginWindowResize(WindowEdge.SouthEast, e);
+    }
+
+    private void BeginWindowResize(WindowEdge edge, PointerPressedEventArgs e)
+    {
+        if (WindowState == WindowState.Maximized
+            || !e.GetCurrentPoint(this).Properties.IsLeftButtonPressed)
+        {
+            return;
+        }
+
+        BeginResizeDrag(edge, e);
+        e.Handled = true;
     }
 
     private void OnAppearanceNavClick(object? sender, RoutedEventArgs e)
@@ -113,15 +205,42 @@ public sealed partial class ThemeSettingsWindow : Window
         button.Classes.Remove("active");
     }
 
+    private void OnSummaryArrowOptionsToggleClick(object? sender, RoutedEventArgs e)
+    {
+        _summaryArrowOptionsExpanded = !_summaryArrowOptionsExpanded;
+        SummaryArrowOptionsPanel.IsVisible = _summaryArrowOptionsExpanded;
+        SummaryArrowOptionsToggleButton.Content = _summaryArrowOptionsExpanded ? "v" : ">";
+    }
+
     private void OnThemeSelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
-        _hoveredTheme = null;
+        RefreshAppearancePreview();
+    }
+
+    private void OnSkinSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
         RefreshAppearancePreview();
     }
 
     private void OnSyntaxThemeSelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
-        _hoveredSyntaxTheme = null;
+        RefreshAppearancePreview();
+    }
+
+    private void OnCodeFontSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        RefreshAppearancePreview();
+    }
+
+    private void OnUiFontSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    {
+        RefreshAppearancePreview();
+    }
+
+    private void OnOptionPickerDropDownClosed(object? sender, EventArgs e)
+    {
+        ClearHoveredOption(sender);
+        ApplyPendingThemeIfNeeded();
         RefreshAppearancePreview();
     }
 
@@ -163,22 +282,124 @@ public sealed partial class ThemeSettingsWindow : Window
         }
     }
 
+    private void OnCodeFontOptionPointerEntered(object? sender, PointerEventArgs e)
+    {
+        if (sender is Control { DataContext: ThemeOptionViewModel option })
+        {
+            _hoveredCodeFont = option;
+            RefreshAppearancePreview();
+        }
+    }
+
+    private void OnCodeFontOptionPointerExited(object? sender, PointerEventArgs e)
+    {
+        if (sender is Control { DataContext: ThemeOptionViewModel option }
+            && IsSameOption(_hoveredCodeFont, option))
+        {
+            _hoveredCodeFont = null;
+            RefreshAppearancePreview();
+        }
+    }
+
     private void RefreshAppearancePreview()
     {
+        if (AppearanceCodePreview is null || PreviewCaption is null)
+        {
+            return;
+        }
+
+        var selectedSkin = SkinPicker?.SelectedItem as ThemeOptionViewModel ?? ViewModel?.SelectedSkin;
+        var skin = WorkbenchSkins.For(selectedSkin?.Key);
         var selectedTheme = ThemePicker?.SelectedItem as ThemeOptionViewModel ?? ViewModel?.SelectedTheme;
         var selectedSyntaxTheme = SyntaxThemePicker?.SelectedItem as ThemeOptionViewModel ?? ViewModel?.SelectedSyntaxTheme;
+        var selectedCodeFont = CodeFontPicker?.SelectedItem as ThemeOptionViewModel ?? ViewModel?.SelectedCodeFont;
+        var selectedUiFont = UiFontPicker?.SelectedItem as ThemeOptionViewModel ?? ViewModel?.SelectedUiFont;
         var previewTheme = _hoveredTheme ?? selectedTheme;
         var previewSyntaxTheme = _hoveredSyntaxTheme ?? selectedSyntaxTheme;
+        var previewCodeFont = _hoveredCodeFont ?? selectedCodeFont;
+        var previewThemeKey = skin.IsActive ? skin.ThemeKey : previewTheme?.Key ?? "empty";
+        var previewSyntaxThemeKey = skin.IsActive ? skin.SyntaxThemeKey : previewSyntaxTheme?.Key ?? "adaptive";
+        var previewCodeFontFamily = skin.IsActive ? skin.CodeFontFamily : previewCodeFont?.FontFamily ?? ViewModel?.CodeFontFamily ?? "avares://ContextControl.Workbench/Assets/Fonts#Cascadia Code, Consolas";
+        var previewUiFontFamily = skin.IsActive ? skin.UiFontFamily : selectedUiFont?.FontFamily ?? ViewModel?.UiFontFamily;
 
-        AppearanceSyntaxPreview.ThemeKey = previewTheme?.Key ?? "empty";
-        AppearanceSyntaxPreview.SyntaxThemeKey = previewSyntaxTheme?.Key ?? "adaptive";
-        PreviewCaption.Text = $"{previewTheme?.Name ?? "Porcelain"} + {previewSyntaxTheme?.Name ?? "Adaptive"}";
+        try
+        {
+            WorkbenchThemeResources.Apply(
+                this,
+                previewThemeKey,
+                previewUiFontFamily,
+                previewCodeFontFamily,
+                updateThemeVariant: !IsAnyOptionPickerOpen(),
+                skinKey: skin.Key);
+        }
+        catch
+        {
+            // A preview should never take down the settings window.
+        }
+
+        AppearanceCodePreview.ThemeKey = previewThemeKey;
+        AppearanceCodePreview.SyntaxThemeKey = previewSyntaxThemeKey;
+        AppearanceCodePreview.CodeFontFamily = previewCodeFontFamily;
+        AppearanceCodePreview.SkinKey = skin.Key;
+        PreviewCaption.Text = skin.IsActive
+            ? $"{skin.Name}: {skin.ThemeName} + {skin.SyntaxThemeName} - {skin.CodeFontName} - {skin.UiFontName}"
+            : $"{previewTheme?.DisplayName ?? "Porcelain"} + {previewSyntaxTheme?.Name ?? "Adaptive"} - {previewCodeFont?.Name ?? "Cascadia Code"} - {selectedUiFont?.Name ?? "Aptos"}";
+    }
+
+    private void ClearHoveredOption(object? picker)
+    {
+        if (ReferenceEquals(picker, ThemePicker))
+        {
+            _hoveredTheme = null;
+        }
+        else if (ReferenceEquals(picker, SyntaxThemePicker))
+        {
+            _hoveredSyntaxTheme = null;
+        }
+        else if (ReferenceEquals(picker, CodeFontPicker))
+        {
+            _hoveredCodeFont = null;
+        }
     }
 
     private static bool IsSameOption(ThemeOptionViewModel? left, ThemeOptionViewModel right)
     {
         return ReferenceEquals(left, right)
             || string.Equals(left?.Key, right.Key, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsAnyOptionPickerOpen()
+    {
+        return ThemePicker?.IsDropDownOpen == true
+            || SkinPicker?.IsDropDownOpen == true
+            || SyntaxThemePicker?.IsDropDownOpen == true
+            || CodeFontPicker?.IsDropDownOpen == true
+            || UiFontPicker?.IsDropDownOpen == true;
+    }
+
+    private void ApplyPendingThemeIfNeeded()
+    {
+        if (IsAnyOptionPickerOpen() || _pendingThemeKey is null)
+        {
+            return;
+        }
+
+        var theme = _pendingThemeKey;
+        var uiFont = _pendingUiFontFamily;
+        var codeFont = _pendingCodeFontFamily;
+        var skin = _pendingSkinKey;
+        _pendingThemeKey = null;
+        _pendingUiFontFamily = null;
+        _pendingCodeFontFamily = null;
+        _pendingSkinKey = null;
+
+        Dispatcher.UIThread.Post(() => ApplyTheme(theme, uiFont, codeFont, skin));
+    }
+
+    private void InitializeAppearancePreview()
+    {
+        AppearanceCodePreview.DocumentPath = "ThemePreview.cs";
+        AppearanceCodePreview.DocumentText = AppearancePreviewSample;
     }
 
     private async void OnEditRuleListClick(object? sender, RoutedEventArgs e)
@@ -213,7 +434,7 @@ public sealed partial class ThemeSettingsWindow : Window
             viewModel.GetFileRuleEntries(kind),
             viewModel.GetFileRuleWatermark(kind),
             focusValue);
-        editor.ApplyTheme(viewModel.ThemeKey);
+        editor.ApplyTheme(viewModel.ThemeKey, viewModel.UiFontFamily, viewModel.CodeFontFamily, viewModel.SkinKey);
 
         var saved = await editor.ShowDialog<bool>(this);
         if (saved)
@@ -222,52 +443,4 @@ public sealed partial class ThemeSettingsWindow : Window
         }
     }
 
-    private void OnSettingsContextToggleClick(object? sender, RoutedEventArgs e)
-    {
-        _contextParseMode = !_contextParseMode;
-        ParseAppearanceButton.IsVisible = _contextParseMode;
-        ParseFileRulesButton.IsVisible = _contextParseMode;
-    }
-
-    private async void OnSettingsContextScopeClick(object? sender, RoutedEventArgs e)
-    {
-        if (sender is not Control { Tag: string scope } || ViewModel is not { } viewModel)
-        {
-            return;
-        }
-
-        var payload = BuildSettingsContextPayload(viewModel, scope);
-        var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
-        if (clipboard is not null)
-        {
-            await clipboard.SetTextAsync(payload);
-        }
-
-        Title = $"Settings - copied {scope}";
-    }
-
-    private static string BuildSettingsContextPayload(WorkbenchViewModel viewModel, string scope)
-    {
-        return scope switch
-        {
-            "settings.appearance" =>
-                "Context Control settings scope: Appearance" + Environment.NewLine
-                + $"Settings file: {viewModel.AppearanceSettingsPath}" + Environment.NewLine
-                + $"Current IDE theme: {viewModel.SelectedTheme.Name} ({viewModel.SelectedTheme.Key})" + Environment.NewLine
-                + $"Current syntax theme: {viewModel.SelectedSyntaxTheme.Name} ({viewModel.SelectedSyntaxTheme.Key})" + Environment.NewLine
-                + "Available IDE themes: " + string.Join(", ", viewModel.Themes.Select(theme => $"{theme.Name}/{theme.Key}")) + Environment.NewLine
-                + "Available syntax themes: " + string.Join(", ", viewModel.SyntaxThemes.Select(theme => $"{theme.Name}/{theme.Key}")) + Environment.NewLine
-                + "Primary files: Views/ThemeSettingsWindow.axaml, Views/ThemeSettingsWindow.axaml.cs, Controls/SyntaxPreviewControl.cs, Services/WorkbenchThemeResources.cs, ViewModels/WorkbenchViewModel.cs",
-            "settings.fileRules" =>
-                "Context Control settings scope: File rules" + Environment.NewLine
-                + $"Rules file: {viewModel.FileRulesPath}" + Environment.NewLine
-                + $"Summary: {viewModel.FileRulesSummary}" + Environment.NewLine
-                + "Skipped folders: " + string.Join(", ", viewModel.GetFileRuleEntries(WorkbenchViewModel.RuleKindIgnoredDirectories)) + Environment.NewLine
-                + "Skipped files: " + string.Join(", ", viewModel.GetFileRuleEntries(WorkbenchViewModel.RuleKindIgnoredFileNames)) + Environment.NewLine
-                + "Skipped file types: " + string.Join(", ", viewModel.GetFileRuleEntries(WorkbenchViewModel.RuleKindIgnoredFileTypes)) + Environment.NewLine
-                + "Allowed file types: " + string.Join(", ", viewModel.GetFileRuleEntries(WorkbenchViewModel.RuleKindSupportedFileTypes)) + Environment.NewLine
-                + "Primary files: Services/ProjectFileRules.cs, ViewModels/WorkbenchViewModel.cs, Views/ThemeSettingsWindow.axaml, Views/FileRuleListEditorWindow.cs",
-            _ => "Context Control settings scope: " + scope
-        };
-    }
 }

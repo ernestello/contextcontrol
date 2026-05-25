@@ -5,7 +5,6 @@ namespace ContextControl.Workbench.ViewModels;
 public sealed class EditorDocumentViewModel
 {
     private const int MaxPreviewBytes = 768 * 1024;
-    private const int MaxPreviewLines = 2500;
     private const long MaxExactDiffCells = 1_500_000;
 
     private EditorDocumentViewModel(
@@ -65,15 +64,10 @@ public sealed class EditorDocumentViewModel
             }
 
             var truncatedByBytes = file.Length > MaxPreviewBytes;
-            var text = ReadPreviewText(absolutePath, out var truncatedByLines);
+            var text = ReadPreviewText(absolutePath, out _);
             var status = truncatedByBytes
                 ? $"preview: first {MaxPreviewBytes / 1024} KB"
                 : $"{file.Length:N0} bytes";
-
-            if (truncatedByLines)
-            {
-                status += $" / first {MaxPreviewLines:N0} lines";
-            }
 
             return new EditorDocumentViewModel(name, displayPath, language, locLabel, version, status, text);
         }
@@ -100,15 +94,11 @@ public sealed class EditorDocumentViewModel
 
         try
         {
-            var current = ReadPreviewLines(version.SnapshotPath, out var currentTruncated);
+            var current = ReadPreviewLines(version.SnapshotPath, out _);
             var previous = string.IsNullOrWhiteSpace(version.PreviousSnapshotPath) || !File.Exists(version.PreviousSnapshotPath)
                 ? []
                 : ReadPreviewLines(version.PreviousSnapshotPath, out _);
             var text = BuildDiffPreview(previous, current, out var changes);
-            if (currentTruncated)
-            {
-                status = $"first {MaxPreviewLines:N0} lines";
-            }
 
             return new EditorDocumentViewModel(
                 name,
@@ -133,6 +123,12 @@ public sealed class EditorDocumentViewModel
         return Message("No file selected", "", "text", "", "", "ready", "Select a file from the project tree.");
     }
 
+    public static EditorDocumentViewModel Loading(string path)
+    {
+        var name = string.IsNullOrWhiteSpace(path) ? "Loading" : System.IO.Path.GetFileName(path);
+        return Message(name, path, DetectLanguage(path), "", "", "loading", "Loading file preview...");
+    }
+
     private static EditorDocumentViewModel LoadCurrentVersionFallback(
         VersionEntryViewModel version,
         string name,
@@ -153,12 +149,8 @@ public sealed class EditorDocumentViewModel
             }
 
             var file = new FileInfo(version.CurrentFilePath);
-            var text = ReadPreviewText(version.CurrentFilePath, out var truncatedByLines);
+            var text = ReadPreviewText(version.CurrentFilePath, out _);
             var status = $"current file / {file.Length:N0} bytes";
-            if (truncatedByLines)
-            {
-                status += $" / first {MaxPreviewLines:N0} lines";
-            }
 
             return new EditorDocumentViewModel(name, displayPath, language, locLabel, version.Version, status, text);
         }
@@ -187,12 +179,6 @@ public sealed class EditorDocumentViewModel
 
         while (!reader.EndOfStream && stream.Position < MaxPreviewBytes)
         {
-            if (lines.Count >= MaxPreviewLines)
-            {
-                truncatedByLines = true;
-                break;
-            }
-
             lines.Add(reader.ReadLine() ?? "");
         }
 

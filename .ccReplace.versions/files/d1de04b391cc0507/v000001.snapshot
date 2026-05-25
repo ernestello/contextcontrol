@@ -1,9 +1,20 @@
+// CC-DESC: Main window event bridge plus compact top-bar and external-update integration.
+
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Primitives;
 using Avalonia.Input;
+using Avalonia.Interactivity;
+using Avalonia.Layout;
+using Avalonia.Media;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
+using System.Collections.Specialized;
 using System.ComponentModel;
+using System.Globalization;
+using System.Linq;
+using System.Text;
 using ContextControl.Workbench.Services;
 using ContextControl.Workbench.ViewModels;
 
@@ -11,13 +22,29 @@ namespace ContextControl.Workbench.Views;
 
 public sealed partial class MainWindow : Window
 {
+    private static readonly IBrush PositiveFallbackBrush = Brush.Parse("#1E7F57");
+    private static readonly IBrush NegativeFallbackBrush = Brush.Parse("#B24A42");
+
     private readonly DispatcherTimer _closeHistoryTimer;
+    private readonly DispatcherTimer _promptTypingTimer;
     private WorkbenchViewModel? _subscribedViewModel;
+    private ContextControlViewModel? _subscribedContextControl;
     private ThemeSettingsWindow? _themeSettingsWindow;
+
+    private int _fileDragHoverCount;
+
+    private IBrush PositiveBrush => ThemeBrush("GoodBrush", PositiveFallbackBrush);
+    private IBrush NegativeBrush => ThemeBrush("BadBrush", NegativeFallbackBrush);
 
     public MainWindow()
     {
         InitializeComponent();
+        AddHandler(KeyDownEvent, OnPreviewKeyDown, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
+        AddHandler(PointerPressedEvent, OnPreviewPointerPressed, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
+        ProjectTreeList.AddHandler(Control.RequestBringIntoViewEvent, OnProjectTreeRequestBringIntoView, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
+        ProjectTreeList.AddHandler(InputElement.PointerPressedEvent, OnProjectTreePointerPressed, RoutingStrategies.Tunnel, handledEventsToo: true);
+        ProjectTreeList.AddHandler(InputElement.PointerWheelChangedEvent, OnProjectTreePointerWheelChanged, RoutingStrategies.Tunnel, handledEventsToo: true);
+        ConfigurePromptFileDropTargets();
 
         _closeHistoryTimer = new DispatcherTimer
         {
@@ -25,8 +52,19 @@ public sealed partial class MainWindow : Window
         };
         _closeHistoryTimer.Tick += (_, _) =>
         {
+            // History must only close from an explicit double-click toggle or close command.
+            // Keep this timer harmless in case an old XAML event still starts it.
             _closeHistoryTimer.Stop();
-            ViewModel?.CloseHistory();
+        };
+
+        _promptTypingTimer = new DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(1400)
+        };
+        _promptTypingTimer.Tick += (_, _) =>
+        {
+            _promptTypingTimer.Stop();
+            ViewModel?.ContextControl.SetPromptTypingActive(false);
         };
 
         WorkbenchThemeResources.Apply(this, "empty");
@@ -34,19 +72,34 @@ public sealed partial class MainWindow : Window
 
     private WorkbenchViewModel? ViewModel => DataContext as WorkbenchViewModel;
 
+    private IBrush ThemeBrush(string key, IBrush fallback)
+    {
+        return Resources.TryGetValue(key, out var value) && value is IBrush brush
+            ? brush
+            : fallback;
+    }
+
     protected override void OnOpened(EventArgs e)
     {
         base.OnOpened(e);
-        AttachThemeHandler();
+        AttachViewModelHandler();
+        ConfigureContextControlBridge();
         ApplySelectedTheme();
+        RefreshWindowTitle();
+        RefreshProjectInfoHeader();
+        ScheduleUiPolish();
         FitToWorkingArea();
     }
 
     protected override void OnDataContextChanged(EventArgs e)
     {
         base.OnDataContextChanged(e);
-        AttachThemeHandler();
+        AttachViewModelHandler();
+        ConfigureContextControlBridge();
         ApplySelectedTheme();
+        RefreshWindowTitle();
+        RefreshProjectInfoHeader();
+        ScheduleUiPolish();
     }
 
     private async void OnOpenProjectClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
@@ -59,29 +112,19 @@ public sealed partial class MainWindow : Window
         await PickAndLoadProjectAsync("Add Project");
     }
 
-    private void OnSettingsClick(object? sender, Avalonia.Interactivity.RoutedEventArgs e)
+    private async void OnProjectScannerCopyClick(object? sender, RoutedEventArgs e)
     {
-        if (ViewModel is null)
+        var text = ViewModel?.ProjectScanResultText;
+        if (string.IsNullOrWhiteSpace(text))
         {
             return;
         }
 
-        if (_themeSettingsWindow is null)
+        var clipboard = TopLevel.GetTopLevel(this)?.Clipboard;
+        if (clipboard is not null)
         {
-            _themeSettingsWindow = new ThemeSettingsWindow
-            {
-                DataContext = ViewModel
-            };
-            _themeSettingsWindow.Closed += (_, _) => _themeSettingsWindow = null;
+            await clipboard.SetTextAsync(text);
         }
-
-        _themeSettingsWindow.ApplyTheme(ViewModel.ThemeKey);
-        if (!_themeSettingsWindow.IsVisible)
-        {
-            _themeSettingsWindow.Show(this);
-        }
-
-        _themeSettingsWindow.Activate();
     }
 
     private async Task PickAndLoadProjectAsync(string title)
@@ -99,19 +142,13 @@ public sealed partial class MainWindow : Window
         }
 
         await ViewModel.LoadProjectAsync(folder);
+        ResetProjectInfoHeaderBinding();
+        RefreshWindowTitle();
+        RefreshProjectInfoHeader();
+        ScheduleUiPolish();
     }
 
-    private void OnKeyDown(object? sender, KeyEventArgs e)
-    {
-        _closeHistoryTimer.Stop();
-    }
-
-    private void OnWorkspacePointerMoved(object? sender, PointerEventArgs e)
-    {
-        _closeHistoryTimer.Stop();
-    }
-
-    private void AttachThemeHandler()
+    private void AttachViewModelHandler()
     {
         if (ReferenceEquals(_subscribedViewModel, ViewModel))
         {
@@ -121,62 +158,23 @@ public sealed partial class MainWindow : Window
         if (_subscribedViewModel is not null)
         {
             _subscribedViewModel.PropertyChanged -= OnViewModelPropertyChanged;
+            _subscribedViewModel.ExternalChanges.CollectionChanged -= OnExternalChangesCollectionChanged;
+        }
+
+        if (_subscribedContextControl is not null)
+        {
+            _subscribedContextControl.PropertyChanged -= OnContextControlPropertyChanged;
+            _subscribedContextControl = null;
         }
 
         _subscribedViewModel = ViewModel;
         if (_subscribedViewModel is not null)
         {
             _subscribedViewModel.PropertyChanged += OnViewModelPropertyChanged;
+            _subscribedViewModel.ExternalChanges.CollectionChanged += OnExternalChangesCollectionChanged;
+            _subscribedContextControl = _subscribedViewModel.ContextControl;
+            _subscribedContextControl.PropertyChanged += OnContextControlPropertyChanged;
         }
-    }
-
-    private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
-    {
-        if (e.PropertyName == nameof(WorkbenchViewModel.ThemeKey))
-        {
-            ApplySelectedTheme();
-        }
-    }
-
-    private void ApplySelectedTheme()
-    {
-        var key = ViewModel?.ThemeKey ?? "empty";
-        WorkbenchThemeResources.Apply(this, key);
-        _themeSettingsWindow?.ApplyTheme(key);
-    }
-
-    private void OnProjectTreeSelectionChanged(object? sender, SelectionChangedEventArgs e)
-    {
-        if (ViewModel is null || e.AddedItems.Count == 0)
-        {
-            return;
-        }
-
-        if (e.AddedItems[0] is TreeRowViewModel row)
-        {
-            ViewModel.SelectedTreeRow = row;
-        }
-    }
-
-    private void OnProjectTreeRowPointerPressed(object? sender, PointerPressedEventArgs e)
-    {
-        if (ViewModel is null || sender is not Control { DataContext: TreeRowViewModel row })
-        {
-            return;
-        }
-
-        ViewModel.SelectTreeRow(row, e.ClickCount >= 2);
-    }
-
-    private void OnHistoryVersionPointerPressed(object? sender, PointerPressedEventArgs e)
-    {
-        if (ViewModel is null || sender is not Control { DataContext: VersionEntryViewModel version })
-        {
-            return;
-        }
-
-        ViewModel.OpenVersionFromHistory(version);
-        e.Handled = true;
     }
 
     private static bool ContainsPointer(Control control, PointerEventArgs e)
@@ -186,29 +184,5 @@ public sealed partial class MainWindow : Window
             && point.Y >= 0
             && point.X <= control.Bounds.Width
             && point.Y <= control.Bounds.Height;
-    }
-
-    private void FitToWorkingArea()
-    {
-        var screen = Screens.ScreenFromWindow(this) ?? Screens.Primary;
-        if (screen is null)
-        {
-            return;
-        }
-
-        var usableHeight = Math.Max(MinHeight, (screen.WorkingArea.Height / screen.Scaling) - 18);
-        MaxHeight = usableHeight;
-        if (Height > usableHeight)
-        {
-            Height = usableHeight;
-        }
-
-        var widthPixels = (int)Math.Ceiling(Math.Max(Width, MinWidth) * screen.Scaling);
-        var heightPixels = (int)Math.Ceiling(Height * screen.Scaling);
-        var maxX = Math.Max(screen.WorkingArea.X, screen.WorkingArea.X + screen.WorkingArea.Width - widthPixels);
-        var maxY = Math.Max(screen.WorkingArea.Y, screen.WorkingArea.Y + screen.WorkingArea.Height - heightPixels);
-        Position = new PixelPoint(
-            Math.Clamp(Position.X, screen.WorkingArea.X, maxX),
-            Math.Clamp(Position.Y, screen.WorkingArea.Y, maxY));
     }
 }

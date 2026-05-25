@@ -8,18 +8,21 @@
     Height="640"
     MinWidth="940"
     MinHeight="560"
+    CanResize="True"
     SystemDecorations="None"
     WindowStartupLocation="CenterOwner"
     Title="Settings"
+    Icon="avares://ContextControl.Workbench/Assets/Icons/contextcontrol64x64.png"
     Background="{DynamicResource AppBackgroundBrush}">
 <Grid RowDefinitions="31,*">
     <Border Classes="custom-titlebar" PointerPressed="OnTitleBarPointerPressed">
       <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
         <Border Classes="title-icon">
-          <TextBlock
-              Classes="title-icon-glyph"
-              Text="▣"
-              />
+          <Image
+              Source="{DynamicResource AppMicroIconImage}"
+              Width="13"
+              Height="13"
+              Stretch="Uniform" />
         </Border>
 
         <TextBlock
@@ -41,7 +44,7 @@
       <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
         <StackPanel Spacing="1">
           <TextBlock Classes="settings-title" Text="Settings" />
-          <TextBlock Classes="muted" Text="{Binding CurrentProject.Name}" />
+          <TextBlock Classes="muted" Text="Workbench preferences" />
         </StackPanel>
 
         <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Bottom">
@@ -50,12 +53,6 @@
               Text="{Binding FileRulesSummary}"
               VerticalAlignment="Center"
               TextTrimming="CharacterEllipsis" />
-          <Button
-              x:Name="SettingsContextToggleButton"
-              Classes="context-chip"
-              Content="◉▤"
-              Click="OnSettingsContextToggleClick"
-              ToolTip.Tip="Context parse mode" />
         </StackPanel>
       </Grid>
 
@@ -76,79 +73,375 @@
         </Border>
 
         <Grid Grid.Column="1">
-          <Grid x:Name="AppearancePage" RowDefinitions="Auto,Auto,Auto,Auto,*" RowSpacing="8">
-            <Button
-                x:Name="ParseAppearanceButton"
-                Classes="context-chip"
-                Content="CTX"
-                HorizontalAlignment="Right"
-                VerticalAlignment="Top"
-                IsVisible="False"
-                Tag="settings.appearance"
-                Click="OnSettingsContextScopeClick" />
+          <Grid x:Name="AppearancePage" RowDefinitions="Auto,Auto,*" RowSpacing="6" ClipToBounds="True">
+            <Grid ColumnDefinitions="*,*,*,*,*" ColumnSpacing="8">
+              <StackPanel Spacing="3">
+                <TextBlock Classes="field-label" Text="Skin" />
+                <ComboBox
+                    x:Name="SkinPicker"
+                    Classes="theme-picker"
+                    ItemsSource="{Binding Skins}"
+                    SelectedItem="{Binding SelectedSkin, Mode=TwoWay}"
+                    DropDownClosed="OnOptionPickerDropDownClosed"
+                    SelectionChanged="OnSkinSelectionChanged">
+                  <ComboBox.SelectionBoxItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                      <TextBlock Text="{Binding Name}" FontSize="10.5" Foreground="{DynamicResource TextPrimaryBrush}" />
+                    </DataTemplate>
+                  </ComboBox.SelectionBoxItemTemplate>
+                  <ComboBox.ItemContainerTheme>
+                    <ControlTheme TargetType="ComboBoxItem">
+                      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                    </ControlTheme>
+                  </ComboBox.ItemContainerTheme>
+                  <ComboBox.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                      <Border
+                          Padding="1,0"
+                          Background="Transparent"
+                          HorizontalAlignment="Stretch">
+                        <StackPanel Spacing="0">
+                          <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                          <TextBlock
+                              Text="{Binding Description}"
+                              FontSize="10"
+                              Foreground="{DynamicResource TextMutedBrush}" />
+                        </StackPanel>
+                      </Border>
+                    </DataTemplate>
+                  </ComboBox.ItemTemplate>
+                </ComboBox>
+              </StackPanel>
 
-            <TextBlock Classes="field-label" Text="Theme" />
-            <ComboBox
-                x:Name="ThemePicker"
-                Grid.Row="1"
-                Classes="theme-picker"
-                ItemsSource="{Binding Themes}"
-                SelectedItem="{Binding SelectedTheme, Mode=TwoWay}"
-                SelectionChanged="OnThemeSelectionChanged">
-              <ComboBox.ItemContainerTheme>
-                <ControlTheme TargetType="ComboBoxItem">
-                  <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                </ControlTheme>
-              </ComboBox.ItemContainerTheme>
-              <ComboBox.ItemTemplate>
-                <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
-                  <Border
-                      Padding="4,3"
-                      Background="Transparent"
-                      HorizontalAlignment="Stretch"
-                      PointerEntered="OnThemeOptionPointerEntered"
-                      PointerExited="OnThemeOptionPointerExited">
-                    <StackPanel>
-                      <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource TextPrimaryBrush}" />
-                      <TextBlock Text="{Binding Description}" FontSize="10" Foreground="{DynamicResource TextMutedBrush}" />
+              <StackPanel Grid.Column="1" Spacing="3">
+                <TextBlock Classes="field-label" Text="Theme" />
+                <ComboBox
+                    x:Name="ThemePicker"
+                    Classes="theme-picker"
+                    ItemsSource="{Binding Themes}"
+                    SelectedItem="{Binding SelectedTheme, Mode=TwoWay}"
+                    IsEnabled="{Binding AppearanceOptionsEnabled}"
+                    DropDownClosed="OnOptionPickerDropDownClosed"
+                    SelectionChanged="OnThemeSelectionChanged">
+                  <ComboBox.SelectionBoxItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                      <TextBlock Text="{Binding DisplayName}" FontSize="10.5" Foreground="{DynamicResource TextPrimaryBrush}" />
+                    </DataTemplate>
+                  </ComboBox.SelectionBoxItemTemplate>
+                  <ComboBox.ItemContainerTheme>
+                    <ControlTheme TargetType="ComboBoxItem">
+                      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                    </ControlTheme>
+                  </ComboBox.ItemContainerTheme>
+                  <ComboBox.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                      <Border
+                          Padding="1,0"
+                          Background="Transparent"
+                          HorizontalAlignment="Stretch"
+                          PointerEntered="OnThemeOptionPointerEntered"
+                          PointerExited="OnThemeOptionPointerExited">
+                        <StackPanel Spacing="0">
+                          <TextBlock Text="{Binding DisplayName}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                          <TextBlock
+                              Text="{Binding Description}"
+                              FontSize="10"
+                              Foreground="{DynamicResource TextMutedBrush}" />
+                        </StackPanel>
+                      </Border>
+                    </DataTemplate>
+                  </ComboBox.ItemTemplate>
+                </ComboBox>
+              </StackPanel>
+
+              <StackPanel Grid.Column="2" Spacing="3">
+                <TextBlock Classes="field-label" Text="Syntax colors" />
+                <ComboBox
+                    x:Name="SyntaxThemePicker"
+                    Classes="theme-picker"
+                    ItemsSource="{Binding SyntaxThemes}"
+                    SelectedItem="{Binding SelectedSyntaxTheme, Mode=TwoWay}"
+                    IsEnabled="{Binding AppearanceOptionsEnabled}"
+                    DropDownClosed="OnOptionPickerDropDownClosed"
+                    SelectionChanged="OnSyntaxThemeSelectionChanged">
+                  <ComboBox.SelectionBoxItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                      <TextBlock Text="{Binding Name}" FontSize="10.5" Foreground="{DynamicResource TextPrimaryBrush}" />
+                    </DataTemplate>
+                  </ComboBox.SelectionBoxItemTemplate>
+                  <ComboBox.ItemContainerTheme>
+                    <ControlTheme TargetType="ComboBoxItem">
+                      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                    </ControlTheme>
+                  </ComboBox.ItemContainerTheme>
+                  <ComboBox.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                      <Border
+                          Padding="1,0"
+                          Background="Transparent"
+                          HorizontalAlignment="Stretch"
+                          PointerEntered="OnSyntaxThemeOptionPointerEntered"
+                          PointerExited="OnSyntaxThemeOptionPointerExited">
+                        <StackPanel Spacing="0">
+                          <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                          <TextBlock
+                              Text="{Binding Description}"
+                              FontSize="10"
+                              Foreground="{DynamicResource TextMutedBrush}" />
+                        </StackPanel>
+                      </Border>
+                    </DataTemplate>
+                  </ComboBox.ItemTemplate>
+                </ComboBox>
+              </StackPanel>
+
+              <StackPanel Grid.Column="3" Spacing="3">
+                <TextBlock Classes="field-label" Text="Code font" />
+                <ComboBox
+                    x:Name="CodeFontPicker"
+                    Classes="theme-picker"
+                    ItemsSource="{Binding CodeFonts}"
+                    SelectedItem="{Binding SelectedCodeFont, Mode=TwoWay}"
+                    IsEnabled="{Binding AppearanceOptionsEnabled}"
+                    DropDownClosed="OnOptionPickerDropDownClosed"
+                    SelectionChanged="OnCodeFontSelectionChanged">
+                  <ComboBox.SelectionBoxItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                      <TextBlock Text="{Binding Name}" FontFamily="{Binding PreviewFontFamily}" FontSize="10.5" Foreground="{DynamicResource TextPrimaryBrush}" />
+                    </DataTemplate>
+                  </ComboBox.SelectionBoxItemTemplate>
+                  <ComboBox.ItemContainerTheme>
+                    <ControlTheme TargetType="ComboBoxItem">
+                      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                    </ControlTheme>
+                  </ComboBox.ItemContainerTheme>
+                  <ComboBox.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                      <Border
+                          Padding="1,0"
+                          Background="Transparent"
+                          HorizontalAlignment="Stretch"
+                          PointerEntered="OnCodeFontOptionPointerEntered"
+                          PointerExited="OnCodeFontOptionPointerExited">
+                        <StackPanel Spacing="0">
+                          <TextBlock Text="{Binding Name}" FontFamily="{Binding PreviewFontFamily}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                          <TextBlock
+                              Text="{Binding Description}"
+                              FontSize="10"
+                              Foreground="{DynamicResource TextMutedBrush}" />
+                        </StackPanel>
+                      </Border>
+                    </DataTemplate>
+                  </ComboBox.ItemTemplate>
+                </ComboBox>
+              </StackPanel>
+
+              <StackPanel Grid.Column="4" Spacing="3">
+                <TextBlock Classes="field-label" Text="UI font" />
+                <ComboBox
+                    x:Name="UiFontPicker"
+                    Classes="theme-picker"
+                    ItemsSource="{Binding UiFonts}"
+                    SelectedItem="{Binding SelectedUiFont, Mode=TwoWay}"
+                    IsEnabled="{Binding AppearanceOptionsEnabled}"
+                    DropDownClosed="OnOptionPickerDropDownClosed"
+                    SelectionChanged="OnUiFontSelectionChanged">
+                  <ComboBox.SelectionBoxItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                      <TextBlock Text="{Binding Name}" FontFamily="{Binding PreviewFontFamily}" FontSize="10.5" Foreground="{DynamicResource TextPrimaryBrush}" />
+                    </DataTemplate>
+                  </ComboBox.SelectionBoxItemTemplate>
+                  <ComboBox.ItemContainerTheme>
+                    <ControlTheme TargetType="ComboBoxItem">
+                      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                    </ControlTheme>
+                  </ComboBox.ItemContainerTheme>
+                  <ComboBox.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                      <Border
+                          Padding="1,0"
+                          Background="Transparent"
+                          HorizontalAlignment="Stretch">
+                        <StackPanel Spacing="0">
+                          <TextBlock Text="{Binding Name}" FontFamily="{Binding PreviewFontFamily}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                          <TextBlock
+                              Text="{Binding Description}"
+                              FontSize="10"
+                              Foreground="{DynamicResource TextMutedBrush}" />
+                        </StackPanel>
+                      </Border>
+                    </DataTemplate>
+                  </ComboBox.ItemTemplate>
+                </ComboBox>
+              </StackPanel>
+            </Grid>
+
+            <Border Grid.Row="1" Classes="rule-card" Padding="4">
+              <StackPanel Spacing="0">
+                <TextBlock Classes="field-label" Text="Editor style" />
+                <Grid ColumnDefinitions="260,*" Classes="editor-style-table">
+                  <Border Classes="editor-style-cell left">
+                    <StackPanel Spacing="0">
+                    <Grid ColumnDefinitions="Auto,Auto" ColumnSpacing="12" MinHeight="17" HorizontalAlignment="Left">
+                      <CheckBox
+                          Classes="appearance-toggle"
+                          Content="On/Off"
+                          IsChecked="{Binding UseParentChildArrowIndentation, Mode=TwoWay}" />
+                      <TextBlock Grid.Column="1" Classes="appearance-parent-label" Text="Parent/Child indentation" />
+                    </Grid>
+                    <Grid ColumnDefinitions="Auto,Auto" ColumnSpacing="12" MinHeight="17" HorizontalAlignment="Left">
+                      <CheckBox
+                          Classes="appearance-toggle"
+                          Content="On/Off"
+                          IsChecked="{Binding ShowVerticalScopeLines, Mode=TwoWay}" />
+                      <TextBlock Grid.Column="1" Classes="appearance-parent-label" Text="Vertical line" />
+                    </Grid>
+                    <Grid ColumnDefinitions="Auto,Auto" ColumnSpacing="12" MinHeight="17" HorizontalAlignment="Left">
+                      <CheckBox
+                          Classes="appearance-toggle"
+                          Content="On/Off"
+                          IsChecked="{Binding UseColorfulFamilies, Mode=TwoWay}" />
+                      <TextBlock Grid.Column="1" Classes="appearance-parent-label" Text="Colorful families" />
+                    </Grid>
+                    <Grid ColumnDefinitions="Auto,Auto" ColumnSpacing="12" MinHeight="17" HorizontalAlignment="Left">
+                      <CheckBox
+                          Classes="appearance-toggle"
+                          Content="On/Off"
+                          IsChecked="{Binding ShowAppearanceCodePreview, Mode=TwoWay}" />
+                      <TextBlock Grid.Column="1" Classes="appearance-parent-label" Text="Code preview" />
+                    </Grid>
                     </StackPanel>
                   </Border>
-                </DataTemplate>
-              </ComboBox.ItemTemplate>
-            </ComboBox>
 
-            <TextBlock Grid.Row="2" Classes="field-label" Text="Syntax colors" Margin="0,4,0,0" />
-            <ComboBox
-                x:Name="SyntaxThemePicker"
-                Grid.Row="3"
-                Classes="theme-picker"
-                ItemsSource="{Binding SyntaxThemes}"
-                SelectedItem="{Binding SelectedSyntaxTheme, Mode=TwoWay}"
-                SelectionChanged="OnSyntaxThemeSelectionChanged">
-              <ComboBox.ItemContainerTheme>
-                <ControlTheme TargetType="ComboBoxItem">
-                  <Setter Property="HorizontalContentAlignment" Value="Stretch" />
-                </ControlTheme>
-              </ComboBox.ItemContainerTheme>
-              <ComboBox.ItemTemplate>
-                <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
-                  <Border
-                      Padding="4,3"
-                      Background="Transparent"
-                      HorizontalAlignment="Stretch"
-                      PointerEntered="OnSyntaxThemeOptionPointerEntered"
-                      PointerExited="OnSyntaxThemeOptionPointerExited">
-                    <StackPanel>
-                      <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource TextPrimaryBrush}" />
-                      <TextBlock Text="{Binding Description}" FontSize="10" Foreground="{DynamicResource TextMutedBrush}" />
+                  <Border Grid.Column="1" Classes="editor-style-cell right">
+                    <StackPanel Spacing="0">
+                    <Grid ColumnDefinitions="Auto,Auto,Auto" ColumnSpacing="8" MinHeight="17" HorizontalAlignment="Left">
+                      <Button
+                          x:Name="SummaryArrowOptionsToggleButton"
+                          Classes="summary-expander"
+                          Content="v"
+                          Click="OnSummaryArrowOptionsToggleClick" />
+                      <CheckBox
+                          Grid.Column="1"
+                          Classes="appearance-toggle"
+                          Content="On/Off"
+                          IsChecked="{Binding ShowFoldArrows, Mode=TwoWay}" />
+                      <TextBlock Grid.Column="2" Classes="appearance-parent-label" Text="Summary arrows" />
+                    </Grid>
+                    <Border
+                        x:Name="SummaryArrowOptionsPanel"
+                        Classes="summary-options-table"
+                        IsEnabled="{Binding ShowFoldArrows}">
+                      <StackPanel Spacing="0">
+                        <Border Classes="summary-options-row first">
+                          <Grid
+                              ColumnDefinitions="78,150"
+                              ColumnSpacing="8"
+                              HorizontalAlignment="Stretch">
+                            <TextBlock Classes="appearance-param-label" Text="Placement" />
+                            <ComboBox
+                                x:Name="FoldArrowPositionPicker"
+                                Grid.Column="1"
+                                Classes="theme-picker"
+                                ItemsSource="{Binding FoldArrowPositions}"
+                                SelectedItem="{Binding SelectedFoldArrowPosition, Mode=TwoWay}">
+                              <ComboBox.SelectionBoxItemTemplate>
+                                <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                                  <TextBlock Text="{Binding Name}" FontSize="10.5" Foreground="{DynamicResource TextPrimaryBrush}" />
+                                </DataTemplate>
+                              </ComboBox.SelectionBoxItemTemplate>
+                              <ComboBox.ItemTemplate>
+                                <DataTemplate DataType="{x:Type vm:ThemeOptionViewModel}">
+                                  <StackPanel Spacing="0">
+                                    <TextBlock Text="{Binding Name}" FontSize="11" FontWeight="Bold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                                    <TextBlock
+                                        Text="{Binding Description}"
+                                        FontSize="10"
+                                        Foreground="{DynamicResource TextMutedBrush}" />
+                                  </StackPanel>
+                                </DataTemplate>
+                              </ComboBox.ItemTemplate>
+                            </ComboBox>
+                          </Grid>
+                        </Border>
+
+                        <Border Classes="summary-options-row">
+                          <Grid
+                              ColumnDefinitions="78,Auto"
+                              ColumnSpacing="8"
+                              MinHeight="17"
+                              HorizontalAlignment="Stretch">
+                            <TextBlock Classes="appearance-param-label" Text="Borders" />
+                            <CheckBox
+                                Grid.Column="1"
+                                Classes="appearance-toggle"
+                                Content="On/Off"
+                                IsChecked="{Binding ShowSummaryArrowBorders, Mode=TwoWay}" />
+                          </Grid>
+                        </Border>
+
+                        <Border Classes="summary-options-row last">
+                          <Grid
+                              ColumnDefinitions="78,*"
+                              ColumnSpacing="8"
+                              HorizontalAlignment="Stretch">
+                            <TextBlock
+                                Classes="appearance-param-label"
+                                Text="Summarize:"
+                                VerticalAlignment="Center" />
+                            <Border Grid.Column="1" Classes="summary-kind-table">
+                              <Grid ColumnDefinitions="2*,*,*">
+                                <Border Classes="summary-kind-cell">
+                                  <Grid RowDefinitions="Auto,*">
+                                    <TextBlock
+                                        Classes="summary-kind-category"
+                                        Text="Curly braces { }"
+                                        HorizontalAlignment="Center" />
+                                    <Grid Grid.Row="1" ColumnDefinitions="Auto,Auto" ColumnSpacing="12" HorizontalAlignment="Center">
+                                      <StackPanel Spacing="0">
+                                        <CheckBox Classes="summary-kind-check" Content="namespace" IsChecked="{Binding SummarizeNamespace, Mode=TwoWay}" />
+                                        <CheckBox Classes="summary-kind-check" Content="class" IsChecked="{Binding SummarizeClass, Mode=TwoWay}" />
+                                        <CheckBox Classes="summary-kind-check" Content="struct" IsChecked="{Binding SummarizeStruct, Mode=TwoWay}" />
+                                        <CheckBox Classes="summary-kind-check" Content="interface" IsChecked="{Binding SummarizeInterface, Mode=TwoWay}" />
+                                        <CheckBox Classes="summary-kind-check" Content="enum" IsChecked="{Binding SummarizeEnum, Mode=TwoWay}" />
+                                      </StackPanel>
+                                      <StackPanel Grid.Column="1" Spacing="0">
+                                        <CheckBox Classes="summary-kind-check" Content="method" IsChecked="{Binding SummarizeMethod, Mode=TwoWay}" />
+                                        <CheckBox Classes="summary-kind-check" Content="property/accessor" IsChecked="{Binding SummarizeProperty, Mode=TwoWay}" />
+                                        <CheckBox Classes="summary-kind-check" Content="object/initializer" IsChecked="{Binding SummarizeObject, Mode=TwoWay}" />
+                                        <CheckBox Classes="summary-kind-check" Content="block" IsChecked="{Binding SummarizeBlock, Mode=TwoWay}" />
+                                      </StackPanel>
+                                    </Grid>
+                                  </Grid>
+                                </Border>
+
+                                <Border Grid.Column="1" Classes="summary-kind-cell">
+                                  <StackPanel Spacing="0">
+                                    <TextBlock Classes="summary-kind-category" Text="Square brackets [ ]" HorizontalAlignment="Center" />
+                                    <CheckBox Classes="summary-kind-check" Content="array/list" IsChecked="{Binding SummarizeArray, Mode=TwoWay}" />
+                                  </StackPanel>
+                                </Border>
+
+                                <Border Grid.Column="2" Classes="summary-kind-cell last">
+                                  <StackPanel Spacing="0">
+                                    <TextBlock Classes="summary-kind-category" Text="Parentheses ( )" HorizontalAlignment="Center" />
+                                    <CheckBox Classes="summary-kind-check" Content="arguments/group" IsChecked="{Binding SummarizeArguments, Mode=TwoWay}" />
+                                  </StackPanel>
+                                </Border>
+                              </Grid>
+                            </Border>
+                        </Grid>
+                      </Border>
                     </StackPanel>
                   </Border>
-                </DataTemplate>
-              </ComboBox.ItemTemplate>
-            </ComboBox>
+                    </StackPanel>
+                  </Border>
+                </Grid>
+              </StackPanel>
+            </Border>
 
-            <Border Grid.Row="4" Classes="syntax-preview-card" Margin="0,4,0,0">
-              <Grid RowDefinitions="Auto,*" RowSpacing="6">
+            <Border Grid.Row="2" Classes="syntax-preview-card" Margin="0,2,0,0" ClipToBounds="True">
+              <Grid RowDefinitions="Auto,*" RowSpacing="6" ClipToBounds="True">
                 <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
                   <TextBlock Classes="field-label" Text="Preview" />
                   <TextBlock
@@ -157,24 +450,28 @@
                       Classes="preview-caption"
                       TextTrimming="CharacterEllipsis" />
                 </Grid>
-                <controls:SyntaxPreviewControl
-                    x:Name="AppearanceSyntaxPreview"
-                    Grid.Row="1" />
+                <controls:CodeEditor
+                    x:Name="AppearanceCodePreview"
+                    Grid.Row="1"
+                    CodeFontFamily="{Binding CodeFontFamily}"
+                    SkinKey="{Binding SkinKey}"
+                    ShowMinimap="{Binding ShowAppearanceCodePreview}"
+                    MinHeight="0"
+                    ClipToBounds="True"
+                    VerticalAlignment="Stretch"
+                    ShowFoldArrows="{Binding ShowFoldArrows}"
+                    ShowSummaryArrowBorders="{Binding ShowSummaryArrowBorders}"
+                    SummaryFoldKinds="{Binding SummaryFoldKinds}"
+                    FoldArrowsInCodeEditor="{Binding FoldArrowsInCodeEditor}"
+                    UseParentChildArrowIndentation="{Binding EffectiveUseParentChildArrowIndentation}"
+                    ShowVerticalScopeLines="{Binding ShowVerticalScopeLines}"
+                    UseColorfulFamilies="{Binding UseColorfulFamilies}"
+                    ShowFoldSummaryPreview="True" />
               </Grid>
             </Border>
           </Grid>
 
           <Grid x:Name="FileRulesPage" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="8" IsVisible="False">
-            <Button
-                x:Name="ParseFileRulesButton"
-                Classes="context-chip"
-                Content="CTX"
-                HorizontalAlignment="Right"
-                VerticalAlignment="Top"
-                IsVisible="False"
-                Tag="settings.fileRules"
-                Click="OnSettingsContextScopeClick" />
-
             <TextBlock
                 Classes="muted"
                 Text="These lists decide what the IDE tree, history, and external-update tracker ignore. Use one entry per line or comma-separated values." />
@@ -186,7 +483,7 @@
 
             <Grid
                 Grid.Row="2"
-                ColumnDefinitions="2*,2*,2*,2*"
+                ColumnDefinitions="2*,2*,2*,2*,2*"
                 ColumnSpacing="8">
               <Border Classes="rule-card">
                 <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
@@ -194,8 +491,13 @@
                     <TextBlock Classes="field-label" Text="Skipped folders" />
                     <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="ignoredDirectories" Click="OnEditRuleListClick" />
                   </Grid>
-                  <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <ItemsControl ItemsSource="{Binding IgnoredDirectoryRules}" Margin="0,0,12,0">
+                  <ScrollViewer
+                      Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12">
+                    <ItemsControl ItemsSource="{Binding IgnoredDirectoryRules}">
                       <ItemsControl.ItemTemplate>
                         <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
                           <Border Classes="rule-row" HorizontalAlignment="Stretch">
@@ -227,8 +529,13 @@
                     <TextBlock Classes="field-label" Text="Skipped files" />
                     <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="ignoredFileNames" Click="OnEditRuleListClick" />
                   </Grid>
-                  <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <ItemsControl ItemsSource="{Binding IgnoredFileNameRules}" Margin="0,0,12,0">
+                  <ScrollViewer
+                      Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12">
+                    <ItemsControl ItemsSource="{Binding IgnoredFileNameRules}">
                       <ItemsControl.ItemTemplate>
                         <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
                           <Border Classes="rule-row" HorizontalAlignment="Stretch">
@@ -260,8 +567,13 @@
                     <TextBlock Classes="field-label" Text="Skipped file types" />
                     <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="ignoredFileTypes" Click="OnEditRuleListClick" />
                   </Grid>
-                  <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <ItemsControl ItemsSource="{Binding IgnoredFileTypeRules}" Margin="0,0,12,0">
+                  <ScrollViewer
+                      Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12">
+                    <ItemsControl ItemsSource="{Binding IgnoredFileTypeRules}">
                       <ItemsControl.ItemTemplate>
                         <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
                           <Border Classes="rule-row" HorizontalAlignment="Stretch">
@@ -293,8 +605,13 @@
                     <TextBlock Classes="field-label" Text="Allowed file types" />
                     <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="supportedFileTypes" Click="OnEditRuleListClick" />
                   </Grid>
-                  <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <ItemsControl ItemsSource="{Binding SupportedFileTypeRules}" Margin="0,0,12,0">
+                  <ScrollViewer
+                      Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12">
+                    <ItemsControl ItemsSource="{Binding SupportedFileTypeRules}">
                       <ItemsControl.ItemTemplate>
                         <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
                           <Border Classes="rule-row" HorizontalAlignment="Stretch">
@@ -316,6 +633,44 @@
                   <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
                     <TextBox Classes="rule-add" Watermark=".cs, .cpp" Text="{Binding NewSupportedFileTypeRuleText, Mode=TwoWay}" />
                     <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="supportedFileTypes" />
+                  </Grid>
+                </Grid>
+              </Border>
+
+              <Border Grid.Column="4" Classes="rule-card">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Classes="field-label" Text="LOC file types" />
+                    <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="locFileTypes" Click="OnEditRuleListClick" />
+                  </Grid>
+                  <ScrollViewer
+                      Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12">
+                    <ItemsControl ItemsSource="{Binding LocFileTypeRules}">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
+                          <Border Classes="rule-row" HorizontalAlignment="Stretch">
+                            <Grid ColumnDefinitions="*,17,15" ColumnSpacing="1">
+                              <TextBlock Classes="rule-value" Text="{Binding Value}" />
+                              <Button Grid.Column="1" Classes="rule-mini" Content="e" Tag="{Binding}" Click="OnEditRuleEntryClick" />
+                              <Button
+                                  Grid.Column="2"
+                                  Classes="rule-x"
+                                  Content="x"
+                                  Command="{Binding DataContext.RemoveFileRuleEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                  <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
+                    <TextBox Classes="rule-add" Watermark=".cs, .md" Text="{Binding NewLocFileTypeRuleText, Mode=TwoWay}" />
+                    <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="locFileTypes" />
                   </Grid>
                 </Grid>
               </Border>
@@ -347,6 +702,14 @@
       </Grid>
     </Grid>
   </Border>
+    <Border Classes="resize-edge resize-left" Grid.RowSpan="2" Width="8" HorizontalAlignment="Left" VerticalAlignment="Stretch" PointerPressed="OnResizeLeftPointerPressed" />
+    <Border Classes="resize-edge resize-right" Grid.RowSpan="2" Width="8" HorizontalAlignment="Right" VerticalAlignment="Stretch" PointerPressed="OnResizeRightPointerPressed" />
+    <Border Classes="resize-edge resize-top" Grid.RowSpan="2" Height="8" HorizontalAlignment="Stretch" VerticalAlignment="Top" PointerPressed="OnResizeTopPointerPressed" />
+    <Border Classes="resize-edge resize-bottom" Grid.RowSpan="2" Height="8" HorizontalAlignment="Stretch" VerticalAlignment="Bottom" PointerPressed="OnResizeBottomPointerPressed" />
+    <Border Classes="resize-edge resize-top-left" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Left" VerticalAlignment="Top" PointerPressed="OnResizeTopLeftPointerPressed" />
+    <Border Classes="resize-edge resize-top-right" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Right" VerticalAlignment="Top" PointerPressed="OnResizeTopRightPointerPressed" />
+    <Border Classes="resize-edge resize-bottom-left" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Left" VerticalAlignment="Bottom" PointerPressed="OnResizeBottomLeftPointerPressed" />
+    <Border Classes="resize-edge resize-bottom-right" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Right" VerticalAlignment="Bottom" PointerPressed="OnResizeBottomRightPointerPressed" />
   </Grid>
 </Window>
 

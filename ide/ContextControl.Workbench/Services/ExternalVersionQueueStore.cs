@@ -157,7 +157,13 @@ public static class ExternalVersionQueueStore
 
     private static string NormalizePath(string path)
     {
-        return (path ?? string.Empty).Replace('\\', '/').TrimStart('.', '/');
+        var normalized = (path ?? string.Empty).Replace('\\', '/');
+        while (normalized.StartsWith("./", StringComparison.Ordinal))
+        {
+            normalized = normalized[2..];
+        }
+
+        return normalized.TrimStart('/');
     }
 
     private static readonly JsonSerializerOptions JsonOptions = new()

@@ -12,16 +12,22 @@ public sealed class ProjectNodeViewModel(
     bool isExternal = false,
     bool canIncludeExternal = false,
     long loc = 0,
-    int fileCount = 0) : ObservableObject
+    int fileCount = 0,
+    int diskFileCount = 0,
+    int directDiskFileCount = 0) : ObservableObject
 {
     private bool _isExpanded;
     private bool _isCurrent;
+    private bool _isExternal = isExternal;
+    private bool _canIncludeExternal = canIncludeExternal;
     private int _depth;
     private bool _isLast;
     private IReadOnlyList<bool> _ancestorContinues = [];
     private string _versionLabel = versionLabel;
     private long _loc = loc;
     private int _fileCount = fileCount;
+    private int _diskFileCount = diskFileCount;
+    private readonly int _directDiskFileCount = directDiskFileCount;
     private const double IndentStep = 8.0;
     private const double ArrowColumnWidth = 15.0;
     private const double ConnectorTail = 3.0;
@@ -30,17 +36,20 @@ public sealed class ProjectNodeViewModel(
     public string Path { get; } = path;
     public bool IsFolder { get; } = isFolder;
     public bool IsFile => !IsFolder;
-    public bool IsExternal { get; } = isExternal;
-    public bool CanIncludeExternal { get; } = canIncludeExternal;
+    public bool IsExternal => _isExternal;
+    public bool CanIncludeExternal => _canIncludeExternal;
     public bool IsRegularFolder => IsFolder && !IsExternal;
     public bool HasChildren => Children.Count > 0;
     public bool HasExpandedChildren => HasChildren && IsExpanded;
     public string VersionLabel => _versionLabel;
     public long Loc => _loc;
     public int FileCount => _fileCount;
+    public int DiskFileCount => _diskFileCount;
+    public int DirectDiskFileCount => _directDiskFileCount;
+    public int DisplayFileCount => IsRegularFolder ? Math.Max(FileCount, DiskFileCount) : FileCount;
     public string LocLabel => Loc > 0 ? Loc.ToString("N0") : "";
     public string LocMetricLabel => Loc > 0 ? $"LOC {Loc:N0}" : "";
-    public string FileCountLabel => IsRegularFolder ? $"F {FileCount:N0}" : "";
+    public string FileCountLabel => IsRegularFolder && DisplayFileCount > 0 ? $"F {DisplayFileCount:N0}" : "";
     public string DirectoryStatsLabel => IsRegularFolder
         ? string.IsNullOrWhiteSpace(LocMetricLabel) ? FileCountLabel : $"{FileCountLabel} {LocMetricLabel}"
         : "";
@@ -142,6 +151,26 @@ public sealed class ProjectNodeViewModel(
         }
     }
 
+    public void SetExternalState(bool isExternal, bool canIncludeExternal = false)
+    {
+        if (SetProperty(ref _isExternal, isExternal, nameof(IsExternal)))
+        {
+            OnPropertyChanged(nameof(IsRegularFolder));
+            OnPropertyChanged(nameof(DisplayFileCount));
+            OnPropertyChanged(nameof(FileCountLabel));
+            OnPropertyChanged(nameof(LocMetricLabel));
+            OnPropertyChanged(nameof(DirectoryStatsLabel));
+            OnPropertyChanged(nameof(NodeRoleLabel));
+            OnPropertyChanged(nameof(NodeBadgeText));
+        }
+
+        if (SetProperty(ref _canIncludeExternal, canIncludeExternal, nameof(CanIncludeExternal)))
+        {
+            OnPropertyChanged(nameof(NodeRoleLabel));
+            OnPropertyChanged(nameof(NodeBadgeText));
+        }
+    }
+
     public long RecalculateDirectoryLoc()
     {
         if (!IsFolder)
@@ -152,6 +181,9 @@ public sealed class ProjectNodeViewModel(
         var activeChildren = Children.Where(child => !child.IsExternal).ToArray();
         var total = activeChildren.Sum(child => child.RecalculateDirectoryLoc());
         var fileTotal = activeChildren.Sum(child => child.FileCount);
+        var diskFileTotal = _directDiskFileCount + activeChildren
+            .Where(child => child.IsFolder)
+            .Sum(child => child.DiskFileCount);
         if (SetProperty(ref _loc, total, nameof(Loc)))
         {
             OnPropertyChanged(nameof(LocLabel));
@@ -163,6 +195,14 @@ public sealed class ProjectNodeViewModel(
 
         if (SetProperty(ref _fileCount, fileTotal, nameof(FileCount)))
         {
+            OnPropertyChanged(nameof(DisplayFileCount));
+            OnPropertyChanged(nameof(FileCountLabel));
+            OnPropertyChanged(nameof(DirectoryStatsLabel));
+        }
+
+        if (SetProperty(ref _diskFileCount, diskFileTotal, nameof(DiskFileCount)))
+        {
+            OnPropertyChanged(nameof(DisplayFileCount));
             OnPropertyChanged(nameof(FileCountLabel));
             OnPropertyChanged(nameof(DirectoryStatsLabel));
         }

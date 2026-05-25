@@ -21,6 +21,7 @@ public sealed class ProjectTabViewModel(
     public string FileCount { get; } = fileCount;
     public string DirectoryCount { get; } = directoryCount;
     public string Commit { get; } = commit;
+    public string CompactStatsLine => $"{Location} | {FileCount} files | {DirectoryCount} dirs | {Commit} commit";
 
     public bool IsActive
     {
@@ -31,5 +32,6 @@ public sealed class ProjectTabViewModel(
     public void UpdateLocation(string value)
     {
         SetProperty(ref _location, value, nameof(Location));
+        OnPropertyChanged(nameof(CompactStatsLine));
     }
 }

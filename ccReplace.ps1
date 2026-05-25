@@ -6,7 +6,10 @@ param(
     [switch]$DryRun,
     [switch]$NoBackup,
     [switch]$Help,
-    [switch]$AgentMode
+    [switch]$AgentMode,
+    [switch]$PlanOnly,
+    [switch]$Json,
+    [string]$Apply = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,4 +34,11 @@ if ($InputFile -eq "") {
     exit 0
 }
 
-Invoke-CcReplaceFile (Resolve-TargetPath $InputFile)
+$resolvedInputFile = Resolve-TargetPath $InputFile
+
+if ($PlanOnly) {
+    Invoke-CcReplacePlanFile $resolvedInputFile -Json:$Json
+    exit 0
+}
+
+Invoke-CcReplaceFile $resolvedInputFile -ApplyDecision $Apply

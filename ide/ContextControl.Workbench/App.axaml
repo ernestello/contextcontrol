@@ -4,8 +4,8 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     RequestedThemeVariant="Light">
   <Application.Resources>
-    <FontFamily x:Key="UiFontFamily">Aptos, Segoe UI Variable Text, Segoe UI, sans-serif</FontFamily>
-    <FontFamily x:Key="CodeFontFamily">Cascadia Code, Cascadia Mono, Consolas, monospace</FontFamily>
+    <FontFamily x:Key="UiFontFamily">fonts:Inter, Segoe UI</FontFamily>
+    <FontFamily x:Key="CodeFontFamily">avares://ContextControl.Workbench/Assets/Fonts#Cascadia Code, Consolas</FontFamily>
   </Application.Resources>
   <Application.Styles>
     <FluentTheme />

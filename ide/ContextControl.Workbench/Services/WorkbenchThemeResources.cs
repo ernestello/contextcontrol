@@ -1,22 +1,54 @@
 using Avalonia.Controls;
 using Avalonia.Media;
+using Avalonia.Media.Imaging;
+using Avalonia.Platform;
 using Avalonia.Styling;
 
 namespace ContextControl.Workbench.Services;
 
 public static class WorkbenchThemeResources
 {
-    public static void Apply(Window window, string? themeKey)
-    {
-        var palette = ThemePalette.For(themeKey);
-        window.RequestedThemeVariant = palette.IsDark ? ThemeVariant.Dark : ThemeVariant.Light;
+    private const string DefaultUiFontFamily = "fonts:Inter, Segoe UI";
+    private const string DefaultCodeFontFamily = "avares://ContextControl.Workbench/Assets/Fonts#Cascadia Code, Consolas";
+    private static readonly Uri OriginalAppIcon64 = new("avares://ContextControl.Workbench/Assets/Icons/contextcontrol64x64.png");
+    private static readonly Uri OriginalAppIcon32 = new("avares://ContextControl.Workbench/Assets/Icons/contextcontrol32x32.png");
+    private static readonly Uri LightAppIcon64 = new("avares://ContextControl.Workbench/Assets/Icons/contextcontrol64x64light.png");
+    private static readonly Uri LightAppIcon32 = new("avares://ContextControl.Workbench/Assets/Icons/contextcontrol32x32light.png");
+    private static readonly Lazy<Bitmap> OriginalMicroIcon = new(() => LoadBitmap(OriginalAppIcon32));
+    private static readonly Lazy<Bitmap> LightMicroIcon = new(() => LoadBitmap(LightAppIcon32));
 
-        window.Resources["UiFontFamily"] = new FontFamily("Aptos, Segoe UI Variable Text, Segoe UI, sans-serif");
-        window.Resources["CodeFontFamily"] = new FontFamily("Cascadia Code, Cascadia Mono, Consolas, monospace");
+    public static void Apply(
+        Window window,
+        string? themeKey,
+        string? uiFontFamily = null,
+        string? codeFontFamily = null,
+        bool updateThemeVariant = true,
+        string? skinKey = null)
+    {
+        var skin = WorkbenchSkins.For(skinKey);
+        if (skin.IsActive)
+        {
+            themeKey = skin.ThemeKey;
+            uiFontFamily = skin.UiFontFamily;
+            codeFontFamily = skin.CodeFontFamily;
+        }
+
+        SetClass(window, "matrix-console-skin", skin.IsMatrixConsole);
+        window.Resources["SkinKey"] = skin.Key;
+        var palette = ThemePalette.For(themeKey);
+        if (updateThemeVariant)
+        {
+            window.RequestedThemeVariant = palette.IsDark ? ThemeVariant.Dark : ThemeVariant.Light;
+        }
+
+        window.Resources["UiFontFamily"] = CreateFontFamily(uiFontFamily, DefaultUiFontFamily, "Segoe UI");
+        window.Resources["CodeFontFamily"] = CreateFontFamily(codeFontFamily, DefaultCodeFontFamily, "Consolas");
         Set(window, "AppBackgroundBrush", palette.AppBackground);
         Set(window, "PanelBackgroundBrush", palette.PanelBackground);
         Set(window, "PanelBorderBrush", palette.PanelBorder);
         Set(window, "HeaderBackgroundBrush", palette.HeaderBackground);
+        Set(window, "TitleBarBackgroundBrush", palette.TitleBarBackground);
+        Set(window, "TitleBarBorderBrush", palette.TitleBarBorder);
         Set(window, "TextPrimaryBrush", palette.TextPrimary);
         Set(window, "TextMutedBrush", palette.TextMuted);
         Set(window, "CommandBackgroundBrush", palette.CommandBackground);
@@ -43,10 +75,30 @@ public static class WorkbenchThemeResources
         Set(window, "IncludeBorderBrush", palette.IncludeBorder);
         Set(window, "IncludeTextBrush", palette.IncludeText);
         Set(window, "SettingsSurfaceBrush", palette.SettingsSurface);
+        Set(window, "DropdownBackgroundBrush", palette.DropdownBackground);
+        Set(window, "DropdownBorderBrush", palette.DropdownBorder);
+        Set(window, "DropdownHoverBrush", palette.DropdownHover);
+        Set(window, "DropdownSelectedBrush", palette.DropdownSelected);
         Set(window, "ScopePinBackgroundBrush", palette.Accent);
         Set(window, "ScopePinBorderBrush", palette.AccentBorder);
         Set(window, "MetricFileBrush", palette.Accent);
         Set(window, "MetricLocBrush", palette.IncludeText);
+        ApplyIconResources(window, palette.UseLightIcons);
+    }
+
+    private static void SetClass(Window window, string className, bool enabled)
+    {
+        if (enabled)
+        {
+            if (!window.Classes.Contains(className))
+            {
+                window.Classes.Add(className);
+            }
+
+            return;
+        }
+
+        window.Classes.Remove(className);
     }
 
     private static void Set(Window window, string key, string color)
@@ -54,12 +106,53 @@ public static class WorkbenchThemeResources
         window.Resources[key] = new SolidColorBrush(Color.Parse(color));
     }
 
+    private static string NormalizeFontFamily(string? value, string fallback)
+    {
+        return string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+    }
+
+    private static FontFamily CreateFontFamily(string? value, string fallback, string finalFallback)
+    {
+        try
+        {
+            return new FontFamily(NormalizeFontFamily(value, fallback));
+        }
+        catch
+        {
+            return new FontFamily(finalFallback);
+        }
+    }
+
+    private static Bitmap LoadBitmap(Uri uri)
+    {
+        return new Bitmap(AssetLoader.Open(uri));
+    }
+
+    private static void ApplyIconResources(Window window, bool useLightIcons)
+    {
+        var icon64 = useLightIcons ? LightAppIcon64 : OriginalAppIcon64;
+        var icon32 = useLightIcons ? LightMicroIcon.Value : OriginalMicroIcon.Value;
+        window.Resources["AppMicroIconImage"] = icon32;
+
+        try
+        {
+            window.Icon = new WindowIcon(AssetLoader.Open(icon64));
+        }
+        catch
+        {
+            // A missing icon should not prevent the workbench from opening.
+        }
+    }
+
     private sealed record ThemePalette(
+        bool UseLightIcons,
         bool IsDark,
         string AppBackground,
         string PanelBackground,
         string PanelBorder,
         string HeaderBackground,
+        string TitleBarBackground,
+        string TitleBarBorder,
         string TextPrimary,
         string TextMuted,
         string CommandBackground,
@@ -85,24 +178,50 @@ public static class WorkbenchThemeResources
         string IncludeBackground,
         string IncludeBorder,
         string IncludeText,
-        string SettingsSurface)
+        string SettingsSurface,
+        string DropdownBackground,
+        string DropdownBorder,
+        string DropdownHover,
+        string DropdownSelected)
     {
         public static ThemePalette For(string? themeKey)
         {
             return themeKey?.ToLowerInvariant() switch
             {
                 "dark" => Dark,
+                "nocturne" => Nocturne,
+                "onyx" => Onyx,
+                "smoke" => Smoke,
+                "carbon" => Carbon,
+                "obsidian" => Obsidian,
+                "ash" => Ash,
+                "graphene" => Graphene,
                 "matrix" => Matrix,
+                "ruby" => Ruby,
+                "amethyst" => Amethyst,
+                "ember" => Ember,
+                "alabaster" => Alabaster,
+                "pearl" => Pearl,
+                "opal" => Opal,
+                "mist" => Mist,
+                "limestone" => Limestone,
+                "verdant" => Verdant,
+                "cobalt" => Cobalt,
+                "solarized" => Solarized,
+                "contrast" => Contrast,
                 _ => Empty
             };
         }
 
         private static readonly ThemePalette Empty = new(
+            true,
             false,
             "#EEF2F2",
             "#FAFBF8",
             "#CBD6D7",
             "#F4F7F6",
+            "#E8EEEE",
+            "#B4C2C5",
             "#1F2629",
             "#687579",
             "#FEFEFA",
@@ -128,72 +247,819 @@ public static class WorkbenchThemeResources
             "#FFF7E2",
             "#D7B965",
             "#7A5A17",
-            "#FFFFFF");
+            "#FFFFFF",
+            "#FAFBF8",
+            "#B8C5C7",
+            "#EFF6F5",
+            "#E3F2F1");
 
         private static readonly ThemePalette Dark = new(
+            false,
             true,
             "#0D1113",
             "#151A1D",
             "#2A363A",
             "#111618",
+            "#0A0F11",
+            "#354247",
             "#E2E8EA",
             "#8A989D",
             "#1A2124",
             "#354247",
-            "#142A2E",
-            "#6BD3D1",
-            "#2E7478",
+            "#202832",
+            "#A7B0BA",
+            "#586675",
             "#192124",
             "#20292C",
-            "#192423",
-            "#173336",
-            "#327E80",
-            "#F0F6F7",
+            "#202832",
+            "#24303C",
+            "#526477",
+            "#C7D5E3",
             "#D8E0E2",
             "#B7AA82",
             "#BBC8CB",
             "#DDBB69",
             "#0B0E10",
-            "#1E2829",
-            "#173336",
+            "#202832",
+            "#24303C",
             "#73D59B",
             "#FF7B72",
             "#2B2519",
             "#896B31",
             "#E3B75E",
-            "#171D20");
+            "#171D20",
+            "#151A1D",
+            "#354247",
+            "#202832",
+            "#24303C");
+
+        private static readonly ThemePalette Nocturne = Dark with
+        {
+            AppBackground = "#0B0F16",
+            PanelBackground = "#121821",
+            PanelBorder = "#273140",
+            HeaderBackground = "#0F141C",
+            TitleBarBackground = "#070B11",
+            TitleBarBorder = "#38475C",
+            TextPrimary = "#E6EBEE",
+            TextMuted = "#8B98A5",
+            CommandBackground = "#18212C",
+            CommandBorder = "#334152",
+            CommandPrimaryBackground = "#1A2A33",
+            Accent = "#7EB7C8",
+            AccentBorder = "#4D7B8C",
+            ProjectTileBackground = "#141D28",
+            ProjectTileActive = "#1B2B38",
+            DirectoryHighlight = "#1A2932",
+            CurrentRow = "#1D3440",
+            CurrentRowBorder = "#4D7B8C",
+            FolderText = "#A9D5DF",
+            FileText = "#DCE6EA",
+            ExternalText = "#D7B775",
+            NodeText = "#B8C6CF",
+            SkipText = "#7E8B93",
+            EditorSurface = "#090D13",
+            HistoryHover = "#172431",
+            HistoryActive = "#1D3440",
+            Good = "#7AD69A",
+            Bad = "#F07C76",
+            IncludeBackground = "#2A2517",
+            IncludeBorder = "#8A733A",
+            IncludeText = "#E6C46F",
+            SettingsSurface = "#101720",
+            DropdownBackground = "#121821",
+            DropdownBorder = "#334152",
+            DropdownHover = "#172431",
+            DropdownSelected = "#1B2B38"
+        };
+
+        private static readonly ThemePalette Onyx = Dark with
+        {
+            AppBackground = "#080807",
+            PanelBackground = "#11110F",
+            PanelBorder = "#343126",
+            HeaderBackground = "#0D0D0B",
+            TitleBarBackground = "#050504",
+            TitleBarBorder = "#5A4C2F",
+            TextPrimary = "#EEE9DF",
+            TextMuted = "#9C968B",
+            CommandBackground = "#191813",
+            CommandBorder = "#403B2C",
+            CommandPrimaryBackground = "#211D12",
+            Accent = "#D0B36B",
+            AccentBorder = "#8F7637",
+            ProjectTileBackground = "#14130F",
+            ProjectTileActive = "#211D14",
+            DirectoryHighlight = "#1D2119",
+            CurrentRow = "#2A2516",
+            CurrentRowBorder = "#8F7637",
+            FolderText = "#E2C878",
+            FileText = "#E7E1D7",
+            ExternalText = "#90B1A7",
+            NodeText = "#CCC3B5",
+            SkipText = "#817B72",
+            EditorSurface = "#0A0A09",
+            HistoryHover = "#1D1B15",
+            HistoryActive = "#2A2516",
+            Good = "#83D29B",
+            Bad = "#F07A72",
+            IncludeBackground = "#18241E",
+            IncludeBorder = "#4C7C59",
+            IncludeText = "#96DEA6",
+            SettingsSurface = "#0F0E0C",
+            DropdownBackground = "#11110F",
+            DropdownBorder = "#403B2C",
+            DropdownHover = "#1D1B15",
+            DropdownSelected = "#211D14"
+        };
+
+        private static readonly ThemePalette Smoke = Dark with
+        {
+            AppBackground = "#101113",
+            PanelBackground = "#191A1D",
+            PanelBorder = "#34363A",
+            HeaderBackground = "#15171A",
+            TitleBarBackground = "#0B0C0E",
+            TitleBarBorder = "#45484D",
+            TextPrimary = "#E6E7E9",
+            TextMuted = "#949BA3",
+            CommandBackground = "#202226",
+            CommandBorder = "#3F4349",
+            CommandPrimaryBackground = "#222B2A",
+            Accent = "#9DB9A4",
+            AccentBorder = "#60796A",
+            ProjectTileBackground = "#1B1D21",
+            ProjectTileActive = "#24272C",
+            DirectoryHighlight = "#202822",
+            CurrentRow = "#26302B",
+            CurrentRowBorder = "#60796A",
+            FolderText = "#B8D3BF",
+            FileText = "#E1E3E5",
+            ExternalText = "#D1B67A",
+            NodeText = "#C5CBD0",
+            SkipText = "#858B91",
+            EditorSurface = "#0F1012",
+            HistoryHover = "#23262B",
+            HistoryActive = "#29302D",
+            Good = "#83D29B",
+            Bad = "#F07A72",
+            IncludeBackground = "#2A2619",
+            IncludeBorder = "#8E7A43",
+            IncludeText = "#E2C977",
+            SettingsSurface = "#17181B",
+            DropdownBackground = "#191A1D",
+            DropdownBorder = "#3F4349",
+            DropdownHover = "#23262B",
+            DropdownSelected = "#24272C"
+        };
+
+        private static readonly ThemePalette Carbon = Dark with
+        {
+            AppBackground = "#050607",
+            PanelBackground = "#0E1012",
+            PanelBorder = "#2B3035",
+            HeaderBackground = "#0B0D0F",
+            TitleBarBackground = "#030404",
+            TitleBarBorder = "#3A4147",
+            TextPrimary = "#E7EAEC",
+            TextMuted = "#9099A1",
+            CommandBackground = "#15181B",
+            CommandBorder = "#363B41",
+            CommandPrimaryBackground = "#182126",
+            Accent = "#8EB2BC",
+            AccentBorder = "#577A85",
+            ProjectTileBackground = "#111417",
+            ProjectTileActive = "#1A2024",
+            DirectoryHighlight = "#17201F",
+            CurrentRow = "#1B2930",
+            CurrentRowBorder = "#577A85",
+            FolderText = "#AAC9CE",
+            FileText = "#E2E6E8",
+            ExternalText = "#C9B57A",
+            NodeText = "#C0C8CC",
+            SkipText = "#7D858C",
+            EditorSurface = "#050607",
+            HistoryHover = "#171B1F",
+            HistoryActive = "#1B2930",
+            Good = "#7DCE94",
+            Bad = "#EF7770",
+            IncludeBackground = "#282419",
+            IncludeBorder = "#86743F",
+            IncludeText = "#E1C875",
+            SettingsSurface = "#0C0E10",
+            DropdownBackground = "#0E1012",
+            DropdownBorder = "#363B41",
+            DropdownHover = "#171B1F",
+            DropdownSelected = "#1A2024"
+        };
+
+        private static readonly ThemePalette Obsidian = Dark with
+        {
+            AppBackground = "#030405",
+            PanelBackground = "#0B0D10",
+            PanelBorder = "#252A30",
+            HeaderBackground = "#080A0D",
+            TitleBarBackground = "#010202",
+            TitleBarBorder = "#343C45",
+            TextPrimary = "#ECEFF0",
+            TextMuted = "#8F99A3",
+            CommandBackground = "#11151A",
+            CommandBorder = "#313841",
+            CommandPrimaryBackground = "#161D25",
+            Accent = "#9BB0C2",
+            AccentBorder = "#5F7182",
+            ProjectTileBackground = "#0F1216",
+            ProjectTileActive = "#171D24",
+            DirectoryHighlight = "#141B20",
+            CurrentRow = "#1A2530",
+            CurrentRowBorder = "#5F7182",
+            FolderText = "#B7C7D4",
+            FileText = "#E7EAEC",
+            ExternalText = "#CBB77F",
+            NodeText = "#C2C9CF",
+            SkipText = "#7C858E",
+            EditorSurface = "#030405",
+            HistoryHover = "#151A20",
+            HistoryActive = "#1A2530",
+            Good = "#82D099",
+            Bad = "#F07A72",
+            IncludeBackground = "#242319",
+            IncludeBorder = "#817244",
+            IncludeText = "#DEC878",
+            SettingsSurface = "#090B0E",
+            DropdownBackground = "#0B0D10",
+            DropdownBorder = "#313841",
+            DropdownHover = "#151A20",
+            DropdownSelected = "#171D24"
+        };
+
+        private static readonly ThemePalette Ash = Dark with
+        {
+            AppBackground = "#141516",
+            PanelBackground = "#1D1F21",
+            PanelBorder = "#3A3D40",
+            HeaderBackground = "#181A1C",
+            TitleBarBackground = "#0F1011",
+            TitleBarBorder = "#4A4D50",
+            TextPrimary = "#E5E6E6",
+            TextMuted = "#969D9D",
+            CommandBackground = "#242629",
+            CommandBorder = "#46494C",
+            CommandPrimaryBackground = "#252C28",
+            Accent = "#9DAF9D",
+            AccentBorder = "#677B68",
+            ProjectTileBackground = "#202225",
+            ProjectTileActive = "#292C30",
+            DirectoryHighlight = "#232B25",
+            CurrentRow = "#2C342F",
+            CurrentRowBorder = "#677B68",
+            FolderText = "#BCD1BA",
+            FileText = "#E1E3E3",
+            ExternalText = "#D0B87D",
+            NodeText = "#C7CBCA",
+            SkipText = "#888E8E",
+            EditorSurface = "#121314",
+            HistoryHover = "#26292C",
+            HistoryActive = "#2C342F",
+            Good = "#83D29B",
+            Bad = "#F07A72",
+            IncludeBackground = "#2A271B",
+            IncludeBorder = "#8B7A44",
+            IncludeText = "#E2CB7B",
+            SettingsSurface = "#1A1C1E",
+            DropdownBackground = "#1D1F21",
+            DropdownBorder = "#46494C",
+            DropdownHover = "#26292C",
+            DropdownSelected = "#292C30"
+        };
+
+        private static readonly ThemePalette Graphene = Dark with
+        {
+            AppBackground = "#07090B",
+            PanelBackground = "#101418",
+            PanelBorder = "#2A3339",
+            HeaderBackground = "#0C1013",
+            TitleBarBackground = "#040607",
+            TitleBarBorder = "#37464D",
+            TextPrimary = "#E4EAEB",
+            TextMuted = "#8D9A9E",
+            CommandBackground = "#171D22",
+            CommandBorder = "#344149",
+            CommandPrimaryBackground = "#172427",
+            Accent = "#7FAEB0",
+            AccentBorder = "#507B7F",
+            ProjectTileBackground = "#12181D",
+            ProjectTileActive = "#19262B",
+            DirectoryHighlight = "#172423",
+            CurrentRow = "#1B3032",
+            CurrentRowBorder = "#507B7F",
+            FolderText = "#A7CBCB",
+            FileText = "#DEE6E8",
+            ExternalText = "#C7B77D",
+            NodeText = "#BCC8CB",
+            SkipText = "#7B878B",
+            EditorSurface = "#060809",
+            HistoryHover = "#172027",
+            HistoryActive = "#1B3032",
+            Good = "#7DD39A",
+            Bad = "#EF7770",
+            IncludeBackground = "#27261A",
+            IncludeBorder = "#837642",
+            IncludeText = "#DEC97A",
+            SettingsSurface = "#0E1216",
+            DropdownBackground = "#101418",
+            DropdownBorder = "#344149",
+            DropdownHover = "#172027",
+            DropdownSelected = "#19262B"
+        };
 
         private static readonly ThemePalette Matrix = new(
+            false,
             true,
-            "#030807",
-            "#07110F",
-            "#17372F",
-            "#04100D",
-            "#CCFFE7",
-            "#78BFA7",
-            "#091915",
-            "#1C604F",
-            "#102922",
-            "#65F0B2",
-            "#2AA979",
-            "#0A1A16",
-            "#0D241D",
-            "#0A1B16",
-            "#103329",
-            "#2AA979",
-            "#E2FFF2",
-            "#CCFFE7",
-            "#8FD9B7",
-            "#A7F0CC",
-            "#D7F77A",
-            "#020604",
-            "#0C1E18",
-            "#102922",
-            "#6AFFB9",
-            "#FF7979",
-            "#14200A",
-            "#66A640",
-            "#D7F77A",
-            "#06140F");
+            "#000000",
+            "#020602",
+            "#008F45",
+            "#000000",
+            "#000000",
+            "#00B85A",
+            "#B7FFD2",
+            "#37B96D",
+            "#001708",
+            "#00A650",
+            "#003315",
+            "#00FF66",
+            "#4DFF93",
+            "#001105",
+            "#003018",
+            "#001F0C",
+            "#003B16",
+            "#00FF66",
+            "#00FF66",
+            "#B7FFD2",
+            "#66FF9F",
+            "#A8FFC9",
+            "#287A45",
+            "#000000",
+            "#001D0A",
+            "#003B18",
+            "#00FF66",
+            "#66FF9F",
+            "#001D0A",
+            "#00A650",
+            "#00FF66",
+            "#000000",
+            "#020602",
+            "#00A650",
+            "#001D0A",
+            "#003B18");
+
+        private static readonly ThemePalette Ruby = Dark with
+        {
+            AppBackground = "#120B0D",
+            PanelBackground = "#1D1416",
+            PanelBorder = "#4B2A30",
+            HeaderBackground = "#180F12",
+            TitleBarBackground = "#10080A",
+            TitleBarBorder = "#6F2F38",
+            CommandBackground = "#26191C",
+            CommandBorder = "#5A3037",
+            CommandPrimaryBackground = "#331C22",
+            Accent = "#FF8A91",
+            AccentBorder = "#A9434D",
+            ProjectTileBackground = "#241719",
+            ProjectTileActive = "#351F25",
+            DirectoryHighlight = "#342026",
+            CurrentRow = "#4A2430",
+            CurrentRowBorder = "#A9434D",
+            FolderText = "#FFB3B7",
+            FileText = "#F2E4E5",
+            NodeText = "#E7C9CC",
+            HistoryHover = "#2A1A1D",
+            HistoryActive = "#3A1E25",
+            IncludeBackground = "#2D2117",
+            IncludeBorder = "#8A6130",
+            IncludeText = "#FFC66D",
+            SettingsSurface = "#1B1114",
+            DropdownBackground = "#1D1416",
+            DropdownBorder = "#5A3037",
+            DropdownHover = "#2A1A1D",
+            DropdownSelected = "#351F25"
+        };
+
+        private static readonly ThemePalette Amethyst = Dark with
+        {
+            AppBackground = "#0F0B15",
+            PanelBackground = "#191321",
+            PanelBorder = "#3D3151",
+            HeaderBackground = "#130E1A",
+            TitleBarBackground = "#0B0811",
+            TitleBarBorder = "#5C4890",
+            CommandBackground = "#21182C",
+            CommandBorder = "#4A3A63",
+            CommandPrimaryBackground = "#271B3B",
+            Accent = "#C9A7FF",
+            AccentBorder = "#8061C8",
+            ProjectTileBackground = "#1D1628",
+            ProjectTileActive = "#2D2142",
+            DirectoryHighlight = "#2B2140",
+            CurrentRow = "#3B2A58",
+            CurrentRowBorder = "#8061C8",
+            FolderText = "#D8C4FF",
+            FileText = "#EEE7F7",
+            NodeText = "#D2C6E5",
+            HistoryHover = "#251A32",
+            HistoryActive = "#2F2145",
+            IncludeBackground = "#20261B",
+            IncludeBorder = "#607C39",
+            IncludeText = "#BFE978",
+            SettingsSurface = "#17101F",
+            DropdownBackground = "#191321",
+            DropdownBorder = "#4A3A63",
+            DropdownHover = "#251A32",
+            DropdownSelected = "#2D2142"
+        };
+
+        private static readonly ThemePalette Ember = Dark with
+        {
+            AppBackground = "#100E0A",
+            PanelBackground = "#1A1610",
+            PanelBorder = "#463526",
+            HeaderBackground = "#14110C",
+            TitleBarBackground = "#0B0906",
+            TitleBarBorder = "#77502C",
+            CommandBackground = "#241B13",
+            CommandBorder = "#56412C",
+            CommandPrimaryBackground = "#2F1F12",
+            Accent = "#FFB36B",
+            AccentBorder = "#A9662D",
+            ProjectTileBackground = "#201711",
+            ProjectTileActive = "#302114",
+            DirectoryHighlight = "#322214",
+            CurrentRow = "#4A2B14",
+            CurrentRowBorder = "#A9662D",
+            FolderText = "#FFC283",
+            FileText = "#F0E5D7",
+            NodeText = "#D9C7B2",
+            HistoryHover = "#281D13",
+            HistoryActive = "#382414",
+            IncludeBackground = "#19291E",
+            IncludeBorder = "#42774F",
+            IncludeText = "#80DF98",
+            SettingsSurface = "#18130D",
+            DropdownBackground = "#1A1610",
+            DropdownBorder = "#56412C",
+            DropdownHover = "#281D13",
+            DropdownSelected = "#302114"
+        };
+
+        private static readonly ThemePalette Alabaster = Empty with
+        {
+            AppBackground = "#ECEAE5",
+            PanelBackground = "#FBFAF6",
+            PanelBorder = "#CAC6BA",
+            HeaderBackground = "#F5F3EC",
+            TitleBarBackground = "#E0DDD3",
+            TitleBarBorder = "#ADA794",
+            TextPrimary = "#252823",
+            TextMuted = "#6C7068",
+            CommandBackground = "#FFFDF7",
+            CommandBorder = "#BEB8A8",
+            CommandPrimaryBackground = "#E9F2EF",
+            Accent = "#216B68",
+            AccentBorder = "#86ADA7",
+            ProjectTileBackground = "#F0EDE5",
+            ProjectTileActive = "#FFFDF7",
+            DirectoryHighlight = "#EEF2E9",
+            CurrentRow = "#E1ECE8",
+            CurrentRowBorder = "#86ADA7",
+            FolderText = "#245F59",
+            FileText = "#363D39",
+            ExternalText = "#8A6A37",
+            NodeText = "#525852",
+            SkipText = "#928D80",
+            EditorSurface = "#FFFDF7",
+            HistoryHover = "#F0EDE5",
+            HistoryActive = "#E1ECE8",
+            Good = "#2B7A4B",
+            Bad = "#B34B45",
+            IncludeBackground = "#F6EDCF",
+            IncludeBorder = "#C2A65E",
+            IncludeText = "#6D5419",
+            SettingsSurface = "#FFFDF7",
+            DropdownBackground = "#FBFAF6",
+            DropdownBorder = "#BEB8A8",
+            DropdownHover = "#F0EDE5",
+            DropdownSelected = "#E9F2EF"
+        };
+
+        private static readonly ThemePalette Pearl = Empty with
+        {
+            AppBackground = "#E9EDF0",
+            PanelBackground = "#FAFBFC",
+            PanelBorder = "#C2CAD1",
+            HeaderBackground = "#F1F4F6",
+            TitleBarBackground = "#DDE4E8",
+            TitleBarBorder = "#A9B6BF",
+            TextPrimary = "#20262B",
+            TextMuted = "#63717B",
+            CommandBackground = "#FFFFFF",
+            CommandBorder = "#B7C2CA",
+            CommandPrimaryBackground = "#E6F0F7",
+            Accent = "#2F6F92",
+            AccentBorder = "#86AEC4",
+            ProjectTileBackground = "#EEF3F5",
+            ProjectTileActive = "#FFFFFF",
+            DirectoryHighlight = "#E7F0EE",
+            CurrentRow = "#DFEDF2",
+            CurrentRowBorder = "#86AEC4",
+            FolderText = "#265E73",
+            FileText = "#34454D",
+            ExternalText = "#7D6A43",
+            NodeText = "#4F6068",
+            SkipText = "#8B98A0",
+            EditorSurface = "#FFFFFF",
+            HistoryHover = "#EDF2F4",
+            HistoryActive = "#DFEDF2",
+            Good = "#277A5B",
+            Bad = "#B04A4A",
+            IncludeBackground = "#F6F0D8",
+            IncludeBorder = "#C7B061",
+            IncludeText = "#6D581B",
+            SettingsSurface = "#FFFFFF",
+            DropdownBackground = "#FAFBFC",
+            DropdownBorder = "#B7C2CA",
+            DropdownHover = "#EDF2F4",
+            DropdownSelected = "#E6F0F7"
+        };
+
+        private static readonly ThemePalette Opal = Empty with
+        {
+            AppBackground = "#EAEEF1",
+            PanelBackground = "#FBFCFB",
+            PanelBorder = "#C6CDD0",
+            HeaderBackground = "#F3F5F3",
+            TitleBarBackground = "#DEE5E3",
+            TitleBarBorder = "#AEBDB8",
+            TextPrimary = "#222727",
+            TextMuted = "#65706F",
+            CommandBackground = "#FFFFFF",
+            CommandBorder = "#BBC6C7",
+            CommandPrimaryBackground = "#E8F3F1",
+            Accent = "#4D6E83",
+            AccentBorder = "#95B2BE",
+            ProjectTileBackground = "#F0F3F1",
+            ProjectTileActive = "#FFFFFF",
+            DirectoryHighlight = "#ECF2EB",
+            CurrentRow = "#E4EEF0",
+            CurrentRowBorder = "#95B2BE",
+            FolderText = "#416A5D",
+            FileText = "#354145",
+            ExternalText = "#7E6652",
+            NodeText = "#566261",
+            SkipText = "#909A9A",
+            EditorSurface = "#FFFFFF",
+            HistoryHover = "#EEF2F1",
+            HistoryActive = "#E4EEF0",
+            Good = "#2F7A55",
+            Bad = "#AD4E56",
+            IncludeBackground = "#F5EBD7",
+            IncludeBorder = "#C4A96C",
+            IncludeText = "#71551F",
+            SettingsSurface = "#FFFFFF",
+            DropdownBackground = "#FBFCFB",
+            DropdownBorder = "#BBC6C7",
+            DropdownHover = "#EEF2F1",
+            DropdownSelected = "#E8F3F1"
+        };
+
+        private static readonly ThemePalette Mist = Empty with
+        {
+            AppBackground = "#EDF1F2",
+            PanelBackground = "#F8FAF9",
+            PanelBorder = "#C5CED0",
+            HeaderBackground = "#F3F6F6",
+            TitleBarBackground = "#E2E9EA",
+            TitleBarBorder = "#AEBFC1",
+            TextPrimary = "#253034",
+            TextMuted = "#657377",
+            CommandBackground = "#F9FBFA",
+            CommandBorder = "#B9C7CA",
+            CommandPrimaryBackground = "#E7F2F1",
+            Accent = "#477782",
+            AccentBorder = "#91B2B7",
+            ProjectTileBackground = "#F0F4F4",
+            ProjectTileActive = "#F9FBFA",
+            DirectoryHighlight = "#EAF1EF",
+            CurrentRow = "#E1EEF0",
+            CurrentRowBorder = "#91B2B7",
+            FolderText = "#3B6F74",
+            FileText = "#354447",
+            ExternalText = "#806B43",
+            NodeText = "#526164",
+            SkipText = "#8C999B",
+            EditorSurface = "#F9FBFA",
+            HistoryHover = "#EEF4F4",
+            HistoryActive = "#E1EEF0",
+            Good = "#2D7A57",
+            Bad = "#AD4E50",
+            IncludeBackground = "#F4EFD8",
+            IncludeBorder = "#C1AD67",
+            IncludeText = "#6C571E",
+            SettingsSurface = "#F9FBFA",
+            DropdownBackground = "#F8FAF9",
+            DropdownBorder = "#B9C7CA",
+            DropdownHover = "#EEF4F4",
+            DropdownSelected = "#E7F2F1"
+        };
+
+        private static readonly ThemePalette Limestone = Empty with
+        {
+            AppBackground = "#ECEDE8",
+            PanelBackground = "#F7F7F1",
+            PanelBorder = "#C9CAC1",
+            HeaderBackground = "#F2F2EC",
+            TitleBarBackground = "#E0E2DA",
+            TitleBarBorder = "#B3B8AC",
+            TextPrimary = "#282D29",
+            TextMuted = "#697168",
+            CommandBackground = "#F9F9F3",
+            CommandBorder = "#BFC2B7",
+            CommandPrimaryBackground = "#E7F0EA",
+            Accent = "#526F65",
+            AccentBorder = "#96ADA3",
+            ProjectTileBackground = "#F0F1EA",
+            ProjectTileActive = "#F9F9F3",
+            DirectoryHighlight = "#EAF0E8",
+            CurrentRow = "#E2ECE8",
+            CurrentRowBorder = "#96ADA3",
+            FolderText = "#466D5D",
+            FileText = "#38423C",
+            ExternalText = "#7D6646",
+            NodeText = "#58625B",
+            SkipText = "#91978E",
+            EditorSurface = "#F9F9F3",
+            HistoryHover = "#EEF0EA",
+            HistoryActive = "#E2ECE8",
+            Good = "#2F7A55",
+            Bad = "#AD504A",
+            IncludeBackground = "#F3ECD4",
+            IncludeBorder = "#C0A964",
+            IncludeText = "#6D561C",
+            SettingsSurface = "#F9F9F3",
+            DropdownBackground = "#F7F7F1",
+            DropdownBorder = "#BFC2B7",
+            DropdownHover = "#EEF0EA",
+            DropdownSelected = "#E7F0EA"
+        };
+
+        private static readonly ThemePalette Verdant = Empty with
+        {
+            AppBackground = "#EAF1EA",
+            PanelBackground = "#FBFEFA",
+            PanelBorder = "#B9CBB9",
+            HeaderBackground = "#F1F8EF",
+            TitleBarBackground = "#DFEBDD",
+            TitleBarBorder = "#95B596",
+            TextPrimary = "#1E291F",
+            TextMuted = "#637263",
+            CommandBackground = "#FEFFFC",
+            CommandBorder = "#AFC5AD",
+            CommandPrimaryBackground = "#E6F5E4",
+            Accent = "#2C7A43",
+            AccentBorder = "#78B881",
+            ProjectTileBackground = "#EAF5E7",
+            ProjectTileActive = "#FFFFFF",
+            DirectoryHighlight = "#E6F3E4",
+            CurrentRow = "#DDF1DE",
+            CurrentRowBorder = "#78B881",
+            FolderText = "#215C31",
+            FileText = "#314038",
+            ExternalText = "#6C6E46",
+            NodeText = "#475848",
+            EditorSurface = "#FFFFFF",
+            HistoryHover = "#E8F4E6",
+            HistoryActive = "#DDF1DE",
+            Good = "#1F7A3B",
+            IncludeBackground = "#FFF7E2",
+            IncludeBorder = "#D1B562",
+            IncludeText = "#715414",
+            SettingsSurface = "#FFFFFF",
+            DropdownBackground = "#FBFEFA",
+            DropdownBorder = "#AFC5AD",
+            DropdownHover = "#E8F4E6",
+            DropdownSelected = "#E6F5E4"
+        };
+
+        private static readonly ThemePalette Cobalt = Dark with
+        {
+            AppBackground = "#07101A",
+            PanelBackground = "#0E1824",
+            PanelBorder = "#263F5B",
+            HeaderBackground = "#0A1420",
+            TitleBarBackground = "#050B12",
+            TitleBarBorder = "#315B83",
+            CommandBackground = "#132233",
+            CommandBorder = "#2D4A68",
+            CommandPrimaryBackground = "#112A44",
+            Accent = "#78C7FF",
+            AccentBorder = "#2E78A8",
+            ProjectTileBackground = "#101C2A",
+            ProjectTileActive = "#152B40",
+            DirectoryHighlight = "#18314A",
+            CurrentRow = "#1A3E60",
+            CurrentRowBorder = "#2E78A8",
+            FolderText = "#9ED6FF",
+            FileText = "#E1EAF2",
+            NodeText = "#C1D3E3",
+            HistoryHover = "#12263A",
+            HistoryActive = "#14324D",
+            IncludeBackground = "#252215",
+            IncludeBorder = "#817039",
+            IncludeText = "#E8CA70",
+            SettingsSurface = "#0C1723",
+            DropdownBackground = "#0E1824",
+            DropdownBorder = "#2D4A68",
+            DropdownHover = "#12263A",
+            DropdownSelected = "#152B40"
+        };
+
+        private static readonly ThemePalette Solarized = Empty with
+        {
+            AppBackground = "#EEE8D5",
+            PanelBackground = "#FDF6E3",
+            PanelBorder = "#CFC7AD",
+            HeaderBackground = "#F5EEDB",
+            TitleBarBackground = "#E4DCC6",
+            TitleBarBorder = "#BDB392",
+            TextPrimary = "#073642",
+            TextMuted = "#657B83",
+            CommandBackground = "#FFF9E8",
+            CommandBorder = "#C9B98F",
+            CommandPrimaryBackground = "#E6F2EC",
+            Accent = "#268BD2",
+            AccentBorder = "#7BAEC6",
+            ProjectTileBackground = "#EEE8D5",
+            ProjectTileActive = "#FFF9E8",
+            DirectoryHighlight = "#E6EEE2",
+            CurrentRow = "#DDECE8",
+            CurrentRowBorder = "#7BAEC6",
+            FolderText = "#2AA198",
+            FileText = "#073642",
+            ExternalText = "#B58900",
+            NodeText = "#586E75",
+            SkipText = "#93A1A1",
+            EditorSurface = "#FDF6E3",
+            HistoryHover = "#E7E0CC",
+            HistoryActive = "#DDECE8",
+            Good = "#859900",
+            Bad = "#DC322F",
+            IncludeBackground = "#FBF0C1",
+            IncludeBorder = "#D0AD2C",
+            IncludeText = "#7B5D00",
+            SettingsSurface = "#FDF6E3",
+            DropdownBackground = "#FDF6E3",
+            DropdownBorder = "#C9B98F",
+            DropdownHover = "#E7E0CC",
+            DropdownSelected = "#E6F2EC"
+        };
+
+        private static readonly ThemePalette Contrast = Dark with
+        {
+            AppBackground = "#050505",
+            PanelBackground = "#0D0D0D",
+            PanelBorder = "#595959",
+            HeaderBackground = "#090909",
+            TitleBarBackground = "#000000",
+            TitleBarBorder = "#888888",
+            TextPrimary = "#FFFFFF",
+            TextMuted = "#C8C8C8",
+            CommandBackground = "#161616",
+            CommandBorder = "#6A6A6A",
+            CommandPrimaryBackground = "#101E26",
+            Accent = "#7DDCFF",
+            AccentBorder = "#42BEEA",
+            ProjectTileBackground = "#111111",
+            ProjectTileActive = "#1A2630",
+            DirectoryHighlight = "#141F16",
+            CurrentRow = "#122C3A",
+            CurrentRowBorder = "#42BEEA",
+            FolderText = "#A8FFB0",
+            FileText = "#FFFFFF",
+            ExternalText = "#FFE08A",
+            NodeText = "#E4E4E4",
+            SkipText = "#B8B8B8",
+            HistoryHover = "#202020",
+            HistoryActive = "#122C3A",
+            Good = "#80FF9A",
+            Bad = "#FF6F6F",
+            IncludeBackground = "#272109",
+            IncludeBorder = "#B99220",
+            IncludeText = "#FFE37D",
+            SettingsSurface = "#0B0B0B",
+            DropdownBackground = "#0D0D0D",
+            DropdownBorder = "#6A6A6A",
+            DropdownHover = "#202020",
+            DropdownSelected = "#1A2630"
+        };
     }
 }

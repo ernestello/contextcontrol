@@ -314,7 +314,8 @@ public sealed class ExternalChangeTracker : IDisposable
 
             foreach (var child in childDirectories)
             {
-                if (!_fileRules.ShouldSkipDirectory(child.Name))
+                var relativePath = NormalizePath(Path.GetRelativePath(_projectRoot, child.FullName));
+                if (!_fileRules.ShouldSkipDirectory(child.Name, relativePath))
                 {
                     stack.Push(child.FullName);
                 }
@@ -322,7 +323,8 @@ public sealed class ExternalChangeTracker : IDisposable
 
             foreach (var file in files)
             {
-                if (_fileRules.ShouldTrackFileName(file.Name, file.Extension))
+                var relativePath = NormalizePath(Path.GetRelativePath(_projectRoot, file.FullName));
+                if (_fileRules.ShouldTrackFile(relativePath, file.Name, file.Extension))
                 {
                     yield return file.FullName;
                 }
@@ -707,7 +709,13 @@ public sealed class ExternalChangeTracker : IDisposable
 
     private static string NormalizePath(string path)
     {
-        return path.Replace('\\', '/').TrimStart('.', '/');
+        var normalized = path.Replace('\\', '/');
+        while (normalized.StartsWith("./", StringComparison.Ordinal))
+        {
+            normalized = normalized[2..];
+        }
+
+        return normalized.TrimStart('/');
     }
 
     private static bool FullPathEquals(string? left, string right)

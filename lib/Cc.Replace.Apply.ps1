@@ -69,10 +69,126 @@ function Apply-CcReplacePlanEntry {
     return $true
 }
 
+function New-CcReplacePlanSummary {
+    param($Plan)
+
+    $items = @($Plan)
+    $effective = @($items | Where-Object { $_.IsEffective })
+    $duplicates = @($items | Where-Object { $_.IsDuplicate })
+    $fileEntries = @($items | Where-Object { -not $_.IsDirectory })
+    $fileGroups = @($fileEntries | Group-Object TargetHeader)
+
+    $added = 0
+    $removed = 0
+    foreach ($entry in $effective | Where-Object { -not $_.IsDirectory }) {
+        $added += [int]$entry.Added
+        $removed += [int]$entry.Removed
+    }
+
+    $actions = @($items | ForEach-Object {
+        [pscustomobject]@{
+            Mode = $_.Mode
+            Target = $_.TargetHeader
+            Part = $_.PartLabel
+            Added = [int]$_.Added
+            Removed = [int]$_.Removed
+            TotalLocAfter = [int]$_.TotalLocAfter
+            IsDirectory = [bool]$_.IsDirectory
+            IsDuplicate = [bool]$_.IsDuplicate
+            IsEffective = [bool]$_.IsEffective
+            DuplicateAction = [string]$_.DuplicateAction
+        }
+    })
+
+    return [pscustomobject]@{
+        EffectiveCount = $effective.Count
+        DuplicateCount = $duplicates.Count
+        FileCount = $fileGroups.Count
+        Added = $added
+        Removed = $removed
+        Actions = $actions
+    }
+}
+
+function Invoke-CcReplacePlanText {
+    param(
+        [string]$Text,
+        [switch]$Json
+    )
+
+    $blocks = @(Parse-CcReplaceBlocks $Text)
+    if ($blocks.Count -eq 0) {
+        $summary = [pscustomobject]@{
+            EffectiveCount = 0
+            DuplicateCount = 0
+            FileCount = 0
+            Added = 0
+            Removed = 0
+            Actions = @()
+            Error = "No CC-REPLACE blocks found."
+        }
+
+        if ($Json) {
+            $summary | ConvertTo-Json -Depth 8
+        }
+        else {
+            Write-Host "No CC-REPLACE blocks found."
+        }
+
+        return
+    }
+
+    $settings = Read-CcReplaceSettings
+    $plan = @(Analyze-CcReplaceBlocks $blocks)
+
+    if ($Json) {
+        New-CcReplacePlanSummary $plan | ConvertTo-Json -Depth 8
+        return
+    }
+
+    $effective = @($plan | Where-Object { $_.IsEffective })
+    $duplicates = @($plan | Where-Object { $_.IsDuplicate })
+    Write-CcReplaceCompactPlan $effective $duplicates $settings
+}
+
+function Invoke-CcReplacePlanFile {
+    param(
+        [string]$Path,
+        [switch]$Json
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Input file not found: $Path"
+    }
+
+    $text = Read-TextFileAutoEncoding $Path
+    Invoke-CcReplacePlanText $text -Json:$Json
+}
+
+function Convert-CcApplyDecision {
+    param([string]$ApplyDecision)
+
+    if ([string]::IsNullOrWhiteSpace($ApplyDecision)) {
+        return ""
+    }
+
+    $clean = $ApplyDecision.Trim().ToLowerInvariant()
+    if ($clean -eq "all") {
+        return "all"
+    }
+
+    if ($clean -eq "effective" -or $clean -eq "effective_only") {
+        return "effective_only"
+    }
+
+    throw "Unknown -Apply value '$ApplyDecision'. Use 'effective' or 'all'."
+}
+
 function Invoke-CcReplaceText {
     param(
         [string]$Text,
-        [switch]$NoExitOnCancel
+        [switch]$NoExitOnCancel,
+        [string]$ApplyDecision = ""
     )
 
     Start-CcReplaceEditPhase
@@ -96,7 +212,19 @@ function Invoke-CcReplaceText {
 
         $settings = Read-CcReplaceSettings
         $plan = @(Analyze-CcReplaceBlocks $blocks)
-        $decision = Get-CcReplacePreflightDecision $plan $settings
+        $forcedDecision = Convert-CcApplyDecision $ApplyDecision
+        $decision = if ($forcedDecision -ne "") {
+            if ([bool]$settings.ShowPreflightStatistics) {
+                $effectivePreview = @($plan | Where-Object { $_.IsEffective })
+                $duplicatePreview = @($plan | Where-Object { $_.IsDuplicate })
+                Write-CcReplaceCompactPlan $effectivePreview $duplicatePreview $settings
+            }
+
+            $forcedDecision
+        }
+        else {
+            Get-CcReplacePreflightDecision $plan $settings
+        }
 
         if ($decision -eq "cancel") {
             return
@@ -164,7 +292,8 @@ function Invoke-CcReplaceText {
 function Invoke-CcReplaceFile {
     param(
         [string]$Path,
-        [switch]$NoExitOnCancel
+        [switch]$NoExitOnCancel,
+        [string]$ApplyDecision = ""
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
@@ -172,7 +301,7 @@ function Invoke-CcReplaceFile {
     }
 
     $text = Read-TextFileAutoEncoding $Path
-    return (Invoke-CcReplaceText $text -NoExitOnCancel:$NoExitOnCancel)
+    return (Invoke-CcReplaceText $text -NoExitOnCancel:$NoExitOnCancel -ApplyDecision $ApplyDecision)
 }
 
 function Apply-Block {
