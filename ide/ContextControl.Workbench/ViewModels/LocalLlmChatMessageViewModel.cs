@@ -113,11 +113,15 @@ public sealed partial class LocalLlmChatMessageViewModel : ObservableObject
             snippets.Add(new ChatSnippetViewModel("patch", "cc-replace", patch.Value.Trim()));
         }
 
-        clean = PatchBlockRegex().Replace(clean, match =>
+        var patchIndex = 0;
+        clean = PatchBlockRegex().Replace(clean, _ =>
         {
-            var index = snippets.Count(snippet => snippet.IsPatch && clean.IndexOf(snippet.Text, StringComparison.Ordinal) <= match.Index);
-            return $"{Environment.NewLine}[CC-REPLACE patch block {Math.Max(1, index)}]{Environment.NewLine}";
+            patchIndex++;
+            return $"{Environment.NewLine}[CC-REPLACE patch block {patchIndex}]{Environment.NewLine}";
         });
+
+        var requestScanText = CodeFenceRegex().Replace(clean, Environment.NewLine);
+        requestScanText = PatchPlaceholderRegex().Replace(requestScanText, Environment.NewLine);
 
         var cursor = 0;
         foreach (Match match in CodeFenceRegex().Matches(clean))
@@ -125,7 +129,16 @@ public sealed partial class LocalLlmChatMessageViewModel : ObservableObject
             AddTextPart(clean[cursor..match.Index], parts);
             var language = match.Groups["lang"].Value;
             var code = match.Groups["code"].Value.Trim();
-            var snippet = new ChatSnippetViewModel("code", language, code);
+            if (PatchPlaceholderRegex().IsMatch(code))
+            {
+                cursor = match.Index + match.Length;
+                continue;
+            }
+
+            var requestFromFence = IsMostlyRequestList(code)
+                ? ExtractRequestList(code)
+                : null;
+            var snippet = requestFromFence ?? new ChatSnippetViewModel("code", language, code);
             snippets.Add(snippet);
             parts.Add(new LocalLlmChatPartViewModel("snippet", "", snippet));
             cursor = match.Index + match.Length;
@@ -133,7 +146,7 @@ public sealed partial class LocalLlmChatMessageViewModel : ObservableObject
 
         AddTextPart(clean[cursor..], parts);
 
-        var requestSnippet = ExtractRequestList(clean);
+        var requestSnippet = ExtractRequestList(requestScanText);
         if (requestSnippet is not null && snippets.All(snippet => !snippet.IsRequestList))
         {
             snippets.Add(requestSnippet);
@@ -218,6 +231,29 @@ public sealed partial class LocalLlmChatMessageViewModel : ObservableObject
         return new ChatSnippetViewModel("request", "cc-request", string.Join(Environment.NewLine, requestLines.Distinct(StringComparer.OrdinalIgnoreCase)));
     }
 
+    private static bool IsMostlyRequestList(string text)
+    {
+        var lines = (text ?? "")
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Split('\n')
+            .Select(line => line.Trim())
+            .Where(line => !string.IsNullOrWhiteSpace(line))
+            .ToArray();
+        if (lines.Length == 0)
+        {
+            return false;
+        }
+
+        var requestLike = lines.Count(line =>
+        {
+            var normalized = ContextPromptBuilder.NormalizeCodeExportRequestLine(line);
+            return normalized.Equals("END", StringComparison.OrdinalIgnoreCase)
+                || IsRequestLine(normalized);
+        });
+        return requestLike == lines.Length && lines.Any(line => IsRequestLine(ContextPromptBuilder.NormalizeCodeExportRequestLine(line)));
+    }
+
     private static bool IsRequestLine(string line)
     {
         return ContextPromptBuilder.IsCodeExportRequestLine(line);
@@ -234,6 +270,9 @@ public sealed partial class LocalLlmChatMessageViewModel : ObservableObject
 
     [GeneratedRegex("(?ms)^\\s*BEGIN\\s+CC-REPLACE\\s*$.*?^\\s*END\\s+CC-REPLACE\\s*$")]
     private static partial Regex PatchBlockRegex();
+
+    [GeneratedRegex("^\\s*\\[CC-REPLACE patch block \\d+\\]\\s*$")]
+    private static partial Regex PatchPlaceholderRegex();
 
     [GeneratedRegex("(?ms)```(?<lang>[^\\r\\n`]*)\\r?\\n(?<code>.*?)\\r?\\n```")]
     private static partial Regex CodeFenceRegex();

@@ -2,6 +2,7 @@
 
 using System.Collections.ObjectModel;
 using System.IO;
+using System.Text;
 using System.Windows.Input;
 using Avalonia.Controls.Primitives;
 using Avalonia.Media;
@@ -77,6 +78,8 @@ public sealed class ContextControlViewModel : ObservableObject
     private string _chatModelId;
     private string _lastExportPath = "";
     private string _patchSummary = "No patch loaded.";
+    private string _activeProjectRoot = "";
+    private string _activeProjectRulesPath = "";
     private ChatSessionViewModel? _selectedChatSession;
 
     public ContextControlViewModel(WorkbenchSettings settings)
@@ -147,6 +150,7 @@ public sealed class ContextControlViewModel : ObservableObject
         ToggleSnippetCommand = new RelayCommand<ChatSnippetViewModel>(snippet => snippet?.ToggleExpanded());
         NewChatSessionCommand = new RelayCommand<object>(_ => CreateNewChatSession());
         SelectChatSessionCommand = new RelayCommand<ChatSessionViewModel>(SelectChatSession);
+        RemoveChatSessionCommand = new RelayCommand<ChatSessionViewModel>(RemoveChatSession);
         CloseOllamaInstallerPromptCommand = new RelayCommand<object>(_ => IsOllamaInstallerPromptOpen = false);
         OpenPromptCommand = new RelayCommand<object>(_ => IsPromptOpen = true);
         ClosePromptCommand = new RelayCommand<object>(_ => IsPromptOpen = false);
@@ -166,9 +170,11 @@ public sealed class ContextControlViewModel : ObservableObject
     public ObservableCollection<SkillbookEntryViewModel> SkillbookEntries { get; }
     public ObservableCollection<ChatSessionViewModel> ChatSessions { get; }
     public ObservableCollection<LocalLlmChatMessageViewModel> ChatMessages { get; } = [];
+    public ObservableCollection<PatchPlanActionViewModel> PatchPlanActions { get; } = [];
     public bool HasAttachments => Attachments.Count > 0;
     public bool HasInstalledLocalModels => InstalledLocalModels.Count > 0;
     public bool HasChatSessions => ChatSessions.Count > 0;
+    public bool HasPatchPlanActions => PatchPlanActions.Count > 0;
     public string ChatHistorySummary => $"{ChatSessions.Count:N0} chat(s)";
 
     public ChatSessionViewModel? SelectedChatSession
@@ -202,6 +208,7 @@ public sealed class ContextControlViewModel : ObservableObject
     public ICommand ToggleSnippetCommand { get; }
     public ICommand NewChatSessionCommand { get; }
     public ICommand SelectChatSessionCommand { get; }
+    public ICommand RemoveChatSessionCommand { get; }
     public ICommand CloseOllamaInstallerPromptCommand { get; }
     public ICommand OpenPromptCommand { get; }
     public ICommand ClosePromptCommand { get; }
@@ -597,10 +604,10 @@ public sealed class ContextControlViewModel : ObservableObject
         get
         {
             var promptTokens = ContextCapsuleBuilder.EstimateTokens(PromptText);
-            var attachmentTokens = Attachments
-                .Where(attachment => attachment.IncludeInPrompt)
-                .Sum(attachment => EstimateAttachmentTokens(attachment));
-            return $"{promptTokens:N0} prompt tok; {attachmentTokens:N0} attachment tok";
+            var attachments = EstimateAttachmentBudget();
+            return attachments.IsClipped
+                ? $"{promptTokens:N0} prompt tok; {attachments.SentTokens:N0} sent attachment tok ({attachments.FullTokens:N0} full)"
+                : $"{promptTokens:N0} prompt tok; {attachments.SentTokens:N0} attachment tok";
         }
     }
 
@@ -610,12 +617,14 @@ public sealed class ContextControlViewModel : ObservableObject
         {
             var model = SelectedLocalModel;
             var budget = EstimateComfortableBudget(model?.ComfortableContext);
+            var attachmentBudget = EstimateAttachmentBudget();
             var total = ContextCapsuleBuilder.EstimateTokens(PromptText)
-                + Attachments.Where(attachment => attachment.IncludeInPrompt).Sum(EstimateAttachmentTokens)
-                + 900;
+                + attachmentBudget.SentTokens
+                + ContextCapsuleBuilder.DefaultOutputReserveTokens;
             var pressure = budget <= 0 ? 0 : total * 100d / budget;
             var modelLabel = model?.DisplayName ?? SelectedLocalModelLabel;
-            return $"{modelLabel}: {total:N0}/{budget:N0} tok est ({pressure:0.#}%)";
+            var suffix = attachmentBudget.IsClipped ? "; clipped" : "";
+            return $"{modelLabel}: {total:N0}/{budget:N0} tok est ({pressure:0.#}%{suffix})";
         }
     }
 
@@ -662,6 +671,43 @@ public sealed class ContextControlViewModel : ObservableObject
     public string ContextRootLabel => string.IsNullOrWhiteSpace(_processService.ContextRoot)
         ? "context root not resolved"
         : _processService.ContextRoot;
+
+    public string ActiveProjectRoot
+    {
+        get => _activeProjectRoot;
+        set
+        {
+            if (SetProperty(ref _activeProjectRoot, value ?? ""))
+            {
+                OnPropertyChanged(nameof(ActiveProjectRootLabel));
+                OnPropertyChanged(nameof(EffectiveProjectRootLabel));
+            }
+        }
+    }
+
+    public string ActiveProjectRootLabel => string.IsNullOrWhiteSpace(ActiveProjectRoot)
+        ? "active project not resolved"
+        : ActiveProjectRoot;
+
+    public string EffectiveProjectRootLabel => string.IsNullOrWhiteSpace(ActiveProjectRoot)
+        ? ContextRootLabel
+        : ActiveProjectRoot;
+
+    public string ActiveProjectRulesPath
+    {
+        get => _activeProjectRulesPath;
+        set
+        {
+            if (SetProperty(ref _activeProjectRulesPath, value ?? ""))
+            {
+                OnPropertyChanged(nameof(ActiveProjectRulesPathLabel));
+            }
+        }
+    }
+
+    public string ActiveProjectRulesPathLabel => string.IsNullOrWhiteSpace(ActiveProjectRulesPath)
+        ? "project rules not resolved"
+        : ActiveProjectRulesPath;
 
     public void SetClipboardWriter(Func<string, Task> clipboardWriter)
     {
@@ -744,7 +790,7 @@ public sealed class ContextControlViewModel : ObservableObject
 
             PhaseTitle = "Copying context";
             PhaseDetail = $"Exporting {lines.Length} {sourceLabel} path(s).";
-            var result = await _processService.RunCodeExportAsync(lines);
+            var result = await _processService.RunCodeExportAsync(lines, ActiveProjectRoot, ActiveProjectRulesPath);
             LogResult(result);
 
             if (!result.Succeeded)
@@ -903,6 +949,39 @@ public sealed class ContextControlViewModel : ObservableObject
         }
     }
 
+    private void RemoveChatSession(ChatSessionViewModel? session)
+    {
+        if (session is null || !ChatSessions.Contains(session))
+        {
+            return;
+        }
+
+        var wasSelected = ReferenceEquals(SelectedChatSession, session);
+        var removedIndex = ChatSessions.IndexOf(session);
+        ChatSessions.Remove(session);
+        OnPropertyChanged(nameof(HasChatSessions));
+        OnPropertyChanged(nameof(ChatHistorySummary));
+
+        if (ChatSessions.Count == 0)
+        {
+            CreateNewChatSession(save: false);
+            SaveChatHistory();
+            PhaseTitle = "Chat removed";
+            PhaseDetail = "Started a fresh chat.";
+            return;
+        }
+
+        if (wasSelected)
+        {
+            var nextIndex = Math.Clamp(removedIndex, 0, ChatSessions.Count - 1);
+            SelectChatSession(ChatSessions[nextIndex], save: false);
+        }
+
+        SaveChatHistory();
+        PhaseTitle = "Chat removed";
+        PhaseDetail = session.Title;
+    }
+
     private void AppendChatMessage(LocalLlmChatMessageViewModel message)
     {
         if (SelectedChatSession is null)
@@ -923,6 +1002,63 @@ public sealed class ContextControlViewModel : ObservableObject
 
         OnPropertyChanged(nameof(ChatHistorySummary));
         SaveChatHistory();
+    }
+
+    private void UpdatePatchPlanActions(PatchPlanSummary? summary)
+    {
+        PatchPlanActions.Clear();
+        if (summary is not null)
+        {
+            foreach (var action in summary.Actions.Take(24))
+            {
+                PatchPlanActions.Add(new PatchPlanActionViewModel(action));
+            }
+        }
+
+        OnPropertyChanged(nameof(HasPatchPlanActions));
+    }
+
+    private static string BuildPatchPlanChatText(PatchPlanSummary summary)
+    {
+        var builder = new StringBuilder();
+        builder.AppendLine("GO preview ready.");
+        builder.AppendLine(summary.CompactLabel);
+        if (summary.Actions.Count > 0)
+        {
+            builder.AppendLine();
+            builder.AppendLine("Files:");
+            foreach (var action in summary.Actions.Take(18))
+            {
+                builder.AppendLine($"{action.AddedLabel} {action.RemovedLabel} {action.FileLabel} :: {action.PartLabel} [{action.StatusLabel}]");
+            }
+
+            if (summary.Actions.Count > 18)
+            {
+                builder.AppendLine($"... {summary.Actions.Count - 18:N0} more action(s)");
+            }
+        }
+
+        builder.AppendLine();
+        builder.AppendLine("GO preview did not write source files. Apply effective writes non-duplicate edits through ccReplace.");
+        return builder.ToString().TrimEnd();
+    }
+
+    private static string BuildPatchFailureChatText(string title, ContextControlCommandResult result, PatchPlanSummary summary)
+    {
+        var detail = !string.IsNullOrWhiteSpace(summary.Error)
+            ? summary.Error
+            : FirstErrorLine(result);
+        return $"{title}.{Environment.NewLine}{detail}{Environment.NewLine}{Environment.NewLine}GO needs raw BEGIN/END CC-REPLACE blocks. Send is for talking to the model; GO is only for patch preview.";
+    }
+
+    private static string BuildPatchApplyChatText(ContextControlCommandResult result, string decision)
+    {
+        if (result.Succeeded)
+        {
+            return $"GO apply complete.{Environment.NewLine}ccReplace applied {decision} edits. Version snapshots are kept by the existing ccReplace cache when enabled.";
+        }
+
+        return $"GO apply failed.{Environment.NewLine}{FirstErrorLine(result)}";
     }
 
     private void SaveChatHistory()
@@ -1445,7 +1581,7 @@ public sealed class ContextControlViewModel : ObservableObject
         {
             PhaseTitle = "DIR export";
             PhaseDetail = "Exporting the project tree and navigation prompt.";
-            var result = await _processService.RunDirectoryExportAsync();
+            var result = await _processService.RunDirectoryExportAsync(ActiveProjectRoot, ActiveProjectRulesPath);
             LogResult(result);
 
             if (!result.Succeeded)
@@ -1455,6 +1591,11 @@ public sealed class ContextControlViewModel : ObservableObject
                 return;
             }
 
+            RemoveAttachmentsByKind("code", "patch");
+            _lastAssistantPatchBlocks = "";
+            IsPatchPlanReady = false;
+            PatchSummary = "No patch loaded.";
+            UpdatePatchPlanActions(null);
             AddAttachment(Path.GetFileName(_processService.DirectoryExportPath), _processService.DirectoryExportPath, "dir");
             LastExportPath = _processService.DirectoryExportPath;
             PromptText = StripLegacyDirPayload(PromptText);
@@ -1481,7 +1622,7 @@ public sealed class ContextControlViewModel : ObservableObject
             PhaseTitle = "CC export";
             PhaseDetail = $"Exporting {requestLines.Count} selected source/function request line(s).";
             AppendTerminalOutput($"CC export started with {requestLines.Count} request line(s).");
-            var result = await _processService.RunCodeExportAsync(requestLines);
+            var result = await _processService.RunCodeExportAsync(requestLines, ActiveProjectRoot, ActiveProjectRulesPath);
             LogResult(result);
 
             if (!result.Succeeded)
@@ -1492,6 +1633,9 @@ public sealed class ContextControlViewModel : ObservableObject
                 return;
             }
 
+            RemoveAttachmentsByKind("patch");
+            IsPatchPlanReady = false;
+            UpdatePatchPlanActions(null);
             AddAttachment(Path.GetFileName(_processService.CodeExportPath), _processService.CodeExportPath, "code");
             LastExportPath = _processService.CodeExportPath;
             PromptText = string.IsNullOrWhiteSpace(_lastUserRequest)
@@ -1507,32 +1651,43 @@ public sealed class ContextControlViewModel : ObservableObject
     {
         await RunBusyAsync("GO preview", async () =>
         {
-            var patchText = !string.IsNullOrWhiteSpace(_lastAssistantPatchBlocks)
-                ? _lastAssistantPatchBlocks
-                : _promptBuilder.ExtractPatchBlocks(PromptText);
+            var promptPatchBlocks = _promptBuilder.ExtractPatchBlocks(PromptText);
+            var patchText = !string.IsNullOrWhiteSpace(promptPatchBlocks)
+                ? promptPatchBlocks
+                : _lastAssistantPatchBlocks;
             if (string.IsNullOrWhiteSpace(patchText))
             {
                 PhaseTitle = "GO needs patch";
-                PhaseDetail = "Paste an AI answer containing BEGIN/END CC-REPLACE blocks.";
+                PhaseDetail = "Paste BEGIN/END CC-REPLACE blocks, or press GO on a patch snippet. Send talks to the model; GO only previews patches.";
                 Log("warn", "GO preview cancelled: no CC-REPLACE blocks found.");
+                AppendTerminalOutput("GO cancelled: no CC-REPLACE blocks found in the prompt or latest assistant patch.");
+                UpdatePatchPlanActions(null);
                 return;
             }
 
             PhaseTitle = "GO preview";
             PhaseDetail = "Writing patch.txt and asking ccReplace for a non-writing plan.";
+            AppendTerminalOutput("GO preview started: writing patch.txt and running ccReplace -PlanOnly -Json.");
             await _processService.WritePatchAsync(patchText);
             AddAttachment(Path.GetFileName(_processService.PatchPath), _processService.PatchPath, "patch");
 
-            var result = await _processService.PreviewPatchAsync();
+            var result = await _processService.PreviewPatchAsync(ActiveProjectRoot, ActiveProjectRulesPath);
             LogResult(result);
-            IsPatchPlanReady = result.Succeeded;
-            PatchSummary = result.Succeeded
-                ? _promptBuilder.BuildPatchSummary(result.StandardOutput)
-                : FirstErrorLine(result);
-            PhaseTitle = result.Succeeded ? "Patch planned" : "Patch preview failed";
-            PhaseDetail = result.Succeeded
+            var summary = _promptBuilder.ParsePatchPlanSummary(result.StandardOutput);
+            var planReady = result.Succeeded && string.IsNullOrWhiteSpace(summary.Error);
+            IsPatchPlanReady = planReady;
+            PatchSummary = result.Succeeded ? summary.CompactLabel : FirstErrorLine(result);
+            UpdatePatchPlanActions(planReady ? summary : null);
+            PhaseTitle = planReady ? "Patch planned" : "Patch preview failed";
+            PhaseDetail = planReady
                 ? "Review the plan, then apply effective edits from the dock."
-                : FirstErrorLine(result);
+                : (string.IsNullOrWhiteSpace(summary.Error) ? FirstErrorLine(result) : summary.Error);
+            AppendTerminalOutput(planReady ? PatchSummary : $"GO preview failed: {PhaseDetail}");
+            AppendChatMessage(new LocalLlmChatMessageViewModel(
+                "assistant",
+                planReady ? BuildPatchPlanChatText(summary) : BuildPatchFailureChatText("GO preview failed", result, summary),
+                "ccReplace",
+                "GO preview"));
         });
     }
 
@@ -1549,11 +1704,17 @@ public sealed class ContextControlViewModel : ObservableObject
             PhaseDetail = string.Equals(decision, "all", StringComparison.OrdinalIgnoreCase)
                 ? "Applying all ccReplace actions."
                 : "Applying effective edits through ccReplace.";
-            var result = await _processService.ApplyPatchAsync(decision);
+            var result = await _processService.ApplyPatchAsync(decision, ActiveProjectRoot, ActiveProjectRulesPath);
             LogResult(result);
             IsPatchPlanReady = false;
             PhaseTitle = result.Succeeded ? "Patch applied" : "Patch failed";
             PhaseDetail = result.Succeeded ? "ccReplace applied the selected edits." : FirstErrorLine(result);
+            AppendTerminalOutput(result.Succeeded ? $"GO apply complete: {decision} edits applied." : $"GO apply failed: {PhaseDetail}");
+            AppendChatMessage(new LocalLlmChatMessageViewModel(
+                "assistant",
+                BuildPatchApplyChatText(result, decision),
+                "ccReplace",
+                "GO apply"));
         });
     }
 
@@ -1614,7 +1775,7 @@ public sealed class ContextControlViewModel : ObservableObject
             return;
         }
 
-        var capsuleAttachments = await BuildCapsuleAttachmentsAsync();
+        var capsuleAttachments = await BuildCapsuleAttachmentsAsync(phase);
         var capsule = _capsuleBuilder.Build(new ContextCapsuleBuildRequest(
             capsuleMessage,
             phase,
@@ -1753,12 +1914,12 @@ public sealed class ContextControlViewModel : ObservableObject
             ?? InstalledLocalModels.FirstOrDefault();
     }
 
-    private async Task<IReadOnlyList<ContextCapsuleAttachment>> BuildCapsuleAttachmentsAsync()
+    private async Task<IReadOnlyList<ContextCapsuleAttachment>> BuildCapsuleAttachmentsAsync(ContextCapsulePhase phase)
     {
         var results = new List<ContextCapsuleAttachment>();
         foreach (var attachment in Attachments)
         {
-            var included = attachment.IncludeInPrompt && File.Exists(attachment.Path);
+            var included = ShouldIncludeAttachmentForPhase(attachment, phase) && File.Exists(attachment.Path);
             var text = "";
             if (included)
             {
@@ -1782,6 +1943,31 @@ public sealed class ContextControlViewModel : ObservableObject
         }
 
         return results;
+    }
+
+    private static bool ShouldIncludeAttachmentForPhase(ContextControlAttachmentViewModel attachment, ContextCapsulePhase phase)
+    {
+        if (!attachment.IncludeInPrompt)
+        {
+            return false;
+        }
+
+        if (attachment.Kind.Equals("dir", StringComparison.OrdinalIgnoreCase))
+        {
+            return phase == ContextCapsulePhase.FileRequest;
+        }
+
+        if (attachment.Kind.Equals("code", StringComparison.OrdinalIgnoreCase))
+        {
+            return phase is ContextCapsulePhase.PatchWrite or ContextCapsulePhase.PatchReview;
+        }
+
+        if (attachment.Kind.Equals("patch", StringComparison.OrdinalIgnoreCase))
+        {
+            return phase == ContextCapsulePhase.PatchReview;
+        }
+
+        return true;
     }
 
     private static string FormatCapsulePhase(ContextCapsulePhase phase)
@@ -1847,7 +2033,38 @@ public sealed class ContextControlViewModel : ObservableObject
             || !string.Equals(existing.Kind, safeKind, StringComparison.OrdinalIgnoreCase)
             || !string.Equals(existing.Label, safeLabel, StringComparison.Ordinal);
         existing.Update(safeLabel, safePath, safeKind);
+        if (changed)
+        {
+            NotifyAttachmentStateChanged();
+        }
+
         return changed;
+    }
+
+    private void RemoveAttachmentsByKind(params string[] kinds)
+    {
+        if (kinds.Length == 0 || Attachments.Count == 0)
+        {
+            return;
+        }
+
+        var kindSet = new HashSet<string>(kinds, StringComparer.OrdinalIgnoreCase);
+        var removed = false;
+        for (var index = Attachments.Count - 1; index >= 0; index--)
+        {
+            if (!kindSet.Contains(Attachments[index].Kind))
+            {
+                continue;
+            }
+
+            Attachments.RemoveAt(index);
+            removed = true;
+        }
+
+        if (removed)
+        {
+            NotifyAttachmentStateChanged();
+        }
     }
 
     private void NotifyAttachmentStateChanged()
@@ -1887,7 +2104,42 @@ public sealed class ContextControlViewModel : ObservableObject
         return 4096;
     }
 
-    private static int EstimateAttachmentTokens(ContextControlAttachmentViewModel attachment)
+    private AttachmentTokenBudget EstimateAttachmentBudget()
+    {
+        var fullTokens = 0;
+        var sentTokens = 0;
+        var remainingCharacters = ContextCapsuleBuilder.MaxAttachmentCharacters;
+        var clipped = false;
+        var phase = ResolveCapsulePhase(PromptText);
+
+        foreach (var attachment in Attachments.Where(attachment => ShouldIncludeAttachmentForPhase(attachment, phase)))
+        {
+            var characters = EstimateAttachmentCharacters(attachment);
+            if (characters <= 0)
+            {
+                continue;
+            }
+
+            fullTokens += EstimateTokensForCharacterCount(characters);
+            if (remainingCharacters <= 0)
+            {
+                clipped = true;
+                continue;
+            }
+
+            var sentCharacters = Math.Min(characters, remainingCharacters);
+            var clippedThisAttachment = characters > remainingCharacters;
+            var billedCharacters = sentCharacters
+                + (clippedThisAttachment ? Environment.NewLine.Length + ContextCapsuleBuilder.AttachmentClipMarker.Length : 0);
+            sentTokens += EstimateTokensForCharacterCount(billedCharacters);
+            remainingCharacters -= Math.Max(0, billedCharacters);
+            clipped |= clippedThisAttachment;
+        }
+
+        return new AttachmentTokenBudget(sentTokens, fullTokens, clipped);
+    }
+
+    private static int EstimateAttachmentCharacters(ContextControlAttachmentViewModel attachment)
     {
         if (attachment is null || string.IsNullOrWhiteSpace(attachment.Path) || !File.Exists(attachment.Path))
         {
@@ -1897,13 +2149,26 @@ public sealed class ContextControlViewModel : ObservableObject
         try
         {
             var length = new FileInfo(attachment.Path).Length;
-            return (int)Math.Ceiling(length / 4d);
+            return length > int.MaxValue ? int.MaxValue : (int)length;
         }
         catch
         {
             return 0;
         }
     }
+
+    private static int EstimateTokensForCharacterCount(long characterCount)
+    {
+        if (characterCount <= 0)
+        {
+            return 0;
+        }
+
+        var tokens = (long)Math.Ceiling(characterCount / 4d);
+        return tokens > int.MaxValue ? int.MaxValue : (int)tokens;
+    }
+
+    private sealed record AttachmentTokenBudget(int SentTokens, int FullTokens, bool IsClipped);
 
     private void LogResult(ContextControlCommandResult result)
     {

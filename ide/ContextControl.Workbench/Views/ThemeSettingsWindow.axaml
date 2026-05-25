@@ -67,7 +67,7 @@
             <Button
                 x:Name="FileRulesNavButton"
                 Classes="settings-nav"
-                Content="File rules"
+                Content="Project Rules"
                 Click="OnFileRulesNavClick" />
             <Button
                 x:Name="LlmsNavButton"
@@ -524,18 +524,57 @@
             </ScrollViewer>
           </Grid>
 
-          <Grid x:Name="FileRulesPage" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="8" IsVisible="False">
+          <Grid x:Name="FileRulesPage" RowDefinitions="Auto,Auto,Auto,*,Auto" RowSpacing="8" IsVisible="False">
             <TextBlock
                 Classes="muted"
-                Text="These lists decide what the IDE tree, history, and external-update tracker ignore. Use one entry per line or comma-separated values." />
+                Text="Project root settings decide what DIR/CC/GO target. File rules decide what the IDE tree, history, and external-update tracker ignore." />
 
             <TextBlock
                 Grid.Row="1"
                 Classes="path-text"
                 Text="{Binding FileRulesPath}" />
 
+            <Border Grid.Row="2" Classes="rule-card">
+              <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="6">
+                <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="6">
+                  <StackPanel>
+                    <TextBlock Classes="settings-title" Text="Context Control project settings" />
+                    <TextBlock Classes="muted" Text="{Binding ProjectSettingsStatus}" />
+                  </StackPanel>
+                  <Button Grid.Column="1" Classes="rule-mini" MinHeight="24" Content="Use active" Command="{Binding UseActiveProjectRootCommand}" />
+                  <Button Grid.Column="2" Classes="rule-mini" MinHeight="24" Content="Use CC root" Command="{Binding UseContextControlProjectRootCommand}" />
+                  <Button Grid.Column="3" Classes="rule-mini primary" MinHeight="24" Content="Save" Command="{Binding SaveProjectSettingsCommand}" />
+                </Grid>
+
+                <Grid Grid.Row="1" ColumnDefinitions="140,*" ColumnSpacing="8">
+                  <TextBlock Classes="field-label" Text="Active project" VerticalAlignment="Center" />
+                  <TextBlock Grid.Column="1" Classes="path-text" Text="{Binding ProjectRulesActiveProjectRoot}" />
+                </Grid>
+                <Grid Grid.Row="2" ColumnDefinitions="140,*" ColumnSpacing="8">
+                  <TextBlock Classes="field-label" Text="CC tool root" VerticalAlignment="Center" />
+                  <TextBlock Grid.Column="1" Classes="path-text" Text="{Binding ProjectRulesContextControlRoot}" />
+                </Grid>
+                <Grid Grid.Row="3" ColumnDefinitions="140,*" ColumnSpacing="8">
+                  <TextBlock Classes="field-label" Text="Active rules" VerticalAlignment="Center" />
+                  <TextBlock Grid.Column="1" Classes="path-text" Text="{Binding ContextControl.ActiveProjectRulesPathLabel}" />
+                </Grid>
+                <Grid Grid.Row="4" ColumnDefinitions="140,*,100,*,120,*" ColumnSpacing="8">
+                  <TextBlock Classes="field-label" Text="ProjectRoot" VerticalAlignment="Center" />
+                  <TextBox Grid.Column="1" Classes="rule-add" Text="{Binding ProjectSettingsProjectRootText, Mode=TwoWay}" Watermark="auto, ., .., or absolute path" />
+                  <TextBlock Grid.Column="2" Classes="field-label" Text="OutputRoot" VerticalAlignment="Center" />
+                  <TextBox Grid.Column="3" Classes="rule-add" Text="{Binding ProjectSettingsOutputRootText, Mode=TwoWay}" Watermark="." />
+                  <TextBlock Grid.Column="4" Classes="field-label" Text="Version cache" VerticalAlignment="Center" />
+                  <TextBox Grid.Column="5" Classes="rule-add" Text="{Binding ProjectSettingsVersionCacheRootText, Mode=TwoWay}" Watermark=".ccReplace.versions" />
+                </Grid>
+                <Grid Grid.Row="5" ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                  <TextBlock Classes="path-text" Text="{Binding ProjectSettingsPath}" />
+                  <Button Grid.Column="1" Classes="rule-mini" MinHeight="22" Content="Reload" Command="{Binding ReloadProjectSettingsCommand}" />
+                </Grid>
+              </Grid>
+            </Border>
+
             <Grid
-                Grid.Row="2"
+                Grid.Row="3"
                 ColumnDefinitions="2*,2*,2*,2*,2*"
                 ColumnSpacing="8">
               <Border Classes="rule-card">
@@ -729,7 +768,7 @@
               </Border>
             </Grid>
 
-            <Grid Grid.Row="3" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+            <Grid Grid.Row="4" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
               <TextBlock
                   Classes="muted"
                   Text="{Binding FileRulesStatus}"

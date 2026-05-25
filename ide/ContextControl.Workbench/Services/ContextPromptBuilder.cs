@@ -1,9 +1,48 @@
 // CC-DESC: Builds Context Control prompt payloads and extracts patch blocks.
 
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 namespace ContextControl.Workbench.Services;
+
+public sealed record PatchPlanSummary(
+    int EffectiveCount,
+    int DuplicateCount,
+    int FileCount,
+    int Added,
+    int Removed,
+    IReadOnlyList<PatchPlanActionSummary> Actions,
+    string Error = "")
+{
+    public string CompactLabel
+    {
+        get
+        {
+            var delta = Added > 0 || Removed > 0 ? $", +{Added:N0} / -{Removed:N0}" : "";
+            var error = string.IsNullOrWhiteSpace(Error) ? "" : $" {Error}";
+            return $"Patch plan: {EffectiveCount:N0} effective, {DuplicateCount:N0} duplicate, {FileCount:N0} files{delta}.{error}".Trim();
+        }
+    }
+}
+
+public sealed record PatchPlanActionSummary(
+    string Mode,
+    string Target,
+    string Part,
+    int Added,
+    int Removed,
+    bool IsDirectory,
+    bool IsDuplicate,
+    bool IsEffective,
+    string DuplicateAction)
+{
+    public string FileLabel => string.IsNullOrWhiteSpace(Target) ? "(unknown target)" : Target;
+    public string PartLabel => string.IsNullOrWhiteSpace(Part) ? Mode : Part;
+    public string StatusLabel => IsDuplicate ? "duplicate" : IsEffective ? "effective" : "planned";
+    public string AddedLabel => $"+{Added:N0}";
+    public string RemovedLabel => $"-{Removed:N0}";
+}
 
 public sealed partial class ContextPromptBuilder
 {
@@ -71,6 +110,17 @@ public sealed partial class ContextPromptBuilder
             return false;
         }
 
+        if (clean.StartsWith("//", StringComparison.Ordinal)
+            || clean.StartsWith("#", StringComparison.Ordinal)
+            || clean.StartsWith("/*", StringComparison.Ordinal)
+            || clean.StartsWith("*", StringComparison.Ordinal)
+            || clean.Contains("CC-REPLACE", StringComparison.OrdinalIgnoreCase)
+            || clean.Equals("BEGIN", StringComparison.OrdinalIgnoreCase)
+            || clean.Equals("END", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
         return clean.StartsWith("FUNCTION ", StringComparison.OrdinalIgnoreCase)
             || clean.StartsWith("FUNC:", StringComparison.OrdinalIgnoreCase)
             || clean.StartsWith("SYMBOL:", StringComparison.OrdinalIgnoreCase)
@@ -90,8 +140,17 @@ public sealed partial class ContextPromptBuilder
             || clean.EndsWith(".vert", StringComparison.OrdinalIgnoreCase)
             || clean.EndsWith(".frag", StringComparison.OrdinalIgnoreCase)
             || clean.EndsWith(".comp", StringComparison.OrdinalIgnoreCase)
-            || clean.Contains('/', StringComparison.Ordinal)
-            || clean.Contains('\\', StringComparison.Ordinal);
+            || LooksLikePathRequest(clean);
+    }
+
+    private static bool LooksLikePathRequest(string clean)
+    {
+        if (!clean.Contains('/', StringComparison.Ordinal) && !clean.Contains('\\', StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        return !clean.Any(char.IsWhiteSpace);
     }
 
     public string ExtractPatchBlocks(string text)
@@ -112,20 +171,95 @@ public sealed partial class ContextPromptBuilder
 
     public string BuildPatchSummary(string jsonPlanOutput)
     {
+        return ParsePatchPlanSummary(jsonPlanOutput).CompactLabel;
+    }
+
+    public PatchPlanSummary ParsePatchPlanSummary(string jsonPlanOutput)
+    {
         if (string.IsNullOrWhiteSpace(jsonPlanOutput))
         {
-            return "No patch plan returned.";
+            return new PatchPlanSummary(0, 0, 0, 0, 0, [], "No patch plan returned.");
         }
 
-        var effectiveMatch = Regex.Match(jsonPlanOutput, "\"EffectiveCount\"\\s*:\\s*(\\d+)");
-        var duplicateMatch = Regex.Match(jsonPlanOutput, "\"DuplicateCount\"\\s*:\\s*(\\d+)");
-        var fileMatch = Regex.Match(jsonPlanOutput, "\"FileCount\"\\s*:\\s*(\\d+)");
+        try
+        {
+            using var document = JsonDocument.Parse(jsonPlanOutput);
+            var root = document.RootElement;
+            var actions = new List<PatchPlanActionSummary>();
+            if (root.TryGetProperty("Actions", out var actionElements)
+                && actionElements.ValueKind == JsonValueKind.Array)
+            {
+                foreach (var action in actionElements.EnumerateArray())
+                {
+                    actions.Add(new PatchPlanActionSummary(
+                        ReadString(action, "Mode"),
+                        ReadString(action, "Target"),
+                        ReadString(action, "Part"),
+                        ReadInt(action, "Added"),
+                        ReadInt(action, "Removed"),
+                        ReadBool(action, "IsDirectory"),
+                        ReadBool(action, "IsDuplicate"),
+                        ReadBool(action, "IsEffective"),
+                        ReadString(action, "DuplicateAction")));
+                }
+            }
 
-        var effective = effectiveMatch.Success ? effectiveMatch.Groups[1].Value : "?";
-        var duplicates = duplicateMatch.Success ? duplicateMatch.Groups[1].Value : "?";
-        var files = fileMatch.Success ? fileMatch.Groups[1].Value : "?";
+            return new PatchPlanSummary(
+                ReadInt(root, "EffectiveCount"),
+                ReadInt(root, "DuplicateCount"),
+                ReadInt(root, "FileCount"),
+                ReadInt(root, "Added"),
+                ReadInt(root, "Removed"),
+                actions,
+                ReadString(root, "Error"));
+        }
+        catch
+        {
+            var effectiveMatch = Regex.Match(jsonPlanOutput, "\"EffectiveCount\"\\s*:\\s*(\\d+)");
+            var duplicateMatch = Regex.Match(jsonPlanOutput, "\"DuplicateCount\"\\s*:\\s*(\\d+)");
+            var fileMatch = Regex.Match(jsonPlanOutput, "\"FileCount\"\\s*:\\s*(\\d+)");
 
-        return $"Patch plan: {effective} effective, {duplicates} duplicate, {files} files.";
+            var effective = effectiveMatch.Success && int.TryParse(effectiveMatch.Groups[1].Value, out var effectiveValue)
+                ? effectiveValue
+                : 0;
+            var duplicates = duplicateMatch.Success && int.TryParse(duplicateMatch.Groups[1].Value, out var duplicateValue)
+                ? duplicateValue
+                : 0;
+            var files = fileMatch.Success && int.TryParse(fileMatch.Groups[1].Value, out var fileValue)
+                ? fileValue
+                : 0;
+
+            return new PatchPlanSummary(effective, duplicates, files, 0, 0, [], "Plan JSON could not be parsed cleanly.");
+        }
+    }
+
+    private static int ReadInt(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var value) && value.TryGetInt32(out var parsed)
+            ? parsed
+            : 0;
+    }
+
+    private static bool ReadBool(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var value))
+        {
+            return false;
+        }
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => false
+        };
+    }
+
+    private static string ReadString(JsonElement element, string propertyName)
+    {
+        return element.TryGetProperty(propertyName, out var value) && value.ValueKind == JsonValueKind.String
+            ? value.GetString() ?? ""
+            : "";
     }
 
     [GeneratedRegex("(?ms)^\\s*BEGIN\\s+CC-REPLACE\\s*$.*?^\\s*END\\s+CC-REPLACE\\s*$")]

@@ -47,7 +47,10 @@ public sealed class ContextControlProcessService
         return null;
     }
 
-    public async Task<ContextControlCommandResult> RunDirectoryExportAsync(CancellationToken cancellationToken = default)
+    public async Task<ContextControlCommandResult> RunDirectoryExportAsync(
+        string? projectRootOverride = null,
+        string? fileRulesPathOverride = null,
+        CancellationToken cancellationToken = default)
     {
         return await RunPowerShellScriptAsync(
             "DIR",
@@ -55,10 +58,16 @@ public sealed class ContextControlProcessService
             ["-OutputFile", DirectoryExportPath],
             null,
             DirectoryExportPath,
+            projectRootOverride,
+            fileRulesPathOverride,
             cancellationToken);
     }
 
-    public async Task<ContextControlCommandResult> RunCodeExportAsync(IEnumerable<string> requestLines, CancellationToken cancellationToken = default)
+    public async Task<ContextControlCommandResult> RunCodeExportAsync(
+        IEnumerable<string> requestLines,
+        string? projectRootOverride = null,
+        string? fileRulesPathOverride = null,
+        CancellationToken cancellationToken = default)
     {
         var input = NormalizeRequestInput(requestLines);
         return await RunPowerShellScriptAsync(
@@ -67,6 +76,8 @@ public sealed class ContextControlProcessService
             ["-OutputFile", CodeExportPath],
             input,
             CodeExportPath,
+            projectRootOverride,
+            fileRulesPathOverride,
             cancellationToken);
     }
 
@@ -81,7 +92,10 @@ public sealed class ContextControlProcessService
         await File.WriteAllTextAsync(PatchPath, patchText ?? "", new UTF8Encoding(false), cancellationToken);
     }
 
-    public async Task<ContextControlCommandResult> PreviewPatchAsync(CancellationToken cancellationToken = default)
+    public async Task<ContextControlCommandResult> PreviewPatchAsync(
+        string? projectRootOverride = null,
+        string? fileRulesPathOverride = null,
+        CancellationToken cancellationToken = default)
     {
         return await RunPowerShellScriptAsync(
             "GO preview",
@@ -89,10 +103,16 @@ public sealed class ContextControlProcessService
             ["-InputFile", PatchPath, "-PlanOnly", "-Json"],
             null,
             PatchPath,
+            projectRootOverride,
+            fileRulesPathOverride,
             cancellationToken);
     }
 
-    public async Task<ContextControlCommandResult> ApplyPatchAsync(string decision, CancellationToken cancellationToken = default)
+    public async Task<ContextControlCommandResult> ApplyPatchAsync(
+        string decision,
+        string? projectRootOverride = null,
+        string? fileRulesPathOverride = null,
+        CancellationToken cancellationToken = default)
     {
         var cleanDecision = string.Equals(decision, "all", StringComparison.OrdinalIgnoreCase)
             ? "all"
@@ -104,6 +124,8 @@ public sealed class ContextControlProcessService
             ["-InputFile", PatchPath, "-Apply", cleanDecision],
             null,
             PatchPath,
+            projectRootOverride,
+            fileRulesPathOverride,
             cancellationToken);
     }
 
@@ -123,6 +145,8 @@ public sealed class ContextControlProcessService
         IReadOnlyList<string> arguments,
         string? standardInput,
         string? outputFile,
+        string? projectRootOverride,
+        string? fileRulesPathOverride,
         CancellationToken cancellationToken)
     {
         var scriptPath = Path.Combine(ContextRoot, scriptName);
@@ -133,11 +157,11 @@ public sealed class ContextControlProcessService
 
         try
         {
-            return await RunProcessAsync("pwsh", command, scriptPath, arguments, standardInput, outputFile, cancellationToken);
+            return await RunProcessAsync("pwsh", command, scriptPath, arguments, standardInput, outputFile, projectRootOverride, fileRulesPathOverride, cancellationToken);
         }
         catch (System.ComponentModel.Win32Exception)
         {
-            return await RunProcessAsync("powershell", command, scriptPath, arguments, standardInput, outputFile, cancellationToken);
+            return await RunProcessAsync("powershell", command, scriptPath, arguments, standardInput, outputFile, projectRootOverride, fileRulesPathOverride, cancellationToken);
         }
     }
 
@@ -148,6 +172,8 @@ public sealed class ContextControlProcessService
         IReadOnlyList<string> arguments,
         string? standardInput,
         string? outputFile,
+        string? projectRootOverride,
+        string? fileRulesPathOverride,
         CancellationToken cancellationToken)
     {
         var startInfo = new ProcessStartInfo
@@ -160,6 +186,16 @@ public sealed class ContextControlProcessService
             RedirectStandardError = true,
             CreateNoWindow = true
         };
+
+        if (!string.IsNullOrWhiteSpace(projectRootOverride))
+        {
+            startInfo.Environment["CC_WORKBENCH_PROJECT_ROOT"] = Path.GetFullPath(projectRootOverride);
+        }
+
+        if (!string.IsNullOrWhiteSpace(fileRulesPathOverride))
+        {
+            startInfo.Environment["CC_WORKBENCH_FILE_RULES_PATH"] = Path.GetFullPath(fileRulesPathOverride);
+        }
 
         startInfo.ArgumentList.Add("-NoLogo");
         startInfo.ArgumentList.Add("-NoProfile");

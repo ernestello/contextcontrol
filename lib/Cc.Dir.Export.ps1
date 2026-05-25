@@ -91,6 +91,8 @@ $ExcludeFileExtensions = @(
     ".svo"
 )
 
+$ExcludeFileNames = @()
+
 $VulkanVXTopLevelAllowList = @(
     "include",
     "src",
@@ -122,6 +124,139 @@ function Get-OutputText {
     }
 
     return $text
+}
+
+function Normalize-CcDirRulePath {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+
+    $clean = ([string]$Value).Trim() -replace '\\', '/'
+    while ($clean.StartsWith("./")) {
+        $clean = $clean.Substring(2)
+    }
+
+    return $clean.Trim("/")
+}
+
+function Normalize-CcDirExtension {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ""
+    }
+
+    $clean = ([string]$Value).Trim().ToLowerInvariant()
+    if (-not $clean.StartsWith(".")) {
+        $clean = ".$clean"
+    }
+
+    return $clean
+}
+
+function Get-CcDirRelativePath {
+    param([System.IO.FileSystemInfo]$Item)
+
+    $root = (Get-Location).Path
+    try {
+        return (Normalize-CcDirRulePath ([System.IO.Path]::GetRelativePath($root, $Item.FullName)))
+    }
+    catch {
+        $relative = $Item.FullName
+        if ($relative.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $relative = $relative.Substring($root.Length)
+        }
+
+        return (Normalize-CcDirRulePath $relative)
+    }
+}
+
+function Test-CcDirDirectoryRule {
+    param(
+        [System.IO.FileSystemInfo]$Item,
+        [string]$Rule
+    )
+
+    $cleanRule = Normalize-CcDirRulePath $Rule
+    if ([string]::IsNullOrWhiteSpace($cleanRule)) {
+        return $false
+    }
+
+    if ($cleanRule.Contains("/")) {
+        $relative = Get-CcDirRelativePath $Item
+        return $relative.Equals($cleanRule, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $relative.StartsWith("$cleanRule/", [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    return $Item.Name.Equals($cleanRule, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-CcDirFileRule {
+    param(
+        [System.IO.FileSystemInfo]$Item,
+        [string]$Rule
+    )
+
+    $cleanRule = Normalize-CcDirRulePath $Rule
+    if ([string]::IsNullOrWhiteSpace($cleanRule)) {
+        return $false
+    }
+
+    if ($cleanRule.Contains("/")) {
+        return (Get-CcDirRelativePath $Item).Equals($cleanRule, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+
+    return $Item.Name.Equals($cleanRule, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Import-CcDirWorkbenchFileRules {
+    $path = $env:CC_WORKBENCH_FILE_RULES_PATH
+    if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
+        return
+    }
+
+    try {
+        $rules = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+
+        if ($rules.PSObject.Properties.Name -contains "IgnoredDirectories") {
+            foreach ($value in @($rules.IgnoredDirectories)) {
+                $clean = Normalize-CcDirRulePath $value
+                if (-not [string]::IsNullOrWhiteSpace($clean) -and $ExcludeDirs -notcontains $clean) {
+                    $script:ExcludeDirs += $clean
+                }
+            }
+        }
+
+        $ignoredFiles = @()
+        if ($rules.PSObject.Properties.Name -contains "IgnoredFileNames") {
+            $ignoredFiles += @($rules.IgnoredFileNames)
+        }
+        if ($rules.PSObject.Properties.Name -contains "IgnoredFiles") {
+            $ignoredFiles += @($rules.IgnoredFiles)
+        }
+        foreach ($value in $ignoredFiles) {
+            $clean = Normalize-CcDirRulePath $value
+            if (-not [string]::IsNullOrWhiteSpace($clean) -and $ExcludeFileNames -notcontains $clean) {
+                $script:ExcludeFileNames += $clean
+            }
+        }
+
+        if ($rules.PSObject.Properties.Name -contains "IgnoredExtensions") {
+            foreach ($value in @($rules.IgnoredExtensions)) {
+                $clean = Normalize-CcDirExtension $value
+                if (-not [string]::IsNullOrWhiteSpace($clean) -and $ExcludeFileExtensions -notcontains $clean) {
+                    $script:ExcludeFileExtensions += $clean
+                }
+            }
+        }
+
+        Write-Host "File rules: $path" -ForegroundColor DarkGray
+    }
+    catch {
+        Write-Host "Workbench file rules could not be read, using DIR defaults: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
 }
 
 function New-CcSharedDefaultSettings {
@@ -213,6 +348,10 @@ function Resolve-CcSharedPathRelativeToScript {
 
 function Resolve-CcSharedProjectRoot {
     param($Settings)
+
+    if (-not [string]::IsNullOrWhiteSpace($env:CC_WORKBENCH_PROJECT_ROOT)) {
+        return [System.IO.Path]::GetFullPath($env:CC_WORKBENCH_PROJECT_ROOT)
+    }
 
     $root = "auto"
     if ($null -ne $Settings -and
@@ -518,6 +657,7 @@ Set-Location -LiteralPath $script:CcProjectRoot
 
 Write-Host "Project root: $script:CcProjectRoot" -ForegroundColor DarkGray
 Write-Host "Output folder: $script:CcOutputRoot" -ForegroundColor DarkGray
+Import-CcDirWorkbenchFileRules
 
 
 $ResolvedProfile = Detect-Profile
@@ -536,7 +676,19 @@ function Is-ExcludedItem($Item) {
             return $true
         }
 
-        return $ExcludeDirs -contains $Item.Name
+        foreach ($rule in $ExcludeDirs) {
+            if (Test-CcDirDirectoryRule $Item $rule) {
+                return $true
+            }
+        }
+
+        return $false
+    }
+
+    foreach ($rule in $ExcludeFileNames) {
+        if (Test-CcDirFileRule $Item $rule) {
+            return $true
+        }
     }
 
     $ext = [System.IO.Path]::GetExtension($Item.Name).ToLower()

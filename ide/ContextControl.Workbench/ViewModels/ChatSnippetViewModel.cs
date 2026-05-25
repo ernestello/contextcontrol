@@ -13,13 +13,14 @@ public sealed class ChatSnippetViewModel(string kind, string language, string te
     public bool IsPatch => string.Equals(Kind, "patch", StringComparison.OrdinalIgnoreCase);
     public bool IsRequestList => string.Equals(Kind, "request", StringComparison.OrdinalIgnoreCase);
     public bool IsCode => !IsPatch && !IsRequestList;
+    public bool HasPromptAction => IsPatch || IsRequestList;
 
     public string Title => IsPatch
         ? "CC-REPLACE patch"
         : IsRequestList ? "CC request list" : $"Code snippet: {Language}";
 
     public string ActionLabel => IsPatch
-        ? "Preview"
+        ? "Send to Prompt"
         : IsRequestList ? "Use for CC" : "Copy";
 
     public int LineCount => string.IsNullOrEmpty(Text)

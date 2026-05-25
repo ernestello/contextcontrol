@@ -259,6 +259,10 @@ function Resolve-CcSharedPathRelativeToScript {
 function Resolve-CcSharedProjectRoot {
     param($Settings)
 
+    if (-not [string]::IsNullOrWhiteSpace($env:CC_WORKBENCH_PROJECT_ROOT)) {
+        return [System.IO.Path]::GetFullPath($env:CC_WORKBENCH_PROJECT_ROOT)
+    }
+
     $root = "auto"
     if ($null -ne $Settings -and
         ($Settings.PSObject.Properties.Name -contains "ProjectRoot") -and
@@ -327,6 +331,10 @@ function Resolve-CcSharedOutputPath {
 
 function Get-CcProjectFileRulesPath {
     param($Settings = $null)
+
+    if (-not [string]::IsNullOrWhiteSpace($env:CC_WORKBENCH_FILE_RULES_PATH)) {
+        return [System.IO.Path]::GetFullPath($env:CC_WORKBENCH_FILE_RULES_PATH)
+    }
 
     if ($null -eq $Settings) {
         $Settings = Read-CcSharedSettings

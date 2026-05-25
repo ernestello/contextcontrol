@@ -166,6 +166,10 @@ function Resolve-CcPathRelativeToScript {
 function Resolve-CcProjectRoot {
     param($Settings)
 
+    if (-not [string]::IsNullOrWhiteSpace($env:CC_WORKBENCH_PROJECT_ROOT)) {
+        return [System.IO.Path]::GetFullPath($env:CC_WORKBENCH_PROJECT_ROOT)
+    }
+
     $root = "auto"
     if ($null -ne $Settings -and
         ($Settings.PSObject.Properties.Name -contains "ProjectRoot") -and

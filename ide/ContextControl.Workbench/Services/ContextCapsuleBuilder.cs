@@ -39,9 +39,10 @@ public sealed record ContextCapsule(
 
 public sealed class ContextCapsuleBuilder
 {
-    private const int DefaultComfortableContextTokens = 4096;
-    private const int DefaultOutputReserveTokens = 900;
-    private const int MaxAttachmentCharacters = 28_000;
+    public const int DefaultComfortableContextTokens = 4096;
+    public const int DefaultOutputReserveTokens = 900;
+    public const int MaxAttachmentCharacters = 28_000;
+    public const string AttachmentClipMarker = "[attachment clipped by local context budget]";
 
     public ContextCapsule Build(ContextCapsuleBuildRequest request)
     {
@@ -55,19 +56,15 @@ public sealed class ContextCapsuleBuilder
         builder.AppendLine($"Phase: {FormatPhase(request.Phase)}");
         builder.AppendLine($"Comfortable context target: {comfortableTokens} tokens");
         builder.AppendLine();
-        builder.AppendLine("Non-negotiable workflow:");
-        builder.AppendLine("- You are a ContextControl patch/chat worker, not a filesystem agent.");
-        builder.AppendLine("- Use only text included in this capsule.");
-        builder.AppendLine("- Do not claim to inspect project files unless their contents are included below.");
-        builder.AppendLine("- Always include a short visible 'Decision summary:' before any final artifact.");
-        builder.AppendLine("- If you emit private-style thinking tags such as <think>, keep them concise.");
+        builder.AppendLine("Core rule: the visible project context is included below as attachment text.");
+        builder.AppendLine("Use that text directly. You cannot access anything outside this capsule or run tools.");
         builder.AppendLine();
         builder.AppendLine(BuildPhaseContract(request.Phase));
         builder.AppendLine();
 
         if (!string.IsNullOrWhiteSpace(request.SkillbookInstructions))
         {
-            builder.AppendLine("Skillbook instructions:");
+            builder.AppendLine("Enabled Skillbook entries:");
             builder.AppendLine(request.SkillbookInstructions.Trim());
             builder.AppendLine();
         }
@@ -92,7 +89,7 @@ public sealed class ContextCapsuleBuilder
                 }
                 else if (clipped.Length > remainingAttachmentChars)
                 {
-                    clipped = clipped[..remainingAttachmentChars] + Environment.NewLine + "[attachment clipped by local context budget]";
+                    clipped = clipped[..remainingAttachmentChars] + Environment.NewLine + AttachmentClipMarker;
                 }
 
                 remainingAttachmentChars -= Math.Max(0, clipped.Length);
@@ -135,22 +132,25 @@ public sealed class ContextCapsuleBuilder
         {
             ContextCapsulePhase.FileRequest => """
                 Phase contract:
-                The attached context is a DIR/tree export. Reply with the smallest safe cc.ps1 request list only after the decision summary.
-                Valid request lines are exact files, FUNCTION path :: symbol, wildcard FUNCTION only when needed, or FIND: exactText.
-                End request lists with END.
+                DIR/tree context is attached.
+                Output only the smallest safe CC request list, ending with END.
+                Valid lines: exact file, FUNCTION path :: symbol, FIND: exactText.
                 """,
             ContextCapsulePhase.PatchWrite => """
                 Phase contract:
-                The attached context is source/function context from CC. Produce raw BEGIN CC-REPLACE blocks for the requested edit.
-                Keep commentary outside patch blocks short. Do not invent APIs not shown in context.
+                CC source/function context is attached.
+                Answer from the provided source or emit raw CC-REPLACE blocks.
+                Do not invent APIs not shown in context.
                 """,
             ContextCapsulePhase.PatchReview => """
                 Phase contract:
-                The attached context includes a patch. Review or repair it using only visible context. If repaired, emit complete CC-REPLACE blocks.
+                Patch context is attached.
+                Review or repair it using only visible context.
+                If repaired, emit complete CC-REPLACE blocks.
                 """,
             _ => """
                 Phase contract:
-                Normal local CC chat. Answer using the included instructions and attachments. Ask for DIR/CC context when code evidence is needed.
+                Normal local chat. Ask for DIR/CC context when code evidence is needed.
                 """
         };
     }

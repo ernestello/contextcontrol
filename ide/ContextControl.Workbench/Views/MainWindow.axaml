@@ -604,16 +604,24 @@
                       <ItemsControl ItemsSource="{Binding ContextControl.ChatSessions}">
                         <ItemsControl.ItemTemplate>
                           <DataTemplate DataType="{x:Type vm:ChatSessionViewModel}">
-                            <Button
-                                Classes="chat-session-row"
-                                Classes.active="{Binding IsActive}"
-                                Command="{Binding DataContext.ContextControl.SelectChatSessionCommand, RelativeSource={RelativeSource AncestorType=Window}}"
-                                CommandParameter="{Binding}">
-                              <Grid RowDefinitions="Auto,Auto" RowSpacing="2">
-                                <TextBlock Text="{Binding Title}" Classes="chat-session-title" />
-                                <TextBlock Grid.Row="1" Text="{Binding Summary}" Classes="history-meta" />
-                              </Grid>
-                            </Button>
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="4" Margin="0,0,0,5">
+                              <Button
+                                  Classes="chat-session-row"
+                                  Classes.active="{Binding IsActive}"
+                                  Command="{Binding DataContext.ContextControl.SelectChatSessionCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}">
+                                <Grid RowDefinitions="Auto,Auto" RowSpacing="2">
+                                  <TextBlock Text="{Binding Title}" Classes="chat-session-title" />
+                                  <TextBlock Grid.Row="1" Text="{Binding Summary}" Classes="history-meta" />
+                                </Grid>
+                              </Button>
+                              <Button
+                                  Grid.Column="1"
+                                  Classes="chat-session-remove"
+                                  Content="x"
+                                  Command="{Binding DataContext.ContextControl.RemoveChatSessionCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
                           </DataTemplate>
                         </ItemsControl.ItemTemplate>
                       </ItemsControl>
@@ -687,6 +695,7 @@
                                               Grid.Column="3"
                                               Classes="cc-prompt-chip"
                                               Content="{Binding Snippet.ActionLabel}"
+                                              IsVisible="{Binding Snippet.HasPromptAction}"
                                               Command="{Binding DataContext.ContextControl.UseSnippetForCcCommand, RelativeSource={RelativeSource AncestorType=Window}}"
                                               CommandParameter="{Binding Snippet}" />
                                           <Button
@@ -1431,10 +1440,29 @@
             </Border>
           </Grid>
 
-          <Grid Grid.Row="3" Margin="10,0,10,0" RowDefinitions="Auto,Auto,Auto" RowSpacing="5">
+          <Grid Grid.Row="3" Margin="10,0,10,0" RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="5">
             <TextBlock Text="{Binding ContextControl.PatchSummary}" Classes="cc-state-detail" />
-            <TextBlock Grid.Row="1" Text="{Binding ContextControl.LastExportPath}" Classes="path-text" />
-            <Grid Grid.Row="2" ColumnDefinitions="*,*" ColumnSpacing="6">
+            <Border Grid.Row="1" Classes="cc-log-host" MaxHeight="118" IsVisible="{Binding ContextControl.HasPatchPlanActions}">
+              <ScrollViewer
+                  VerticalScrollBarVisibility="Auto"
+                  HorizontalScrollBarVisibility="Disabled"
+                  controls:HoverScrollbarBehavior.IsEnabled="True"
+                  controls:HoverScrollbarBehavior.ReserveRight="12">
+                <ItemsControl ItemsSource="{Binding ContextControl.PatchPlanActions}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:PatchPlanActionViewModel}">
+                      <Grid ColumnDefinitions="34,34,*" ColumnSpacing="5" Margin="0,0,0,3">
+                        <TextBlock Text="{Binding AddedLabel}" Classes="history-meta" TextAlignment="Right" FontWeight="Black" Foreground="{DynamicResource GoodBrush}" />
+                        <TextBlock Grid.Column="1" Text="{Binding RemovedLabel}" Classes="history-meta" TextAlignment="Right" FontWeight="Black" Foreground="{DynamicResource BadBrush}" />
+                        <TextBlock Grid.Column="2" Text="{Binding Summary}" Classes="cc-log-message" TextTrimming="CharacterEllipsis" />
+                      </Grid>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+              </ScrollViewer>
+            </Border>
+            <TextBlock Grid.Row="2" Text="{Binding ContextControl.LastExportPath}" Classes="path-text" />
+            <Grid Grid.Row="3" ColumnDefinitions="*,*" ColumnSpacing="6">
               <Button
                   Classes="header-mini primary"
                   Content="Apply effective"

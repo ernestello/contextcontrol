@@ -1,6 +1,8 @@
 // CC-DESC: Coordinates project tabs, tree selection, history, and external-change queues.
 
 using System.Collections.ObjectModel;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Windows.Input;
 using Avalonia.Collections;
@@ -77,6 +79,11 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
     private string _locFileTypesText = "";
     private string _newLocFileTypeRuleText = "";
     private string _fileRulesStatus = "";
+    private string _projectSettingsPath = "";
+    private string _projectSettingsProjectRootText = "";
+    private string _projectSettingsOutputRootText = "";
+    private string _projectSettingsVersionCacheRootText = "";
+    private string _projectSettingsStatus = "";
     private string _projectScanSummary = "No scan yet.";
     private string _projectScanResultText = "No scan yet.";
     private string _projectScanRuleSummary = "";
@@ -287,6 +294,10 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
         ResetFileRulesCommand = new RelayCommand<object>(_ => _ = ResetFileRulesAsync());
         ScanProjectRulesCommand = new RelayCommand<object>(_ => _ = ScanProjectRulesAsync());
         AutoSetupProjectRulesCommand = new RelayCommand<object>(_ => _ = AutoSetupProjectRulesAsync());
+        SaveProjectSettingsCommand = new RelayCommand<object>(_ => SaveProjectSettings());
+        ReloadProjectSettingsCommand = new RelayCommand<object>(_ => LoadProjectSettings());
+        UseActiveProjectRootCommand = new RelayCommand<object>(_ => UseActiveProjectRootForSettings());
+        UseContextControlProjectRootCommand = new RelayCommand<object>(_ => UseContextControlProjectRootForSettings());
 
         if (!treeStatePrepared)
         {
@@ -294,6 +305,7 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
         }
 
         SelectProject(projects.FirstOrDefault());
+        LoadProjectSettings();
 
         ActiveDocument = EditorDocumentViewModel.Empty();
         // FileSystemWatcher plus the tracker's own background poll handles changes.
@@ -357,6 +369,10 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
     public ICommand ResetFileRulesCommand { get; }
     public ICommand ScanProjectRulesCommand { get; }
     public ICommand AutoSetupProjectRulesCommand { get; }
+    public ICommand SaveProjectSettingsCommand { get; }
+    public ICommand ReloadProjectSettingsCommand { get; }
+    public ICommand UseActiveProjectRootCommand { get; }
+    public ICommand UseContextControlProjectRootCommand { get; }
 
     public ThemeOptionViewModel SelectedTheme
     {
@@ -712,6 +728,7 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
             {
                 OnPropertyChanged(nameof(CanScanProjectRules));
                 OnPropertyChanged(nameof(CanAutoSetupProjectRules));
+                OnPropertyChanged(nameof(ProjectRulesActiveProjectRoot));
             }
         }
     }
@@ -914,6 +931,40 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
     {
         get => _fileRulesStatus;
         private set => SetProperty(ref _fileRulesStatus, value);
+    }
+
+    public string ProjectRulesActiveProjectRoot => CurrentProject?.ProjectRoot ?? "No project open.";
+
+    public string ProjectRulesContextControlRoot => _workbenchSettings.ContextControlRoot;
+
+    public string ProjectSettingsPath
+    {
+        get => _projectSettingsPath;
+        private set => SetProperty(ref _projectSettingsPath, value ?? "");
+    }
+
+    public string ProjectSettingsProjectRootText
+    {
+        get => _projectSettingsProjectRootText;
+        set => SetProperty(ref _projectSettingsProjectRootText, value ?? "");
+    }
+
+    public string ProjectSettingsOutputRootText
+    {
+        get => _projectSettingsOutputRootText;
+        set => SetProperty(ref _projectSettingsOutputRootText, value ?? "");
+    }
+
+    public string ProjectSettingsVersionCacheRootText
+    {
+        get => _projectSettingsVersionCacheRootText;
+        set => SetProperty(ref _projectSettingsVersionCacheRootText, value ?? "");
+    }
+
+    public string ProjectSettingsStatus
+    {
+        get => _projectSettingsStatus;
+        private set => SetProperty(ref _projectSettingsStatus, value ?? "");
     }
 
     public string ProjectScanSummary
@@ -1822,8 +1873,11 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
         }
 
         CurrentProject = project;
+        ContextControl.ActiveProjectRoot = project.ProjectRoot;
+        OnPropertyChanged(nameof(ProjectRulesActiveProjectRoot));
         if (_workspaceByProjectId.TryGetValue(project.Id, out var workspace))
         {
+            ContextControl.ActiveProjectRulesPath = workspace.FileRules.RulesPath;
             // Let the active project tile render first; loading workspace content can be expensive.
             PostToUi(() =>
             {
@@ -2574,6 +2628,86 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
         await RefreshCurrentProjectFromDiskAsync();
     }
 
+    private void LoadProjectSettings()
+    {
+        ProjectSettingsPath = Path.Combine(_workbenchSettings.ContextControlRoot, ".ccReplace.settings.json");
+
+        var settings = ReadProjectSettingsObject();
+        ProjectSettingsProjectRootText = GetProjectSetting(settings, "ProjectRoot", "auto");
+        ProjectSettingsOutputRootText = GetProjectSetting(settings, "OutputRoot", ".");
+        ProjectSettingsVersionCacheRootText = GetProjectSetting(settings, "VersionCacheRoot", ".ccReplace.versions");
+        ProjectSettingsStatus = File.Exists(ProjectSettingsPath)
+            ? $"Loaded {ProjectSettingsPath}"
+            : "Using default project settings; save to create the file.";
+    }
+
+    private void SaveProjectSettings()
+    {
+        ProjectSettingsPath = Path.Combine(_workbenchSettings.ContextControlRoot, ".ccReplace.settings.json");
+        var settings = ReadProjectSettingsObject();
+        settings["ProjectRoot"] = NormalizeProjectSettingText(ProjectSettingsProjectRootText, "auto");
+        settings["OutputRoot"] = NormalizeProjectSettingText(ProjectSettingsOutputRootText, ".");
+        settings["VersionCacheRoot"] = NormalizeProjectSettingText(ProjectSettingsVersionCacheRootText, ".ccReplace.versions");
+
+        var parent = Path.GetDirectoryName(ProjectSettingsPath);
+        if (!string.IsNullOrWhiteSpace(parent))
+        {
+            Directory.CreateDirectory(parent);
+        }
+
+        File.WriteAllText(
+            ProjectSettingsPath,
+            settings.ToJsonString(ProjectSettingsJsonOptions) + Environment.NewLine);
+        ProjectSettingsStatus = $"Saved {ProjectSettingsPath}";
+    }
+
+    private void UseActiveProjectRootForSettings()
+    {
+        if (CurrentProject is null || string.IsNullOrWhiteSpace(CurrentProject.ProjectRoot))
+        {
+            ProjectSettingsStatus = "Open a project before using the active project root.";
+            return;
+        }
+
+        ProjectSettingsProjectRootText = CurrentProject.ProjectRoot;
+        ProjectSettingsStatus = "ProjectRoot set to active project. Save to persist.";
+    }
+
+    private void UseContextControlProjectRootForSettings()
+    {
+        ProjectSettingsProjectRootText = ".";
+        ProjectSettingsStatus = "ProjectRoot set to the Context Control tool folder. Save to persist.";
+    }
+
+    private JsonObject ReadProjectSettingsObject()
+    {
+        try
+        {
+            if (File.Exists(ProjectSettingsPath))
+            {
+                return JsonNode.Parse(File.ReadAllText(ProjectSettingsPath)) as JsonObject ?? [];
+            }
+        }
+        catch
+        {
+            ProjectSettingsStatus = "Could not read project settings; editing defaults.";
+        }
+
+        return [];
+    }
+
+    private static string GetProjectSetting(JsonObject settings, string key, string fallback)
+    {
+        return settings.TryGetPropertyValue(key, out var node) && node is not null
+            ? (node.GetValue<string>() ?? fallback)
+            : fallback;
+    }
+
+    private static string NormalizeProjectSettingText(string value, string fallback)
+    {
+        return string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+    }
+
     private async Task SaveFileRulesAsync()
     {
         if (CurrentProject is null || !_workspaceByProjectId.TryGetValue(CurrentProject.Id, out var workspace))
@@ -2819,6 +2953,7 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
         SupportedFileTypesLabel = rules.SupportedLabel;
         IgnoredFileTypesLabel = rules.IgnoredLabel;
         FileRulesPath = rules.RulesPath;
+        ContextControl.ActiveProjectRulesPath = rules.RulesPath;
         SupportedFileTypesText = rules.SupportedExtensionsText;
         IgnoredFileTypesText = rules.IgnoredExtensionsText;
         LocFileTypesText = rules.LocExtensionsText;
@@ -3829,6 +3964,11 @@ public void ToggleHistoryForNode(ProjectNodeViewModel node)
         clone.SetTreeState(node.Depth, node.IsLast, node.AncestorContinues);
         return clone;
     }
+
+    private static readonly JsonSerializerOptions ProjectSettingsJsonOptions = new()
+    {
+        WriteIndented = true
+    };
 
     private sealed class ProjectWorkspaceState(
         ObservableCollection<ProjectNodeViewModel> projectTree,

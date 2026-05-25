@@ -84,27 +84,26 @@ public sealed class SkillbookService
             return;
         }
 
-        var agentPrompt = Path.Combine(ContextControlRoot, "agentPrompt.txt");
-        var text = File.Exists(agentPrompt)
-            ? File.ReadAllText(agentPrompt)
-            : BuildFallbackInstructions();
-
-        File.WriteAllText(projectDefault, text.TrimEnd() + Environment.NewLine, Utf8NoBom);
+        File.WriteAllText(projectDefault, BuildFallbackInstructions().TrimEnd() + Environment.NewLine, Utf8NoBom);
     }
 
     private static string BuildFallbackInstructions()
     {
         return """
-            You are working in ContextControl economy mode.
+            # CC-native local model skill
 
-            ROLE:
-            You are a patch author, not a repo agent.
+            You are not an autonomous filesystem agent. You only see the capsule text sent by ContextControl.
 
-            RULES:
-            - Use only the context attached to the current request.
-            - Ask for the smallest safe file/function/FIND list when only DIR context is available.
-            - Produce raw BEGIN CC-REPLACE blocks when CC source context is available and a patch is requested.
-            - Never claim to have read files that were not included in the prompt.
+            Follow the active phase:
+            - DIR context: identify the smallest useful next CC request.
+            - CC source context: answer from the provided source, or emit CC-REPLACE blocks.
+            - Patch context: review or repair the provided patch.
+            - No context: chat normally and ask for DIR/CC when code evidence is needed.
+
+            Keep outputs mechanical:
+            - Prefer exact files, FUNCTION path :: symbol, or FIND: exactText.
+            - Avoid broad folders and invented APIs.
+            - Patch output must use raw BEGIN/END CC-REPLACE blocks.
             """;
     }
 
