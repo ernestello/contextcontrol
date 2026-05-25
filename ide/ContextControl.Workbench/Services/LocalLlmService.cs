@@ -114,7 +114,8 @@ public sealed record LocalLlmRequest(
     string ModelId,
     string Prompt,
     string Phase,
-    IReadOnlyList<string> AttachmentLabels);
+    IReadOnlyList<string> AttachmentLabels,
+    int? ContextWindowTokens = null);
 
 public sealed record LocalLlmChatResult(
     bool Succeeded,
@@ -319,13 +320,18 @@ public sealed class LocalLlmService
         var chatRequest = new OllamaChatRequest(
             request.ModelId,
             [new OllamaChatMessage("user", request.Prompt.Trim())],
-            Stream: true);
+            Stream: true,
+            Options: request.ContextWindowTokens is > 0
+                ? new OllamaChatOptions(request.ContextWindowTokens.Value)
+                : null);
 
         try
         {
-            terminal?.Report($"> ollama chat {chatRequest.Model}");
+            terminal?.Report(request.ContextWindowTokens is > 0
+                ? $"> ollama chat {chatRequest.Model} --num-ctx {request.ContextWindowTokens.Value}"
+                : $"> ollama chat {chatRequest.Model}");
             progress?.Report(new LocalLlmGenerationProgress("Loading model and preparing prompt...", null, null, null, null, null, null, null, false));
-            using var http = CreateHttpClient(TimeSpan.FromMinutes(10));
+            using var http = CreateHttpClient(request.ContextWindowTokens is > 8192 ? TimeSpan.FromMinutes(30) : TimeSpan.FromMinutes(10));
             using var content = new StringContent(JsonSerializer.Serialize(chatRequest, JsonOptions), Encoding.UTF8, "application/json");
             using var response = await http.PostAsync(new Uri(OllamaBaseUri, "/api/chat"), content, cancellationToken).ConfigureAwait(false);
 
@@ -1231,7 +1237,13 @@ public sealed class LocalLlmService
 
     private sealed record OllamaModelTag(string? Name, string? Model);
 
-    private sealed record OllamaChatRequest(string Model, IReadOnlyList<OllamaChatMessage> Messages, bool Stream);
+    private sealed record OllamaChatRequest(
+        string Model,
+        IReadOnlyList<OllamaChatMessage> Messages,
+        bool Stream,
+        OllamaChatOptions? Options = null);
+
+    private sealed record OllamaChatOptions([property: JsonPropertyName("num_ctx")] int NumContext);
 
     private sealed record OllamaChatMessage(string Role, string Content);
 

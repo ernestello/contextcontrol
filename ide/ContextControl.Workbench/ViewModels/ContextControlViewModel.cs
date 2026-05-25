@@ -619,16 +619,21 @@ public sealed class ContextControlViewModel : ObservableObject
     {
         get
         {
-            var model = SelectedLocalModel;
-            var budget = EstimateComfortableBudget(model?.ComfortableContext);
+            var phase = ResolveCapsulePhase(PromptText);
+            var model = ResolveModelForPhase(phase) ?? SelectedLocalModel;
+            var comfortableBudget = EstimateComfortableBudget(model?.ComfortableContext);
+            var requestedBudget = ResolveRequestedContextTokens(model, phase);
             var attachmentBudget = EstimateAttachmentBudget();
             var total = ContextCapsuleBuilder.EstimateTokens(PromptText)
                 + attachmentBudget.SentTokens
                 + ContextCapsuleBuilder.DefaultOutputReserveTokens;
-            var pressure = budget <= 0 ? 0 : total * 100d / budget;
+            var requestedPressure = requestedBudget <= 0 ? 0 : total * 100d / requestedBudget;
+            var comfortablePressure = comfortableBudget <= 0 ? 0 : total * 100d / comfortableBudget;
             var modelLabel = model?.DisplayName ?? SelectedLocalModelLabel;
             var suffix = attachmentBudget.IsClipped ? "; clipped" : "";
-            return $"{modelLabel}: {total:N0}/{budget:N0} tok est ({pressure:0.#}%{suffix})";
+            return requestedBudget > comfortableBudget
+                ? $"{modelLabel}: {total:N0}/{requestedBudget:N0} tok send ({requestedPressure:0.#}% req; {comfortablePressure:0.#}% comfy{suffix})"
+                : $"{modelLabel}: {total:N0}/{comfortableBudget:N0} tok est ({comfortablePressure:0.#}%{suffix})";
         }
     }
 
@@ -1841,11 +1846,13 @@ public sealed class ContextControlViewModel : ObservableObject
         }
 
         var capsuleAttachments = await BuildCapsuleAttachmentsAsync(phase);
+        var requestedContextTokens = ResolveRequestedContextTokens(model, phase);
         var capsule = _capsuleBuilder.Build(new ContextCapsuleBuildRequest(
             capsuleMessage,
             phase,
             model.Id,
             model.ComfortableContext,
+            requestedContextTokens,
             _skillbookService.BuildEnabledInstructionText(),
             capsuleAttachments));
 
@@ -1864,13 +1871,15 @@ public sealed class ContextControlViewModel : ObservableObject
         var generationProgress = CreateGenerationProgress(model.DisplayName);
         var terminal = CreateTerminalProgress();
         terminal.Report($"Sending {FormatCapsulePhase(phase)} capsule to {model.DisplayName} ({model.Id})...");
+        terminal.Report($"Requested Ollama context window: {capsule.RequestedContextTokens:N0} tokens.");
 
         var result = await _localLlmService.SendChatAsync(
             new LocalLlmRequest(
                 model.Id,
                 capsule.Text,
                 FormatCapsulePhase(phase),
-                attachmentSnapshot.Select(attachment => attachment.DisplayTitle).ToArray()),
+                attachmentSnapshot.Select(attachment => attachment.DisplayTitle).ToArray(),
+                capsule.RequestedContextTokens),
             generationProgress,
             terminal);
 
@@ -2494,6 +2503,25 @@ public sealed class ContextControlViewModel : ObservableObject
             ?? InstalledLocalModels.FirstOrDefault();
     }
 
+    private static int ResolveRequestedContextTokens(LocalLlmModelViewModel? model, ContextCapsulePhase phase)
+    {
+        if (model is null)
+        {
+            return ContextCapsuleBuilder.DefaultComfortableContextTokens;
+        }
+
+        var comfortable = ContextCapsuleBuilder.EstimateContextTokens(
+            model.ComfortableContext,
+            ContextCapsuleBuilder.DefaultComfortableContextTokens);
+        if (phase == ContextCapsulePhase.Chat)
+        {
+            return comfortable;
+        }
+
+        var advertised = ContextCapsuleBuilder.EstimateContextTokens(model.AdvertisedContext, comfortable);
+        return Math.Max(comfortable, advertised);
+    }
+
     private async Task<IReadOnlyList<ContextCapsuleAttachment>> BuildCapsuleAttachmentsAsync(ContextCapsulePhase phase)
     {
         var results = new List<ContextCapsuleAttachment>();
@@ -2688,9 +2716,10 @@ public sealed class ContextControlViewModel : ObservableObject
     {
         var fullTokens = 0;
         var sentTokens = 0;
-        var remainingCharacters = ContextCapsuleBuilder.MaxAttachmentCharacters;
         var clipped = false;
         var phase = ResolveCapsulePhase(PromptText);
+        var requestedContextTokens = ResolveRequestedContextTokens(ResolveModelForPhase(phase), phase);
+        var remainingCharacters = ContextCapsuleBuilder.EstimateAttachmentCharacterLimit(requestedContextTokens);
 
         foreach (var attachment in Attachments.Where(attachment => ShouldIncludeAttachmentForPhase(attachment, phase)))
         {

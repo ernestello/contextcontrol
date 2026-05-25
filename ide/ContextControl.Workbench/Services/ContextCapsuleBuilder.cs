@@ -24,6 +24,7 @@ public sealed record ContextCapsuleBuildRequest(
     ContextCapsulePhase Phase,
     string ModelId,
     string ModelContextLabel,
+    int TargetContextTokens,
     string SkillbookInstructions,
     IReadOnlyList<ContextCapsuleAttachment> Attachments);
 
@@ -33,6 +34,7 @@ public sealed record ContextCapsule(
     int EstimatedInputTokens,
     int EstimatedAttachmentTokens,
     int ComfortableContextTokens,
+    int RequestedContextTokens,
     int OutputReserveTokens,
     double ContextPressurePercent,
     string Summary);
@@ -42,11 +44,13 @@ public sealed class ContextCapsuleBuilder
     public const int DefaultComfortableContextTokens = 4096;
     public const int DefaultOutputReserveTokens = 900;
     public const int MaxAttachmentCharacters = 28_000;
+    public const int MaxExpandedAttachmentCharacters = 512_000;
     public const string AttachmentClipMarker = "[attachment clipped by local context budget]";
 
     public ContextCapsule Build(ContextCapsuleBuildRequest request)
     {
-        var comfortableTokens = EstimateComfortableContextTokens(request.ModelContextLabel);
+        var comfortableTokens = EstimateContextTokens(request.ModelContextLabel, DefaultComfortableContextTokens);
+        var requestedTokens = Math.Max(comfortableTokens, request.TargetContextTokens);
         var outputReserve = DefaultOutputReserveTokens;
         var builder = new StringBuilder();
 
@@ -55,9 +59,11 @@ public sealed class ContextCapsuleBuilder
         builder.AppendLine($"Model: {request.ModelId}");
         builder.AppendLine($"Phase: {FormatPhase(request.Phase)}");
         builder.AppendLine($"Comfortable context target: {comfortableTokens} tokens");
+        builder.AppendLine($"Requested Ollama context: {requestedTokens} tokens");
         builder.AppendLine();
         builder.AppendLine("Core rule: the visible project context is included below as attachment text.");
         builder.AppendLine("Use that text directly. You cannot access anything outside this capsule or run tools.");
+        builder.AppendLine("This is an authorized local project editing workflow; do not give a generic refusal when the requested edit can be answered from visible context.");
         builder.AppendLine();
         builder.AppendLine(BuildPhaseContract(request.Phase));
         builder.AppendLine();
@@ -74,7 +80,7 @@ public sealed class ContextCapsuleBuilder
         builder.AppendLine();
 
         var attachmentTokens = 0;
-        var remainingAttachmentChars = MaxAttachmentCharacters;
+        var remainingAttachmentChars = EstimateAttachmentCharacterLimit(requestedTokens, outputReserve);
         var included = request.Attachments.Where(attachment => attachment.Included).ToArray();
         if (included.Length > 0)
         {
@@ -106,10 +112,12 @@ public sealed class ContextCapsuleBuilder
 
         var textOut = builder.ToString().TrimEnd();
         var inputTokens = EstimateTokens(textOut);
-        var pressure = comfortableTokens <= 0
+        var pressure = requestedTokens <= 0
             ? 0
-            : Math.Clamp(inputTokens * 100d / Math.Max(1, comfortableTokens - outputReserve), 0, 999);
-        var summary = $"{inputTokens:N0} in tok; {attachmentTokens:N0} attachment tok; {outputReserve:N0} reserve; {pressure:0.#}% of comfortable context";
+            : Math.Clamp(inputTokens * 100d / Math.Max(1, requestedTokens - outputReserve), 0, 999);
+        var summary = requestedTokens > comfortableTokens
+            ? $"{inputTokens:N0} in tok; {attachmentTokens:N0} attachment tok; {outputReserve:N0} reserve; {pressure:0.#}% of requested ctx; comfy {comfortableTokens:N0}"
+            : $"{inputTokens:N0} in tok; {attachmentTokens:N0} attachment tok; {outputReserve:N0} reserve; {pressure:0.#}% of comfortable context";
 
         return new ContextCapsule(
             textOut,
@@ -117,6 +125,7 @@ public sealed class ContextCapsuleBuilder
             inputTokens,
             attachmentTokens,
             comfortableTokens,
+            requestedTokens,
             outputReserve,
             pressure,
             summary);
@@ -125,6 +134,43 @@ public sealed class ContextCapsuleBuilder
     public static int EstimateTokens(string text)
     {
         return string.IsNullOrEmpty(text) ? 0 : (int)Math.Ceiling(text.Length / 4d);
+    }
+
+    public static int EstimateContextTokens(string? contextLabel, int fallbackTokens = DefaultComfortableContextTokens)
+    {
+        var label = contextLabel ?? "";
+        var digits = new StringBuilder();
+        for (var index = 0; index < label.Length; index++)
+        {
+            var ch = label[index];
+            if (char.IsDigit(ch))
+            {
+                digits.Append(ch);
+                continue;
+            }
+
+            if (digits.Length > 0)
+            {
+                var unit = ch;
+                if (char.ToUpperInvariant(unit) == 'K'
+                    && int.TryParse(digits.ToString(), out var thousands)
+                    && thousands > 0)
+                {
+                    return thousands * 1024;
+                }
+
+                digits.Clear();
+            }
+        }
+
+        return fallbackTokens;
+    }
+
+    public static int EstimateAttachmentCharacterLimit(int contextTokens, int outputReserveTokens = DefaultOutputReserveTokens)
+    {
+        var usableTokens = Math.Max(DefaultComfortableContextTokens - outputReserveTokens, contextTokens - outputReserveTokens);
+        var characters = Math.Max(MaxAttachmentCharacters, usableTokens * 4);
+        return Math.Min(MaxExpandedAttachmentCharacters, characters);
     }
 
     private static string BuildPhaseContract(ContextCapsulePhase phase)
@@ -171,19 +217,5 @@ public sealed class ContextCapsuleBuilder
         };
     }
 
-    private static int EstimateComfortableContextTokens(string contextLabel)
-    {
-        var label = contextLabel ?? "";
-        if (label.Contains("8K", StringComparison.OrdinalIgnoreCase))
-        {
-            return 8192;
-        }
-
-        if (label.Contains("4K", StringComparison.OrdinalIgnoreCase))
-        {
-            return 4096;
-        }
-
-        return DefaultComfortableContextTokens;
-    }
+    private static int EstimateComfortableContextTokens(string contextLabel) => EstimateContextTokens(contextLabel);
 }
