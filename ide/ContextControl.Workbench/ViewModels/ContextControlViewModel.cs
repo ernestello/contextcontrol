@@ -2148,64 +2148,120 @@ public sealed class ContextControlViewModel : ObservableObject
 
     private static int ScoreSemanticPathCandidate(string userMessage, IReadOnlyList<string> queryWords, string path, string semanticLine)
     {
-        var haystack = $"{path} {semanticLine}";
-        var score = queryWords.Count(word => haystack.Contains(word, StringComparison.OrdinalIgnoreCase)) * 4;
-        var lowerRequest = userMessage.ToLowerInvariant();
+        var score = 0;
+        var lineTokens = ExtractSemanticTokens(semanticLine).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        var pathTokens = ExtractSemanticTokens(path).ToHashSet(StringComparer.OrdinalIgnoreCase);
         var lowerPath = path.ToLowerInvariant();
         var lowerLine = semanticLine.ToLowerInvariant();
-
-        var asksPromptSendButton = lowerRequest.Contains("prompt", StringComparison.Ordinal)
-            && lowerRequest.Contains("send", StringComparison.Ordinal)
-            && lowerRequest.Contains("button", StringComparison.Ordinal);
-        if (asksPromptSendButton && lowerLine.Contains("cc-prompt-send", StringComparison.Ordinal))
+        foreach (var word in queryWords)
         {
-            score += 60;
+            if (pathTokens.Contains(word))
+            {
+                score += 12;
+            }
+
+            if (lineTokens.Contains(word))
+            {
+                score += 10;
+            }
+
+            if (lowerLine.Contains(word, StringComparison.OrdinalIgnoreCase))
+            {
+                score += 3;
+            }
         }
 
-        if ((lowerRequest.Contains("red", StringComparison.Ordinal)
-                || lowerRequest.Contains("color", StringComparison.Ordinal)
-                || lowerRequest.Contains("colour", StringComparison.Ordinal)
-                || lowerRequest.Contains("style", StringComparison.Ordinal))
-            && lowerPath.Contains("workbenchdesign.axaml", StringComparison.Ordinal))
+        var wantsVisualStyle = queryWords.Any(IsVisualStyleWord);
+        if (wantsVisualStyle)
         {
-            score += 45;
+            if (lineTokens.Overlaps(["style", "styles", "theme", "themes", "class", "classes", "control", "controls", "resource", "resources"]))
+            {
+                score += 18;
+            }
+
+            if (Path.GetExtension(path).Equals(".axaml", StringComparison.OrdinalIgnoreCase))
+            {
+                score += 12;
+            }
+
+            if (lowerPath.EndsWith(".cs", StringComparison.Ordinal))
+            {
+                score -= 16;
+            }
         }
 
-        if (asksPromptSendButton && lowerPath.Contains("mainwindow.axaml", StringComparison.Ordinal))
-        {
-            score += 30;
-        }
-
-        if (asksPromptSendButton && lowerPath.Contains("contextcontrolviewmodel.cs", StringComparison.Ordinal))
-        {
-            score += 12;
-        }
-
-        if (lowerPath.Contains("/styles/", StringComparison.Ordinal) && lowerRequest.Contains("button", StringComparison.Ordinal))
-        {
-            score += 18;
-        }
-
-        if (lowerPath.Contains("/views/", StringComparison.Ordinal) && lowerRequest.Contains("window", StringComparison.Ordinal))
+        if (queryWords.Any(word => word.Equals("window", StringComparison.OrdinalIgnoreCase))
+            && lineTokens.Overlaps(["layout", "pane", "panes", "window", "windows"]))
         {
             score += 10;
         }
 
-        if ((lowerRequest.Contains("red", StringComparison.Ordinal)
-                || lowerRequest.Contains("color", StringComparison.Ordinal)
-                || lowerRequest.Contains("colour", StringComparison.Ordinal)
-                || lowerRequest.Contains("style", StringComparison.Ordinal))
-            && lowerPath.EndsWith(".cs", StringComparison.Ordinal))
+        if (queryWords.Any(word => word.Equals("button", StringComparison.OrdinalIgnoreCase))
+            && lineTokens.Overlaps(["button", "buttons", "control", "controls", "class", "classes"]))
         {
-            score -= 50;
+            score += 10;
         }
 
-        if (asksPromptSendButton && lowerPath.Contains("themesettings", StringComparison.Ordinal))
+        if (queryWords.Any(word => word.Equals("send", StringComparison.OrdinalIgnoreCase))
+            && lineTokens.Contains("send"))
         {
-            score -= 30;
+            score += 10;
         }
 
         return score;
+    }
+
+    private static IEnumerable<string> ExtractSemanticTokens(string text)
+    {
+        var builder = new StringBuilder();
+        var previousWasLower = false;
+        foreach (var character in text ?? "")
+        {
+            if (char.IsUpper(character) && previousWasLower && builder.Length > 0)
+            {
+                yield return builder.ToString().ToLowerInvariant();
+                builder.Clear();
+            }
+
+            if (char.IsLetterOrDigit(character))
+            {
+                builder.Append(char.ToLowerInvariant(character));
+                previousWasLower = char.IsLower(character);
+                continue;
+            }
+
+            if (builder.Length > 0)
+            {
+                yield return builder.ToString().ToLowerInvariant();
+                builder.Clear();
+            }
+
+            previousWasLower = false;
+        }
+
+        if (builder.Length > 0)
+        {
+            yield return builder.ToString().ToLowerInvariant();
+        }
+    }
+
+    private static bool IsVisualStyleWord(string word)
+    {
+        return word.Equals("color", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("colour", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("red", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("green", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("blue", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("black", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("white", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("yellow", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("purple", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("orange", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("style", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("theme", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("background", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("foreground", StringComparison.OrdinalIgnoreCase)
+            || word.Equals("border", StringComparison.OrdinalIgnoreCase);
     }
 
     private static string BuildFallbackFindRequest(string userMessage)
