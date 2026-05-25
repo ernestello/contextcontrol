@@ -9,7 +9,11 @@ $script:TextExtensions = @(
     ".ps1", ".bat", ".cmd",
     ".glsl", ".vert", ".frag", ".comp", ".geom", ".tesc", ".tese", ".mesh", ".task", ".shader",
     ".gd", ".gdshader", ".tscn", ".tres",
-    ".cs", ".ts", ".js", ".html", ".css"
+    ".axaml", ".xaml", ".xml",
+    ".cs", ".csproj", ".fs", ".fsproj", ".vb", ".vbproj",
+    ".props", ".targets", ".sln",
+    ".ts", ".tsx", ".js", ".jsx", ".html", ".css",
+    ".py", ".rs", ".sh", ".bash", ".zsh", ".lua", ".metal", ".slang", ".wgsl"
 )
 
 # Files searched by FUNC:/FIND:.
@@ -23,7 +27,11 @@ $script:CodeSearchExtensions = @(
     ".ps1", ".bat", ".cmd",
     ".glsl", ".vert", ".frag", ".comp", ".geom", ".tesc", ".tese", ".mesh", ".task", ".shader",
     ".gd", ".gdshader", ".tscn", ".tres",
-    ".cs", ".ts", ".js", ".html", ".css"
+    ".axaml", ".xaml", ".xml",
+    ".cs", ".csproj", ".fs", ".fsproj", ".vb", ".vbproj",
+    ".props", ".targets", ".sln",
+    ".ts", ".tsx", ".js", ".jsx", ".html", ".css",
+    ".py", ".rs", ".sh", ".bash", ".zsh", ".lua", ".metal", ".slang", ".wgsl"
 )
 
 $script:ExcludeDirs = @(
@@ -49,6 +57,7 @@ $script:BinaryExtensions = @(
 )
 
 $script:IgnoredFiles = @()
+$script:DefaultTextExtensions = @($script:TextExtensions)
 $script:DefaultCodeSearchExtensions = @($script:CodeSearchExtensions)
 $script:DefaultExcludeDirs = @($script:ExcludeDirs)
 $script:DefaultIgnoredFiles = @($script:IgnoredFiles)
@@ -102,14 +111,22 @@ function Set-CcExportFilterRules {
 
     $ignoreDirs = New-Object System.Collections.Generic.List[string]
     $ignoreFiles = New-Object System.Collections.Generic.List[string]
+    $textSupported = New-Object System.Collections.Generic.List[string]
     $searchSupported = New-Object System.Collections.Generic.List[string]
     $searchIgnored = New-Object System.Collections.Generic.List[string]
 
     foreach ($value in @($script:DefaultExcludeDirs)) { [void]$ignoreDirs.Add([string]$value) }
     foreach ($value in @($script:DefaultIgnoredFiles)) { [void]$ignoreFiles.Add([string]$value) }
+    foreach ($value in @($script:DefaultTextExtensions)) { [void]$textSupported.Add([string]$value) }
     foreach ($value in @($script:DefaultCodeSearchExtensions)) { [void]$searchSupported.Add([string]$value) }
 
     if ($null -ne $Settings) {
+        if ($Settings.PSObject.Properties.Name -contains "SupportedFileExtensions") {
+            foreach ($value in @($Settings.SupportedFileExtensions)) {
+                [void]$textSupported.Add([string]$value)
+                [void]$searchSupported.Add([string]$value)
+            }
+        }
         if ($Settings.PSObject.Properties.Name -contains "IgnoredDirectories") {
             foreach ($value in @($Settings.IgnoredDirectories)) { [void]$ignoreDirs.Add([string]$value) }
         }
@@ -122,6 +139,12 @@ function Set-CcExportFilterRules {
     }
 
     if ($null -ne $Rules) {
+        if ($Rules.PSObject.Properties.Name -contains "SupportedExtensions") {
+            foreach ($value in @($Rules.SupportedExtensions)) {
+                [void]$textSupported.Add([string]$value)
+                [void]$searchSupported.Add([string]$value)
+            }
+        }
         if ($Rules.PSObject.Properties.Name -contains "IgnoredDirectories") {
             foreach ($value in @($Rules.IgnoredDirectories)) { [void]$ignoreDirs.Add([string]$value) }
         }
@@ -135,8 +158,9 @@ function Set-CcExportFilterRules {
 
     $script:ExcludeDirs = @(Normalize-CcExportNameList $ignoreDirs.ToArray())
     $script:IgnoredFiles = @(Normalize-CcExportNameList $ignoreFiles.ToArray())
-    $script:SearchSupportedExtensions = @(Normalize-CcExportExtensionList $searchSupported.ToArray())
     $script:SearchIgnoredExtensions = @(Normalize-CcExportExtensionList $searchIgnored.ToArray())
+    $script:TextExtensions = @(Normalize-CcExportExtensionList $textSupported.ToArray() | Where-Object { $script:SearchIgnoredExtensions -notcontains $_ })
+    $script:SearchSupportedExtensions = @(Normalize-CcExportExtensionList $searchSupported.ToArray() | Where-Object { $script:SearchIgnoredExtensions -notcontains $_ })
     $script:SearchCandidateFilesCacheRoot = $null
     $script:SearchCandidateFilesCache = $null
 }
