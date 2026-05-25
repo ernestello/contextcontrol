@@ -1884,6 +1884,11 @@ public sealed class ContextControlViewModel : ObservableObject
                 _lastAssistantPatchBlocks = latestPatch.Text;
             }
 
+            if (phase == ContextCapsulePhase.FileRequest)
+            {
+                AppendFileRequestFallbackIfNeeded(assistant, capsuleMessage);
+            }
+
             if (assistant.HasThinking)
             {
                 model.MarkThinkingDetected();
@@ -1955,6 +1960,116 @@ public sealed class ContextControlViewModel : ObservableObject
                 || ContextPromptBuilder.IsCodeExportRequestLine(clean);
         });
         return requestLike >= Math.Max(1, lines.Length - 1);
+    }
+
+    private void AppendFileRequestFallbackIfNeeded(LocalLlmChatMessageViewModel assistant, string userMessage)
+    {
+        if (assistant.Snippets.Any(snippet => snippet.IsRequestList))
+        {
+            return;
+        }
+
+        var fallback = BuildFallbackFindRequest(userMessage);
+        if (string.IsNullOrWhiteSpace(fallback))
+        {
+            PhaseTitle = "No file request";
+            PhaseDetail = "The model returned no CC request lines. Try a more specific file, UI label, or FIND term.";
+            return;
+        }
+
+        AppendChatMessage(new LocalLlmChatMessageViewModel(
+            "assistant",
+            $"The model did not return usable CC request lines. ContextControl generated a discovery fallback from your request.{Environment.NewLine}{Environment.NewLine}```text{Environment.NewLine}{fallback}{Environment.NewLine}```",
+            "ContextControl",
+            "file request fallback"));
+        PhaseTitle = "File request fallback";
+        PhaseDetail = "The model returned no files; use the generated FIND list for CC.";
+        AppendTerminalOutput("File request fallback generated because the model returned no usable paths.");
+    }
+
+    private static string BuildFallbackFindRequest(string userMessage)
+    {
+        var terms = ExtractFallbackFindTerms(userMessage).Take(5).ToArray();
+        if (terms.Length == 0)
+        {
+            return "";
+        }
+
+        return string.Join(
+            Environment.NewLine,
+            terms.Select(term => $"FIND: {term}").Append("END"));
+    }
+
+    private static IEnumerable<string> ExtractFallbackFindTerms(string text)
+    {
+        var words = ExtractSearchWords(text).ToArray();
+        if (words.Length == 0)
+        {
+            yield break;
+        }
+
+        var emitted = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        for (var index = 0; index < words.Length - 1; index++)
+        {
+            if (!IsUsefulFindWord(words[index]) || !IsUsefulFindWord(words[index + 1]))
+            {
+                continue;
+            }
+
+            var lowerNext = words[index + 1].ToLowerInvariant();
+            if (lowerNext is "button" or "window" or "panel" or "tab" or "view" or "style" or "theme")
+            {
+                var phrase = $"{words[index]} {words[index + 1]}";
+                if (emitted.Add(phrase))
+                {
+                    yield return phrase;
+                }
+            }
+        }
+
+        foreach (var word in words.Where(IsUsefulFindWord))
+        {
+            if (emitted.Add(word))
+            {
+                yield return word;
+            }
+        }
+    }
+
+    private static IEnumerable<string> ExtractSearchWords(string text)
+    {
+        var current = new StringBuilder();
+        foreach (var character in text ?? "")
+        {
+            if (char.IsLetterOrDigit(character) || character is '_' or '-')
+            {
+                current.Append(character);
+                continue;
+            }
+
+            if (current.Length > 0)
+            {
+                yield return current.ToString();
+                current.Clear();
+            }
+        }
+
+        if (current.Length > 0)
+        {
+            yield return current.ToString();
+        }
+    }
+
+    private static bool IsUsefulFindWord(string word)
+    {
+        var clean = (word ?? "").Trim();
+        if (clean.Length < 3)
+        {
+            return false;
+        }
+
+        var lower = clean.ToLowerInvariant();
+        return lower is not ("make" or "change" or "set" or "the" or "and" or "for" or "with" or "from" or "into" or "that" or "this" or "should" or "please" or "color" or "colour" or "red" or "blue" or "green" or "black" or "white" or "yellow" or "purple" or "orange");
     }
 
     private IReadOnlyList<string> FindMissingRequestPaths(IReadOnlyList<string> requestLines)

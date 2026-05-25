@@ -138,6 +138,7 @@ public sealed class ContextCapsuleBuilder
                 Every exact file path must be copied from the attached DIR tree exactly.
                 If the user's named path is absent from the DIR tree, treat it as a hint and return real nearby tree paths or FIND: terms.
                 Never invent src/, .xaml.cs, .csproj, or framework-style paths that are not present in the tree.
+                Never return END by itself. If unsure, output 2-5 FIND: terms from the user request, then END.
                 """,
             ContextCapsulePhase.PatchWrite => """
                 Phase contract:
