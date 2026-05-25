@@ -888,7 +888,7 @@ public sealed class ContextControlViewModel : ObservableObject
 
         if (ChatSessions.Count == 0)
         {
-            CreateNewChatSession(save: false);
+            CreateNewChatSession(save: false, resetWorkflow: false);
             return;
         }
 
@@ -900,16 +900,26 @@ public sealed class ContextControlViewModel : ObservableObject
 
     private void CreateNewChatSession()
     {
-        CreateNewChatSession(save: true);
+        CreateNewChatSession(save: true, resetWorkflow: true);
     }
 
     private void CreateNewChatSession(bool save)
+    {
+        CreateNewChatSession(save, resetWorkflow: true);
+    }
+
+    private void CreateNewChatSession(bool save, bool resetWorkflow)
     {
         var session = ChatSessionViewModel.CreateNew();
         ChatSessions.Insert(0, session);
         OnPropertyChanged(nameof(HasChatSessions));
         OnPropertyChanged(nameof(ChatHistorySummary));
         SelectChatSession(session, save);
+
+        if (resetWorkflow)
+        {
+            ResetChatWorkflowState();
+        }
     }
 
     private void SelectChatSession(ChatSessionViewModel? session)
@@ -964,7 +974,7 @@ public sealed class ContextControlViewModel : ObservableObject
 
         if (ChatSessions.Count == 0)
         {
-            CreateNewChatSession(save: false);
+            CreateNewChatSession(save: false, resetWorkflow: true);
             SaveChatHistory();
             PhaseTitle = "Chat removed";
             PhaseDetail = "Started a fresh chat.";
@@ -982,11 +992,26 @@ public sealed class ContextControlViewModel : ObservableObject
         PhaseDetail = session.Title;
     }
 
+    private void ResetChatWorkflowState()
+    {
+        Attachments.Clear();
+        _lastAssistantPatchBlocks = "";
+        _lastUserRequest = "";
+        PromptText = "";
+        LastExportPath = "";
+        IsPatchPlanReady = false;
+        PatchSummary = "No patch loaded.";
+        UpdatePatchPlanActions(null);
+        NotifyAttachmentStateChanged();
+        PhaseTitle = "New chat";
+        PhaseDetail = "Fresh local chat with no DIR, CC, patch, or previous request context.";
+    }
+
     private void AppendChatMessage(LocalLlmChatMessageViewModel message)
     {
         if (SelectedChatSession is null)
         {
-            CreateNewChatSession(save: false);
+            CreateNewChatSession(save: false, resetWorkflow: false);
         }
 
         ChatMessages.Add(message);
@@ -1901,6 +1926,11 @@ public sealed class ContextControlViewModel : ObservableObject
 
     private LocalLlmModelViewModel? ResolveModelForPhase(ContextCapsulePhase phase)
     {
+        if (SelectedLocalModel is { IsInstalled: true } selected)
+        {
+            return selected;
+        }
+
         var preferredId = phase switch
         {
             ContextCapsulePhase.FileRequest => FileRequestModelId,
@@ -1910,7 +1940,6 @@ public sealed class ContextControlViewModel : ObservableObject
         };
 
         return InstalledLocalModels.FirstOrDefault(model => string.Equals(model.Id, preferredId, StringComparison.OrdinalIgnoreCase))
-            ?? SelectedLocalModel
             ?? InstalledLocalModels.FirstOrDefault();
     }
 
