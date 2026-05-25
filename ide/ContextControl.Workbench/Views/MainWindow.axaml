@@ -668,10 +668,18 @@
                               <ItemsControl.ItemTemplate>
                                 <DataTemplate DataType="{x:Type vm:LocalLlmChatPartViewModel}">
                                   <Grid>
-                                    <TextBlock
-                                        Classes="cc-chat-text"
-                                        Text="{Binding Text}"
-                                        IsVisible="{Binding IsText}" />
+                                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="5" IsVisible="{Binding IsText}">
+                                      <SelectableTextBlock
+                                          Classes="cc-chat-text"
+                                          Text="{Binding Text}" />
+                                      <Button
+                                          Grid.Column="1"
+                                          Classes="chat-text-copy"
+                                          Content="⧉"
+                                          ToolTip.Tip="Copy message text"
+                                          Command="{Binding DataContext.ContextControl.CopyChatTextCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                          CommandParameter="{Binding}" />
+                                    </Grid>
                                     <Border Classes="chat-snippet" IsVisible="{Binding IsSnippet}">
                                       <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="5">
                                         <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto" ColumnSpacing="5">

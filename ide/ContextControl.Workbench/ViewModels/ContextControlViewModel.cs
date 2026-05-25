@@ -143,6 +143,7 @@ public sealed class ContextControlViewModel : ObservableObject
         SwitchPromptToTerminalCommand = new RelayCommand<object>(_ => PromptModeKey = "terminal");
         ClearTerminalCommand = new RelayCommand<object>(_ => TerminalOutputText = "");
         CopySnippetCommand = new RelayCommand<ChatSnippetViewModel>(snippet => _ = CopySnippetAsync(snippet));
+        CopyChatTextCommand = new RelayCommand<LocalLlmChatPartViewModel>(part => _ = CopyChatTextAsync(part));
         UseSnippetForCcCommand = new RelayCommand<ChatSnippetViewModel>(UseSnippetForCc);
         PreviewSnippetCommand = new RelayCommand<ChatSnippetViewModel>(snippet => _ = PreviewSnippetAsync(snippet), snippet => snippet?.IsPatch == true);
         ToggleAttachmentIncludeCommand = new RelayCommand<ContextControlAttachmentViewModel>(ToggleAttachmentInclude);
@@ -201,6 +202,7 @@ public sealed class ContextControlViewModel : ObservableObject
     public ICommand SwitchPromptToTerminalCommand { get; }
     public ICommand ClearTerminalCommand { get; }
     public ICommand CopySnippetCommand { get; }
+    public ICommand CopyChatTextCommand { get; }
     public ICommand UseSnippetForCcCommand { get; }
     public ICommand PreviewSnippetCommand { get; }
     public ICommand ToggleAttachmentIncludeCommand { get; }
@@ -846,6 +848,19 @@ public sealed class ContextControlViewModel : ObservableObject
         PhaseTitle = "Snippet copied";
         PhaseDetail = snippet.Title;
         Log("info", $"Copied snippet: {snippet.Title}");
+    }
+
+    private async Task CopyChatTextAsync(LocalLlmChatPartViewModel? part)
+    {
+        if (part is null || !part.IsText || string.IsNullOrWhiteSpace(part.Text) || _clipboardWriter is null)
+        {
+            return;
+        }
+
+        await _clipboardWriter(part.Text);
+        PhaseTitle = "Chat text copied";
+        PhaseDetail = "Copied message body text only.";
+        Log("info", "Copied chat message text.");
     }
 
     private void UseSnippetForCc(ChatSnippetViewModel? snippet)
