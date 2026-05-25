@@ -132,7 +132,7 @@ public sealed class ContextCapsuleBuilder
         {
             ContextCapsulePhase.FileRequest => """
                 Phase contract:
-                DIR/tree context is attached.
+                DIR semantic map/tree context is attached.
                 Output only the smallest safe CC request list, ending with END.
                 Valid lines: exact file, FUNCTION path :: symbol, FIND: exactText.
                 Every exact file path must be copied from the attached DIR tree exactly.

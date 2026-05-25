@@ -8,6 +8,7 @@ namespace ContextControl.Workbench.Services;
 public sealed class ContextControlProcessService
 {
     private const string DirectoryExportFileName = "cc_project_dir.md";
+    private const string SemanticMapFileName = "cc_semantic_map.md";
     private const string CodeExportFileName = "cc_code_export.md";
     private const string PatchFileName = "patch.txt";
 
@@ -20,6 +21,7 @@ public sealed class ContextControlProcessService
 
     public string ContextRoot { get; }
     public string DirectoryExportPath => Path.Combine(ContextRoot, DirectoryExportFileName);
+    public string SemanticMapPath => Path.Combine(ContextRoot, SemanticMapFileName);
     public string CodeExportPath => Path.Combine(ContextRoot, CodeExportFileName);
     public string PatchPath => Path.Combine(ContextRoot, PatchFileName);
 
@@ -90,6 +92,17 @@ public sealed class ContextControlProcessService
         }
 
         await File.WriteAllTextAsync(PatchPath, patchText ?? "", new UTF8Encoding(false), cancellationToken);
+    }
+
+    public async Task WriteSemanticMapAsync(string semanticMapText, CancellationToken cancellationToken = default)
+    {
+        var parent = Path.GetDirectoryName(SemanticMapPath);
+        if (!string.IsNullOrWhiteSpace(parent))
+        {
+            Directory.CreateDirectory(parent);
+        }
+
+        await File.WriteAllTextAsync(SemanticMapPath, semanticMapText ?? "", new UTF8Encoding(false), cancellationToken);
     }
 
     public async Task<ContextControlCommandResult> PreviewPatchAsync(

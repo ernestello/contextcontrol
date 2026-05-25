@@ -38,6 +38,7 @@ public sealed class ContextControlViewModel : ObservableObject
     private readonly LocalLlmService _localLlmService;
     private readonly SkillbookService _skillbookService;
     private readonly ContextCapsuleBuilder _capsuleBuilder;
+    private readonly ContextSemanticMapBuilder _semanticMapBuilder;
     private readonly ChatHistoryService _chatHistoryService;
     private Func<string, Task>? _clipboardWriter;
     private bool _isBusy;
@@ -92,6 +93,7 @@ public sealed class ContextControlViewModel : ObservableObject
         _localLlmService = new LocalLlmService();
         _skillbookService = new SkillbookService(settings.ContextControlRoot);
         _capsuleBuilder = new ContextCapsuleBuilder();
+        _semanticMapBuilder = new ContextSemanticMapBuilder();
         _chatHistoryService = new ChatHistoryService(settings.ContextControlRoot);
         _fileRequestModelId = settings.FileRequestModel;
         _patchWriteModelId = settings.PatchWriteModel;
@@ -1631,16 +1633,21 @@ public sealed class ContextControlViewModel : ObservableObject
                 return;
             }
 
+            var directoryExportText = await _processService.ReadOutputFileAsync(_processService.DirectoryExportPath);
+            var semanticMap = await _semanticMapBuilder.BuildAsync(ResolveEffectiveProjectRootPath(), directoryExportText);
+            await _processService.WriteSemanticMapAsync(semanticMap);
+
             RemoveAttachmentsByKind("code", "patch");
             _lastAssistantPatchBlocks = "";
             IsPatchPlanReady = false;
             PatchSummary = "No patch loaded.";
             UpdatePatchPlanActions(null);
-            AddAttachment(Path.GetFileName(_processService.DirectoryExportPath), _processService.DirectoryExportPath, "dir");
-            LastExportPath = _processService.DirectoryExportPath;
+            AddAttachment(Path.GetFileName(_processService.SemanticMapPath), _processService.SemanticMapPath, "dir");
+            LastExportPath = _processService.SemanticMapPath;
             PromptText = StripLegacyDirPayload(PromptText);
             PhaseTitle = "Waiting for scope";
-            PhaseDetail = "DIR export attached. Send your prompt; request only the smallest safe file/function/FIND list for CC.";
+            PhaseDetail = "Semantic DIR map attached. Send your prompt; request only the smallest safe file/function/FIND list for CC.";
+            AppendTerminalOutput($"DIR semantic map ready: {Path.GetFileName(_processService.SemanticMapPath)}");
         });
     }
 
