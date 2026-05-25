@@ -18,6 +18,7 @@ public sealed class ContextControlAttachmentViewModel(string label, string path,
     private string _label = label ?? "";
     private string _path = path ?? "";
     private string _kind = kind ?? "";
+    private bool _includeInPrompt = IsAutoIncludedKind(kind ?? "");
 
     public string Label
     {
@@ -57,6 +58,20 @@ public sealed class ContextControlAttachmentViewModel(string label, string path,
 
     public string DisplayTitle => string.IsNullOrWhiteSpace(FileName) ? Label : FileName;
 
+    public bool IncludeInPrompt
+    {
+        get => _includeInPrompt;
+        set
+        {
+            if (SetProperty(ref _includeInPrompt, value))
+            {
+                OnPropertyChanged(nameof(IncludeLabel));
+            }
+        }
+    }
+
+    public string IncludeLabel => IncludeInPrompt ? "Included" : "Path only";
+
     public string ExtensionTagBackground => ResolveExtensionPalette(ExtensionTagText).Background;
 
     public string ExtensionTagBorder => ResolveExtensionPalette(ExtensionTagText).Border;
@@ -68,6 +83,7 @@ public sealed class ContextControlAttachmentViewModel(string label, string path,
         Label = label;
         Path = path;
         Kind = kind;
+        IncludeInPrompt = IsAutoIncludedKind(kind);
         OnPropertyChanged(nameof(ExtensionTagText));
         OnPropertyChanged(nameof(DisplayTitle));
         OnPropertyChanged(nameof(ExtensionTagBackground));
@@ -102,5 +118,12 @@ public sealed class ContextControlAttachmentViewModel(string label, string path,
         var hash = StringComparer.OrdinalIgnoreCase.GetHashCode(extensionKey ?? "FILE");
         var index = Math.Abs(hash) % ExtensionPalette.Length;
         return ExtensionPalette[index];
+    }
+
+    private static bool IsAutoIncludedKind(string kind)
+    {
+        return string.Equals(kind, "dir", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(kind, "code", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(kind, "patch", StringComparison.OrdinalIgnoreCase);
     }
 }

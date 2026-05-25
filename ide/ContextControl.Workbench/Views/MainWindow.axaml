@@ -356,6 +356,38 @@
               </Grid>
             </Border>
 
+            <Border Grid.Row="1" Classes="pane-header" Padding="12,0" IsVisible="{Binding IsChatMode}">
+              <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="8">
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="CC Chat" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                  <TextBlock Text="{Binding ContextControl.PromptContextPressureLabel}" Classes="editor-meta" Margin="0,2,0,0" />
+                  <TextBlock Text="{Binding ContextControl.PromptTokenomicsLabel}" Classes="scanner-status" />
+                </StackPanel>
+                <ComboBox
+                    Grid.Column="1"
+                    Classes="cc-local-model-picker"
+                    ItemsSource="{Binding ContextControl.InstalledLocalModels}"
+                    SelectedItem="{Binding ContextControl.SelectedLocalModel, Mode=TwoWay}"
+                    MaxDropDownHeight="180">
+                  <ComboBox.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:LocalLlmModelViewModel}">
+                      <TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis" />
+                    </DataTemplate>
+                  </ComboBox.ItemTemplate>
+                </ComboBox>
+                <Button
+                    Grid.Column="2"
+                    Classes="browser-open-button"
+                    Content="Refresh"
+                    Command="{Binding ContextControl.RefreshLocalModelsCommand}" />
+                <Button
+                    Grid.Column="3"
+                    Classes="browser-open-button primary"
+                    Content="Prompt"
+                    Command="{Binding ContextControl.OpenPromptCommand}" />
+              </Grid>
+            </Border>
+
             <Border Grid.Row="1" Classes="browser-nav-bar" Padding="6,2" IsVisible="{Binding IsBrowserMode}">
               <Grid ColumnDefinitions="24,24,24,*,24,Auto" ColumnSpacing="4">
                 <Button
@@ -396,6 +428,48 @@
                     Classes="browser-open-button"
                     Content="Go"
                     Click="OnBrowserOpenClick" />
+              </Grid>
+            </Border>
+
+            <Border Grid.Row="1" Classes="pane-header" Padding="12,0" IsVisible="{Binding IsLlmsMode}">
+              <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto" ColumnSpacing="6">
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="Local LLMs" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                  <TextBlock Text="{Binding ContextControl.OllamaInstallerSizeLabel}" Classes="editor-meta" Margin="0,2,0,0" />
+                  <TextBlock Text="{Binding ContextControl.LocalLlmStatus}" Classes="scanner-status" />
+                </StackPanel>
+                <Button
+                    Grid.Column="1"
+                    Classes="browser-open-button primary"
+                    Content="{Binding ContextControl.OllamaInstallButtonLabel}"
+                    ToolTip.Tip="{Binding ContextControl.OllamaInstallCommandLabel}"
+                    Command="{Binding ContextControl.InstallOllamaCommand}" />
+                <Button
+                    Grid.Column="2"
+                    Classes="browser-open-button"
+                    Content="Open Page"
+                    Command="{Binding ContextControl.OpenOllamaDownloadPageCommand}" />
+                <Button
+                    Grid.Column="3"
+                    Classes="browser-open-button"
+                    Content="Refresh"
+                    Command="{Binding ContextControl.RefreshLocalModelsCommand}" />
+                <Button
+                    Grid.Column="4"
+                    Classes="browser-open-button"
+                    Content="Prompt"
+                    Command="{Binding ContextControl.OpenPromptCommand}" />
+              </Grid>
+            </Border>
+
+            <Border Grid.Row="1" Classes="pane-header" Padding="12,0" IsVisible="{Binding IsSkillbookMode}">
+              <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                <StackPanel VerticalAlignment="Center">
+                  <TextBlock Text="Skillbook" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                  <TextBlock Text="{Binding ContextControl.SkillbookSummary}" Classes="editor-meta" Margin="0,2,0,0" />
+                  <TextBlock Text="{Binding ContextControl.SkillbookProjectPath}" Classes="scanner-status" />
+                </StackPanel>
+                <TextBlock Grid.Column="1" Text="{Binding ContextControl.SkillbookGlobalPath}" Classes="path-text" VerticalAlignment="Center" />
               </Grid>
             </Border>
 
@@ -479,6 +553,204 @@
 
             <Border
                 Grid.Row="2"
+                Classes="editor-body chat-page"
+                Padding="8"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsChatMode}">
+              <Grid RowDefinitions="Auto,*" ColumnDefinitions="220,*" RowSpacing="8" ColumnSpacing="8" MinHeight="0">
+                <Border Grid.ColumnSpan="2" Classes="scanner-metric-strip">
+                  <WrapPanel>
+                    <Border Classes="scanner-metric" Width="210">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Prompt" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.PromptTokenomicsLabel}" />
+                      </Grid>
+                    </Border>
+                    <Border Classes="scanner-metric" Width="260">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Context" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.PromptContextPressureLabel}" />
+                      </Grid>
+                    </Border>
+                    <Border Classes="scanner-metric" Width="220">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Phase" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.PhaseTitle}" />
+                      </Grid>
+                    </Border>
+                  </WrapPanel>
+                </Border>
+
+                <Border Grid.Row="1" Grid.Column="0" Classes="chat-history-panel">
+                  <Grid RowDefinitions="Auto,*" RowSpacing="7" MinHeight="0">
+                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                      <StackPanel VerticalAlignment="Center">
+                        <TextBlock Classes="cc-chat-role" Text="Chats" />
+                        <TextBlock Classes="history-meta" Text="{Binding ContextControl.ChatHistorySummary}" />
+                      </StackPanel>
+                      <Button
+                          Grid.Column="1"
+                          Classes="cc-prompt-chip"
+                          Content="New"
+                          Command="{Binding ContextControl.NewChatSessionCommand}" />
+                    </Grid>
+                    <ScrollViewer
+                        Grid.Row="1"
+                        VerticalScrollBarVisibility="Auto"
+                        HorizontalScrollBarVisibility="Disabled"
+                        controls:HoverScrollbarBehavior.IsEnabled="True"
+                        controls:HoverScrollbarBehavior.ReserveRight="12">
+                      <ItemsControl ItemsSource="{Binding ContextControl.ChatSessions}">
+                        <ItemsControl.ItemTemplate>
+                          <DataTemplate DataType="{x:Type vm:ChatSessionViewModel}">
+                            <Button
+                                Classes="chat-session-row"
+                                Classes.active="{Binding IsActive}"
+                                Command="{Binding DataContext.ContextControl.SelectChatSessionCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                CommandParameter="{Binding}">
+                              <Grid RowDefinitions="Auto,Auto" RowSpacing="2">
+                                <TextBlock Text="{Binding Title}" Classes="chat-session-title" />
+                                <TextBlock Grid.Row="1" Text="{Binding Summary}" Classes="history-meta" />
+                              </Grid>
+                            </Button>
+                          </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                      </ItemsControl>
+                    </ScrollViewer>
+                  </Grid>
+                </Border>
+
+                <ScrollViewer
+                    Grid.Row="1"
+                    Grid.Column="1"
+                    VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled"
+                    controls:HoverScrollbarBehavior.IsEnabled="True"
+                    controls:HoverScrollbarBehavior.ReserveRight="12">
+                  <ItemsControl ItemsSource="{Binding ContextControl.ChatMessages}">
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate DataType="{x:Type vm:LocalLlmChatMessageViewModel}">
+                        <Border Classes="cc-chat-message" Classes.user="{Binding IsUser}">
+                          <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="6">
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                              <StackPanel>
+                                <TextBlock Classes="cc-chat-role" Text="{Binding RoleLabel}" />
+                                <TextBlock Classes="history-meta" Text="{Binding MetaLabel}" />
+                              </StackPanel>
+                              <TextBlock Grid.Column="1" Classes="history-meta" Text="{Binding Time}" />
+                            </Grid>
+
+                            <ItemsControl Grid.Row="1" ItemsSource="{Binding AttachedFiles}" IsVisible="{Binding HasAttachments}">
+                              <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                  <WrapPanel />
+                                </ItemsPanelTemplate>
+                              </ItemsControl.ItemsPanel>
+                              <ItemsControl.ItemTemplate>
+                                <DataTemplate DataType="{x:Type vm:ContextControlAttachmentViewModel}">
+                                  <Border Classes="chat-attachment-chip" ToolTip.Tip="{Binding Path}" Tapped="OnAttachmentRowTapped">
+                                    <TextBlock Text="{Binding DisplayTitle}" Classes="chat-attachment-chip-text" />
+                                  </Border>
+                                </DataTemplate>
+                              </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+
+                            <ItemsControl Grid.Row="2" ItemsSource="{Binding Parts}">
+                              <ItemsControl.ItemTemplate>
+                                <DataTemplate DataType="{x:Type vm:LocalLlmChatPartViewModel}">
+                                  <Grid>
+                                    <TextBlock
+                                        Classes="cc-chat-text"
+                                        Text="{Binding Text}"
+                                        IsVisible="{Binding IsText}" />
+                                    <Border Classes="chat-snippet" IsVisible="{Binding IsSnippet}">
+                                      <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="5">
+                                        <Grid ColumnDefinitions="*,Auto,Auto,Auto,Auto" ColumnSpacing="5">
+                                          <StackPanel>
+                                            <TextBlock Classes="chat-snippet-title" Text="{Binding Snippet.Title}" />
+                                            <TextBlock Classes="history-meta" Text="{Binding Snippet.MetaLabel}" />
+                                          </StackPanel>
+                                          <Button
+                                              Grid.Column="1"
+                                              Classes="cc-prompt-chip"
+                                              Content="{Binding Snippet.ToggleLabel}"
+                                              Command="{Binding DataContext.ContextControl.ToggleSnippetCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                              CommandParameter="{Binding Snippet}" />
+                                          <Button
+                                              Grid.Column="2"
+                                              Classes="cc-prompt-chip"
+                                              Content="Copy"
+                                              Command="{Binding DataContext.ContextControl.CopySnippetCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                              CommandParameter="{Binding Snippet}" />
+                                          <Button
+                                              Grid.Column="3"
+                                              Classes="cc-prompt-chip"
+                                              Content="{Binding Snippet.ActionLabel}"
+                                              Command="{Binding DataContext.ContextControl.UseSnippetForCcCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                              CommandParameter="{Binding Snippet}" />
+                                          <Button
+                                              Grid.Column="4"
+                                              Classes="cc-prompt-chip"
+                                              Content="GO"
+                                              IsVisible="{Binding Snippet.IsPatch}"
+                                              Command="{Binding DataContext.ContextControl.PreviewSnippetCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                              CommandParameter="{Binding Snippet}" />
+                                        </Grid>
+                                        <TextBlock
+                                            Grid.Row="1"
+                                            Classes="chat-snippet-preview"
+                                            Text="{Binding Snippet.CollapsedPreview}"
+                                            IsVisible="{Binding Snippet.IsCollapsed}" />
+                                        <TextBox
+                                            Grid.Row="2"
+                                            Classes="chat-snippet-code"
+                                            IsReadOnly="True"
+                                            IsVisible="{Binding Snippet.IsExpanded}"
+                                            AcceptsReturn="True"
+                                            TextWrapping="NoWrap"
+                                            Text="{Binding Snippet.Text}"
+                                            ScrollViewer.AllowAutoHide="True"
+                                            ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                            ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                            controls:HoverScrollbarBehavior.IsEnabled="True"
+                                            controls:HoverScrollbarBehavior.ReserveRight="12" />
+                                      </Grid>
+                                    </Border>
+                                  </Grid>
+                                </DataTemplate>
+                              </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+
+                            <Border Grid.Row="3" Classes="chat-thinking" IsVisible="{Binding HasThinking}">
+                              <Grid RowDefinitions="Auto,Auto" RowSpacing="5">
+                                <Button
+                                    Classes="cc-prompt-chip"
+                                    HorizontalAlignment="Left"
+                                    Content="Thinking"
+                                    Command="{Binding DataContext.ContextControl.ToggleThinkingCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                    CommandParameter="{Binding}" />
+                                <TextBox
+                                    Grid.Row="1"
+                                    Classes="chat-snippet-code"
+                                    IsReadOnly="True"
+                                    IsVisible="{Binding IsThinkingExpanded}"
+                                    AcceptsReturn="True"
+                                    TextWrapping="Wrap"
+                                    Text="{Binding ThinkingText}" />
+                              </Grid>
+                            </Border>
+                          </Grid>
+                        </Border>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </ScrollViewer>
+              </Grid>
+            </Border>
+
+            <Border
+                Grid.Row="2"
                 Classes="browser-surface"
                 ClipToBounds="True"
                 MinHeight="0"
@@ -489,6 +761,219 @@
                   NavigationStarted="OnBrowserNavigationStarted"
                   NavigationCompleted="OnBrowserNavigationCompleted"
                   InitializationFailed="OnBrowserInitializationFailed" />
+            </Border>
+
+            <Border
+                Grid.Row="2"
+                Classes="editor-body llm-page"
+                Padding="6"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsLlmsMode}">
+              <Grid RowDefinitions="Auto,*" RowSpacing="6">
+                <Border Classes="scanner-metric-strip">
+                  <WrapPanel>
+                    <Border Classes="scanner-metric" Width="190" ToolTip.Tip="{Binding ContextControl.HardwareSummary}">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="GPU" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.HardwareSummary}" />
+                      </Grid>
+                    </Border>
+                    <Border Classes="scanner-metric" Width="130">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Installed" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.InstalledLocalModels.Count}" />
+                      </Grid>
+                    </Border>
+                    <Border Classes="scanner-metric" Width="290" ToolTip.Tip="{Binding ContextControl.LocalLlmStatus}">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Ollama" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.LocalLlmStatus}" />
+                      </Grid>
+                    </Border>
+                    <Border Classes="scanner-metric" Width="220" ToolTip.Tip="{Binding ContextControl.OllamaInstallCommandLabel}">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Installer" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.OllamaInstallerSizeLabel}" />
+                      </Grid>
+                    </Border>
+                  </WrapPanel>
+                </Border>
+
+                <ScrollViewer
+                    Grid.Row="1"
+                    VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled"
+                    controls:HoverScrollbarBehavior.IsEnabled="True"
+                    controls:HoverScrollbarBehavior.ReserveRight="12">
+                  <ItemsControl ItemsSource="{Binding ContextControl.LocalLlmModels}" HorizontalAlignment="Stretch">
+                    <ItemsControl.ItemsPanel>
+                      <ItemsPanelTemplate>
+                        <StackPanel Spacing="6" />
+                      </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate DataType="{x:Type vm:LocalLlmModelViewModel}">
+                        <Border
+                            Classes="llm-model-card"
+                            Classes.recommended="{Binding IsRecommended}"
+                            Classes.installed="{Binding IsInstalled}"
+                            ToolTip.Tip="{Binding SourceBudget}"
+                            HorizontalAlignment="Stretch">
+                          <Grid ColumnDefinitions="2.2*,3.6*,Auto" ColumnSpacing="10">
+                            <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="3" VerticalAlignment="Center">
+                              <StackPanel>
+                                <TextBlock Classes="llm-model-title" Text="{Binding DisplayName}" />
+                                <TextBlock Classes="llm-model-id" Text="{Binding Id}" />
+                              </StackPanel>
+                              <TextBlock Grid.Row="1" Classes="llm-model-use" Text="{Binding PracticalUse}" />
+                              <TextBlock Grid.Row="2" Classes="llm-fit-detail" Text="{Binding FitDetail}" />
+                            </Grid>
+
+                            <Grid Grid.Column="1" RowDefinitions="Auto" VerticalAlignment="Center">
+                              <WrapPanel>
+                                <Border Classes="llm-metric-chip">
+                                  <Grid ColumnDefinitions="Auto,*" ColumnSpacing="5">
+                                    <TextBlock Classes="llm-metric-icon" Text="DL" />
+                                    <TextBlock Grid.Column="1" Classes="llm-metric-text" Text="{Binding DownloadSize}" />
+                                  </Grid>
+                                </Border>
+                                <Border Classes="llm-metric-chip">
+                                  <Grid ColumnDefinitions="Auto,*" ColumnSpacing="5">
+                                    <TextBlock Classes="llm-metric-icon" Text="VRAM" />
+                                    <TextBlock Grid.Column="1" Classes="llm-metric-text" Text="{Binding MinimumRequirement}" />
+                                  </Grid>
+                                </Border>
+                                <Border Classes="llm-metric-chip">
+                                  <Grid ColumnDefinitions="Auto,*" ColumnSpacing="5">
+                                    <TextBlock Classes="llm-metric-icon" Text="CTX" />
+                                    <TextBlock Grid.Column="1" Classes="llm-metric-text" Text="{Binding AdvertisedContext}" />
+                                  </Grid>
+                                </Border>
+                                <Border Classes="llm-metric-chip">
+                                  <Grid ColumnDefinitions="Auto,*" ColumnSpacing="5">
+                                    <TextBlock Classes="llm-metric-icon" Text="OK" />
+                                    <TextBlock Grid.Column="1" Classes="llm-metric-text" Text="{Binding ComfortableContext}" />
+                                  </Grid>
+                                </Border>
+                                <Border Classes="llm-metric-chip">
+                                  <Grid ColumnDefinitions="Auto,*" ColumnSpacing="5">
+                                    <TextBlock Classes="llm-metric-icon" Text="TPS" />
+                                    <TextBlock Grid.Column="1" Classes="llm-metric-text" Text="{Binding ExpectedSpeed}" />
+                                  </Grid>
+                                </Border>
+                                <Border Classes="llm-metric-chip">
+                                  <Grid ColumnDefinitions="Auto,*" ColumnSpacing="5">
+                                    <TextBlock Classes="llm-metric-icon" Text="LIC" />
+                                    <TextBlock Grid.Column="1" Classes="llm-metric-text" Text="{Binding License}" />
+                                  </Grid>
+                                </Border>
+                                <Border Classes="llm-metric-chip">
+                                  <Grid ColumnDefinitions="Auto,*" ColumnSpacing="5">
+                                    <TextBlock Classes="llm-metric-icon" Text="THK" />
+                                    <TextBlock Grid.Column="1" Classes="llm-metric-text" Text="{Binding ThinkingLabel}" />
+                                  </Grid>
+                                </Border>
+                              </WrapPanel>
+                            </Grid>
+
+                            <Grid Grid.Column="2" RowDefinitions="Auto,Auto" RowSpacing="5" MinWidth="96" VerticalAlignment="Center">
+                              <StackPanel Orientation="Horizontal" Spacing="5" HorizontalAlignment="Right">
+                                <Border Classes="llm-pill">
+                                  <TextBlock Classes="llm-pill-text" Text="{Binding InstallLabel}" />
+                                </Border>
+                                <Border Classes="llm-pill recommended" IsVisible="{Binding IsRecommended}">
+                                  <TextBlock Classes="llm-pill-text" Text="{Binding FitLabel}" />
+                                </Border>
+                              </StackPanel>
+                              <Button
+                                  Grid.Row="1"
+                                  Classes="browser-open-button"
+                                  HorizontalAlignment="Right"
+                                  Content="{Binding PullButtonLabel}"
+                                  IsEnabled="{Binding CanPull}"
+                                  ToolTip.Tip="{Binding PullCommand}"
+                                  Command="{Binding DataContext.ContextControl.PullLocalModelCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Grid>
+                        </Border>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </ScrollViewer>
+              </Grid>
+            </Border>
+
+            <Border
+                Grid.Row="2"
+                Classes="editor-body skillbook-page"
+                Padding="8"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsSkillbookMode}">
+              <Grid RowDefinitions="Auto,*" RowSpacing="8">
+                <Border Classes="scanner-metric-strip">
+                  <WrapPanel>
+                    <Border Classes="scanner-metric" Width="360" ToolTip.Tip="{Binding ContextControl.SkillbookProjectPath}">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Project Skillbook" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.SkillbookProjectPath}" />
+                      </Grid>
+                    </Border>
+                    <Border Classes="scanner-metric" Width="360" ToolTip.Tip="{Binding ContextControl.SkillbookGlobalPath}">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Global Skillbook" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.SkillbookGlobalPath}" />
+                      </Grid>
+                    </Border>
+                  </WrapPanel>
+                </Border>
+
+                <ScrollViewer
+                    Grid.Row="1"
+                    VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled"
+                    controls:HoverScrollbarBehavior.IsEnabled="True"
+                    controls:HoverScrollbarBehavior.ReserveRight="12">
+                  <ItemsControl ItemsSource="{Binding ContextControl.SkillbookEntries}">
+                    <ItemsControl.ItemsPanel>
+                      <ItemsPanelTemplate>
+                        <StackPanel Spacing="7" />
+                      </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate DataType="{x:Type vm:SkillbookEntryViewModel}">
+                        <Border Classes="skillbook-entry">
+                          <Grid RowDefinitions="Auto,Auto" RowSpacing="6">
+                            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                              <StackPanel>
+                                <TextBlock Classes="llm-model-title" Text="{Binding Title}" />
+                                <TextBlock Classes="history-meta" Text="{Binding Summary}" />
+                              </StackPanel>
+                              <Border Grid.Column="1" Classes="llm-pill">
+                                <TextBlock Classes="llm-pill-text" Text="{Binding SourceLabel}" />
+                              </Border>
+                            </Grid>
+                            <TextBox
+                                Grid.Row="1"
+                                Classes="skillbook-text"
+                                IsReadOnly="True"
+                                AcceptsReturn="True"
+                                TextWrapping="Wrap"
+                                Text="{Binding Text}"
+                                ScrollViewer.AllowAutoHide="True"
+                                ScrollViewer.VerticalScrollBarVisibility="Auto"
+                                ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                                controls:HoverScrollbarBehavior.IsEnabled="True"
+                                controls:HoverScrollbarBehavior.ReserveRight="12" />
+                          </Grid>
+                        </Border>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </ScrollViewer>
+              </Grid>
             </Border>
 
             <Border
@@ -745,25 +1230,61 @@
                   <DoubleTransition Property="Opacity" Duration="0:0:0.12" />
                 </Transitions>
               </Border.Transitions>
-              <Grid RowDefinitions="Auto,*" RowSpacing="0">
+              <Grid RowDefinitions="Auto,Auto,*" RowSpacing="0">
                 <ProgressBar
                     Classes="cc-prompt-progress"
                     Minimum="0"
                     Maximum="100"
                     Value="0"
                     Margin="0,0,0,7"
-                    IsVisible="{Binding ContextControl.IsBusy}"
-                    IsIndeterminate="{Binding ContextControl.IsBusy}" />
+                    IsVisible="{Binding ContextControl.ShowBusyPromptProgress}"
+                    IsIndeterminate="{Binding ContextControl.ShowBusyPromptProgress}" />
 
-                <Border x:Name="ContextPromptComposer" Grid.Row="1" Classes="cc-prompt-composer">
+                <Border
+                    Grid.Row="1"
+                    Classes="cc-transfer-progress"
+                    IsVisible="{Binding ContextControl.IsTransferProgressActive}">
+                  <Grid RowDefinitions="Auto,Auto" RowSpacing="5">
+                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="10">
+                      <TextBlock Classes="cc-transfer-title" Text="{Binding ContextControl.TransferProgressTitle}" />
+                      <TextBlock Grid.Column="1" Classes="cc-transfer-meta" Text="{Binding ContextControl.TransferProgressSizeLabel}" />
+                      <TextBlock Grid.Column="2" Classes="cc-transfer-meta" Text="{Binding ContextControl.TransferProgressSpeedLabel}" />
+                    </Grid>
+                    <Grid Grid.Row="1" ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                      <ProgressBar
+                          Classes="cc-transfer-bar"
+                          Minimum="0"
+                          Maximum="100"
+                          Value="{Binding ContextControl.TransferProgressValue}"
+                          IsIndeterminate="{Binding ContextControl.IsTransferProgressIndeterminate}" />
+                      <TextBlock Grid.Column="1" Classes="cc-transfer-percent" Text="{Binding ContextControl.TransferProgressPercentLabel}" />
+                    </Grid>
+                  </Grid>
+                </Border>
+
+                <Border x:Name="ContextPromptComposer" Grid.Row="2" Classes="cc-prompt-composer">
                   <Grid RowDefinitions="Auto,*,Auto" RowSpacing="8">
-                    <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="8">
-                      <Border Classes="cc-prompt-status-pill">
+                    <Grid ColumnDefinitions="Auto,Auto,*,Auto" ColumnSpacing="8">
+                      <StackPanel Orientation="Horizontal" Spacing="4">
+                        <Button
+                            Classes="cc-prompt-mode"
+                            Classes.active="{Binding ContextControl.IsContextPromptMode}"
+                            Content="CC"
+                            ToolTip.Tip="Context Control prompt"
+                            Command="{Binding ContextControl.SwitchPromptToContextCommand}" />
+                        <Button
+                            Classes="cc-prompt-mode"
+                            Classes.active="{Binding ContextControl.IsTerminalPromptMode}"
+                            Content="Term"
+                            ToolTip.Tip="Install and model download terminal"
+                            Command="{Binding ContextControl.SwitchPromptToTerminalCommand}" />
+                      </StackPanel>
+                      <Border Grid.Column="1" Classes="cc-prompt-status-pill">
                         <TextBlock Text="{Binding ContextControl.PhaseTitle}" Classes="cc-prompt-status" />
                       </Border>
-                      <TextBlock Grid.Column="1" Text="{Binding ContextControl.PhaseDetail}" Classes="cc-prompt-detail" />
+                      <TextBlock Grid.Column="2" Text="{Binding ContextControl.PhaseDetail}" Classes="cc-prompt-detail" />
                       <Button
-                          Grid.Column="2"
+                          Grid.Column="3"
                           Classes="cc-prompt-icon"
                           Content="x"
                           ToolTip.Tip="Close prompt"
@@ -774,31 +1295,64 @@
                         x:Name="ContextPromptTextBox"
                         Grid.Row="1"
                         Classes="cc-prompt-input"
+                        IsVisible="{Binding ContextControl.IsMessagePromptMode}"
                         AcceptsReturn="True"
-                        TextWrapping="Wrap"
-                        Watermark="Message Context Control..."
+                        TextWrapping="{Binding ContextControl.PromptTextWrapping}"
+                        Watermark="{Binding ContextControl.PromptWatermark}"
                         GotFocus="OnPromptTextBoxGotFocus"
                         LostFocus="OnPromptTextBoxLostFocus"
                         KeyDown="OnPromptTextBoxKeyDown"
                         TextChanged="OnPromptTextBoxTextChanged"
                         ScrollViewer.AllowAutoHide="True"
                         ScrollViewer.VerticalScrollBarVisibility="Auto"
-                        ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                        ScrollViewer.HorizontalScrollBarVisibility="{Binding ContextControl.PromptHorizontalScrollBarVisibility}"
                         controls:HoverScrollbarBehavior.IsEnabled="True"
                         controls:HoverScrollbarBehavior.ReserveRight="12"
                         Text="{Binding ContextControl.PromptText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
 
-                    <Grid Grid.Row="2" ColumnDefinitions="Auto,*,Auto" ColumnSpacing="7">
-                      <StackPanel Orientation="Horizontal" Spacing="5">
+                    <TextBox
+                        Grid.Row="1"
+                        Classes="cc-terminal-output"
+                        IsVisible="{Binding ContextControl.IsTerminalPromptMode}"
+                        AcceptsReturn="True"
+                        IsReadOnly="True"
+                        TextWrapping="Wrap"
+                        ScrollViewer.AllowAutoHide="True"
+                        ScrollViewer.VerticalScrollBarVisibility="Auto"
+                        ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+                        controls:HoverScrollbarBehavior.IsEnabled="True"
+                        controls:HoverScrollbarBehavior.ReserveRight="12"
+                        Text="{Binding ContextControl.TerminalOutputText}" />
+
+                    <Grid Grid.Row="2" ColumnDefinitions="Auto,Auto,*,Auto" ColumnSpacing="7">
+                      <StackPanel Orientation="Horizontal" Spacing="5" IsVisible="{Binding ContextControl.IsContextPromptMode}">
                         <Button Classes="cc-prompt-chip" Content="DIR" ToolTip.Tip="Create directory context" Command="{Binding ContextControl.RunDirCommand}" />
                         <Button Classes="cc-prompt-chip" Content="CC" ToolTip.Tip="Create selected code context" Command="{Binding ContextControl.RunCcCommand}" />
                         <Button Classes="cc-prompt-chip" Content="GO" ToolTip.Tip="Preview patch blocks" Command="{Binding ContextControl.RunGoCommand}" />
                       </StackPanel>
-                      <TextBlock Grid.Column="1" Text="{Binding ContextControl.AttachmentSummary}" Classes="cc-prompt-meta" />
+                      <StackPanel Orientation="Horizontal" Spacing="5" IsVisible="{Binding ContextControl.IsTerminalPromptMode}">
+                        <Button Classes="cc-prompt-chip" Content="Clear" ToolTip.Tip="Clear terminal output" Command="{Binding ContextControl.ClearTerminalCommand}" />
+                      </StackPanel>
+                      <ComboBox
+                          Grid.Column="1"
+                          Classes="cc-local-model-picker"
+                          IsVisible="{Binding ContextControl.IsContextPromptMode}"
+                          ItemsSource="{Binding ContextControl.InstalledLocalModels}"
+                          SelectedItem="{Binding ContextControl.SelectedLocalModel, Mode=TwoWay}"
+                          MaxDropDownHeight="180">
+                        <ComboBox.ItemTemplate>
+                          <DataTemplate DataType="{x:Type vm:LocalLlmModelViewModel}">
+                            <TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis" />
+                          </DataTemplate>
+                        </ComboBox.ItemTemplate>
+                      </ComboBox>
+                      <TextBlock Grid.Column="2" Text="{Binding ContextControl.PromptFooterSummary}" Classes="cc-prompt-meta" IsVisible="{Binding ContextControl.IsMessagePromptMode}" />
+                      <TextBlock Grid.Column="2" Text="{Binding ContextControl.TransferProgressStatus}" Classes="cc-prompt-meta" IsVisible="{Binding ContextControl.IsTerminalPromptMode}" />
                       <Button
-                          Grid.Column="2"
+                          Grid.Column="3"
                           Classes="cc-prompt-send"
-                          Content="Send"
+                          IsVisible="{Binding ContextControl.IsMessagePromptMode}"
+                          Content="{Binding ContextControl.PromptSendButtonLabel}"
                           Command="{Binding ContextControl.SendCommand}" />
                     </Grid>
                   </Grid>
@@ -836,7 +1390,7 @@
                 Classes="cc-dock-tab"
                 Classes.active="{Binding ContextControl.IsLogPanelOpen}"
                 Content="LOG"
-                Command="{Binding ContextControl.ToggleLogPanelCommand}" />
+                Command="{Binding ContextControl.SelectLogPanelCommand}" />
           </Grid>
 
           <Grid Grid.Row="2" Margin="10,0,10,0" RowDefinitions="Auto,Auto,Auto" RowSpacing="6">
@@ -880,15 +1434,20 @@
           <Grid Grid.Row="3" Margin="10,0,10,0" RowDefinitions="Auto,Auto,Auto" RowSpacing="5">
             <TextBlock Text="{Binding ContextControl.PatchSummary}" Classes="cc-state-detail" />
             <TextBlock Grid.Row="1" Text="{Binding ContextControl.LastExportPath}" Classes="path-text" />
-            <Grid Grid.Row="2" ColumnDefinitions="*" ColumnSpacing="6">
+            <Grid Grid.Row="2" ColumnDefinitions="*,*" ColumnSpacing="6">
               <Button
                   Classes="header-mini primary"
                   Content="Apply effective"
                   Command="{Binding ContextControl.ApplyPatchCommand}" />
+              <Button
+                  Grid.Column="1"
+                  Classes="header-mini"
+                  Content="Apply all"
+                  Command="{Binding ContextControl.ApplyAllPatchCommand}" />
             </Grid>
           </Grid>
 
-          <Grid Grid.Row="4" Margin="10,0,10,10" RowDefinitions="Auto,*" RowSpacing="8" MinHeight="0">
+          <Grid Grid.Row="4" Margin="10,0,10,10" RowDefinitions="*,Auto" RowSpacing="8" MinHeight="0">
             <Border Grid.Row="0" Classes="cc-log-host" IsVisible="{Binding ContextControl.IsLogPanelOpen}">
               <ScrollViewer
                   VerticalScrollBarVisibility="Auto"
@@ -907,6 +1466,54 @@
                   </ItemsControl.ItemTemplate>
                 </ItemsControl>
               </ScrollViewer>
+            </Border>
+
+            <Border Grid.Row="0" Classes="cc-log-host" IsVisible="False">
+              <Grid RowDefinitions="Auto,*" RowSpacing="7" MinHeight="0">
+                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                  <ComboBox
+                      Classes="cc-route-picker"
+                      HorizontalAlignment="Stretch"
+                      ItemsSource="{Binding ContextControl.InstalledLocalModels}"
+                      SelectedItem="{Binding ContextControl.SelectedLocalModel, Mode=TwoWay}"
+                      MaxDropDownHeight="180">
+                    <ComboBox.ItemTemplate>
+                      <DataTemplate DataType="{x:Type vm:LocalLlmModelViewModel}">
+                        <TextBlock Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis" />
+                      </DataTemplate>
+                    </ComboBox.ItemTemplate>
+                  </ComboBox>
+                  <Button
+                      Grid.Column="1"
+                      Classes="browser-nav-button"
+                      Content="↻"
+                      ToolTip.Tip="Refresh local models"
+                      Command="{Binding ContextControl.RefreshLocalModelsCommand}" />
+                </Grid>
+
+                <ScrollViewer
+                    Grid.Row="1"
+                    VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled"
+                    controls:HoverScrollbarBehavior.IsEnabled="True"
+                    controls:HoverScrollbarBehavior.ReserveRight="12">
+                  <ItemsControl ItemsSource="{Binding ContextControl.ChatMessages}">
+                    <ItemsControl.ItemTemplate>
+                      <DataTemplate DataType="{x:Type vm:LocalLlmChatMessageViewModel}">
+                        <Border Classes="cc-chat-message" Classes.user="{Binding IsUser}">
+                          <Grid RowDefinitions="Auto,Auto" RowSpacing="4">
+                            <Grid ColumnDefinitions="*,Auto">
+                              <TextBlock Classes="cc-chat-role" Text="{Binding RoleLabel}" />
+                              <TextBlock Grid.Column="1" Classes="history-meta" Text="{Binding Time}" />
+                            </Grid>
+                            <TextBlock Grid.Row="1" Classes="cc-chat-text" Text="{Binding Text}" />
+                          </Grid>
+                        </Border>
+                      </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                  </ItemsControl>
+                </ScrollViewer>
+              </Grid>
             </Border>
 
             <Grid
@@ -957,7 +1564,7 @@
                             HorizontalAlignment="Stretch"
                             Tapped="OnAttachmentRowTapped"
                             ToolTip.Tip="{Binding Path}">
-                          <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="7">
+                          <Grid ColumnDefinitions="Auto,*,Auto,Auto" ColumnSpacing="7">
                             <Border
                                 Classes="cc-attachment-ext-tag"
                                 Background="{Binding ExtensionTagBackground}"
@@ -972,8 +1579,14 @@
                                 Text="{Binding DisplayTitle}"
                                 Classes="path-text"
                                 VerticalAlignment="Center" />
-                            <Border
+                            <Button
                                 Grid.Column="2"
+                                Classes="cc-prompt-chip"
+                                Content="{Binding IncludeLabel}"
+                                Command="{Binding DataContext.ContextControl.ToggleAttachmentIncludeCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                CommandParameter="{Binding}" />
+                            <Border
+                                Grid.Column="3"
                                 Classes="cc-attachment-remove"
                                 Tapped="OnAttachmentRemoveTapped"
                                 ToolTip.Tip="Remove attachment">
@@ -1009,6 +1622,39 @@
                 Classes="cc-filedrop-title"
                 TextAlignment="Center" />
           </StackPanel>
+        </Border>
+      </Grid>
+    </Border>
+    <Border
+        Grid.RowSpan="2"
+        Classes="cc-modal-overlay"
+        IsVisible="{Binding ContextControl.IsOllamaInstallerPromptOpen}"
+        IsHitTestVisible="{Binding ContextControl.IsOllamaInstallerPromptOpen}">
+      <Grid HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Border Classes="cc-modal-panel" Width="430">
+          <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="12">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+              <TextBlock
+                  Text="Ollama setup"
+                  Classes="cc-modal-title" />
+              <Button
+                  Grid.Column="1"
+                  Classes="cc-prompt-icon"
+                  Content="x"
+                  ToolTip.Tip="Close"
+                  Command="{Binding ContextControl.CloseOllamaInstallerPromptCommand}" />
+            </Grid>
+            <TextBlock
+                Grid.Row="1"
+                Text="{Binding ContextControl.OllamaInstallerPromptMessage}"
+                Classes="cc-modal-message" />
+            <Button
+                Grid.Row="2"
+                Classes="browser-open-button primary"
+                Content="OK"
+                HorizontalAlignment="Right"
+                Command="{Binding ContextControl.CloseOllamaInstallerPromptCommand}" />
+          </Grid>
         </Border>
       </Grid>
     </Border>

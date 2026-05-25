@@ -214,8 +214,11 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
         WorkspaceModes =
         [
             new WorkbenchModeOptionViewModel("code", "Code Editor"),
+            new WorkbenchModeOptionViewModel("chat", "Chat"),
             new WorkbenchModeOptionViewModel("graph", "Graph"),
             new WorkbenchModeOptionViewModel("browser", "Browser"),
+            new WorkbenchModeOptionViewModel("llms", "LLMs"),
+            new WorkbenchModeOptionViewModel("skillbook", "Skillbook"),
             new WorkbenchModeOptionViewModel("scanner", "Project scanner")
         ];
         _selectedTheme = FindOptionByKey(Themes, _workbenchSettings.ThemeKey, Themes[0]);
@@ -668,6 +671,9 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
                 OnPropertyChanged(nameof(IsCodeEditorMode));
                 OnPropertyChanged(nameof(IsProjectGraphMode));
                 OnPropertyChanged(nameof(IsBrowserMode));
+                OnPropertyChanged(nameof(IsLlmsMode));
+                OnPropertyChanged(nameof(IsChatMode));
+                OnPropertyChanged(nameof(IsSkillbookMode));
                 OnPropertyChanged(nameof(IsProjectScannerMode));
                 SaveAppearanceSettings();
             }
@@ -682,6 +688,15 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
 
     public bool IsBrowserMode =>
         string.Equals(SelectedWorkspaceMode.Key, "browser", StringComparison.OrdinalIgnoreCase);
+
+    public bool IsLlmsMode =>
+        string.Equals(SelectedWorkspaceMode.Key, "llms", StringComparison.OrdinalIgnoreCase);
+
+    public bool IsChatMode =>
+        string.Equals(SelectedWorkspaceMode.Key, "chat", StringComparison.OrdinalIgnoreCase);
+
+    public bool IsSkillbookMode =>
+        string.Equals(SelectedWorkspaceMode.Key, "skillbook", StringComparison.OrdinalIgnoreCase);
 
     public bool IsProjectScannerMode =>
         string.Equals(SelectedWorkspaceMode.Key, "scanner", StringComparison.OrdinalIgnoreCase);
@@ -1646,6 +1661,10 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
         if (IsProjectScannerMode)
         {
             _ = ScanProjectRulesAsync();
+        }
+        else if (IsLlmsMode && ContextControl.RefreshLocalModelsCommand.CanExecute(null))
+        {
+            ContextControl.RefreshLocalModelsCommand.Execute(null);
         }
     }
 

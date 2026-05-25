@@ -174,20 +174,39 @@ public sealed partial class ThemeSettingsWindow : Window
         ShowFileRulesPage();
     }
 
+    private void OnLlmsNavClick(object? sender, RoutedEventArgs e)
+    {
+        ShowLlmsPage();
+    }
+
     private void ShowAppearancePage()
     {
         AppearancePage.IsVisible = true;
         FileRulesPage.IsVisible = false;
+        LlmsPage.IsVisible = false;
         SetActive(AppearanceNavButton, true);
         SetActive(FileRulesNavButton, false);
+        SetActive(LlmsNavButton, false);
     }
 
     private void ShowFileRulesPage()
     {
         AppearancePage.IsVisible = false;
         FileRulesPage.IsVisible = true;
+        LlmsPage.IsVisible = false;
         SetActive(AppearanceNavButton, false);
         SetActive(FileRulesNavButton, true);
+        SetActive(LlmsNavButton, false);
+    }
+
+    private void ShowLlmsPage()
+    {
+        AppearancePage.IsVisible = false;
+        FileRulesPage.IsVisible = false;
+        LlmsPage.IsVisible = true;
+        SetActive(AppearanceNavButton, false);
+        SetActive(FileRulesNavButton, false);
+        SetActive(LlmsNavButton, true);
     }
 
     private static void SetActive(Button button, bool active)

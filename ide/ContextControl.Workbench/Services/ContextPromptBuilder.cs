@@ -34,8 +34,64 @@ public sealed partial class ContextPromptBuilder
             .Replace("\r\n", "\n", StringComparison.Ordinal)
             .Replace('\r', '\n')
             .Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Select(NormalizeCodeExportRequestLine)
+            .Where(line => !string.IsNullOrWhiteSpace(line))
             .Where(line => !string.Equals(line, "END", StringComparison.OrdinalIgnoreCase))
+            .Where(IsCodeExportRequestLine)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
             .ToArray();
+    }
+
+    public static string NormalizeCodeExportRequestLine(string? line)
+    {
+        var clean = (line ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(clean))
+        {
+            return "";
+        }
+
+        if (clean.StartsWith("- ", StringComparison.Ordinal))
+        {
+            clean = clean[2..].Trim();
+        }
+
+        clean = clean.Trim().TrimStart('[').TrimEnd(']').Trim();
+        clean = clean.TrimEnd(',', ';').Trim();
+        clean = clean.Trim('"', '\'', '`').Trim();
+        clean = clean.TrimEnd(',', ';').Trim();
+
+        return clean;
+    }
+
+    public static bool IsCodeExportRequestLine(string? line)
+    {
+        var clean = NormalizeCodeExportRequestLine(line);
+        if (string.IsNullOrWhiteSpace(clean))
+        {
+            return false;
+        }
+
+        return clean.StartsWith("FUNCTION ", StringComparison.OrdinalIgnoreCase)
+            || clean.StartsWith("FUNC:", StringComparison.OrdinalIgnoreCase)
+            || clean.StartsWith("SYMBOL:", StringComparison.OrdinalIgnoreCase)
+            || clean.StartsWith("FIND:", StringComparison.OrdinalIgnoreCase)
+            || clean.Equals("CMakeLists.txt", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".cpp", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".cc", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".cxx", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".c", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".h", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".hpp", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".hlsl", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".glsl", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".vert", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".frag", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".comp", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains('/', StringComparison.Ordinal)
+            || clean.Contains('\\', StringComparison.Ordinal);
     }
 
     public string ExtractPatchBlocks(string text)

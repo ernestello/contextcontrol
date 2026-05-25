@@ -346,7 +346,9 @@ public sealed partial class MainWindow
 
     private void MarkPromptTypingActive()
     {
-        if (ViewModel?.ContextControl.IsPromptOpen != true || !ContextPromptTextBox.IsFocused)
+        if (ViewModel?.ContextControl.IsPromptOpen != true
+            || ViewModel.ContextControl.IsLargePrompt
+            || !ContextPromptTextBox.IsFocused)
         {
             return;
         }

@@ -27,6 +27,12 @@ public sealed class WorkbenchSettings
         bool useColorfulFamilies,
         bool showAppearanceCodePreview,
         string selectedAiRoute,
+        string selectedLocalModel,
+        string fileRequestModel,
+        string patchWriteModel,
+        string patchReviewModel,
+        string chatModel,
+        string promptModeKey,
         bool promptBarOpenByDefault,
         string workspaceModeKey,
         string externalBrowserKey,
@@ -51,6 +57,12 @@ public sealed class WorkbenchSettings
         UseColorfulFamilies = useColorfulFamilies;
         ShowAppearanceCodePreview = showAppearanceCodePreview;
         SelectedAiRoute = string.IsNullOrWhiteSpace(selectedAiRoute) ? "Browser: ChatGPT" : selectedAiRoute.Trim();
+        SelectedLocalModel = string.IsNullOrWhiteSpace(selectedLocalModel) ? "qwen2.5-coder:3b" : selectedLocalModel.Trim();
+        FileRequestModel = NormalizeModelId(fileRequestModel, "qwen2.5-coder:1.5b");
+        PatchWriteModel = NormalizeModelId(patchWriteModel, "qwen2.5-coder:3b");
+        PatchReviewModel = NormalizeModelId(patchReviewModel, "phi4-mini");
+        ChatModel = NormalizeModelId(chatModel, "qwen2.5-coder:3b");
+        PromptModeKey = NormalizePromptModeKey(promptModeKey);
         PromptBarOpenByDefault = promptBarOpenByDefault;
         WorkspaceModeKey = NormalizeWorkspaceModeKey(workspaceModeKey);
         ExternalBrowserKey = NormalizeExternalBrowserKey(externalBrowserKey);
@@ -76,6 +88,12 @@ public sealed class WorkbenchSettings
     public bool UseColorfulFamilies { get; set; }
     public bool ShowAppearanceCodePreview { get; set; }
     public string SelectedAiRoute { get; set; }
+    public string SelectedLocalModel { get; set; }
+    public string FileRequestModel { get; set; }
+    public string PatchWriteModel { get; set; }
+    public string PatchReviewModel { get; set; }
+    public string ChatModel { get; set; }
+    public string PromptModeKey { get; set; }
     public bool PromptBarOpenByDefault { get; set; }
     public string WorkspaceModeKey { get; set; }
     public string ExternalBrowserKey { get; set; }
@@ -120,6 +138,12 @@ public sealed class WorkbenchSettings
             data.UseColorfulFamilies ?? true,
             data.ShowAppearanceCodePreview ?? true,
             data.SelectedAiRoute ?? "Browser: ChatGPT",
+            data.SelectedLocalModel ?? "qwen2.5-coder:3b",
+            data.FileRequestModel ?? "qwen2.5-coder:1.5b",
+            data.PatchWriteModel ?? "qwen2.5-coder:3b",
+            data.PatchReviewModel ?? "phi4-mini",
+            data.ChatModel ?? "qwen2.5-coder:3b",
+            data.PromptModeKey ?? "context",
             data.PromptBarOpenByDefault ?? false,
             data.WorkspaceModeKey ?? "code",
             data.ExternalBrowserKey ?? "default",
@@ -153,6 +177,12 @@ public sealed class WorkbenchSettings
             UseColorfulFamilies = UseColorfulFamilies,
             ShowAppearanceCodePreview = ShowAppearanceCodePreview,
             SelectedAiRoute = string.IsNullOrWhiteSpace(SelectedAiRoute) ? "Browser: ChatGPT" : SelectedAiRoute.Trim(),
+            SelectedLocalModel = string.IsNullOrWhiteSpace(SelectedLocalModel) ? "qwen2.5-coder:3b" : SelectedLocalModel.Trim(),
+            FileRequestModel = NormalizeModelId(FileRequestModel, "qwen2.5-coder:1.5b"),
+            PatchWriteModel = NormalizeModelId(PatchWriteModel, "qwen2.5-coder:3b"),
+            PatchReviewModel = NormalizeModelId(PatchReviewModel, "phi4-mini"),
+            ChatModel = NormalizeModelId(ChatModel, "qwen2.5-coder:3b"),
+            PromptModeKey = NormalizePromptModeKey(PromptModeKey),
             PromptBarOpenByDefault = PromptBarOpenByDefault,
             WorkspaceModeKey = NormalizeWorkspaceModeKey(WorkspaceModeKey),
             ExternalBrowserKey = NormalizeExternalBrowserKey(ExternalBrowserKey),
@@ -227,9 +257,24 @@ public sealed class WorkbenchSettings
         {
             "browser" => "browser",
             "graph" => "graph",
+            "llms" => "llms",
+            "chat" => "chat",
+            "skillbook" => "skillbook",
             "scanner" => "scanner",
             _ => "code"
         };
+    }
+
+    private static string NormalizePromptModeKey(string? key)
+    {
+        return string.Equals(key?.Trim(), "terminal", StringComparison.OrdinalIgnoreCase)
+            ? "terminal"
+            : "context";
+    }
+
+    private static string NormalizeModelId(string? modelId, string fallback)
+    {
+        return string.IsNullOrWhiteSpace(modelId) ? fallback : modelId.Trim();
     }
 
     private static string NormalizeExternalBrowserKey(string? key)
@@ -283,6 +328,12 @@ public sealed class WorkbenchSettings
         public bool? UseColorfulFamilies { get; set; }
         public bool? ShowAppearanceCodePreview { get; set; }
         public string? SelectedAiRoute { get; set; }
+        public string? SelectedLocalModel { get; set; }
+        public string? FileRequestModel { get; set; }
+        public string? PatchWriteModel { get; set; }
+        public string? PatchReviewModel { get; set; }
+        public string? ChatModel { get; set; }
+        public string? PromptModeKey { get; set; }
         public bool? PromptBarOpenByDefault { get; set; }
         public string? WorkspaceModeKey { get; set; }
         public string? ExternalBrowserKey { get; set; }

@@ -69,6 +69,11 @@
                 Classes="settings-nav"
                 Content="File rules"
                 Click="OnFileRulesNavClick" />
+            <Button
+                x:Name="LlmsNavButton"
+                Classes="settings-nav"
+                Content="LLMs"
+                Click="OnLlmsNavClick" />
           </StackPanel>
         </Border>
 
@@ -469,6 +474,54 @@
                     ShowFoldSummaryPreview="True" />
               </Grid>
             </Border>
+          </Grid>
+
+          <Grid x:Name="LlmsPage" RowDefinitions="Auto,*" RowSpacing="8" IsVisible="False">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+              <StackPanel>
+                <TextBlock Classes="settings-title" Text="Local LLM roles" />
+                <TextBlock Classes="muted" Text="Defaults used by the CC-native chat capsule builder" />
+              </StackPanel>
+              <TextBlock Grid.Column="1" Classes="muted" Text="{Binding ContextControl.LocalLlmStatus}" VerticalAlignment="Center" />
+            </Grid>
+
+            <ScrollViewer
+                Grid.Row="1"
+                VerticalScrollBarVisibility="Auto"
+                HorizontalScrollBarVisibility="Disabled"
+                controls:HoverScrollbarBehavior.IsEnabled="True"
+                controls:HoverScrollbarBehavior.ReserveRight="12">
+              <StackPanel Spacing="8">
+                <Border Classes="rule-card">
+                  <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="8">
+                    <Grid ColumnDefinitions="180,*" ColumnSpacing="10">
+                      <TextBlock Classes="field-label" Text="File request model" VerticalAlignment="Center" />
+                      <ComboBox Grid.Column="1" Classes="theme-picker" ItemsSource="{Binding ContextControl.LocalModelIdOptions}" SelectedItem="{Binding ContextControl.FileRequestModelId, Mode=TwoWay}" />
+                    </Grid>
+                    <Grid Grid.Row="1" ColumnDefinitions="180,*" ColumnSpacing="10">
+                      <TextBlock Classes="field-label" Text="Patch write model" VerticalAlignment="Center" />
+                      <ComboBox Grid.Column="1" Classes="theme-picker" ItemsSource="{Binding ContextControl.LocalModelIdOptions}" SelectedItem="{Binding ContextControl.PatchWriteModelId, Mode=TwoWay}" />
+                    </Grid>
+                    <Grid Grid.Row="2" ColumnDefinitions="180,*" ColumnSpacing="10">
+                      <TextBlock Classes="field-label" Text="Patch review model" VerticalAlignment="Center" />
+                      <ComboBox Grid.Column="1" Classes="theme-picker" ItemsSource="{Binding ContextControl.LocalModelIdOptions}" SelectedItem="{Binding ContextControl.PatchReviewModelId, Mode=TwoWay}" />
+                    </Grid>
+                    <Grid Grid.Row="3" ColumnDefinitions="180,*" ColumnSpacing="10">
+                      <TextBlock Classes="field-label" Text="General chat model" VerticalAlignment="Center" />
+                      <ComboBox Grid.Column="1" Classes="theme-picker" ItemsSource="{Binding ContextControl.LocalModelIdOptions}" SelectedItem="{Binding ContextControl.ChatModelId, Mode=TwoWay}" />
+                    </Grid>
+                  </Grid>
+                </Border>
+
+                <Border Classes="rule-card">
+                  <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="6">
+                    <TextBlock Classes="settings-title" Text="Skillbook roots" />
+                    <TextBlock Grid.Row="1" Classes="path-text" Text="{Binding ContextControl.SkillbookGlobalPath}" />
+                    <TextBlock Grid.Row="2" Classes="path-text" Text="{Binding ContextControl.SkillbookProjectPath}" />
+                  </Grid>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
           </Grid>
 
           <Grid x:Name="FileRulesPage" RowDefinitions="Auto,Auto,*,Auto" RowSpacing="8" IsVisible="False">
