@@ -1971,12 +1971,20 @@ public sealed class ContextControlViewModel : ObservableObject
 
     private void AppendFileRequestFallbackIfNeeded(LocalLlmChatMessageViewModel assistant, string userMessage)
     {
-        if (assistant.Snippets.Any(snippet => snippet.IsRequestList))
+        var requestSnippet = assistant.Snippets.LastOrDefault(snippet => snippet.IsRequestList);
+        if (requestSnippet is not null && !IsFindOnlyRequestList(requestSnippet.Text))
         {
             return;
         }
 
-        var fallback = BuildFallbackFindRequest(userMessage);
+        var fallback = BuildFileRequestFallback(userMessage, out var fallbackKind);
+        if (requestSnippet is not null
+            && (!fallbackKind.Equals("semantic path", StringComparison.OrdinalIgnoreCase)
+                || RequestListsMatch(requestSnippet.Text, fallback)))
+        {
+            return;
+        }
+
         if (string.IsNullOrWhiteSpace(fallback))
         {
             PhaseTitle = "No file request";
@@ -1984,14 +1992,220 @@ public sealed class ContextControlViewModel : ObservableObject
             return;
         }
 
+        var intro = requestSnippet is null
+            ? "The model did not return usable CC request lines."
+            : "The model returned only FIND discovery lines; the semantic map found likely exact files.";
         AppendChatMessage(new LocalLlmChatMessageViewModel(
             "assistant",
-            $"The model did not return usable CC request lines. ContextControl generated a discovery fallback from your request.{Environment.NewLine}{Environment.NewLine}```text{Environment.NewLine}{fallback}{Environment.NewLine}```",
+            $"{intro} ContextControl generated a {fallbackKind} fallback from your request.{Environment.NewLine}{Environment.NewLine}```text{Environment.NewLine}{fallback}{Environment.NewLine}```",
             "ContextControl",
             "file request fallback"));
         PhaseTitle = "File request fallback";
-        PhaseDetail = "The model returned no files; use the generated FIND list for CC.";
-        AppendTerminalOutput("File request fallback generated because the model returned no usable paths.");
+        PhaseDetail = fallbackKind.Equals("semantic path", StringComparison.OrdinalIgnoreCase)
+            ? "The model returned no files; use the generated semantic file list for CC."
+            : "The model returned no files; use the generated FIND list for CC.";
+        AppendTerminalOutput($"File request {fallbackKind} fallback generated because the model returned no usable paths.");
+    }
+
+    private static bool IsFindOnlyRequestList(string text)
+    {
+        var lines = (text ?? "")
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Where(line => !line.Equals("END", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        return lines.Length > 0 && lines.All(line => line.StartsWith("FIND:", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static bool RequestListsMatch(string left, string right)
+    {
+        static string Normalize(string text)
+        {
+            return string.Join(
+                "\n",
+                (text ?? "")
+                    .Replace("\r\n", "\n", StringComparison.Ordinal)
+                    .Replace('\r', '\n')
+                    .Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+                    .Select(ContextPromptBuilder.NormalizeCodeExportRequestLine));
+        }
+
+        return string.Equals(Normalize(left), Normalize(right), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private string BuildFileRequestFallback(string userMessage, out string fallbackKind)
+    {
+        var semanticRequest = BuildSemanticFileRequest(userMessage);
+        if (!string.IsNullOrWhiteSpace(semanticRequest))
+        {
+            fallbackKind = "semantic path";
+            return semanticRequest;
+        }
+
+        fallbackKind = "discovery";
+        return BuildFallbackFindRequest(userMessage);
+    }
+
+    private string BuildSemanticFileRequest(string userMessage)
+    {
+        if (string.IsNullOrWhiteSpace(_processService.SemanticMapPath) || !File.Exists(_processService.SemanticMapPath))
+        {
+            return "";
+        }
+
+        var root = ResolveEffectiveProjectRootPath();
+        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+        {
+            return "";
+        }
+
+        string semanticMap;
+        try
+        {
+            semanticMap = File.ReadAllText(_processService.SemanticMapPath);
+        }
+        catch
+        {
+            return "";
+        }
+
+        var queryWords = ExtractSemanticQueryWords(userMessage).ToArray();
+        if (queryWords.Length == 0)
+        {
+            return "";
+        }
+
+        var candidates = new Dictionary<string, SemanticPathCandidate>(StringComparer.OrdinalIgnoreCase);
+        foreach (var line in semanticMap.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n').Split('\n'))
+        {
+            if (!TryExtractSemanticPath(line, out var path))
+            {
+                continue;
+            }
+
+            if (!RequestPathExists(root, path))
+            {
+                continue;
+            }
+
+            var score = ScoreSemanticPathCandidate(userMessage, queryWords, path, line);
+            if (score < 20)
+            {
+                continue;
+            }
+
+            if (!candidates.TryGetValue(path, out var existing) || score > existing.Score)
+            {
+                candidates[path] = new SemanticPathCandidate(path, score);
+            }
+        }
+
+        var paths = candidates.Values
+            .OrderByDescending(candidate => candidate.Score)
+            .ThenBy(candidate => candidate.Path, StringComparer.OrdinalIgnoreCase)
+            .Take(4)
+            .Select(candidate => candidate.Path)
+            .ToArray();
+        if (paths.Length == 0)
+        {
+            return "";
+        }
+
+        return string.Join(Environment.NewLine, paths.Append("END"));
+    }
+
+    private static bool TryExtractSemanticPath(string line, out string path)
+    {
+        path = "";
+        var clean = (line ?? "").Trim();
+        if (string.IsNullOrWhiteSpace(clean))
+        {
+            return false;
+        }
+
+        if (clean.StartsWith("- ", StringComparison.Ordinal))
+        {
+            clean = clean[2..].Trim();
+            var separator = clean.IndexOf(" — ", StringComparison.Ordinal);
+            if (separator > 0)
+            {
+                clean = clean[..separator].Trim();
+            }
+        }
+
+        if (!ContextPromptBuilder.IsCodeExportRequestLine(clean))
+        {
+            return false;
+        }
+
+        path = ContextPromptBuilder.NormalizeCodeExportRequestLine(clean);
+        return !string.IsNullOrWhiteSpace(path)
+            && !path.StartsWith("FIND:", StringComparison.OrdinalIgnoreCase)
+            && !path.StartsWith("FUNC:", StringComparison.OrdinalIgnoreCase)
+            && !path.StartsWith("FUNCTION ", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int ScoreSemanticPathCandidate(string userMessage, IReadOnlyList<string> queryWords, string path, string semanticLine)
+    {
+        var haystack = $"{path} {semanticLine}";
+        var score = queryWords.Count(word => haystack.Contains(word, StringComparison.OrdinalIgnoreCase)) * 4;
+        var lowerRequest = userMessage.ToLowerInvariant();
+        var lowerPath = path.ToLowerInvariant();
+        var lowerLine = semanticLine.ToLowerInvariant();
+
+        var asksPromptSendButton = lowerRequest.Contains("prompt", StringComparison.Ordinal)
+            && lowerRequest.Contains("send", StringComparison.Ordinal)
+            && lowerRequest.Contains("button", StringComparison.Ordinal);
+        if (asksPromptSendButton && lowerLine.Contains("cc-prompt-send", StringComparison.Ordinal))
+        {
+            score += 60;
+        }
+
+        if ((lowerRequest.Contains("red", StringComparison.Ordinal)
+                || lowerRequest.Contains("color", StringComparison.Ordinal)
+                || lowerRequest.Contains("colour", StringComparison.Ordinal)
+                || lowerRequest.Contains("style", StringComparison.Ordinal))
+            && lowerPath.Contains("workbenchdesign.axaml", StringComparison.Ordinal))
+        {
+            score += 45;
+        }
+
+        if (asksPromptSendButton && lowerPath.Contains("mainwindow.axaml", StringComparison.Ordinal))
+        {
+            score += 30;
+        }
+
+        if (asksPromptSendButton && lowerPath.Contains("contextcontrolviewmodel.cs", StringComparison.Ordinal))
+        {
+            score += 12;
+        }
+
+        if (lowerPath.Contains("/styles/", StringComparison.Ordinal) && lowerRequest.Contains("button", StringComparison.Ordinal))
+        {
+            score += 18;
+        }
+
+        if (lowerPath.Contains("/views/", StringComparison.Ordinal) && lowerRequest.Contains("window", StringComparison.Ordinal))
+        {
+            score += 10;
+        }
+
+        if ((lowerRequest.Contains("red", StringComparison.Ordinal)
+                || lowerRequest.Contains("color", StringComparison.Ordinal)
+                || lowerRequest.Contains("colour", StringComparison.Ordinal)
+                || lowerRequest.Contains("style", StringComparison.Ordinal))
+            && lowerPath.EndsWith(".cs", StringComparison.Ordinal))
+        {
+            score -= 50;
+        }
+
+        if (asksPromptSendButton && lowerPath.Contains("themesettings", StringComparison.Ordinal))
+        {
+            score -= 30;
+        }
+
+        return score;
     }
 
     private static string BuildFallbackFindRequest(string userMessage)
@@ -2078,6 +2292,28 @@ public sealed class ContextControlViewModel : ObservableObject
         var lower = clean.ToLowerInvariant();
         return lower is not ("make" or "change" or "set" or "the" or "and" or "for" or "with" or "from" or "into" or "that" or "this" or "should" or "please" or "color" or "colour" or "red" or "blue" or "green" or "black" or "white" or "yellow" or "purple" or "orange");
     }
+
+    private static IEnumerable<string> ExtractSemanticQueryWords(string text)
+    {
+        foreach (var word in ExtractSearchWords(text))
+        {
+            var clean = word.Trim();
+            if (clean.Length < 3)
+            {
+                continue;
+            }
+
+            var lower = clean.ToLowerInvariant();
+            if (lower is "make" or "change" or "set" or "the" or "and" or "for" or "with" or "from" or "into" or "that" or "this" or "should" or "please" or "to")
+            {
+                continue;
+            }
+
+            yield return clean;
+        }
+    }
+
+    private sealed record SemanticPathCandidate(string Path, int Score);
 
     private IReadOnlyList<string> FindMissingRequestPaths(IReadOnlyList<string> requestLines)
     {

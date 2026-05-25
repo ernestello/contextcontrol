@@ -79,6 +79,7 @@ public sealed class ContextCapsuleBuilder
         if (included.Length > 0)
         {
             builder.AppendLine("Included ContextControl attachments:");
+            builder.AppendLine("The attachment bodies below are the actual visible context. Do not claim an attachment is empty when text appears between its markers.");
             foreach (var attachment in included)
             {
                 var text = attachment.Text ?? "";
