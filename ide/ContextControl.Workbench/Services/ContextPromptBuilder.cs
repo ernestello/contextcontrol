@@ -89,17 +89,72 @@ public sealed partial class ContextPromptBuilder
             return "";
         }
 
-        if (clean.StartsWith("- ", StringComparison.Ordinal))
+        if (clean.StartsWith("- ", StringComparison.Ordinal)
+            || clean.StartsWith("* ", StringComparison.Ordinal)
+            || clean.StartsWith("+ ", StringComparison.Ordinal))
         {
             clean = clean[2..].Trim();
         }
 
+        clean = StripOrderedListPrefix(clean);
         clean = clean.Trim().TrimStart('[').TrimEnd(']').Trim();
         clean = clean.TrimEnd(',', ';').Trim();
         clean = clean.Trim('"', '\'', '`').Trim();
         clean = clean.TrimEnd(',', ';').Trim();
+        clean = StripInlineCodeWrapper(clean);
+        clean = CleanFindLine(clean);
 
         return clean;
+    }
+
+    private static string StripOrderedListPrefix(string text)
+    {
+        var index = 0;
+        while (index < text.Length && char.IsDigit(text[index]))
+        {
+            index++;
+        }
+
+        if (index == 0 || index >= text.Length)
+        {
+            return text;
+        }
+
+        if (text[index] is not ('.' or ')'))
+        {
+            return text;
+        }
+
+        var next = index + 1;
+        if (next >= text.Length || !char.IsWhiteSpace(text[next]))
+        {
+            return text;
+        }
+
+        return text[next..].Trim();
+    }
+
+    private static string StripInlineCodeWrapper(string text)
+    {
+        var clean = text.Trim();
+        if (clean.Length >= 2 && clean[0] == '`' && clean[^1] == '`')
+        {
+            return clean[1..^1].Trim();
+        }
+
+        return clean;
+    }
+
+    private static string CleanFindLine(string text)
+    {
+        const string prefix = "FIND:";
+        if (!text.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        {
+            return text;
+        }
+
+        var value = StripInlineCodeWrapper(text[prefix.Length..].Trim().Trim('"', '\'', '`').Trim());
+        return string.IsNullOrWhiteSpace(value) ? prefix : $"{prefix} {value}";
     }
 
     public static bool IsCodeExportRequestLine(string? line)
@@ -127,6 +182,7 @@ public sealed partial class ContextPromptBuilder
             || clean.StartsWith("FIND:", StringComparison.OrdinalIgnoreCase)
             || clean.Equals("CMakeLists.txt", StringComparison.OrdinalIgnoreCase)
             || clean.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)
+            || clean.EndsWith(".axaml", StringComparison.OrdinalIgnoreCase)
             || clean.EndsWith(".xaml", StringComparison.OrdinalIgnoreCase)
             || clean.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase)
             || clean.EndsWith(".cpp", StringComparison.OrdinalIgnoreCase)

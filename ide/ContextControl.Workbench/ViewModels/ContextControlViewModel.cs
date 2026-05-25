@@ -1790,6 +1790,18 @@ public sealed class ContextControlViewModel : ObservableObject
 
     private async Task SendAsync()
     {
+        var currentMessage = PromptText.Trim();
+        if (!string.IsNullOrWhiteSpace(currentMessage)
+            && IsLikelyCcRequestList(currentMessage)
+            && _promptBuilder.BuildCodeExportRequestLines(currentMessage).Count > 0)
+        {
+            PhaseTitle = "CC request detected";
+            PhaseDetail = "Send detected file/function/FIND lines and is running CC export instead of asking the model again.";
+            AppendTerminalOutput("Send detected a CC request list; running CC export.");
+            await RunCcAsync();
+            return;
+        }
+
         await RunBusyAsync("Send prompt", async () =>
         {
             var message = PromptText.Trim();
@@ -1975,7 +1987,13 @@ public sealed class ContextControlViewModel : ObservableObject
             return clean.Equals("END", StringComparison.OrdinalIgnoreCase)
                 || ContextPromptBuilder.IsCodeExportRequestLine(clean);
         });
-        return requestLike >= Math.Max(1, lines.Length - 1);
+        var realRequestLines = lines.Count(line =>
+        {
+            var clean = ContextPromptBuilder.NormalizeCodeExportRequestLine(line);
+            return !clean.Equals("END", StringComparison.OrdinalIgnoreCase)
+                && ContextPromptBuilder.IsCodeExportRequestLine(clean);
+        });
+        return realRequestLines > 0 && requestLike >= Math.Max(1, lines.Length - 1);
     }
 
     private void AppendFileRequestFallbackIfNeeded(LocalLlmChatMessageViewModel assistant, string userMessage)
