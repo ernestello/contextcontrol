@@ -1658,6 +1658,24 @@ public sealed class ContextControlViewModel : ObservableObject
                 return;
             }
 
+            var missingPaths = FindMissingRequestPaths(requestLines);
+            if (missingPaths.Count > 0)
+            {
+                PhaseTitle = "CC path not found";
+                PhaseDetail = missingPaths.Count == 1
+                    ? $"Not in project tree: {missingPaths[0]}"
+                    : $"{missingPaths.Count} request paths are not in the active project tree.";
+                Log("warn", $"CC cancelled: missing request path {missingPaths[0]}");
+                AppendTerminalOutput("CC cancelled: these request paths are not in the active project tree:");
+                foreach (var missing in missingPaths.Take(8))
+                {
+                    AppendTerminalOutput($"  {missing}");
+                }
+
+                AppendTerminalOutput("Use real paths from DIR, or use FIND: text for discovery.");
+                return;
+            }
+
             PromptText = EnsureEndsWithEnd(string.Join(Environment.NewLine, requestLines));
             PhaseTitle = "CC export";
             PhaseDetail = $"Exporting {requestLines.Count} selected source/function request line(s).";
@@ -1937,6 +1955,110 @@ public sealed class ContextControlViewModel : ObservableObject
                 || ContextPromptBuilder.IsCodeExportRequestLine(clean);
         });
         return requestLike >= Math.Max(1, lines.Length - 1);
+    }
+
+    private IReadOnlyList<string> FindMissingRequestPaths(IReadOnlyList<string> requestLines)
+    {
+        var root = ResolveEffectiveProjectRootPath();
+        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+        {
+            return [];
+        }
+
+        var missing = new List<string>();
+        foreach (var line in requestLines)
+        {
+            var requestPath = ExtractRequestPathForValidation(line);
+            if (string.IsNullOrWhiteSpace(requestPath))
+            {
+                continue;
+            }
+
+            if (!RequestPathExists(root, requestPath))
+            {
+                missing.Add(requestPath);
+            }
+        }
+
+        return missing.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private string ResolveEffectiveProjectRootPath()
+    {
+        return string.IsNullOrWhiteSpace(ActiveProjectRoot)
+            ? _processService.ContextRoot
+            : ActiveProjectRoot;
+    }
+
+    private static string ExtractRequestPathForValidation(string requestLine)
+    {
+        var clean = ContextPromptBuilder.NormalizeCodeExportRequestLine(requestLine);
+        if (string.IsNullOrWhiteSpace(clean)
+            || clean.StartsWith("FIND:", StringComparison.OrdinalIgnoreCase)
+            || clean.StartsWith("FUNC:", StringComparison.OrdinalIgnoreCase)
+            || clean.StartsWith("SYMBOL:", StringComparison.OrdinalIgnoreCase))
+        {
+            return "";
+        }
+
+        if (clean.StartsWith("FUNCTION ", StringComparison.OrdinalIgnoreCase))
+        {
+            var body = clean["FUNCTION ".Length..].Trim();
+            var separator = body.IndexOf(" :: ", StringComparison.Ordinal);
+            return separator > 0 ? body[..separator].Trim() : "";
+        }
+
+        return clean;
+    }
+
+    private static bool RequestPathExists(string projectRoot, string requestPath)
+    {
+        try
+        {
+            if (requestPath.Contains('*', StringComparison.Ordinal) || requestPath.Contains('?', StringComparison.Ordinal))
+            {
+                return RequestWildcardPathExists(projectRoot, requestPath);
+            }
+
+            var fullPath = ResolveProjectRelativePath(projectRoot, requestPath);
+            return !string.IsNullOrWhiteSpace(fullPath) && File.Exists(fullPath);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool RequestWildcardPathExists(string projectRoot, string requestPath)
+    {
+        var normalized = requestPath.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+        var directoryPart = Path.GetDirectoryName(normalized) ?? "";
+        var pattern = Path.GetFileName(normalized);
+        if (string.IsNullOrWhiteSpace(pattern))
+        {
+            return false;
+        }
+
+        var searchRoot = string.IsNullOrWhiteSpace(directoryPart)
+            ? Path.GetFullPath(projectRoot)
+            : ResolveProjectRelativePath(projectRoot, directoryPart);
+        if (string.IsNullOrWhiteSpace(searchRoot) || !Directory.Exists(searchRoot))
+        {
+            return false;
+        }
+
+        return Directory.EnumerateFiles(searchRoot, pattern, SearchOption.TopDirectoryOnly).Any();
+    }
+
+    private static string ResolveProjectRelativePath(string projectRoot, string relativePath)
+    {
+        var root = Path.GetFullPath(projectRoot);
+        var normalizedRelative = relativePath.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
+        var fullPath = Path.GetFullPath(Path.Combine(root, normalizedRelative));
+        var rootWithSeparator = root.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        return fullPath.StartsWith(rootWithSeparator, StringComparison.OrdinalIgnoreCase)
+            ? fullPath
+            : "";
     }
 
     private LocalLlmModelViewModel? ResolveModelForPhase(ContextCapsulePhase phase)

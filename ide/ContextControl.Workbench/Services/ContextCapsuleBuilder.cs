@@ -135,6 +135,9 @@ public sealed class ContextCapsuleBuilder
                 DIR/tree context is attached.
                 Output only the smallest safe CC request list, ending with END.
                 Valid lines: exact file, FUNCTION path :: symbol, FIND: exactText.
+                Every exact file path must be copied from the attached DIR tree exactly.
+                If the user's named path is absent from the DIR tree, treat it as a hint and return real nearby tree paths or FIND: terms.
+                Never invent src/, .xaml.cs, .csproj, or framework-style paths that are not present in the tree.
                 """,
             ContextCapsulePhase.PatchWrite => """
                 Phase contract:

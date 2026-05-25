@@ -102,6 +102,7 @@ public sealed class SkillbookService
 
             Keep outputs mechanical:
             - Prefer exact files, FUNCTION path :: symbol, or FIND: exactText.
+            - In DIR phase, exact file paths must exist in the attached tree. If a user/generator names a missing path, use it only as a hint and return real tree paths or FIND:.
             - Avoid broad folders and invented APIs.
             - Patch output must use raw BEGIN/END CC-REPLACE blocks.
             """;
