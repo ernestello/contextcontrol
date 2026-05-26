@@ -194,6 +194,7 @@ public sealed class ContextCapsuleBuilder
                 If the user's named path is absent from the DIR tree, treat it as a hint and return real nearby tree paths or FIND: terms.
                 Never invent src/, .xaml.cs, .csproj, or framework-style paths that are not present in the tree.
                 Ignore diagnostic questions about whether attachments were received; the inventory above is authoritative, and your output must still be a useful CC request list.
+                FIND terms must come from the user's real task, not from capsule headings such as local LLM capsule, attachment, semantic map, or context.
                 Never return END by itself. If unsure, output 2-5 FIND: terms from the user request, then END.
                 """,
             ContextCapsulePhase.PatchWrite => """

@@ -64,7 +64,6 @@ public sealed class ContextControlViewModel : ObservableObject
     private string _transferProgressSpeedLabel = "";
     private string _transferProgressPercentLabel = "";
     private string _terminalOutputText = "";
-    private DateTime? _generationStartedAt;
     private string _promptText = "";
     private string _selectedRoute;
     private LocalLlmModelViewModel? _selectedLocalModel;
@@ -124,6 +123,11 @@ public sealed class ContextControlViewModel : ObservableObject
         SkillbookEntries = new ObservableCollection<SkillbookEntryViewModel>(
             _skillbookService.LoadEntries().Select(entry => new SkillbookEntryViewModel(entry)));
         ChatSessions = [];
+        ChatRequestProgressItems.CollectionChanged += (_, _) =>
+        {
+            OnPropertyChanged(nameof(HasChatRequestProgress));
+            OnPropertyChanged(nameof(PromptBarHeight));
+        };
 
         RunDirCommand = new RelayCommand<object>(_ => _ = RunDirAsync(), _ => !IsBusy);
         RunCcCommand = new RelayCommand<object>(_ => _ = RunCcAsync(), _ => !IsBusy);
@@ -173,10 +177,12 @@ public sealed class ContextControlViewModel : ObservableObject
     public ObservableCollection<SkillbookEntryViewModel> SkillbookEntries { get; }
     public ObservableCollection<ChatSessionViewModel> ChatSessions { get; }
     public ObservableCollection<LocalLlmChatMessageViewModel> ChatMessages { get; } = [];
+    public ObservableCollection<ChatRequestProgressViewModel> ChatRequestProgressItems { get; } = [];
     public ObservableCollection<PatchPlanActionViewModel> PatchPlanActions { get; } = [];
     public bool HasAttachments => Attachments.Count > 0;
     public bool HasInstalledLocalModels => InstalledLocalModels.Count > 0;
     public bool HasChatSessions => ChatSessions.Count > 0;
+    public bool HasChatRequestProgress => ChatRequestProgressItems.Count > 0;
     public bool HasPatchPlanActions => PatchPlanActions.Count > 0;
     public string ChatHistorySummary => $"{ChatSessions.Count:N0} chat(s)";
 
@@ -252,7 +258,7 @@ public sealed class ContextControlViewModel : ObservableObject
     }
 
     public double PromptBarHeight => IsPromptOpen
-        ? CalculatePromptBarBaseHeight() + (IsTransferProgressActive ? 54 : 0)
+        ? CalculatePromptBarBaseHeight() + (IsTransferProgressActive ? 54 : 0) + (ChatRequestProgressItems.Count * 54)
         : 0;
 
     public double PromptBarOpacity => IsPromptOpen ? 1 : 0;
@@ -1031,20 +1037,37 @@ public sealed class ContextControlViewModel : ObservableObject
 
     private void AppendChatMessage(LocalLlmChatMessageViewModel message)
     {
-        if (SelectedChatSession is null)
+        AppendChatMessageToSession(EnsureSelectedChatSession(), message);
+    }
+
+    private ChatSessionViewModel EnsureSelectedChatSession()
+    {
+        if (SelectedChatSession is { } selected)
         {
-            CreateNewChatSession(save: false, resetWorkflow: false);
+            return selected;
         }
 
-        ChatMessages.Add(message);
-        SelectedChatSession?.Append(message);
-        if (SelectedChatSession is { } active)
+        CreateNewChatSession(save: false, resetWorkflow: false);
+        return SelectedChatSession ?? ChatSessions[0];
+    }
+
+    private void AppendChatMessageToSession(ChatSessionViewModel session, LocalLlmChatMessageViewModel message)
+    {
+        if (!ChatSessions.Contains(session))
         {
-            var index = ChatSessions.IndexOf(active);
-            if (index > 0)
-            {
-                ChatSessions.Move(index, 0);
-            }
+            return;
+        }
+
+        session.Append(message);
+        if (ReferenceEquals(SelectedChatSession, session))
+        {
+            ChatMessages.Add(message);
+        }
+
+        var index = ChatSessions.IndexOf(session);
+        if (index > 0)
+        {
+            ChatSessions.Move(index, 0);
         }
 
         OnPropertyChanged(nameof(ChatHistorySummary));
@@ -1179,42 +1202,36 @@ public sealed class ContextControlViewModel : ObservableObject
         return new Progress<string>(AppendTerminalOutput);
     }
 
-    private IProgress<LocalLlmGenerationProgress> CreateGenerationProgress(string modelName)
-    {
-        BeginGenerationProgress(modelName);
-        return new Progress<LocalLlmGenerationProgress>(UpdateGenerationProgress);
-    }
-
-    private void BeginGenerationProgress(string modelName)
+    private (ChatRequestProgressViewModel Item, IProgress<LocalLlmGenerationProgress> Progress) CreateGenerationProgress(
+        ChatSessionViewModel session,
+        string modelName,
+        string phase)
     {
         IsPromptOpen = true;
-        _generationStartedAt = DateTime.UtcNow;
-        TransferProgressTitle = $"Chatting with {modelName}";
-        TransferProgressStatus = "Loading model...";
-        TransferProgressSizeLabel = "0 output tok";
-        TransferProgressSpeedLabel = "speed pending";
-        TransferProgressPercentLabel = "";
-        TransferProgressValue = 0;
-        IsTransferProgressIndeterminate = true;
-        IsTransferProgressActive = true;
+        var startedAt = DateTime.UtcNow;
+        var item = new ChatRequestProgressViewModel(session.Id, $"{phase} with {modelName}");
+        ChatRequestProgressItems.Add(item);
+
+        return (item, new Progress<LocalLlmGenerationProgress>(progress =>
+        {
+            var elapsed = Math.Max(0, (DateTime.UtcNow - startedAt).TotalSeconds);
+            item.Status = progress.Status;
+            item.SizeLabel = progress.EvalCount is { } evalCount
+                ? $"{evalCount} output tok"
+                : "loading";
+            item.SpeedLabel = BuildGenerationSpeedLabel(progress, elapsed);
+            item.ElapsedLabel = elapsed > 0 ? $"{elapsed:0.#}s" : "";
+            item.IsIndeterminate = !progress.Done;
+            if (progress.Done)
+            {
+                item.Value = 100;
+            }
+        }));
     }
 
-    private void UpdateGenerationProgress(LocalLlmGenerationProgress progress)
+    private void CompleteGenerationProgress(ChatRequestProgressViewModel item)
     {
-        var elapsed = _generationStartedAt is { } startedAt
-            ? Math.Max(0, (DateTime.UtcNow - startedAt).TotalSeconds)
-            : 0;
-        TransferProgressStatus = progress.Status;
-        TransferProgressSizeLabel = progress.EvalCount is { } evalCount
-            ? $"{evalCount} output tok"
-            : "loading";
-        TransferProgressSpeedLabel = BuildGenerationSpeedLabel(progress, elapsed);
-        TransferProgressPercentLabel = elapsed > 0 ? $"{elapsed:0.#}s" : "";
-        IsTransferProgressIndeterminate = !progress.Done;
-        if (progress.Done)
-        {
-            TransferProgressValue = 100;
-        }
+        ChatRequestProgressItems.Remove(item);
     }
 
     private static string BuildGenerationSpeedLabel(LocalLlmGenerationProgress progress, double elapsedSeconds)
@@ -1802,6 +1819,24 @@ public sealed class ContextControlViewModel : ObservableObject
             return;
         }
 
+        if (IsChatPromptMode || SelectedRoute.StartsWith("Local:", StringComparison.OrdinalIgnoreCase))
+        {
+            var localMessage = currentMessage;
+            if (string.IsNullOrWhiteSpace(localMessage))
+            {
+                localMessage = BuildEmptyLocalSendMessage();
+                if (string.IsNullOrWhiteSpace(localMessage))
+                {
+                    PhaseTitle = "Nothing to send";
+                    PhaseDetail = "Write a prompt, run DIR, or attach CC context first.";
+                    return;
+                }
+            }
+
+            _ = SendLocalChatAsync(localMessage);
+            return;
+        }
+
         await RunBusyAsync("Send prompt", async () =>
         {
             var message = PromptText.Trim();
@@ -1809,12 +1844,6 @@ public sealed class ContextControlViewModel : ObservableObject
             {
                 PhaseTitle = "Nothing to send";
                 PhaseDetail = "Write or generate a prompt first.";
-                return;
-            }
-
-            if (IsChatPromptMode || SelectedRoute.StartsWith("Local:", StringComparison.OrdinalIgnoreCase))
-            {
-                await SendLocalChatAsync(message);
                 return;
             }
 
@@ -1837,13 +1866,38 @@ public sealed class ContextControlViewModel : ObservableObject
         });
     }
 
+    private string BuildEmptyLocalSendMessage()
+    {
+        if (Attachments.Any(attachment => attachment.Kind.Equals("code", StringComparison.OrdinalIgnoreCase) && attachment.IncludeInPrompt))
+        {
+            return string.IsNullOrWhiteSpace(_lastUserRequest)
+                ? "Use the attached CC source context. If the task is not clear, ask for the missing user request."
+                : _lastUserRequest;
+        }
+
+        if (Attachments.Any(attachment => attachment.Kind.Equals("patch", StringComparison.OrdinalIgnoreCase) && attachment.IncludeInPrompt))
+        {
+            return "Review the attached patch context using the ContextControl patch review flow.";
+        }
+
+        if (Attachments.Any(attachment => attachment.Kind.Equals("dir", StringComparison.OrdinalIgnoreCase) && attachment.IncludeInPrompt))
+        {
+            return string.IsNullOrWhiteSpace(_lastUserRequest)
+                ? "Identify the smallest useful next CC request from the attached DIR semantic map."
+                : _lastUserRequest;
+        }
+
+        return "";
+    }
+
     private async Task SendLocalChatAsync(string message)
     {
+        var targetSession = EnsureSelectedChatSession();
         var phase = ResolveCapsulePhase(message);
         var capsuleMessage = phase is ContextCapsulePhase.PatchWrite or ContextCapsulePhase.PatchReview
             ? ResolvePatchTaskMessage(message)
             : message;
-        if (phase == ContextCapsulePhase.FileRequest && !IsLikelyCcRequestList(message))
+        if (phase == ContextCapsulePhase.FileRequest && IsMeaningfulTaskPrompt(message))
         {
             _lastUserRequest = message;
         }
@@ -1869,7 +1923,7 @@ public sealed class ContextControlViewModel : ObservableObject
             capsuleAttachments));
 
         var attachmentSnapshot = Attachments.ToArray();
-        AppendChatMessage(new LocalLlmChatMessageViewModel(
+        AppendChatMessageToSession(targetSession, new LocalLlmChatMessageViewModel(
             "user",
             capsuleMessage,
             model.Id,
@@ -1880,55 +1934,68 @@ public sealed class ContextControlViewModel : ObservableObject
         PhaseTitle = "Local CC chat";
         PhaseDetail = $"{FormatCapsulePhase(phase)} with {model.DisplayName}; {capsule.Summary}.";
         ProviderStatus = $"Local Ollama: {model.Id}";
-        var generationProgress = CreateGenerationProgress(model.DisplayName);
+        var generationProgress = CreateGenerationProgress(targetSession, model.DisplayName, FormatCapsulePhase(phase));
         var terminal = CreateTerminalProgress();
-        terminal.Report($"Sending {FormatCapsulePhase(phase)} capsule to {model.DisplayName} ({model.Id})...");
-        terminal.Report($"Requested Ollama context window: {capsule.RequestedContextTokens:N0} tokens.");
-        ReportCapsuleAttachments(terminal, capsuleAttachments);
-
-        var result = await _localLlmService.SendChatAsync(
-            new LocalLlmRequest(
-                model.Id,
-                capsule.Text,
-                FormatCapsulePhase(phase),
-                attachmentSnapshot.Select(attachment => attachment.DisplayTitle).ToArray(),
-                capsule.RequestedContextTokens),
-            generationProgress,
-            terminal);
-
-        if (result.Succeeded && !string.IsNullOrWhiteSpace(result.Message))
+        try
         {
-            var assistant = new LocalLlmChatMessageViewModel(
-                "assistant",
-                result.Message,
-                model.Id,
-                FormatCapsulePhase(phase),
-                capsule.Summary,
-                result.Stats,
-                attachmentSnapshot);
-            AppendChatMessage(assistant);
-            var latestPatch = assistant.Snippets.LastOrDefault(snippet => snippet.IsPatch);
-            if (latestPatch is not null)
+            terminal.Report($"Sending {FormatCapsulePhase(phase)} capsule to {model.DisplayName} ({model.Id})...");
+            terminal.Report($"Requested Ollama context window: {capsule.RequestedContextTokens:N0} tokens.");
+            ReportCapsuleAttachments(terminal, capsuleAttachments);
+
+            var result = await _localLlmService.SendChatAsync(
+                new LocalLlmRequest(
+                    model.Id,
+                    capsule.Text,
+                    FormatCapsulePhase(phase),
+                    attachmentSnapshot.Select(attachment => attachment.DisplayTitle).ToArray(),
+                    capsule.RequestedContextTokens),
+                generationProgress.Progress,
+                terminal);
+
+            if (result.Succeeded && !string.IsNullOrWhiteSpace(result.Message))
             {
-                _lastAssistantPatchBlocks = latestPatch.Text;
+                var assistant = new LocalLlmChatMessageViewModel(
+                    "assistant",
+                    result.Message,
+                    model.Id,
+                    FormatCapsulePhase(phase),
+                    capsule.Summary,
+                    result.Stats,
+                    attachmentSnapshot);
+                AppendChatMessageToSession(targetSession, assistant);
+                var latestPatch = assistant.Snippets.LastOrDefault(snippet => snippet.IsPatch);
+                if (latestPatch is not null && ReferenceEquals(SelectedChatSession, targetSession))
+                {
+                    _lastAssistantPatchBlocks = latestPatch.Text;
+                }
+
+                if (phase == ContextCapsulePhase.FileRequest)
+                {
+                    AppendFileRequestFallbackIfNeeded(targetSession, assistant, capsuleMessage);
+                }
+
+                if (assistant.HasThinking)
+                {
+                    model.MarkThinkingDetected();
+                }
             }
 
-            if (phase == ContextCapsulePhase.FileRequest)
-            {
-                AppendFileRequestFallbackIfNeeded(assistant, capsuleMessage);
-            }
-
-            if (assistant.HasThinking)
-            {
-                model.MarkThinkingDetected();
-            }
+            ProviderStatus = result.Status;
+            PhaseTitle = result.Succeeded ? "Local answer ready" : "Local chat failed";
+            PhaseDetail = result.Status;
+            Log(result.Succeeded ? "ok" : "warn", result.Status);
         }
-
-        ProviderStatus = result.Status;
-        PhaseTitle = result.Succeeded ? "Local answer ready" : "Local chat failed";
-        PhaseDetail = result.Status;
-        CompleteTransferProgress(result.Status, result.Succeeded);
-        Log(result.Succeeded ? "ok" : "warn", result.Status);
+        catch (Exception ex)
+        {
+            ProviderStatus = ex.Message;
+            PhaseTitle = "Local chat failed";
+            PhaseDetail = ex.Message;
+            Log("error", ex.Message);
+        }
+        finally
+        {
+            CompleteGenerationProgress(generationProgress.Item);
+        }
     }
 
     private static void ReportCapsuleAttachments(IProgress<string> terminal, IReadOnlyList<ContextCapsuleAttachment> attachments)
@@ -2013,7 +2080,36 @@ public sealed class ContextControlViewModel : ObservableObject
         return realRequestLines > 0 && requestLike >= Math.Max(1, lines.Length - 1);
     }
 
-    private void AppendFileRequestFallbackIfNeeded(LocalLlmChatMessageViewModel assistant, string userMessage)
+    private static bool IsMeaningfulTaskPrompt(string text)
+    {
+        return !IsLikelyCcRequestList(text)
+            && !LooksLikeAttachmentDiagnostic(text)
+            && !LooksLikeContextOnlyPrompt(text);
+    }
+
+    private static bool LooksLikeContextOnlyPrompt(string text)
+    {
+        var words = ExtractSearchWords(text).Select(word => word.ToLowerInvariant()).ToArray();
+        if (words.Length == 0)
+        {
+            return true;
+        }
+
+        var taskWords = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "add", "apply", "build", "change", "create", "delete", "edit", "fix", "implement",
+            "make", "modify", "move", "red", "remove", "replace", "review", "set", "update"
+        };
+        if (words.Any(taskWords.Contains))
+        {
+            return false;
+        }
+
+        return words.All(word => word is "attach" or "attached" or "attachment" or "context" or "dir" or "file"
+            or "here" or "map" or "semantic" or "sent" or "this" or "with");
+    }
+
+    private void AppendFileRequestFallbackIfNeeded(ChatSessionViewModel targetSession, LocalLlmChatMessageViewModel assistant, string userMessage)
     {
         var requestSnippet = assistant.Snippets.LastOrDefault(snippet => snippet.IsRequestList);
         if (requestSnippet is not null && !IsFindOnlyRequestList(requestSnippet.Text))
@@ -2038,12 +2134,15 @@ public sealed class ContextControlViewModel : ObservableObject
         }
 
         PhaseTitle = "File request fallback";
-        PromptText = EnsureEndsWithEnd(fallback);
-        IsPromptOpen = true;
-        PromptModeKey = "context";
+        if (ReferenceEquals(SelectedChatSession, targetSession))
+        {
+            PromptText = EnsureEndsWithEnd(fallback);
+            IsPromptOpen = true;
+            PromptModeKey = "context";
+        }
         PhaseDetail = fallbackKind.Equals("semantic path", StringComparison.OrdinalIgnoreCase)
-            ? "Semantic fallback loaded into the prompt. Press Send or CC to export those files."
-            : "Discovery fallback loaded into the prompt. Press Send or CC to run FIND.";
+            ? "Semantic fallback loaded for the request. Select that chat, then press Send or CC to export those files."
+            : "Discovery fallback loaded for the request. Select that chat, then press Send or CC to run FIND.";
         AppendTerminalOutput(requestSnippet is null
             ? $"File request {fallbackKind} fallback loaded into prompt because the model returned no usable paths."
             : $"File request {fallbackKind} fallback loaded into prompt because the model returned only FIND discovery lines.");
@@ -2062,7 +2161,7 @@ public sealed class ContextControlViewModel : ObservableObject
 
     private string SelectFallbackSourceText(string userMessage)
     {
-        if (LooksLikeAttachmentDiagnostic(userMessage) && !string.IsNullOrWhiteSpace(_lastUserRequest))
+        if ((LooksLikeAttachmentDiagnostic(userMessage) || LooksLikeContextOnlyPrompt(userMessage)) && !string.IsNullOrWhiteSpace(_lastUserRequest))
         {
             return _lastUserRequest;
         }
@@ -2413,7 +2512,7 @@ public sealed class ContextControlViewModel : ObservableObject
         }
 
         var lower = clean.ToLowerInvariant();
-        return lower is not ("make" or "change" or "set" or "the" or "and" or "for" or "with" or "from" or "into" or "that" or "this" or "should" or "please" or "color" or "colour" or "red" or "blue" or "green" or "black" or "white" or "yellow" or "purple" or "orange");
+        return lower is not ("make" or "change" or "set" or "the" or "and" or "for" or "with" or "from" or "into" or "that" or "this" or "should" or "please" or "color" or "colour" or "red" or "blue" or "green" or "black" or "white" or "yellow" or "purple" or "orange" or "semantic" or "map" or "attached" or "attachment" or "context" or "capsule" or "local" or "llm");
     }
 
     private static IEnumerable<string> ExtractSemanticQueryWords(string text)
@@ -2427,7 +2526,7 @@ public sealed class ContextControlViewModel : ObservableObject
             }
 
             var lower = clean.ToLowerInvariant();
-            if (lower is "make" or "change" or "set" or "the" or "and" or "for" or "with" or "from" or "into" or "that" or "this" or "should" or "please" or "to")
+            if (lower is "make" or "change" or "set" or "the" or "and" or "for" or "with" or "from" or "into" or "that" or "this" or "should" or "please" or "to" or "semantic" or "map" or "attached" or "attachment" or "context" or "capsule" or "local" or "llm")
             {
                 continue;
             }

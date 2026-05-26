@@ -1247,7 +1247,7 @@
                   <DoubleTransition Property="Opacity" Duration="0:0:0.12" />
                 </Transitions>
               </Border.Transitions>
-              <Grid RowDefinitions="Auto,Auto,*" RowSpacing="0">
+              <Grid RowDefinitions="Auto,Auto,Auto,*" RowSpacing="0">
                 <ProgressBar
                     Classes="cc-prompt-progress"
                     Minimum="0"
@@ -1257,8 +1257,37 @@
                     IsVisible="{Binding ContextControl.ShowBusyPromptProgress}"
                     IsIndeterminate="{Binding ContextControl.ShowBusyPromptProgress}" />
 
-                <Border
+                <ItemsControl
                     Grid.Row="1"
+                    Margin="0,0,0,6"
+                    ItemsSource="{Binding ContextControl.ChatRequestProgressItems}"
+                    IsVisible="{Binding ContextControl.HasChatRequestProgress}">
+                  <ItemsControl.ItemTemplate>
+                    <DataTemplate DataType="{x:Type vm:ChatRequestProgressViewModel}">
+                      <Border Classes="cc-transfer-progress" Margin="0,0,0,4">
+                        <Grid RowDefinitions="Auto,Auto" RowSpacing="5">
+                          <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="10">
+                            <TextBlock Classes="cc-transfer-title" Text="{Binding Title}" />
+                            <TextBlock Grid.Column="1" Classes="cc-transfer-meta" Text="{Binding SizeLabel}" />
+                            <TextBlock Grid.Column="2" Classes="cc-transfer-meta" Text="{Binding SpeedLabel}" />
+                          </Grid>
+                          <Grid Grid.Row="1" ColumnDefinitions="*,Auto" ColumnSpacing="10">
+                            <ProgressBar
+                                Classes="cc-transfer-bar"
+                                Minimum="0"
+                                Maximum="100"
+                                Value="{Binding Value}"
+                                IsIndeterminate="{Binding IsIndeterminate}" />
+                            <TextBlock Grid.Column="1" Classes="cc-transfer-percent" Text="{Binding ElapsedLabel}" />
+                          </Grid>
+                        </Grid>
+                      </Border>
+                    </DataTemplate>
+                  </ItemsControl.ItemTemplate>
+                </ItemsControl>
+
+                <Border
+                    Grid.Row="2"
                     Classes="cc-transfer-progress"
                     IsVisible="{Binding ContextControl.IsTransferProgressActive}">
                   <Grid RowDefinitions="Auto,Auto" RowSpacing="5">
@@ -1279,7 +1308,7 @@
                   </Grid>
                 </Border>
 
-                <Border x:Name="ContextPromptComposer" Grid.Row="2" Classes="cc-prompt-composer">
+                <Border x:Name="ContextPromptComposer" Grid.Row="3" Classes="cc-prompt-composer">
                   <Grid RowDefinitions="Auto,*,Auto" RowSpacing="8">
                     <Grid ColumnDefinitions="Auto,Auto,*,Auto" ColumnSpacing="8">
                       <StackPanel Orientation="Horizontal" Spacing="4">
