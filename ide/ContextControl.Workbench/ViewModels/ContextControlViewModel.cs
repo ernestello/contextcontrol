@@ -2036,19 +2036,16 @@ public sealed class ContextControlViewModel : ObservableObject
             return;
         }
 
-        var intro = requestSnippet is null
-            ? "The model did not return usable CC request lines."
-            : "The model returned only FIND discovery lines; the semantic map found likely exact files.";
-        AppendChatMessage(new LocalLlmChatMessageViewModel(
-            "assistant",
-            $"{intro} ContextControl generated a {fallbackKind} fallback from your request.{Environment.NewLine}{Environment.NewLine}```text{Environment.NewLine}{fallback}{Environment.NewLine}```",
-            "ContextControl",
-            "file request fallback"));
         PhaseTitle = "File request fallback";
+        PromptText = EnsureEndsWithEnd(fallback);
+        IsPromptOpen = true;
+        PromptModeKey = "context";
         PhaseDetail = fallbackKind.Equals("semantic path", StringComparison.OrdinalIgnoreCase)
-            ? "The model returned no files; use the generated semantic file list for CC."
-            : "The model returned no files; use the generated FIND list for CC.";
-        AppendTerminalOutput($"File request {fallbackKind} fallback generated because the model returned no usable paths.");
+            ? "Semantic fallback loaded into the prompt. Press Send or CC to export those files."
+            : "Discovery fallback loaded into the prompt. Press Send or CC to run FIND.";
+        AppendTerminalOutput(requestSnippet is null
+            ? $"File request {fallbackKind} fallback loaded into prompt because the model returned no usable paths."
+            : $"File request {fallbackKind} fallback loaded into prompt because the model returned only FIND discovery lines.");
     }
 
     private static bool IsFindOnlyRequestList(string text)
