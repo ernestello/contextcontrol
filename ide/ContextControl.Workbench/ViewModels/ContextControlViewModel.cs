@@ -1884,6 +1884,7 @@ public sealed class ContextControlViewModel : ObservableObject
         var terminal = CreateTerminalProgress();
         terminal.Report($"Sending {FormatCapsulePhase(phase)} capsule to {model.DisplayName} ({model.Id})...");
         terminal.Report($"Requested Ollama context window: {capsule.RequestedContextTokens:N0} tokens.");
+        ReportCapsuleAttachments(terminal, capsuleAttachments);
 
         var result = await _localLlmService.SendChatAsync(
             new LocalLlmRequest(
@@ -1928,6 +1929,22 @@ public sealed class ContextControlViewModel : ObservableObject
         PhaseDetail = result.Status;
         CompleteTransferProgress(result.Status, result.Succeeded);
         Log(result.Succeeded ? "ok" : "warn", result.Status);
+    }
+
+    private static void ReportCapsuleAttachments(IProgress<string> terminal, IReadOnlyList<ContextCapsuleAttachment> attachments)
+    {
+        var included = attachments.Where(attachment => attachment.Included).ToArray();
+        if (included.Length == 0)
+        {
+            terminal.Report("No raw attachments included in this capsule.");
+            return;
+        }
+
+        foreach (var attachment in included)
+        {
+            var text = attachment.Text ?? "";
+            terminal.Report($"Raw attachment included: {attachment.Label} ({attachment.Kind}, {text.Length:N0} chars, ~{ContextCapsuleBuilder.EstimateTokens(text):N0} tok)");
+        }
     }
 
     private ContextCapsulePhase ResolveCapsulePhase(string message)

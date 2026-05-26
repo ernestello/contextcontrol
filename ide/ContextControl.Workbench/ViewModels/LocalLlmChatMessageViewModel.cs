@@ -53,7 +53,9 @@ public sealed partial class LocalLlmChatMessageViewModel : ObservableObject
     public ObservableCollection<ContextControlAttachmentViewModel> AttachedFiles { get; }
 
     public bool IsUser => string.Equals(Role, "user", StringComparison.OrdinalIgnoreCase);
-    public string RoleLabel => IsUser ? "You" : "Local";
+    public bool IsContextControlGenerated => string.Equals(ModelId, "ContextControl", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(ModelId, "ccReplace", StringComparison.OrdinalIgnoreCase);
+    public string RoleLabel => IsUser ? "You" : IsContextControlGenerated ? ModelId : "Local";
     public bool HasStats => Stats is not null;
     public bool HasThinking => !string.IsNullOrWhiteSpace(ThinkingText);
     public bool HasAttachments => AttachedFiles.Count > 0;
