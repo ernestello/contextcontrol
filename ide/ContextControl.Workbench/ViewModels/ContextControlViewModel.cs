@@ -2021,7 +2021,8 @@ public sealed class ContextControlViewModel : ObservableObject
             return;
         }
 
-        var fallback = BuildFileRequestFallback(userMessage, out var fallbackKind);
+        var fallbackSource = SelectFallbackSourceText(userMessage);
+        var fallback = BuildFileRequestFallback(fallbackSource, out var fallbackKind);
         if (requestSnippet is not null
             && (!fallbackKind.Equals("semantic path", StringComparison.OrdinalIgnoreCase)
                 || RequestListsMatch(requestSnippet.Text, fallback)))
@@ -2057,6 +2058,31 @@ public sealed class ContextControlViewModel : ObservableObject
             .Where(line => !line.Equals("END", StringComparison.OrdinalIgnoreCase))
             .ToArray();
         return lines.Length > 0 && lines.All(line => line.StartsWith("FIND:", StringComparison.OrdinalIgnoreCase));
+    }
+
+    private string SelectFallbackSourceText(string userMessage)
+    {
+        if (LooksLikeAttachmentDiagnostic(userMessage) && !string.IsNullOrWhiteSpace(_lastUserRequest))
+        {
+            return _lastUserRequest;
+        }
+
+        var currentFallback = BuildFallbackFindRequest(userMessage);
+        if (!string.IsNullOrWhiteSpace(currentFallback))
+        {
+            return userMessage;
+        }
+
+        return string.IsNullOrWhiteSpace(_lastUserRequest)
+            ? userMessage
+            : _lastUserRequest;
+    }
+
+    private static bool LooksLikeAttachmentDiagnostic(string text)
+    {
+        var lower = (text ?? "").ToLowerInvariant();
+        return (lower.Contains("receive", StringComparison.Ordinal) || lower.Contains("received", StringComparison.Ordinal))
+            && (lower.Contains("attachment", StringComparison.Ordinal) || lower.Contains("context", StringComparison.Ordinal));
     }
 
     private static bool RequestListsMatch(string left, string right)

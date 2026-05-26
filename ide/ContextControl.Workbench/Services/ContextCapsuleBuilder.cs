@@ -84,6 +84,14 @@ public sealed class ContextCapsuleBuilder
         var included = request.Attachments.Where(attachment => attachment.Included).ToArray();
         if (included.Length > 0)
         {
+            builder.AppendLine("Attachment inventory:");
+            foreach (var attachment in included)
+            {
+                var text = attachment.Text ?? "";
+                builder.AppendLine($"- {attachment.Label} ({attachment.Kind}) PATH: {attachment.Path}; BODY_CHARS: {text.Length}; EST_TOKENS: {EstimateTokens(text)}");
+            }
+
+            builder.AppendLine();
             builder.AppendLine("Included ContextControl attachments:");
             builder.AppendLine("The attachment bodies below are the actual visible context. Do not claim an attachment is empty when text appears between its markers.");
             foreach (var attachment in included)
@@ -185,6 +193,7 @@ public sealed class ContextCapsuleBuilder
                 Every exact file path must be copied from the attached DIR tree exactly.
                 If the user's named path is absent from the DIR tree, treat it as a hint and return real nearby tree paths or FIND: terms.
                 Never invent src/, .xaml.cs, .csproj, or framework-style paths that are not present in the tree.
+                Ignore diagnostic questions about whether attachments were received; the inventory above is authoritative, and your output must still be a useful CC request list.
                 Never return END by itself. If unsure, output 2-5 FIND: terms from the user request, then END.
                 """,
             ContextCapsulePhase.PatchWrite => """
