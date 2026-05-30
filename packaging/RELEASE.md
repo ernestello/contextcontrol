@@ -40,7 +40,7 @@ Quiet uninstall smoke test:
 
 No LLM weights, dependency runtimes, chat history, source files, tests, or build folders are bundled. The app installs dependencies and downloads local LLMs from inside the Dependencies and Local LLM pages.
 
-The workbench checks GitHub releases on startup and exposes a header-bar **Check updates** button. If a newer release exists, the button downloads `ContextControl-win-x64-Setup.exe` and starts it with the current install folder preselected. During install, setup closes any running Workbench process in the target folder before extracting files.
+The workbench checks GitHub releases on startup and exposes a header-bar **Check updates** button. If a newer release exists, the button downloads `ContextControl-win-x64-Setup.exe` and starts it with the current install folder preselected. The updater reuses an already downloaded installer for the same release, cleans stale temp update folders when possible, hands setup off only after the running Workbench process exits, and setup skips unchanged files while extracting.
 
 Current app-side autosetup coverage documented in the README and packaged install guide:
 
@@ -48,7 +48,7 @@ Current app-side autosetup coverage documented in the README and packaged instal
 - 262/301 catalog entries use local Ollama model pulls
 - 11/301 catalog entries use non-Ollama managed/backend setup
 - 28/301 catalog entries are Ollama Cloud entries with no local weight download
-- 12/12 image-generation catalog entries have a route
+- 12/12 image-generation catalog entries have a route; 3 experimental Ollama image entries are macOS-only and disabled on Windows/Linux
 
 Fresh Windows Python bootstrap: managed Python dependencies ignore the Microsoft Store `python.exe` alias and install Python 3.12 through `winget` when no real interpreter is present.
 

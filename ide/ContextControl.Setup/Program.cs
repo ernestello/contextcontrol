@@ -850,6 +850,7 @@ internal static class InstallerEngine
         {
             Log($"Preparing to remove {resolvedInstallDir}...");
             EnsureSafeUninstallTarget(resolvedInstallDir);
+            WaitForProcessExit(options.WaitForProcessId, Log);
 
             Log("Stopping running ContextControl windows...");
             StopRunningWorkbench(resolvedInstallDir, Log);
@@ -861,7 +862,7 @@ internal static class InstallerEngine
             RemoveUninstallEntry();
 
             Log("Removing installed app folder...");
-            Directory.Delete(resolvedInstallDir, recursive: true);
+            DeleteDirectoryWithRetry(resolvedInstallDir, recursive: true, Log);
 
             if (options.RemoveUserData)
             {
@@ -931,7 +932,8 @@ internal static class InstallerEngine
         {
             "/uninstall",
             "/uninstallRelaunched",
-            $"/installDir={options.InstallDir}"
+            $"/installDir={options.InstallDir}",
+            $"/waitForProcess={Environment.ProcessId}"
         };
         if (options.Quiet)
         {
@@ -1147,6 +1149,35 @@ internal static class InstallerEngine
         DeleteDirectoryIfExists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ContextControl"), log);
     }
 
+    private static void DeleteDirectoryWithRetry(string path, bool recursive, Action<string> log)
+    {
+        Exception? lastException = null;
+        for (var attempt = 1; attempt <= 40; attempt++)
+        {
+            try
+            {
+                if (!Directory.Exists(path))
+                {
+                    return;
+                }
+
+                Directory.Delete(path, recursive);
+                return;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                lastException = ex;
+                Thread.Sleep(250);
+            }
+        }
+
+        log($"Could not remove {path}: {lastException?.Message}");
+        if (lastException is not null)
+        {
+            throw lastException;
+        }
+    }
+
     private static void DeleteFileIfExists(string path)
     {
         try
@@ -1217,6 +1248,8 @@ internal static class InstallerEngine
         var root = Path.GetFullPath(installDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var rootWithSeparator = root + Path.DirectorySeparatorChar;
         var entries = archive.Entries;
+        var updatedFiles = 0;
+        var skippedUnchangedFiles = 0;
         for (var index = 0; index < entries.Count; index++)
         {
             var entry = entries[index];
@@ -1252,13 +1285,97 @@ internal static class InstallerEngine
                 continue;
             }
 
+            if (DestinationMatchesEntry(destinationPath, entry))
+            {
+                skippedUnchangedFiles++;
+                continue;
+            }
+
             var parent = Path.GetDirectoryName(destinationPath);
             if (!string.IsNullOrWhiteSpace(parent))
             {
                 Directory.CreateDirectory(parent);
             }
 
-            entry.ExtractToFile(destinationPath, overwrite: true);
+            ExtractChangedFile(entry, destinationPath);
+            updatedFiles++;
+        }
+
+        log($"Extraction finished. Updated {updatedFiles} file(s), skipped {skippedUnchangedFiles} unchanged file(s).");
+    }
+
+    private static bool DestinationMatchesEntry(string destinationPath, ZipArchiveEntry entry)
+    {
+        try
+        {
+            if (!File.Exists(destinationPath))
+            {
+                return false;
+            }
+
+            var fileInfo = new FileInfo(destinationPath);
+            if (fileInfo.Length != entry.Length)
+            {
+                return false;
+            }
+
+            using var source = entry.Open();
+            using var target = new FileStream(destinationPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return StreamsEqual(source, target);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool StreamsEqual(Stream left, Stream right)
+    {
+        var leftBuffer = new byte[1024 * 64];
+        var rightBuffer = new byte[1024 * 64];
+        while (true)
+        {
+            var leftRead = left.Read(leftBuffer, 0, leftBuffer.Length);
+            var rightRead = right.Read(rightBuffer, 0, rightBuffer.Length);
+            if (leftRead != rightRead)
+            {
+                return false;
+            }
+
+            if (leftRead == 0)
+            {
+                return true;
+            }
+
+            if (!leftBuffer.AsSpan(0, leftRead).SequenceEqual(rightBuffer.AsSpan(0, rightRead)))
+            {
+                return false;
+            }
+        }
+    }
+
+    private static void ExtractChangedFile(ZipArchiveEntry entry, string destinationPath)
+    {
+        var tempPath = destinationPath + ".ccupdate";
+        try
+        {
+            if (File.Exists(tempPath))
+            {
+                File.Delete(tempPath);
+            }
+
+            entry.ExtractToFile(tempPath, overwrite: true);
+            if (File.Exists(destinationPath))
+            {
+                File.Delete(destinationPath);
+            }
+
+            File.Move(tempPath, destinationPath);
+        }
+        catch
+        {
+            DeleteFileIfExists(tempPath);
+            throw;
         }
     }
 

@@ -13,6 +13,7 @@ public sealed record AppUpdateInfo(
     string LatestVersion,
     string ReleaseUrl,
     string InstallerUrl,
+    long? InstallerSizeBytes,
     string TargetCommit,
     DateTimeOffset? PublishedAt);
 
@@ -44,7 +45,7 @@ public sealed class UpdateService
         var releaseUrl = GetString(root, "html_url") ?? "https://github.com/VulkanVX/contextcontrol/releases/latest";
         var targetCommit = GetString(root, "target_commitish") ?? "";
         var publishedAt = TryReadDate(root, "published_at");
-        var installerUrl = ResolveInstallerUrl(root);
+        var installer = ResolveInstallerAsset(root);
         var currentVersion = CurrentVersion;
 
         return new AppUpdateInfo(
@@ -52,7 +53,8 @@ public sealed class UpdateService
             currentVersion,
             latestVersion,
             releaseUrl,
-            installerUrl,
+            installer.Url,
+            installer.SizeBytes,
             targetCommit,
             publishedAt);
     }
@@ -75,13 +77,35 @@ public sealed class UpdateService
 
         var updateDirectory = Path.Combine(Path.GetTempPath(), "ContextControl", "updates", update.LatestVersion);
         Directory.CreateDirectory(updateDirectory);
+        CleanupUpdateCache(updateDirectory);
         var installerPath = Path.Combine(updateDirectory, InstallerAssetName);
-        var partialPath = installerPath + ".download";
-        if (File.Exists(partialPath))
+
+        if (TryUseCachedInstaller(installerPath, update.InstallerSizeBytes, progress, update.LatestVersion, out var cached))
         {
-            File.Delete(partialPath);
+            return cached;
         }
 
+        if (File.Exists(installerPath))
+        {
+            try
+            {
+                File.Delete(installerPath);
+            }
+            catch (IOException)
+            {
+                return new AppUpdateDownloadResult(
+                    false,
+                    "A previous ContextControl setup window is still using the cached installer. Close that setup window, then press Check updates again.");
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return new AppUpdateDownloadResult(
+                    false,
+                    "ContextControl could not replace the cached installer. Close any open setup window, then press Check updates again.");
+            }
+        }
+
+        var partialPath = Path.Combine(updateDirectory, $"{InstallerAssetName}.{Environment.ProcessId}.{Guid.NewGuid():N}.download");
         using var http = CreateHttpClient(timeout: TimeSpan.FromMinutes(20));
         using var response = await http.GetAsync(uri, HttpCompletionOption.ResponseHeadersRead, cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
@@ -90,51 +114,71 @@ public sealed class UpdateService
         }
 
         var totalBytes = response.Content.Headers.ContentLength;
-        await using var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        await using var target = new FileStream(partialPath, FileMode.Create, FileAccess.Write, FileShare.Read, 1024 * 128, useAsync: true);
-        var buffer = new byte[1024 * 128];
-        var stopwatch = Stopwatch.StartNew();
         long readBytes = 0;
-        progress?.Report(new LocalLlmTransferProgress(
-            "Downloading update",
-            $"Downloading ContextControl {update.LatestVersion}...",
-            0,
-            totalBytes,
-            null,
-            totalBytes is > 0 ? 0 : null));
-        while (true)
+        try
         {
-            var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
-            if (read == 0)
-            {
-                break;
-            }
-
-            await target.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
-            readBytes += read;
-            var elapsedSeconds = Math.Max(0.001d, stopwatch.Elapsed.TotalSeconds);
-            var speed = readBytes / elapsedSeconds;
-            var percent = totalBytes is > 0
-                ? Math.Clamp(readBytes / (double)totalBytes.Value * 100d, 0d, 100d)
-                : (double?)null;
-            var status = totalBytes is > 0
-                ? $"Downloading update {FormatBytes(readBytes)} / {FormatBytes(totalBytes.Value)}"
-                : $"Downloading update {FormatBytes(readBytes)}";
+            await using var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            await using var target = new FileStream(partialPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read, 1024 * 128, useAsync: true);
+            var buffer = new byte[1024 * 128];
+            var stopwatch = Stopwatch.StartNew();
             progress?.Report(new LocalLlmTransferProgress(
                 "Downloading update",
-                status,
-                readBytes,
+                $"Downloading ContextControl {update.LatestVersion}...",
+                0,
                 totalBytes,
-                speed,
-                percent));
-        }
+                null,
+                totalBytes is > 0 ? 0 : null));
+            while (true)
+            {
+                var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
+                if (read == 0)
+                {
+                    break;
+                }
 
-        if (File.Exists(installerPath))
+                await target.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
+                readBytes += read;
+                var elapsedSeconds = Math.Max(0.001d, stopwatch.Elapsed.TotalSeconds);
+                var speed = readBytes / elapsedSeconds;
+                var percent = totalBytes is > 0
+                    ? Math.Clamp(readBytes / (double)totalBytes.Value * 100d, 0d, 100d)
+                    : (double?)null;
+                var status = totalBytes is > 0
+                    ? $"Downloading update {FormatBytes(readBytes)} / {FormatBytes(totalBytes.Value)}"
+                    : $"Downloading update {FormatBytes(readBytes)}";
+                progress?.Report(new LocalLlmTransferProgress(
+                    "Downloading update",
+                    status,
+                    readBytes,
+                    totalBytes,
+                    speed,
+                    percent));
+            }
+        }
+        catch
         {
-            File.Delete(installerPath);
+            DeleteFileBestEffort(partialPath);
+            throw;
         }
 
-        File.Move(partialPath, installerPath);
+        try
+        {
+            File.Move(partialPath, installerPath);
+        }
+        catch (IOException)
+        {
+            if (IsCachedInstallerUsable(installerPath, update.InstallerSizeBytes))
+            {
+                DeleteFileBestEffort(partialPath);
+                return BuildCachedInstallerResult(installerPath, progress, update.LatestVersion, update.InstallerSizeBytes);
+            }
+
+            DeleteFileBestEffort(partialPath);
+            return new AppUpdateDownloadResult(
+                false,
+                "The update downloaded, but ContextControl could not store it because another setup process is using the cached installer. Close the setup window, then press Check updates again.");
+        }
+
         progress?.Report(new LocalLlmTransferProgress(
             "Downloading update",
             $"Downloaded ContextControl {update.LatestVersion}.",
@@ -152,23 +196,117 @@ public sealed class UpdateService
             return new AppUpdateDownloadResult(false, "Downloaded installer was not found.");
         }
 
+        if (IsProcessRunningFromPath(installerPath))
+        {
+            return new AppUpdateDownloadResult(true, "Update installer is already open. Closing ContextControl so setup can continue.", installerPath);
+        }
+
+        var installerArguments = BuildInstallerArguments(installDirectory, waitForProcessId);
+        if (waitForProcessId > 0)
+        {
+            return LaunchInstallerAfterProcessExit(installerPath, installerArguments, waitForProcessId);
+        }
+
         var startInfo = new ProcessStartInfo
         {
             FileName = installerPath,
-            UseShellExecute = false
+            UseShellExecute = false,
+            WorkingDirectory = Path.GetDirectoryName(installerPath) ?? Path.GetTempPath()
         };
-        if (!string.IsNullOrWhiteSpace(installDirectory) && Directory.Exists(installDirectory))
-        {
-            startInfo.ArgumentList.Add($"/installDir={installDirectory}");
-        }
 
-        if (waitForProcessId > 0)
+        foreach (var argument in installerArguments)
         {
-            startInfo.ArgumentList.Add($"/waitForProcess={waitForProcessId}");
+            startInfo.ArgumentList.Add(argument);
         }
 
         Process.Start(startInfo);
         return new AppUpdateDownloadResult(true, "Update installer started.", installerPath);
+    }
+
+    private static IReadOnlyList<string> BuildInstallerArguments(string installDirectory, int waitForProcessId)
+    {
+        var arguments = new List<string>();
+        if (!string.IsNullOrWhiteSpace(installDirectory) && Directory.Exists(installDirectory))
+        {
+            arguments.Add($"/installDir={installDirectory}");
+        }
+
+        if (waitForProcessId > 0)
+        {
+            arguments.Add($"/waitForProcess={waitForProcessId}");
+        }
+
+        return arguments;
+    }
+
+    private static AppUpdateDownloadResult LaunchInstallerAfterProcessExit(
+        string installerPath,
+        IReadOnlyList<string> installerArguments,
+        int waitForProcessId)
+    {
+        var powershell = ResolveWindowsPowerShell();
+        if (powershell is null)
+        {
+            return new AppUpdateDownloadResult(false, "Windows PowerShell was not found, so ContextControl could not hand off the update safely.");
+        }
+
+        var updateDirectory = Path.GetDirectoryName(installerPath) ?? Path.GetTempPath();
+        var handoffPath = Path.Combine(updateDirectory, $"ContextControlUpdateHandoff-{Environment.ProcessId}-{Guid.NewGuid():N}.ps1");
+        var script = BuildUpdateHandoffScript(installerPath, installerArguments, waitForProcessId);
+        File.WriteAllText(handoffPath, script);
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = powershell,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WorkingDirectory = updateDirectory
+        };
+        startInfo.ArgumentList.Add("-NoProfile");
+        startInfo.ArgumentList.Add("-ExecutionPolicy");
+        startInfo.ArgumentList.Add("Bypass");
+        startInfo.ArgumentList.Add("-WindowStyle");
+        startInfo.ArgumentList.Add("Hidden");
+        startInfo.ArgumentList.Add("-File");
+        startInfo.ArgumentList.Add(handoffPath);
+
+        Process.Start(startInfo);
+        return new AppUpdateDownloadResult(true, "Update handoff started. ContextControl will close before setup replaces files.", installerPath);
+    }
+
+    private static bool IsProcessRunningFromPath(string executablePath)
+    {
+        string fullPath;
+        try
+        {
+            fullPath = Path.GetFullPath(executablePath);
+        }
+        catch
+        {
+            return false;
+        }
+
+        foreach (var process in Process.GetProcesses())
+        {
+            using (process)
+            {
+                try
+                {
+                    var path = process.MainModule?.FileName;
+                    if (!string.IsNullOrWhiteSpace(path)
+                        && string.Equals(Path.GetFullPath(path), fullPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+                catch
+                {
+                    // Access can fail for elevated or system processes.
+                }
+            }
+        }
+
+        return false;
     }
 
     private static HttpClient CreateHttpClient(TimeSpan? timeout = null)
@@ -182,11 +320,11 @@ public sealed class UpdateService
         return http;
     }
 
-    private static string ResolveInstallerUrl(JsonElement releaseRoot)
+    private static InstallerAsset ResolveInstallerAsset(JsonElement releaseRoot)
     {
         if (!releaseRoot.TryGetProperty("assets", out var assets) || assets.ValueKind != JsonValueKind.Array)
         {
-            return "";
+            return new InstallerAsset("", null);
         }
 
         foreach (var asset in assets.EnumerateArray())
@@ -197,10 +335,157 @@ public sealed class UpdateService
                 continue;
             }
 
-            return GetString(asset, "browser_download_url") ?? "";
+            var sizeBytes = asset.TryGetProperty("size", out var size) && size.TryGetInt64(out var value)
+                ? value
+                : (long?)null;
+            return new InstallerAsset(GetString(asset, "browser_download_url") ?? "", sizeBytes);
         }
 
-        return "";
+        return new InstallerAsset("", null);
+    }
+
+    private static bool TryUseCachedInstaller(
+        string installerPath,
+        long? expectedSizeBytes,
+        IProgress<LocalLlmTransferProgress>? progress,
+        string latestVersion,
+        out AppUpdateDownloadResult result)
+    {
+        if (!IsCachedInstallerUsable(installerPath, expectedSizeBytes))
+        {
+            result = new AppUpdateDownloadResult(false, "");
+            return false;
+        }
+
+        result = BuildCachedInstallerResult(installerPath, progress, latestVersion, expectedSizeBytes);
+        return true;
+    }
+
+    private static AppUpdateDownloadResult BuildCachedInstallerResult(
+        string installerPath,
+        IProgress<LocalLlmTransferProgress>? progress,
+        string latestVersion,
+        long? expectedSizeBytes)
+    {
+        var size = expectedSizeBytes ?? new FileInfo(installerPath).Length;
+        progress?.Report(new LocalLlmTransferProgress(
+            "Downloading update",
+            $"Using already downloaded ContextControl {latestVersion} installer.",
+            size,
+            size,
+            null,
+            100));
+        return new AppUpdateDownloadResult(true, $"Using already downloaded ContextControl {latestVersion} installer.", installerPath);
+    }
+
+    private static bool IsCachedInstallerUsable(string installerPath, long? expectedSizeBytes)
+    {
+        try
+        {
+            if (!File.Exists(installerPath))
+            {
+                return false;
+            }
+
+            var length = new FileInfo(installerPath).Length;
+            if (length <= 0)
+            {
+                return false;
+            }
+
+            return expectedSizeBytes is null or <= 0 || length == expectedSizeBytes.Value;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static void CleanupUpdateCache(string activeUpdateDirectory)
+    {
+        var updatesRoot = Path.GetDirectoryName(activeUpdateDirectory);
+        if (string.IsNullOrWhiteSpace(updatesRoot) || !Directory.Exists(updatesRoot))
+        {
+            return;
+        }
+
+        foreach (var directory in Directory.EnumerateDirectories(updatesRoot))
+        {
+            try
+            {
+                if (!string.Equals(Path.GetFullPath(directory), Path.GetFullPath(activeUpdateDirectory), StringComparison.OrdinalIgnoreCase))
+                {
+                    Directory.Delete(directory, recursive: true);
+                }
+            }
+            catch
+            {
+                // A setup process may still be using an older cached installer.
+            }
+        }
+
+        foreach (var file in Directory.EnumerateFiles(activeUpdateDirectory, "*.download"))
+        {
+            DeleteFileBestEffort(file);
+        }
+
+        foreach (var file in Directory.EnumerateFiles(activeUpdateDirectory, "ContextControlUpdateHandoff*.ps1"))
+        {
+            DeleteFileBestEffort(file);
+        }
+    }
+
+    private static void DeleteFileBestEffort(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // Temp cleanup must not block update installation.
+        }
+    }
+
+    private static string? ResolveWindowsPowerShell()
+    {
+        var systemPowerShell = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+            "System32",
+            "WindowsPowerShell",
+            "v1.0",
+            "powershell.exe");
+        return File.Exists(systemPowerShell) ? systemPowerShell : "powershell.exe";
+    }
+
+    private static string BuildUpdateHandoffScript(
+        string installerPath,
+        IReadOnlyList<string> installerArguments,
+        int waitForProcessId)
+    {
+        var arguments = string.Join(", ", installerArguments.Select(argument => $"'{EscapePowerShell(argument)}'"));
+        return $$"""
+$ErrorActionPreference = 'SilentlyContinue'
+$processIdToWait = {{waitForProcessId}}
+$installerPath = '{{EscapePowerShell(installerPath)}}'
+$installerArguments = @({{arguments}})
+try {
+    Wait-Process -Id $processIdToWait -Timeout 90 -ErrorAction SilentlyContinue
+} catch {
+}
+Start-Sleep -Milliseconds 500
+Start-Process -FilePath $installerPath -ArgumentList $installerArguments -WorkingDirectory (Split-Path -Parent $installerPath)
+Start-Sleep -Seconds 2
+Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
+""";
+    }
+
+    private static string EscapePowerShell(string value)
+    {
+        return (value ?? "").Replace("'", "''", StringComparison.Ordinal);
     }
 
     private static bool IsVersionNewer(string latest, string current)
@@ -269,4 +554,6 @@ public sealed class UpdateService
             ? $"{number:0} {units[unitIndex]}"
             : $"{number:0.#} {units[unitIndex]}";
     }
+
+    private sealed record InstallerAsset(string Url, long? SizeBytes);
 }

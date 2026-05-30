@@ -32,7 +32,7 @@ Run the installed app from the Start Menu shortcut or from:
 <install folder>\ContextControl.Workbench.exe
 ```
 
-After this version is installed, ContextControl checks GitHub releases on startup when internet is available. Use the **Check updates** button in the header bar to manually check, download, and start a newer setup EXE against the current install folder.
+After this version is installed, ContextControl checks GitHub releases on startup when internet is available. Use the **Check updates** button in the header bar to manually check, download, and start a newer setup EXE against the current install folder. A new release still downloads the full setup EXE once, but repeated attempts for the same release reuse the cached installer. During install, setup waits for the running app to close and then writes only changed files.
 
 ## Local LLM Autosetup
 
@@ -44,7 +44,7 @@ Current autosetup coverage:
 - local Ollama model pulls: 262/301 catalog entries
 - non-Ollama managed/backend setup: 11/301 catalog entries
 - Ollama Cloud entries: 28/301 catalog entries, no local weight download
-- image generation: 12/12 image-generation catalog entries have a route
+- image generation: 12/12 image-generation catalog entries have a route; 3 experimental Ollama image entries are macOS-only and disabled on Windows/Linux
 
 On a raw Windows PC, the Microsoft Store `python.exe` app alias is ignored because it is not a real Python interpreter. Python-backed dependencies such as Diffusers automatically install Python 3.12 through `winget` when no usable Python exists, then create a ContextControl-managed virtual environment.
 
