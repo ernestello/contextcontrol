@@ -1,30 +1,78 @@
-# ContextControl Portable Install
+# ContextControl Install Guide
 
-This package is a self-contained Windows x64 build. It does not require the .NET runtime to be installed.
+This is a self-contained Windows x64 build. A separate .NET runtime install is not required.
 
-## Portable
+## Recommended Install
 
-Run `ContextControl.Workbench.exe` from this folder.
+Download and run:
 
-This is a full self-contained app folder, not a single-file launcher. Keep the files together.
+```text
+ContextControl-win-x64-Setup.exe
+```
 
-The bundled `.ccWorkbench.settings.json` opens the app on the Local LLM catalog with the release appearance defaults. Your later settings, chat history, downloaded dependencies, and model files are kept outside the GitHub source tree.
+You do not need a separate zip. The setup EXE contains the full app folder and installs it to the folder you choose.
 
-## User-Local Install
+The setup window lets you:
 
-Run `ContextControl-win-x64-Setup.exe` if you downloaded the installer EXE from GitHub Releases.
+- choose the install folder
+- create Start Menu and desktop shortcuts
+- optionally install Microsoft Edge WebView2 Runtime for the Browser workspace
+- launch ContextControl when setup finishes
 
-The setup EXE lets you choose the install folder, create Start Menu or desktop shortcuts, optionally install Microsoft Edge WebView2 Runtime, and launch ContextControl when setup finishes. It writes `install.log` in the installed folder and in `%LOCALAPPDATA%\ContextControl\install.log`.
+Default install folder:
 
-For the portable zip, run this in PowerShell from the extracted package:
+```text
+%LOCALAPPDATA%\Programs\ContextControl
+```
+
+Run the installed app from the Start Menu shortcut or from:
+
+```text
+<install folder>\ContextControl.Workbench.exe
+```
+
+Setup writes logs to:
+
+```text
+<install folder>\install.log
+%LOCALAPPDATA%\ContextControl\install.log
+```
+
+## Quiet Install
+
+For automated testing:
+
+```powershell
+.\ContextControl-win-x64-Setup.exe /quiet /installDir=C:\Tools\ContextControl /noLaunch
+```
+
+Useful switches:
+
+```text
+/installDir=<path>
+/desktopShortcut
+/noStartMenu
+/installWebView2
+/noLaunch
+```
+
+## Portable Folder
+
+If you already have a full app folder from a local release build, run:
+
+```text
+ContextControl.Workbench.exe
+```
+
+Keep the files together. The EXE needs the DLLs, runtime files, assets, and `runtimes\` folder beside it.
+
+From a local app folder you can also run:
 
 ```powershell
 .\Install-ContextControl.ps1
 ```
 
-The installer copies the package to `%LOCALAPPDATA%\Programs\ContextControl`, keeps an existing user settings file during updates, creates a Start Menu shortcut, and launches the app.
-
-Optional switches:
+Optional script switches:
 
 ```powershell
 .\Install-ContextControl.ps1 -DesktopShortcut
@@ -32,10 +80,4 @@ Optional switches:
 .\Install-ContextControl.ps1 -NoLaunch
 ```
 
-`-InstallWebView2Runtime` uses `winget` to install Microsoft Edge WebView2 Runtime if it is not detected. The Local LLM and dependency pages do not need preinstalled LLM runtimes; install them from inside ContextControl.
-
-The setup EXE also supports quiet install testing:
-
-```powershell
-.\ContextControl-win-x64-Setup.exe /quiet /installDir=C:\Tools\ContextControl /noLaunch
-```
+GitHub's automatic source-code zip is not a portable app package. Use it only for building from source.

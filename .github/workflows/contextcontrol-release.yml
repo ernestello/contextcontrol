@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   windows-portable:
-    name: Windows x64 portable
+    name: Windows x64 installer
     runs-on: windows-latest
 
     steps:
@@ -36,7 +36,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $tag = '${{ github.ref_name }}'
           $repo = '${{ github.repository }}'
-          $notes = 'Windows x64 release. Run ContextControl-win-x64-Setup.exe for the installer UI with folder and shortcut options, or extract the portable zip and run ContextControl.Workbench.exe from the full app folder.'
+          $notes = 'Windows x64 release. Download ContextControl-win-x64-Setup.exe only. It is a single-file installer that contains the full app folder, lets you choose the install location and shortcuts, and launches ContextControl after setup if selected.'
           $apiBase = "https://api.github.com/repos/$repo"
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"
@@ -88,27 +88,46 @@ jobs:
             }
           }
 
+          $releaseBody = @{
+            name = "ContextControl $tag"
+            body = $notes
+            target_commitish = '${{ github.sha }}'
+          } | ConvertTo-Json
+
+          $release = Invoke-WithRetry -Action {
+            Invoke-RestMethod -Method Patch -Headers $headers -Uri "$apiBase/releases/$($release.id)" -Body $releaseBody -ContentType 'application/json'
+          }
+
           $installerPayload = '.tmp/release/ContextControl-win-x64-Setup.payload'
           Copy-Item -LiteralPath '.tmp/release/ContextControl-win-x64-Setup.exe' -Destination $installerPayload -Force
 
+          $assetNamesToDelete = @(
+            'ContextControl-win-x64-Setup.exe',
+            'ContextControl-win-x64-Setup.exe.sha256.txt',
+            'ContextControl-win-x64.zip',
+            'ContextControl-win-x64.zip.sha256.txt'
+          )
+
+          foreach ($assetName in $assetNamesToDelete) {
+            $existing = @($release.assets | Where-Object { $_.name -eq $assetName })
+            foreach ($oldAsset in $existing) {
+              Invoke-WithRetry -Action {
+                Invoke-RestMethod -Method Delete -Headers $headers -Uri "$apiBase/releases/assets/$($oldAsset.id)"
+              } | Out-Null
+            }
+          }
+
+          $release = Invoke-RestMethod -Headers $headers -Uri "$apiBase/releases/tags/$tag"
+
           $assets = @(
             @{ Path = $installerPayload; Name = 'ContextControl-win-x64-Setup.exe'; ContentType = 'application/octet-stream' },
-            @{ Path = '.tmp/release/ContextControl-win-x64-Setup.exe.sha256.txt'; Name = 'ContextControl-win-x64-Setup.exe.sha256.txt'; ContentType = 'text/plain' },
-            @{ Path = '.tmp/release/ContextControl-win-x64.zip'; Name = 'ContextControl-win-x64.zip'; ContentType = 'application/zip' },
-            @{ Path = '.tmp/release/ContextControl-win-x64.zip.sha256.txt'; Name = 'ContextControl-win-x64.zip.sha256.txt'; ContentType = 'text/plain' }
+            @{ Path = '.tmp/release/ContextControl-win-x64-Setup.exe.sha256.txt'; Name = 'ContextControl-win-x64-Setup.exe.sha256.txt'; ContentType = 'text/plain' }
           )
 
           foreach ($asset in $assets) {
             if (-not (Test-Path -LiteralPath $asset.Path)) {
               Get-ChildItem -LiteralPath '.tmp/release' -Force | Format-Table Name,Length,LastWriteTime
               throw "Missing release asset: $($asset.Path)"
-            }
-
-            $existing = @($release.assets | Where-Object { $_.name -eq $asset.Name })
-            foreach ($oldAsset in $existing) {
-              Invoke-WithRetry -Action {
-                Invoke-RestMethod -Method Delete -Headers $headers -Uri "$apiBase/releases/assets/$($oldAsset.id)"
-              } | Out-Null
             }
 
             $escapedName = [System.Uri]::EscapeDataString($asset.Name)
@@ -124,7 +143,5 @@ jobs:
         with:
           name: ContextControl-win-x64
           path: |
-            .tmp/release/ContextControl-win-x64.zip
-            .tmp/release/ContextControl-win-x64.zip.sha256.txt
             .tmp/release/ContextControl-win-x64-Setup.exe
             .tmp/release/ContextControl-win-x64-Setup.exe.sha256.txt

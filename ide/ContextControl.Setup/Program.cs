@@ -59,9 +59,11 @@ internal sealed class SetupForm : Form
     public SetupForm(SetupOptions initialOptions)
     {
         Text = "ContextControl Setup";
-        ClientSize = new Size(640, 380);
-        FormBorderStyle = FormBorderStyle.FixedDialog;
-        MaximizeBox = false;
+        AutoScaleMode = AutoScaleMode.Dpi;
+        ClientSize = new Size(780, 540);
+        MinimumSize = new Size(720, 500);
+        FormBorderStyle = FormBorderStyle.Sizable;
+        MaximizeBox = true;
         MinimizeBox = true;
         StartPosition = FormStartPosition.CenterScreen;
         BuildUi(initialOptions);
@@ -72,21 +74,30 @@ internal sealed class SetupForm : Form
 
     private void BuildUi(SetupOptions initialOptions)
     {
-        var root = new TableLayoutPanel
+        var shell = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
             Padding = new Padding(22),
             ColumnCount = 1,
-            RowCount = 8,
+            RowCount = 3,
         };
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        shell.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        shell.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        var content = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            AutoScroll = true,
+            ColumnCount = 1,
+            RowCount = 6,
+        };
+        content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        content.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        content.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
 
         var title = new Label
         {
@@ -95,7 +106,7 @@ internal sealed class SetupForm : Form
             Text = "Install ContextControl",
             Margin = new Padding(0, 0, 0, 8),
         };
-        root.Controls.Add(title, 0, 0);
+        content.Controls.Add(title, 0, 0);
 
         var intro = new Label
         {
@@ -103,7 +114,7 @@ internal sealed class SetupForm : Form
             Text = "Choose where the full app folder will be installed.",
             Margin = new Padding(0, 0, 0, 14),
         };
-        root.Controls.Add(intro, 0, 1);
+        content.Controls.Add(intro, 0, 1);
 
         var installLabel = new Label
         {
@@ -111,7 +122,7 @@ internal sealed class SetupForm : Form
             Text = "Install folder",
             Margin = new Padding(0, 0, 0, 6),
         };
-        root.Controls.Add(installLabel, 0, 2);
+        content.Controls.Add(installLabel, 0, 2);
 
         var pathRow = new TableLayoutPanel
         {
@@ -136,7 +147,7 @@ internal sealed class SetupForm : Form
         };
         browseButton.Click += OnBrowse;
         pathRow.Controls.Add(browseButton, 1, 0);
-        root.Controls.Add(pathRow, 0, 3);
+        content.Controls.Add(pathRow, 0, 3);
 
         var optionPanel = new FlowLayoutPanel
         {
@@ -167,31 +178,33 @@ internal sealed class SetupForm : Form
         _launchBox.Checked = initialOptions.Launch;
         optionPanel.Controls.Add(_launchBox);
 
-        root.Controls.Add(optionPanel, 0, 4);
+        content.Controls.Add(optionPanel, 0, 4);
 
         var statusPanel = new Panel
         {
             Dock = DockStyle.Fill,
-            MinimumSize = new Size(0, 86),
+            MinimumSize = new Size(0, 110),
         };
         _statusLabel.AutoSize = false;
         _statusLabel.Dock = DockStyle.Fill;
         _statusLabel.Text = "Ready to install.";
         _statusLabel.TextAlign = ContentAlignment.BottomLeft;
         statusPanel.Controls.Add(_statusLabel);
-        root.Controls.Add(statusPanel, 0, 5);
+        content.Controls.Add(statusPanel, 0, 5);
+        shell.Controls.Add(content, 0, 0);
 
         _progressBar.Dock = DockStyle.Top;
         _progressBar.Style = ProgressBarStyle.Blocks;
         _progressBar.Height = 18;
         _progressBar.Margin = new Padding(0, 0, 0, 14);
-        root.Controls.Add(_progressBar, 0, 6);
+        shell.Controls.Add(_progressBar, 0, 1);
 
         var buttons = new FlowLayoutPanel
         {
-            Dock = DockStyle.Bottom,
+            Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.RightToLeft,
             AutoSize = true,
+            WrapContents = false,
         };
 
         _installButton.Text = "Install";
@@ -204,8 +217,8 @@ internal sealed class SetupForm : Form
         _cancelButton.Click += (_, _) => Close();
         buttons.Controls.Add(_cancelButton);
 
-        root.Controls.Add(buttons, 0, 7);
-        Controls.Add(root);
+        shell.Controls.Add(buttons, 0, 2);
+        Controls.Add(shell);
 
         AcceptButton = _installButton;
         CancelButton = _cancelButton;

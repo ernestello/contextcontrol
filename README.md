@@ -4,42 +4,45 @@ ContextControl is a native desktop workbench for keeping local code context, loc
 
 The current release focuses on a Windows x64 desktop app that can be opened like a normal EXE, then used to install local LLM dependencies and download model weights on demand. The older PowerShell CLI pipeline is still included as the core deterministic context engine.
 
-## Download
+## Install On Windows
 
 Latest release:
 
 https://github.com/VulkanVX/contextcontrol/releases/tag/v0.3.0
 
-For a fresh Windows PC, download and run:
+For a fresh Windows PC, download only the installer:
 
 ```text
 ContextControl-win-x64-Setup.exe
 ```
 
-The installer opens a setup window where you choose the install folder, shortcuts, optional WebView2 Runtime install, and whether to launch after setup. The default install folder is:
+You do not need to download a separate app zip. The setup EXE is a single-file installer that already contains the full ContextControl app folder. It asks for the install location, shortcut options, optional WebView2 Runtime install, and whether to launch when setup finishes.
+
+Default install folder:
 
 ```text
 %LOCALAPPDATA%\Programs\ContextControl
 ```
 
-It installs a normal `ContextControl` folder with `ContextControl.Workbench.exe` plus the runtime files the EXE needs. The app is self-contained, so a separate .NET runtime install is not required.
-
-Portable zip users can extract `ContextControl-win-x64.zip` and run:
+After install, run ContextControl from the Start Menu shortcut or from:
 
 ```text
-ContextControl.Workbench.exe
+<install folder>\ContextControl.Workbench.exe
 ```
+
+The app is self-contained, so a separate .NET runtime install is not required.
+
+GitHub's automatic **Source code** downloads are source snapshots, not runnable app packages. Use them only if you want to build from source.
 
 ## What Is Bundled
 
-Bundled:
+Bundled inside the installer:
 
 - ContextControl Workbench native desktop app
 - PowerShell ContextControl CLI scripts
 - Release appearance defaults
 - Full Windows app folder with runtime files beside the EXE
-- Setup EXE with install folder picker and shortcut options
-- Portable installer script and launcher
+- Setup UI with install folder picker, shortcut options, logs, and quiet install mode
 
 Not bundled:
 
@@ -55,7 +58,7 @@ Those are created or downloaded only after the user chooses them in the app.
 
 Stable enough to test:
 
-- Windows x64 installer and portable release
+- Windows x64 installer
 - Project file tree and project scanner views
 - Local LLM catalog
 - Dependency detection and one-click installers where safe
@@ -146,7 +149,7 @@ Output goes to:
 .tmp\release\
 ```
 
-The GitHub Actions workflow in `.github/workflows/contextcontrol-release.yml` builds the Windows zip and installer when a `v*` tag is pushed.
+The GitHub Actions workflow in `.github/workflows/contextcontrol-release.yml` publishes the Windows installer when a `v*` tag is pushed. The release script also creates a local app-folder zip as the installer payload and for developer smoke testing, but end users only need the setup EXE.
 
 ## Repository Layout
 
