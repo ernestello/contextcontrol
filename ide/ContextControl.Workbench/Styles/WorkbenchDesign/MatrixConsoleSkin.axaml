@@ -1,0 +1,88 @@
+<Styles
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls">
+
+  <Style Selector="Window.matrix-console-skin">
+    <Setter Property="FontFamily" Value="{DynamicResource UiFontFamily}" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Button">
+    <Setter Property="FontFamily" Value="{DynamicResource UiFontFamily}" />
+    <Setter Property="FontWeight" Value="Bold" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin TextBox">
+    <Setter Property="FontFamily" Value="{DynamicResource UiFontFamily}" />
+    <Setter Property="CornerRadius" Value="1" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin ComboBox">
+    <Setter Property="FontFamily" Value="{DynamicResource UiFontFamily}" />
+    <Setter Property="CornerRadius" Value="1" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Border.panel">
+    <Setter Property="CornerRadius" Value="2" />
+    <Setter Property="BoxShadow" Value="0 0 18 0 #552AFF9A" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Border.pane-header">
+    <Setter Property="CornerRadius" Value="1,1,0,0" />
+    <Setter Property="BoxShadow" Value="0 0 8 0 #332AFF9A" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Border.settings-panel">
+    <Setter Property="CornerRadius" Value="2" />
+    <Setter Property="BoxShadow" Value="0 0 20 0 #552AFF9A" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Border.side-rail">
+    <Setter Property="CornerRadius" Value="1" />
+    <Setter Property="BoxShadow" Value="0 0 12 0 #332AFF9A" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Border.rule-card">
+    <Setter Property="CornerRadius" Value="1" />
+    <Setter Property="BoxShadow" Value="0 0 10 0 #332AFF9A" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Border.syntax-preview-card">
+    <Setter Property="CornerRadius" Value="1" />
+    <Setter Property="BoxShadow" Value="0 0 16 0 #442AFF9A" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Border.browser-surface">
+    <Setter Property="BoxShadow" Value="0 0 16 0 #332AFF9A" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Button.command">
+    <Setter Property="CornerRadius" Value="1" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Button.icon">
+    <Setter Property="CornerRadius" Value="1" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Button.settings-nav">
+    <Setter Property="CornerRadius" Value="1" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Button.window-control">
+    <Setter Property="CornerRadius" Value="1" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin ComboBox.theme-picker">
+    <Setter Property="CornerRadius" Value="1" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Border.cc-log-host">
+    <Setter Property="CornerRadius" Value="1" />
+    <Setter Property="BoxShadow" Value="0 0 12 0 #332AFF9A" />
+  </Style>
+
+  <Style Selector="Window.matrix-console-skin Border.cc-prompt-composer">
+    <Setter Property="CornerRadius" Value="1" />
+    <Setter Property="BoxShadow" Value="0 0 14 0 #332AFF9A" />
+  </Style>
+</Styles>

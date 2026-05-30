@@ -1,0 +1,7 @@
+<Styles
+    xmlns="https://github.com/avaloniaui">
+  <StyleInclude Source="avares://ContextControl.Workbench/Styles/WorkbenchDesign/ContextControlDock/Foundation.axaml" />
+  <StyleInclude Source="avares://ContextControl.Workbench/Styles/WorkbenchDesign/ContextControlDock/ConversationAndSkillbook.axaml" />
+  <StyleInclude Source="avares://ContextControl.Workbench/Styles/WorkbenchDesign/ContextControlDock/AttachmentsAndOverlays.axaml" />
+  <StyleInclude Source="avares://ContextControl.Workbench/Styles/WorkbenchDesign/ContextControlDock/PromptComposer.axaml" />
+</Styles>

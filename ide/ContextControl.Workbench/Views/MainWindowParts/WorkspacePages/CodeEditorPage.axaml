@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="ContextControl.Workbench.Views.MainWindowParts.CodeEditorPage"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls"
+    xmlns:svc="clr-namespace:ContextControl.Workbench.Services"
+    xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
+>
+            <Border
+                Grid.Row="2"
+                Classes="editor-body"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsCodeEditorMode}">
+              <controls:CodeEditor
+                  x:Name="FileEditor"
+                  Background="{DynamicResource EditorSurfaceBrush}"
+                  DocumentPath="{Binding ActiveDocument.Path}"
+                  DocumentText="{Binding ActiveDocument.Text}"
+                  LineChanges="{Binding ActiveDocument.LineChanges}"
+                  VerticalScrollBarVisibility="Visible"
+                  ThemeKey="{Binding ThemeKey}"
+                  SyntaxThemeKey="{Binding SyntaxThemeKey}"
+                  CodeFontFamily="{Binding CodeFontFamily}"
+                  SkinKey="{Binding SkinKey}"
+                  ShowMinimap="{Binding ShowAppearanceCodePreview}"
+                  ShowFoldArrows="{Binding ShowFoldArrows}"
+                  ShowSummaryArrowBorders="{Binding ShowSummaryArrowBorders}"
+                  SummaryFoldKinds="{Binding SummaryFoldKinds}"
+                  FoldArrowsInCodeEditor="{Binding FoldArrowsInCodeEditor}"
+                  UseParentChildArrowIndentation="{Binding EffectiveUseParentChildArrowIndentation}"
+                  ShowVerticalScopeLines="{Binding ShowVerticalScopeLines}"
+                  UseColorfulFamilies="{Binding UseColorfulFamilies}" />
+            </Border>
+</UserControl>

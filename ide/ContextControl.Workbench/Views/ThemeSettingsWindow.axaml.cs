@@ -2,7 +2,9 @@ using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
+using Avalonia.Platform.Storage;
 using Avalonia.Threading;
+using ContextControl.Workbench.Controls;
 using ContextControl.Workbench.Services;
 using ContextControl.Workbench.ViewModels;
 
@@ -40,6 +42,8 @@ public sealed partial class ThemeSettingsWindow : Window
     private string? _pendingUiFontFamily;
     private string? _pendingCodeFontFamily;
     private string? _pendingSkinKey;
+    private string? _pendingUiFontColorModeKey;
+    private string? _pendingCustomUiFontColor;
 
     public ThemeSettingsWindow()
     {
@@ -50,7 +54,13 @@ public sealed partial class ThemeSettingsWindow : Window
         RefreshAppearancePreview();
     }
 
-    public void ApplyTheme(string? themeKey, string? uiFontFamily = null, string? codeFontFamily = null, string? skinKey = null)
+    public void ApplyTheme(
+        string? themeKey,
+        string? uiFontFamily = null,
+        string? codeFontFamily = null,
+        string? skinKey = null,
+        string? uiFontColorModeKey = null,
+        string? customUiFontColor = null)
     {
         if (IsAnyOptionPickerOpen())
         {
@@ -58,14 +68,37 @@ public sealed partial class ThemeSettingsWindow : Window
             _pendingUiFontFamily = uiFontFamily;
             _pendingCodeFontFamily = codeFontFamily;
             _pendingSkinKey = skinKey;
+            _pendingUiFontColorModeKey = uiFontColorModeKey;
+            _pendingCustomUiFontColor = customUiFontColor;
             return;
         }
 
-        WorkbenchThemeResources.Apply(this, themeKey, uiFontFamily, codeFontFamily, skinKey: skinKey);
+        WorkbenchThemeResources.Apply(
+            this,
+            themeKey,
+            uiFontFamily,
+            codeFontFamily,
+            skinKey: skinKey,
+            uiFontColorModeKey: uiFontColorModeKey,
+            customUiFontColor: customUiFontColor,
+            themeAdaptFileCountColor: ViewModel?.ThemeAdaptFileCountColor ?? false,
+            themeAdaptLocColor: ViewModel?.ThemeAdaptLocColor ?? false,
+            themeAdaptVersionColor: ViewModel?.ThemeAdaptVersionColor ?? false,
+            themeAdaptBytesColor: ViewModel?.ThemeAdaptBytesColor ?? false);
         RefreshAppearancePreview();
     }
 
     private WorkbenchViewModel? ViewModel => DataContext as WorkbenchViewModel;
+    private ComboBox SkinPicker => AppearancePage.SkinPickerControl;
+    private ComboBox ThemePicker => AppearancePage.ThemePickerControl;
+    private ComboBox SyntaxThemePicker => AppearancePage.SyntaxThemePickerControl;
+    private ComboBox CodeFontPicker => AppearancePage.CodeFontPickerControl;
+    private ComboBox UiFontPicker => AppearancePage.UiFontPickerControl;
+    private Button SummaryArrowOptionsToggleButton => AppearancePage.SummaryArrowOptionsToggleButtonControl;
+    private Border SummaryArrowOptionsPanel => AppearancePage.SummaryArrowOptionsPanelControl;
+    private ComboBox FoldArrowPositionPicker => AppearancePage.FoldArrowPositionPickerControl;
+    private TextBlock PreviewCaption => AppearancePage.PreviewCaptionControl;
+    private CodeEditor AppearanceCodePreview => AppearancePage.AppearanceCodePreviewControl;
 
     protected override void OnDataContextChanged(EventArgs e)
     {
@@ -179,6 +212,23 @@ public sealed partial class ThemeSettingsWindow : Window
         ShowLlmsPage();
     }
 
+    internal async void OnOllamaModelsBrowseClick(object? sender, RoutedEventArgs e)
+    {
+        var folders = await StorageProvider.OpenFolderPickerAsync(new FolderPickerOpenOptions
+        {
+            Title = "Choose Ollama model storage",
+            AllowMultiple = false
+        });
+
+        var folder = folders.Count > 0 ? folders[0].TryGetLocalPath() : null;
+        if (string.IsNullOrWhiteSpace(folder))
+        {
+            return;
+        }
+
+        ViewModel?.ContextControl.SelectOllamaModelsDirectory(folder);
+    }
+
     private void ShowAppearancePage()
     {
         AppearancePage.IsVisible = true;
@@ -224,46 +274,46 @@ public sealed partial class ThemeSettingsWindow : Window
         button.Classes.Remove("active");
     }
 
-    private void OnSummaryArrowOptionsToggleClick(object? sender, RoutedEventArgs e)
+    internal void OnSummaryArrowOptionsToggleClick(object? sender, RoutedEventArgs e)
     {
         _summaryArrowOptionsExpanded = !_summaryArrowOptionsExpanded;
         SummaryArrowOptionsPanel.IsVisible = _summaryArrowOptionsExpanded;
         SummaryArrowOptionsToggleButton.Content = _summaryArrowOptionsExpanded ? "v" : ">";
     }
 
-    private void OnThemeSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    internal void OnThemeSelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
         RefreshAppearancePreview();
     }
 
-    private void OnSkinSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    internal void OnSkinSelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
         RefreshAppearancePreview();
     }
 
-    private void OnSyntaxThemeSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    internal void OnSyntaxThemeSelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
         RefreshAppearancePreview();
     }
 
-    private void OnCodeFontSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    internal void OnCodeFontSelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
         RefreshAppearancePreview();
     }
 
-    private void OnUiFontSelectionChanged(object? sender, SelectionChangedEventArgs e)
+    internal void OnUiFontSelectionChanged(object? sender, SelectionChangedEventArgs e)
     {
         RefreshAppearancePreview();
     }
 
-    private void OnOptionPickerDropDownClosed(object? sender, EventArgs e)
+    internal void OnOptionPickerDropDownClosed(object? sender, EventArgs e)
     {
         ClearHoveredOption(sender);
         ApplyPendingThemeIfNeeded();
         RefreshAppearancePreview();
     }
 
-    private void OnThemeOptionPointerEntered(object? sender, PointerEventArgs e)
+    internal void OnThemeOptionPointerEntered(object? sender, PointerEventArgs e)
     {
         if (sender is Control { DataContext: ThemeOptionViewModel option })
         {
@@ -272,7 +322,7 @@ public sealed partial class ThemeSettingsWindow : Window
         }
     }
 
-    private void OnThemeOptionPointerExited(object? sender, PointerEventArgs e)
+    internal void OnThemeOptionPointerExited(object? sender, PointerEventArgs e)
     {
         if (sender is Control { DataContext: ThemeOptionViewModel option }
             && IsSameOption(_hoveredTheme, option))
@@ -282,7 +332,7 @@ public sealed partial class ThemeSettingsWindow : Window
         }
     }
 
-    private void OnSyntaxThemeOptionPointerEntered(object? sender, PointerEventArgs e)
+    internal void OnSyntaxThemeOptionPointerEntered(object? sender, PointerEventArgs e)
     {
         if (sender is Control { DataContext: ThemeOptionViewModel option })
         {
@@ -291,7 +341,7 @@ public sealed partial class ThemeSettingsWindow : Window
         }
     }
 
-    private void OnSyntaxThemeOptionPointerExited(object? sender, PointerEventArgs e)
+    internal void OnSyntaxThemeOptionPointerExited(object? sender, PointerEventArgs e)
     {
         if (sender is Control { DataContext: ThemeOptionViewModel option }
             && IsSameOption(_hoveredSyntaxTheme, option))
@@ -301,7 +351,7 @@ public sealed partial class ThemeSettingsWindow : Window
         }
     }
 
-    private void OnCodeFontOptionPointerEntered(object? sender, PointerEventArgs e)
+    internal void OnCodeFontOptionPointerEntered(object? sender, PointerEventArgs e)
     {
         if (sender is Control { DataContext: ThemeOptionViewModel option })
         {
@@ -310,7 +360,7 @@ public sealed partial class ThemeSettingsWindow : Window
         }
     }
 
-    private void OnCodeFontOptionPointerExited(object? sender, PointerEventArgs e)
+    internal void OnCodeFontOptionPointerExited(object? sender, PointerEventArgs e)
     {
         if (sender is Control { DataContext: ThemeOptionViewModel option }
             && IsSameOption(_hoveredCodeFont, option))
@@ -349,7 +399,13 @@ public sealed partial class ThemeSettingsWindow : Window
                 previewUiFontFamily,
                 previewCodeFontFamily,
                 updateThemeVariant: !IsAnyOptionPickerOpen(),
-                skinKey: skin.Key);
+                skinKey: skin.Key,
+                uiFontColorModeKey: ViewModel?.UiFontColorModeKey,
+                customUiFontColor: ViewModel?.CustomUiFontColorHex,
+                themeAdaptFileCountColor: ViewModel?.ThemeAdaptFileCountColor ?? false,
+                themeAdaptLocColor: ViewModel?.ThemeAdaptLocColor ?? false,
+                themeAdaptVersionColor: ViewModel?.ThemeAdaptVersionColor ?? false,
+                themeAdaptBytesColor: ViewModel?.ThemeAdaptBytesColor ?? false);
         }
         catch
         {
@@ -407,12 +463,16 @@ public sealed partial class ThemeSettingsWindow : Window
         var uiFont = _pendingUiFontFamily;
         var codeFont = _pendingCodeFontFamily;
         var skin = _pendingSkinKey;
+        var uiFontColorMode = _pendingUiFontColorModeKey;
+        var customUiFontColor = _pendingCustomUiFontColor;
         _pendingThemeKey = null;
         _pendingUiFontFamily = null;
         _pendingCodeFontFamily = null;
         _pendingSkinKey = null;
+        _pendingUiFontColorModeKey = null;
+        _pendingCustomUiFontColor = null;
 
-        Dispatcher.UIThread.Post(() => ApplyTheme(theme, uiFont, codeFont, skin));
+        Dispatcher.UIThread.Post(() => ApplyTheme(theme, uiFont, codeFont, skin, uiFontColorMode, customUiFontColor));
     }
 
     private void InitializeAppearancePreview()
@@ -421,7 +481,7 @@ public sealed partial class ThemeSettingsWindow : Window
         AppearanceCodePreview.DocumentText = AppearancePreviewSample;
     }
 
-    private async void OnEditRuleListClick(object? sender, RoutedEventArgs e)
+    internal async void OnEditRuleListClick(object? sender, RoutedEventArgs e)
     {
         if (sender is not Control { Tag: string kind })
         {
@@ -431,7 +491,7 @@ public sealed partial class ThemeSettingsWindow : Window
         await OpenRuleListEditorAsync(kind, null);
     }
 
-    private async void OnEditRuleEntryClick(object? sender, RoutedEventArgs e)
+    internal async void OnEditRuleEntryClick(object? sender, RoutedEventArgs e)
     {
         if (sender is not Control { Tag: FileRuleEntryViewModel entry })
         {
@@ -453,7 +513,13 @@ public sealed partial class ThemeSettingsWindow : Window
             viewModel.GetFileRuleEntries(kind),
             viewModel.GetFileRuleWatermark(kind),
             focusValue);
-        editor.ApplyTheme(viewModel.ThemeKey, viewModel.UiFontFamily, viewModel.CodeFontFamily, viewModel.SkinKey);
+        editor.ApplyTheme(
+            viewModel.ThemeKey,
+            viewModel.UiFontFamily,
+            viewModel.CodeFontFamily,
+            viewModel.SkinKey,
+            viewModel.UiFontColorModeKey,
+            viewModel.CustomUiFontColorHex);
 
         var saved = await editor.ShowDialog<bool>(this);
         if (saved)

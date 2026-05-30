@@ -49,3 +49,8 @@ The existing scripts remain the source of truth:
 - `ccStart.ps1` remains the terminal agent-mode entry point.
 
 The desktop app is a native orchestration layer over that core, not a replacement for it.
+
+## LLM Navigation
+
+- Use `LLM_PROJECT_GUIDE.md` for a quick map of source folders and edit boundaries.
+- Use `UI_ELEMENT_NAMES.md` for canonical UI element names when prompting an LLM about a visual change.

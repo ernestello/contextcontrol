@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="ContextControl.Workbench.Views.MainWindowParts.BrowserSurface"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls"
+    xmlns:svc="clr-namespace:ContextControl.Workbench.Services"
+    xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
+>
+            <Border
+                Grid.Row="2"
+                Classes="browser-surface"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsBrowserMode}">
+              <controls:WebView2Host
+                  x:Name="BrowserWebView"
+                  UserDataFolder="{Binding BrowserPane.NativeUserDataFolder}"
+                  NavigationStarted="OnBrowserNavigationStarted"
+                  NavigationCompleted="OnBrowserNavigationCompleted"
+                  InitializationFailed="OnBrowserInitializationFailed" />
+            </Border>
+</UserControl>

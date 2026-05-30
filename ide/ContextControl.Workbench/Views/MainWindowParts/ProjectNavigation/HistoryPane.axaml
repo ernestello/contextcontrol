@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="ContextControl.Workbench.Views.MainWindowParts.HistoryPane"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls"
+    xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
+>
+        <Border
+            x:Name="HistoryPaneRoot"
+            Classes="panel"
+            Grid.Column="0"
+            Width="{Binding HistoryWidth}"
+            Opacity="{Binding HistoryOpacity}"
+            IsHitTestVisible="{Binding IsHistoryOpen}"
+            ClipToBounds="True">
+          <Border.Transitions>
+            <Transitions>
+              <DoubleTransition Property="Width" Duration="0:0:0.12" />
+              <DoubleTransition Property="Opacity" Duration="0:0:0.12" />
+            </Transitions>
+          </Border.Transitions>
+
+          <Grid RowDefinitions="*">
+            <ScrollViewer
+                Grid.Row="0"
+                VerticalScrollBarVisibility="Auto"
+                HorizontalScrollBarVisibility="Disabled"
+                Padding="4"
+                controls:HoverScrollbarBehavior.IsEnabled="True"
+                controls:HoverScrollbarBehavior.ReserveRight="12">
+              <ItemsControl ItemsSource="{Binding SelectedHistory.Versions}">
+                <ItemsControl.ItemTemplate>
+                  <DataTemplate DataType="{x:Type vm:VersionEntryViewModel}">
+                    <Border
+                        Classes="history-version"
+                        Classes.active="{Binding IsActive}"
+                        PointerPressed="OnHistoryVersionPointerPressed">
+                      <Grid ColumnDefinitions="34,*,44,44,44" ColumnSpacing="6">
+                        <TextBlock
+                            Text="{Binding Version}"
+                            VerticalAlignment="Center"
+                            TextAlignment="Center"
+                            FontFamily="{DynamicResource CodeFontFamily}"
+                            FontSize="10"
+                            FontWeight="Black"
+                            Foreground="{DynamicResource TreeVersionFixedBrush}" />
+
+                        <TextBlock
+                            Grid.Column="1"
+                            Text="{Binding Date}"
+                            VerticalAlignment="Center"
+                            FontSize="10"
+                            FontWeight="ExtraBold"
+                            Foreground="{DynamicResource TextPrimaryBrush}"
+                            TextTrimming="CharacterEllipsis" />
+                        <TextBlock Grid.Column="2" Text="{Binding AddedLabel}" Classes="history-meta plus" TextAlignment="Right" FontWeight="Black" />
+                        <TextBlock Grid.Column="3" Text="{Binding RemovedLabel}" Classes="history-meta minus" TextAlignment="Right" FontWeight="Black" />
+                        <TextBlock Grid.Column="4" Text="{Binding LocLabel}" Classes="history-meta loc" TextAlignment="Right" FontWeight="Black" />
+                      </Grid>
+                    </Border>
+                  </DataTemplate>
+                </ItemsControl.ItemTemplate>
+              </ItemsControl>
+            </ScrollViewer>
+          </Grid>
+        </Border>
+</UserControl>

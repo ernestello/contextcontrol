@@ -1,0 +1,85 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="ContextControl.Workbench.Views.MainWindowParts.ProjectFilesPane"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls">
+      <Border
+          x:Name="SidebarPane"
+          Classes="panel"
+          Grid.Column="0"
+          ClipToBounds="True"
+          IsVisible="{Binding IsProjectFilesPaneOpen}"
+          IsHitTestVisible="{Binding IsProjectFilesPaneOpen}">
+        <Grid RowDefinitions="43,Auto,*">
+          <Border Grid.Row="0" Classes="pane-header" Padding="12,0,9,0">
+            <Grid ColumnDefinitions="Auto,*,Auto,Auto,Auto" ColumnSpacing="6">
+              <Button
+                  Classes="tree-detail-toggle"
+                  Classes.active="{Binding IsTopLocMode}"
+                  Content="{Binding TopLocToggleLabel}"
+                  ToolTip.Tip="Toggle highest LOC files"
+                  Command="{Binding ToggleTopLocModeCommand}" />
+              <Button
+                  Grid.Column="2"
+                  Classes="tree-detail-toggle"
+                  Classes.active="{Binding ShowFileDetails}"
+                  Content="{Binding FileDetailsToggleLabel}"
+                  Command="{Binding ToggleFileDetailsCommand}" />
+              <Button
+                  Grid.Column="3"
+                  Classes="tree-detail-toggle"
+                  Classes.active="{Binding ShowSkippedFiles}"
+                  Content="{Binding SkippedFilesToggleLabel}"
+                  Command="{Binding ToggleSkippedFilesCommand}" />
+              <Button
+                  Grid.Column="4"
+                  Classes="tree-detail-toggle"
+                  Content="x"
+                  ToolTip.Tip="Close project files tree"
+                  Command="{Binding ToggleProjectFilesPaneCommand}" />
+            </Grid>
+          </Border>
+
+          <Border
+              x:Name="ProjectTreeSearchPanel"
+              Grid.Row="1"
+              Classes="graph-search-panel project-tree-search-panel"
+              Margin="6,4,6,2"
+              IsVisible="{Binding IsProjectTreeSearchOpen}"
+              IsHitTestVisible="{Binding IsProjectTreeSearchOpen}">
+            <TextBox
+                x:Name="ProjectTreeSearchBox"
+                Classes="graph-search-input"
+                Watermark="Search files"
+                Text="{Binding ProjectTreeSearchText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                KeyDown="OnProjectTreeSearchKeyDown" />
+          </Border>
+
+          <ScrollViewer
+              x:Name="ProjectTreeList"
+              Grid.Row="2"
+              Classes="project-tree-scroll"
+              controls:HoverScrollbarBehavior.IsEnabled="True"
+              controls:HoverScrollbarBehavior.ReserveRight="12"
+              ScrollViewer.AllowAutoHide="True"
+              VerticalScrollBarVisibility="Auto"
+              HorizontalScrollBarVisibility="Disabled">
+            <controls:ProjectTreeRenderControl
+                x:Name="ProjectTreeView"
+                HorizontalAlignment="Stretch"
+                Items="{Binding ProjectTreeDisplayRows}"
+                ShowFileDetails="{Binding ShowFileDetails}"
+                ThemeAdaptFileCountColor="{Binding ThemeAdaptFileCountColor}"
+                ThemeAdaptLocColor="{Binding ThemeAdaptLocColor}"
+                ThemeAdaptVersionColor="{Binding ThemeAdaptVersionColor}"
+                ThemeKey="{Binding ThemeKey}"
+                UiFontFamily="{Binding UiFontFamily}"
+                CodeFontFamily="{Binding CodeFontFamily}"
+                PointerPressed="OnProjectTreeViewPointerPressed"
+                DoubleTapped="OnProjectTreeViewDoubleTapped" />
+          </ScrollViewer>
+
+        </Grid>
+      </Border>
+</UserControl>

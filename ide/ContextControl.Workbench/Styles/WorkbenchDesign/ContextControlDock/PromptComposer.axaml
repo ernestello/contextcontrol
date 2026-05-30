@@ -1,0 +1,317 @@
+<Styles
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls">
+  <Style Selector="Border.cc-prompt-bar">
+    <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+    <Setter Property="BorderThickness" Value="0,1,0,0" />
+    <Setter Property="CornerRadius" Value="0,0,7,7" />
+    <Setter Property="Padding" Value="10,5,11,10" />
+    <Setter Property="MinHeight" Value="0" />
+    <Setter Property="BoxShadow" Value="0 0 0 0 #00000000" />
+  </Style>
+
+  <Style Selector="ProgressBar.cc-prompt-progress">
+    <Setter Property="Height" Value="3" />
+    <Setter Property="MinHeight" Value="3" />
+    <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+  </Style>
+
+  <Style Selector="Border.cc-transfer-progress">
+    <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="6" />
+    <Setter Property="Padding" Value="8,6" />
+    <Setter Property="Margin" Value="0,0,1,7" />
+  </Style>
+
+  <Style Selector="ProgressBar.cc-transfer-bar">
+    <Setter Property="Height" Value="8" />
+    <Setter Property="MinHeight" Value="8" />
+    <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+  </Style>
+
+  <Style Selector="TextBlock.cc-transfer-title">
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+    <Setter Property="FontSize" Value="10.5" />
+    <Setter Property="FontWeight" Value="ExtraBold" />
+    <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+  </Style>
+
+  <Style Selector="TextBlock.cc-transfer-meta">
+    <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+    <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+    <Setter Property="FontSize" Value="9" />
+    <Setter Property="FontWeight" Value="Bold" />
+    <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    <Setter Property="VerticalAlignment" Value="Center" />
+  </Style>
+
+  <Style Selector="TextBlock.cc-transfer-percent">
+    <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+    <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+    <Setter Property="FontSize" Value="9" />
+    <Setter Property="FontWeight" Value="Black" />
+    <Setter Property="MinWidth" Value="42" />
+    <Setter Property="TextAlignment" Value="Right" />
+    <Setter Property="VerticalAlignment" Value="Center" />
+  </Style>
+
+  <Style Selector="Border.cc-prompt-composer">
+    <Setter Property="Background" Value="{DynamicResource PanelBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="8" />
+    <Setter Property="Padding" Value="9,6,9,10" />
+    <Setter Property="Margin" Value="0,0,1,0" />
+    <Setter Property="BoxShadow" Value="0 0 0 0 #00000000" />
+  </Style>
+
+  <Style Selector="Border.cc-prompt-status-pill">
+    <Setter Property="Height" Value="21" />
+    <Setter Property="MinWidth" Value="82" />
+    <Setter Property="MaxWidth" Value="160" />
+    <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="5" />
+    <Setter Property="Padding" Value="7,0" />
+  </Style>
+
+  <Style Selector="TextBlock.cc-prompt-status">
+    <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+    <Setter Property="FontSize" Value="9.5" />
+    <Setter Property="FontWeight" Value="ExtraBold" />
+    <Setter Property="VerticalAlignment" Value="Center" />
+    <Setter Property="TextAlignment" Value="Center" />
+    <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+  </Style>
+
+  <Style Selector="TextBlock.cc-prompt-detail">
+    <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+    <Setter Property="FontSize" Value="9.5" />
+    <Setter Property="LineHeight" Value="12" />
+    <Setter Property="VerticalAlignment" Value="Center" />
+    <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+  </Style>
+
+  <Style Selector="Border.cc-timeline-panel">
+    <Setter Property="MinHeight" Value="36" />
+    <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="6" />
+    <Setter Property="Padding" Value="5,3" />
+  </Style>
+
+  <Style Selector="Border.cc-timeline-stop">
+    <Setter Property="Height" Value="31" />
+    <Setter Property="MinWidth" Value="58" />
+    <Setter Property="Margin" Value="0,0,4,0" />
+    <Setter Property="Padding" Value="5,1" />
+    <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="5" />
+  </Style>
+
+  <Style Selector="Border.cc-timeline-stop.complete">
+    <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+  </Style>
+
+  <Style Selector="Border.cc-timeline-stop.current">
+    <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+  </Style>
+
+  <Style Selector="TextBlock.cc-timeline-marker">
+    <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+    <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+    <Setter Property="FontSize" Value="7.2" />
+    <Setter Property="FontWeight" Value="Black" />
+    <Setter Property="MinWidth" Value="12" />
+    <Setter Property="LineHeight" Value="8" />
+    <Setter Property="HorizontalAlignment" Value="Center" />
+    <Setter Property="VerticalAlignment" Value="Center" />
+    <Setter Property="TextAlignment" Value="Center" />
+  </Style>
+
+  <Style Selector="TextBlock.cc-timeline-title">
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+    <Setter Property="FontSize" Value="8.2" />
+    <Setter Property="FontWeight" Value="ExtraBold" />
+    <Setter Property="LineHeight" Value="10" />
+    <Setter Property="HorizontalAlignment" Value="Center" />
+    <Setter Property="TextAlignment" Value="Center" />
+    <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+  </Style>
+
+  <Style Selector="TextBlock.cc-timeline-state">
+    <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+    <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+    <Setter Property="FontSize" Value="6.8" />
+    <Setter Property="FontWeight" Value="Bold" />
+    <Setter Property="LineHeight" Value="8" />
+    <Setter Property="HorizontalAlignment" Value="Center" />
+    <Setter Property="TextAlignment" Value="Center" />
+    <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+  </Style>
+
+  <Style Selector="TextBlock.cc-prompt-route">
+    <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+    <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+    <Setter Property="FontSize" Value="9.5" />
+    <Setter Property="FontWeight" Value="Bold" />
+    <Setter Property="VerticalAlignment" Value="Center" />
+    <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    <Setter Property="MaxWidth" Value="116" />
+  </Style>
+
+  <Style Selector="Button.cc-prompt-mode">
+    <Setter Property="Height" Value="21" />
+    <Setter Property="MinHeight" Value="21" />
+    <Setter Property="MinWidth" Value="36" />
+    <Setter Property="Padding" Value="6,0" />
+    <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="5" />
+    <Setter Property="FontSize" Value="9" />
+    <Setter Property="FontWeight" Value="Bold" />
+    <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+  </Style>
+
+  <Style Selector="Button.cc-prompt-mode:pointerover">
+    <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+  </Style>
+
+  <Style Selector="Button.cc-prompt-mode.active">
+    <Setter Property="Background" Value="{DynamicResource HistoryActiveBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+  </Style>
+
+  <Style Selector="TextBox.cc-prompt-input">
+    <Setter Property="MinHeight" Value="74" />
+    <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+    <Setter Property="FontSize" Value="12" />
+    <Setter Property="LineHeight" Value="18" />
+    <Setter Property="Padding" Value="2,6" />
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderBrush" Value="Transparent" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+  </Style>
+
+  <Style Selector="TextBox.cc-prompt-input:focus">
+    <Setter Property="BorderBrush" Value="Transparent" />
+  </Style>
+
+  <Style Selector="TextBox.cc-terminal-output">
+    <Setter Property="MinHeight" Value="74" />
+    <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+    <Setter Property="FontSize" Value="10.5" />
+    <Setter Property="LineHeight" Value="15" />
+    <Setter Property="Padding" Value="2,6" />
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderBrush" Value="Transparent" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+  </Style>
+
+  <Style Selector="TextBox.cc-terminal-output:focus">
+    <Setter Property="BorderBrush" Value="Transparent" />
+  </Style>
+
+  <Style Selector="TextBlock.cc-prompt-meta">
+    <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+    <Setter Property="FontSize" Value="10" />
+    <Setter Property="VerticalAlignment" Value="Center" />
+    <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+  </Style>
+
+  <Style Selector="Button.cc-prompt-chip">
+    <Setter Property="Height" Value="25" />
+    <Setter Property="MinHeight" Value="25" />
+    <Setter Property="Padding" Value="9,0" />
+    <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="6" />
+    <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+    <Setter Property="FontSize" Value="10" />
+    <Setter Property="FontWeight" Value="Bold" />
+    <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+  </Style>
+
+  <Style Selector="Button.cc-prompt-chip:pointerover">
+    <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+  </Style>
+
+  <Style Selector="ComboBox.cc-local-model-picker">
+    <Setter Property="MinHeight" Value="25" />
+    <Setter Property="Width" Value="190" />
+    <Setter Property="VerticalAlignment" Value="Center" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+    <Setter Property="Padding" Value="8,0" />
+    <Setter Property="FontSize" Value="10" />
+    <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+  </Style>
+
+  <Style Selector="Button.cc-prompt-send">
+    <Setter Property="Height" Value="25" />
+    <Setter Property="MinHeight" Value="25" />
+    <Setter Property="MinWidth" Value="58" />
+    <Setter Property="Padding" Value="12,0" />
+    <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+    <Setter Property="BorderThickness" Value="1" />
+    <Setter Property="CornerRadius" Value="6" />
+    <Setter Property="FontSize" Value="11" />
+    <Setter Property="FontWeight" Value="ExtraBold" />
+    <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+  </Style>
+
+  <Style Selector="Button.cc-prompt-send:pointerover">
+    <Setter Property="Background" Value="{DynamicResource HistoryActiveBrush}" />
+    <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+  </Style>
+
+  <Style Selector="Button.cc-prompt-icon">
+    <Setter Property="Width" Value="23" />
+    <Setter Property="Height" Value="23" />
+    <Setter Property="MinWidth" Value="0" />
+    <Setter Property="MinHeight" Value="0" />
+    <Setter Property="Padding" Value="0" />
+    <Setter Property="Background" Value="Transparent" />
+    <Setter Property="BorderBrush" Value="Transparent" />
+    <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+    <Setter Property="BorderThickness" Value="0" />
+    <Setter Property="CornerRadius" Value="5" />
+    <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+    <Setter Property="FontSize" Value="10" />
+    <Setter Property="FontWeight" Value="Bold" />
+    <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+  </Style>
+
+  <Style Selector="Button.cc-prompt-icon:pointerover">
+    <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+    <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+  </Style>
+</Styles>

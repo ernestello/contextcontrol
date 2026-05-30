@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="ContextControl.Workbench.Views.MainWindowParts.ProjectGraphPage"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls"
+    xmlns:svc="clr-namespace:ContextControl.Workbench.Services"
+    xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
+>
+            <Border
+                Grid.Row="2"
+                Classes="editor-body graph-page"
+                Padding="6"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsProjectGraphMode}">
+              <Grid ColumnSpacing="{Binding ProjectGraphTreeColumnSpacing}" MinHeight="0">
+                <Grid.ColumnDefinitions>
+                  <ColumnDefinition Width="*" />
+                  <ColumnDefinition Width="{Binding ProjectGraphTreePaneWidth}" />
+                </Grid.ColumnDefinitions>
+                <Border Classes="graph-surface" ClipToBounds="True" MinHeight="0">
+                  <Grid ClipToBounds="True">
+                    <controls:ProjectGraphRenderControl
+                        x:Name="ProjectGraphView"
+                        Items="{Binding ProjectTree}"
+                        SelectedNode="{Binding ProjectGraphSelectedNode, Mode=TwoWay}"
+                        GraphVersion="{Binding ProjectGraphVersion}"
+                        CenterOnSelectedNodeVersion="{Binding ProjectGraphCenterVersion}"
+                        ThemeKey="{Binding ThemeKey}"
+                        UiFontFamily="{Binding UiFontFamily}"
+                        CodeFontFamily="{Binding CodeFontFamily}"
+                        LayoutMode="{Binding ProjectGraphLayoutMode}"
+                        GenerationPalette="{Binding ProjectGraphGenerationPalette}" />
+
+                    <Border
+                        x:Name="ProjectGraphSearchPanel"
+                        Classes="graph-search-panel"
+                        HorizontalAlignment="Center"
+                        VerticalAlignment="Top"
+                        Margin="0,8,0,0"
+                        IsVisible="{Binding IsProjectGraphSearchOpen}"
+                        IsHitTestVisible="{Binding IsProjectGraphSearchOpen}">
+                      <Grid RowDefinitions="Auto,Auto" Width="380">
+                        <TextBox
+                            x:Name="ProjectGraphSearchBox"
+                            Classes="graph-search-input"
+                            Watermark="Search graph"
+                            Text="{Binding ProjectGraphSearchText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                            KeyDown="OnProjectGraphSearchKeyDown" />
+
+                        <ItemsControl
+                            Grid.Row="1"
+                            Classes="graph-search-suggestions"
+                            ItemsSource="{Binding ProjectGraphSearchSuggestions}"
+                            IsVisible="{Binding HasProjectGraphSearchSuggestions}">
+                          <ItemsControl.ItemTemplate>
+                            <DataTemplate DataType="{x:Type vm:ProjectGraphSearchSuggestionViewModel}">
+                              <Button
+                                  Classes="graph-search-suggestion"
+                                  Command="{Binding DataContext.SelectProjectGraphSearchSuggestionCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}">
+                                <Grid ColumnDefinitions="*,Auto" RowDefinitions="Auto,Auto" ColumnSpacing="8">
+                                  <TextBlock
+                                      Classes="graph-search-title"
+                                      Text="{Binding Title}" />
+                                  <TextBlock
+                                      Grid.Column="1"
+                                      Classes="graph-search-meta"
+                                      Text="{Binding Meta}" />
+                                  <TextBlock
+                                      Grid.Row="1"
+                                      Grid.ColumnSpan="2"
+                                      Classes="graph-search-detail"
+                                      Text="{Binding Detail}" />
+                                </Grid>
+                              </Button>
+                            </DataTemplate>
+                          </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                      </Grid>
+                    </Border>
+                  </Grid>
+                </Border>
+
+                <Border
+                    Grid.Column="1"
+                    Classes="graph-tree-sidebar"
+                    MinHeight="0"
+                    IsVisible="{Binding IsProjectGraphTreePaneOpen}"
+                    IsHitTestVisible="{Binding IsProjectGraphTreePaneOpen}">
+                  <Grid RowDefinitions="Auto,*" RowSpacing="6" MinHeight="0">
+                    <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="6">
+                      <TextBlock Classes="graph-sidebar-title" Text="Current project tree" />
+                      <Button
+                          Grid.Column="1"
+                          Classes="browser-nav-button"
+                          ToolTip.Tip="Copy"
+                          Click="OnProjectGraphCopyTreeClick">
+                        <Canvas Width="12" Height="13">
+                          <Border
+                              Canvas.Left="1"
+                              Canvas.Top="1"
+                              Width="7.5"
+                              Height="8.5"
+                              CornerRadius="1.4"
+                              BorderThickness="1.15"
+                              BorderBrush="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" />
+                          <Border
+                              Canvas.Left="4"
+                              Canvas.Top="4"
+                              Width="7.5"
+                              Height="8.5"
+                              CornerRadius="1.4"
+                              BorderThickness="1.15"
+                              BorderBrush="{Binding Foreground, RelativeSource={RelativeSource AncestorType=Button}}" />
+                        </Canvas>
+                      </Button>
+                      <Button
+                          Grid.Column="2"
+                          Classes="browser-nav-button"
+                          Content="x"
+                          ToolTip.Tip="Close graph project tree"
+                          Command="{Binding ToggleProjectGraphTreePaneCommand}" />
+                    </Grid>
+                    <TextBox
+                        Grid.Row="1"
+                        Classes="graph-tree-text"
+                        AcceptsReturn="True"
+                        IsReadOnly="True"
+                        TextWrapping="NoWrap"
+                        Text="{Binding ProjectGraphTreeText}"
+                        ScrollViewer.AllowAutoHide="True"
+                        ScrollViewer.VerticalScrollBarVisibility="Auto"
+                        ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                        controls:HoverScrollbarBehavior.IsEnabled="True"
+                        controls:HoverScrollbarBehavior.ReserveRight="12" />
+                  </Grid>
+                </Border>
+              </Grid>
+            </Border>
+</UserControl>

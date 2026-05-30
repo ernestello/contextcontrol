@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="ContextControl.Workbench.Views.MainWindowParts.ProjectScannerPage"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls"
+    xmlns:svc="clr-namespace:ContextControl.Workbench.Services"
+    xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
+>
+            <Border
+                Grid.Row="2"
+                Classes="editor-body scanner-page"
+                Padding="6"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsProjectScannerMode}">
+              <Grid RowDefinitions="*" RowSpacing="0">
+                <ScrollViewer
+                    Grid.Row="0"
+                    VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled"
+                    AllowAutoHide="False">
+                  <controls:ProjectScannerRenderControl
+                      Metrics="{Binding ProjectScanMetrics}"
+                      IdentitySections="{Binding ProjectScanIdentitySections}"
+                      FileSections="{Binding ProjectScanFileSections}"
+                      RuleSections="{Binding ProjectScanRuleSections}"
+                      DiagnosticSections="{Binding ProjectScanDiagnosticSections}"
+                      ShowMetrics="{Binding ShowProjectScanMetrics}"
+                      ThemeKey="{Binding ThemeKey}"
+                      UiFontFamily="{Binding UiFontFamily}"
+                      CodeFontFamily="{Binding CodeFontFamily}" />
+                </ScrollViewer>
+              </Grid>
+            </Border>
+</UserControl>

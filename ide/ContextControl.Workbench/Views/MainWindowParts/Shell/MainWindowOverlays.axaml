@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="ContextControl.Workbench.Views.MainWindowParts.MainWindowOverlays"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <Grid>
+    <Border
+        x:Name="PromptFileDropOverlay"
+        Grid.RowSpan="2"
+        Classes="cc-filedrop-overlay"
+        IsVisible="False"
+        IsHitTestVisible="False">
+      <Grid HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Border Classes="cc-filedrop-panel">
+          <StackPanel Spacing="10" HorizontalAlignment="Center">
+            <Border Classes="cc-filedrop-icon-host" HorizontalAlignment="Center">
+              <TextBlock Text="⇩" Classes="cc-filedrop-icon" />
+            </Border>
+            <TextBlock
+                Text="Drop your files to attach them to the prompt"
+                Classes="cc-filedrop-title"
+                TextAlignment="Center" />
+          </StackPanel>
+        </Border>
+      </Grid>
+    </Border>
+    <Border
+        Grid.RowSpan="2"
+        Classes="cc-modal-overlay"
+        IsVisible="{Binding ContextControl.IsOllamaInstallerPromptOpen}"
+        IsHitTestVisible="{Binding ContextControl.IsOllamaInstallerPromptOpen}">
+      <Grid HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Border Classes="cc-modal-panel" Width="430">
+          <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="12">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+              <TextBlock
+                  Text="Ollama setup"
+                  Classes="cc-modal-title" />
+              <Button
+                  Grid.Column="1"
+                  Classes="cc-prompt-icon"
+                  Content="x"
+                  ToolTip.Tip="Close"
+                  Command="{Binding ContextControl.CloseOllamaInstallerPromptCommand}" />
+            </Grid>
+            <TextBlock
+                Grid.Row="1"
+                Text="{Binding ContextControl.OllamaInstallerPromptMessage}"
+                Classes="cc-modal-message" />
+            <Button
+                Grid.Row="2"
+                Classes="browser-open-button primary"
+                Content="OK"
+                HorizontalAlignment="Right"
+                Command="{Binding ContextControl.CloseOllamaInstallerPromptCommand}" />
+          </Grid>
+        </Border>
+      </Grid>
+    </Border>
+    <Border
+        Grid.RowSpan="2"
+        Classes="cc-modal-overlay"
+        IsVisible="{Binding ContextControl.IsExternalDependencyDeletePromptOpen}"
+        IsHitTestVisible="{Binding ContextControl.IsExternalDependencyDeletePromptOpen}">
+      <Grid HorizontalAlignment="Center" VerticalAlignment="Center">
+        <Border Classes="cc-modal-panel" Width="460">
+          <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="12">
+            <Grid ColumnDefinitions="*,Auto" ColumnSpacing="10">
+              <TextBlock
+                  Text="{Binding ContextControl.ExternalDependencyDeletePromptTitle}"
+                  Classes="cc-modal-title" />
+              <Button
+                  Grid.Column="1"
+                  Classes="cc-prompt-icon"
+                  Content="x"
+                  ToolTip.Tip="Close"
+                  Command="{Binding ContextControl.IgnoreExternalDependencyDeleteCommand}" />
+            </Grid>
+            <TextBlock
+                Grid.Row="1"
+                Text="{Binding ContextControl.ExternalDependencyDeletePromptMessage}"
+                Classes="cc-modal-message" />
+            <StackPanel
+                Grid.Row="2"
+                Orientation="Horizontal"
+                HorizontalAlignment="Right"
+                Spacing="8">
+              <Button
+                  Classes="browser-open-button primary"
+                  Content="Yes, Delete"
+                  Command="{Binding ContextControl.ConfirmExternalDependencyDeleteCommand}" />
+              <Button
+                  Classes="browser-open-button"
+                  Content="No, Ignore"
+                  Command="{Binding ContextControl.IgnoreExternalDependencyDeleteCommand}" />
+            </StackPanel>
+          </Grid>
+        </Border>
+      </Grid>
+    </Border>
+    <Border Classes="resize-edge resize-left" Grid.RowSpan="2" Width="8" HorizontalAlignment="Left" VerticalAlignment="Stretch" PointerPressed="OnResizeLeftPointerPressed" />
+    <Border Classes="resize-edge resize-right" Grid.RowSpan="2" Width="8" HorizontalAlignment="Right" VerticalAlignment="Stretch" PointerPressed="OnResizeRightPointerPressed" />
+    <Border Classes="resize-edge resize-top" Grid.RowSpan="2" Height="8" HorizontalAlignment="Stretch" VerticalAlignment="Top" PointerPressed="OnResizeTopPointerPressed" />
+    <Border Classes="resize-edge resize-bottom" Grid.RowSpan="2" Height="8" HorizontalAlignment="Stretch" VerticalAlignment="Bottom" PointerPressed="OnResizeBottomPointerPressed" />
+    <Border Classes="resize-edge resize-top-left" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Left" VerticalAlignment="Top" PointerPressed="OnResizeTopLeftPointerPressed" />
+    <Border Classes="resize-edge resize-top-right" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Right" VerticalAlignment="Top" PointerPressed="OnResizeTopRightPointerPressed" />
+    <Border Classes="resize-edge resize-bottom-left" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Left" VerticalAlignment="Bottom" PointerPressed="OnResizeBottomLeftPointerPressed" />
+    <Border Classes="resize-edge resize-bottom-right" Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Right" VerticalAlignment="Bottom" PointerPressed="OnResizeBottomRightPointerPressed" />
+  </Grid>
+</UserControl>

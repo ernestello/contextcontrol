@@ -15,6 +15,7 @@ using System.ComponentModel;
 using System.Globalization;
 using System.Linq;
 using System.Text;
+using ContextControl.Workbench.Controls;
 using ContextControl.Workbench.Services;
 using ContextControl.Workbench.ViewModels;
 
@@ -22,8 +23,8 @@ namespace ContextControl.Workbench.Views;
 
 public sealed partial class MainWindow : Window
 {
-    private static readonly IBrush PositiveFallbackBrush = Brush.Parse("#1E7F57");
-    private static readonly IBrush NegativeFallbackBrush = Brush.Parse("#B24A42");
+    private static readonly IBrush PositiveFallbackBrush = Brush.Parse("#2FA36B");
+    private static readonly IBrush NegativeFallbackBrush = Brush.Parse("#D95D5D");
 
     private readonly DispatcherTimer _closeHistoryTimer;
     private readonly DispatcherTimer _promptTypingTimer;
@@ -33,8 +34,8 @@ public sealed partial class MainWindow : Window
 
     private int _fileDragHoverCount;
 
-    private IBrush PositiveBrush => ThemeBrush("GoodBrush", PositiveFallbackBrush);
-    private IBrush NegativeBrush => ThemeBrush("BadBrush", NegativeFallbackBrush);
+    private IBrush PositiveBrush => ThemeBrush("FixedGoodBrush", PositiveFallbackBrush);
+    private IBrush NegativeBrush => ThemeBrush("FixedBadBrush", NegativeFallbackBrush);
 
     public MainWindow()
     {
@@ -71,6 +72,23 @@ public sealed partial class MainWindow : Window
     }
 
     private WorkbenchViewModel? ViewModel => DataContext as WorkbenchViewModel;
+
+    private Button EditMenuButton => MainTitleBar.EditMenu;
+    private ScrollViewer ProjectTreeList => ProjectFilesPane.TreeList;
+    private Border ProjectTreeSearchPanel => ProjectFilesPane.TreeSearchPanel;
+    private TextBox ProjectTreeSearchBox => ProjectFilesPane.TreeSearchBox;
+    private ProjectTreeRenderControl ProjectTreeView => ProjectFilesPane.TreeView;
+    private TextBox ContextPromptTextBox => ContextPromptBar.PromptTextBox;
+    private WebView2Host BrowserWebView => BrowserSurface.BrowserWebViewControl;
+    private TextBox LlmSearchBox => LocalLlmPage.SearchBox;
+    private TextBox DependencySearchBox => DependenciesPage.SearchBox;
+    private ProjectGraphRenderControl ProjectGraphView => ProjectGraphPage.GraphView;
+    private Border ProjectGraphSearchPanel => ProjectGraphPage.SearchPanel;
+    private TextBox ProjectGraphSearchBox => ProjectGraphPage.SearchBox;
+    private Grid AttachmentRegion => BrowserRoutingPane.AttachmentRegionControl;
+    private Border AttachmentListHost => BrowserRoutingPane.AttachmentListHostControl;
+    private ListBox AttachmentList => BrowserRoutingPane.AttachmentListControl;
+    private Border PromptFileDropOverlay => MainWindowOverlays.FileDropOverlay;
 
     private IBrush ThemeBrush(string key, IBrush fallback)
     {
@@ -112,7 +130,7 @@ public sealed partial class MainWindow : Window
         await PickAndLoadProjectAsync("Add Project");
     }
 
-    private async void OnProjectScannerCopyClick(object? sender, RoutedEventArgs e)
+    internal async void OnProjectScannerCopyClick(object? sender, RoutedEventArgs e)
     {
         var text = ViewModel?.ProjectScanResultText;
         if (string.IsNullOrWhiteSpace(text))

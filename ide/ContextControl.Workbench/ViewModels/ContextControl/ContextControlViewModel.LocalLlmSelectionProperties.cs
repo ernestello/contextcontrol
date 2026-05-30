@@ -1,0 +1,349 @@
+// CC-DESC: Route, model selection, local LLM filters, model IDs, and Ollama storage bindable properties.
+
+// CC-DESC: Owns Context Control workflow state, prompt bar state, and DIR/CC/GO commands.
+
+using System.Collections.ObjectModel;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Windows.Input;
+using Avalonia.Collections;
+using Avalonia.Controls.Primitives;
+using Avalonia.Media;
+using ContextControl.Workbench.Services;
+
+namespace ContextControl.Workbench.ViewModels;
+
+public sealed partial class ContextControlViewModel
+{
+    public string SelectedRoute
+    {
+        get => _selectedRoute;
+        set
+        {
+            var clean = string.IsNullOrWhiteSpace(value) ? RouteOptions[0] : value;
+            if (SetProperty(ref _selectedRoute, clean))
+            {
+                _settings.SelectedAiRoute = clean;
+                ProviderStatus = clean.StartsWith("Local:", StringComparison.OrdinalIgnoreCase)
+                    ? "Local Ollama route selected"
+                    : clean.StartsWith("API:", StringComparison.OrdinalIgnoreCase)
+                    ? "API profile selected"
+                    : "Browser profile selected";
+                SaveSettingsQuietly();
+            }
+        }
+    }
+
+    public LocalLlmModelViewModel? SelectedLocalModel
+    {
+        get => _selectedLocalModel;
+        set
+        {
+            if (value is null
+                && _selectedLocalModel is not null
+                && InstalledLocalModels.Contains(_selectedLocalModel))
+            {
+                OnPropertyChanged(nameof(SelectedLocalModel));
+                OnPropertyChanged(nameof(SelectedActiveLocalModel));
+                return;
+            }
+
+            if (value is not null && !value.CanUseInLocalChat)
+            {
+                return;
+            }
+
+            if (SetProperty(ref _selectedLocalModel, value))
+            {
+                if (value is not null)
+                {
+                    _settings.SelectedLocalModel = value.Id;
+                    SaveSettingsQuietly();
+                    SaveChatHistory();
+                }
+
+                OnPropertyChanged(nameof(SelectedLocalModelLabel));
+                OnPropertyChanged(nameof(SelectedActiveLocalModel));
+                OnPropertyChanged(nameof(PromptContextPressureLabel));
+                OnPropertyChanged(nameof(PromptFooterSummary));
+                OnPropertyChanged(nameof(PromptModelCapabilityHint));
+                OnPropertyChanged(nameof(HasPromptModelCapabilityHint));
+            }
+        }
+    }
+
+    public LocalLlmModelViewModel? SelectedImageGenerationModel
+    {
+        get => _selectedImageGenerationModel;
+        set
+        {
+            if (value is null
+                && _selectedImageGenerationModel is not null
+                && InstalledImageGenerationModels.Contains(_selectedImageGenerationModel))
+            {
+                OnPropertyChanged(nameof(SelectedImageGenerationModel));
+                OnPropertyChanged(nameof(SelectedActiveLocalModel));
+                return;
+            }
+
+            if (value is not null && !value.IsImageGenerationModel)
+            {
+                return;
+            }
+
+            if (SetProperty(ref _selectedImageGenerationModel, value))
+            {
+                if (value is not null)
+                {
+                    _settings.SelectedImageModel = value.Id;
+                    SaveSettingsQuietly();
+                    SaveChatHistory();
+                }
+
+                OnPropertyChanged(nameof(SelectedLocalModelLabel));
+                OnPropertyChanged(nameof(SelectedActiveLocalModel));
+                OnPropertyChanged(nameof(PromptContextPressureLabel));
+                OnPropertyChanged(nameof(PromptFooterSummary));
+                OnPropertyChanged(nameof(PromptModelCapabilityHint));
+                OnPropertyChanged(nameof(HasPromptModelCapabilityHint));
+            }
+        }
+    }
+
+    public LocalLlmModelViewModel? SelectedActiveLocalModel
+    {
+        get => IsImageGenWorkspaceActive ? SelectedImageGenerationModel : SelectedLocalModel;
+        set
+        {
+            if (value is null)
+            {
+                return;
+            }
+
+            if (IsImageGenWorkspaceActive)
+            {
+                if (value.IsImageGenerationModel)
+                {
+                    SelectedImageGenerationModel = value;
+                }
+            }
+            else if (value.CanUseInLocalChat)
+            {
+                SelectedLocalModel = value;
+            }
+        }
+    }
+
+    public IEnumerable<LocalLlmModelViewModel> ActiveInstalledLocalModels =>
+        IsImageGenWorkspaceActive ? InstalledImageGenerationModels : InstalledLocalModels;
+
+    public string SelectedLocalModelLabel => SelectedActiveLocalModel?.DisplayName ?? "No installed local model";
+
+    public string SelectedLocalLlmSortOption
+    {
+        get => _selectedLocalLlmSortOption;
+        set
+        {
+            var clean = NormalizeLocalLlmSortOption(value);
+            if (SetProperty(ref _selectedLocalLlmSortOption, clean))
+            {
+                PersistLocalLlmFilterSettings();
+                ApplyLocalLlmFilters();
+            }
+        }
+    }
+
+    public string LocalLlmSearchText
+    {
+        get => _localLlmSearchText;
+        set
+        {
+            if (SetProperty(ref _localLlmSearchText, value ?? ""))
+            {
+                ApplyLocalLlmFilters();
+            }
+        }
+    }
+
+    public string DependencySearchText
+    {
+        get => _dependencySearchText;
+        set
+        {
+            if (SetProperty(ref _dependencySearchText, value ?? ""))
+            {
+                ApplyDependencyFilters();
+            }
+        }
+    }
+
+    public string SelectedLocalLlmProviderFilter
+    {
+        get => _selectedLocalLlmProviderFilter;
+        set
+        {
+            var clean = CleanLocalLlmFilter(value, LlmProviderAll);
+            if (SetProperty(ref _selectedLocalLlmProviderFilter, clean))
+            {
+                PersistLocalLlmFilterSettings();
+                ApplyLocalLlmFilters();
+            }
+        }
+    }
+
+    public string SelectedLocalLlmSourceFilter
+    {
+        get => _selectedLocalLlmSourceFilter;
+        set
+        {
+            var clean = NormalizeLocalLlmSourceFilter(value);
+            if (SetProperty(ref _selectedLocalLlmSourceFilter, clean))
+            {
+                PersistLocalLlmFilterSettings();
+                ApplyLocalLlmFilters();
+            }
+        }
+    }
+
+    public string SelectedLocalLlmPurposeFilter
+    {
+        get => _selectedLocalLlmPurposeFilter;
+        set
+        {
+            var clean = CleanLocalLlmFilter(value, LlmPurposeAll);
+            if (SetProperty(ref _selectedLocalLlmPurposeFilter, clean))
+            {
+                PersistLocalLlmFilterSettings();
+                ApplyLocalLlmFilters();
+            }
+        }
+    }
+
+    public string SelectedLocalLlmBaseFilter
+    {
+        get => _selectedLocalLlmBaseFilter;
+        set
+        {
+            var clean = CleanLocalLlmFilter(value, LlmBaseAll);
+            if (SetProperty(ref _selectedLocalLlmBaseFilter, clean))
+            {
+                PersistLocalLlmFilterSettings();
+                ApplyLocalLlmFilters();
+            }
+        }
+    }
+
+    public string SelectedLocalLlmContextFilter
+    {
+        get => _selectedLocalLlmContextFilter;
+        set
+        {
+            var clean = NormalizeLocalLlmContextFilter(value);
+            if (SetProperty(ref _selectedLocalLlmContextFilter, clean))
+            {
+                PersistLocalLlmFilterSettings();
+                ApplyLocalLlmFilters();
+            }
+        }
+    }
+
+    public string SelectedLocalLlmRequirementFilter
+    {
+        get => _selectedLocalLlmRequirementFilter;
+        set
+        {
+            var clean = NormalizeLocalLlmRequirementFilter(value);
+            if (SetProperty(ref _selectedLocalLlmRequirementFilter, clean))
+            {
+                PersistLocalLlmFilterSettings();
+                ApplyLocalLlmFilters();
+            }
+        }
+    }
+
+    public string FileRequestModelId
+    {
+        get => _fileRequestModelId;
+        set
+        {
+            var clean = CleanModelId(value, "qwen2.5-coder:1.5b");
+            if (SetProperty(ref _fileRequestModelId, clean))
+            {
+                _settings.FileRequestModel = clean;
+                SaveSettingsQuietly();
+            }
+        }
+    }
+
+    public string PatchWriteModelId
+    {
+        get => _patchWriteModelId;
+        set
+        {
+            var clean = CleanModelId(value, "qwen2.5-coder:3b");
+            if (SetProperty(ref _patchWriteModelId, clean))
+            {
+                _settings.PatchWriteModel = clean;
+                SaveSettingsQuietly();
+            }
+        }
+    }
+
+    public string PatchReviewModelId
+    {
+        get => _patchReviewModelId;
+        set
+        {
+            var clean = CleanModelId(value, "phi4-mini");
+            if (SetProperty(ref _patchReviewModelId, clean))
+            {
+                _settings.PatchReviewModel = clean;
+                SaveSettingsQuietly();
+            }
+        }
+    }
+
+    public string ChatModelId
+    {
+        get => _chatModelId;
+        set
+        {
+            var clean = CleanModelId(value, "qwen2.5-coder:3b");
+            if (SetProperty(ref _chatModelId, clean))
+            {
+                _settings.ChatModel = clean;
+                SaveSettingsQuietly();
+            }
+        }
+    }
+
+    public string OllamaModelsDirectory
+    {
+        get => _ollamaModelsDirectory;
+        set
+        {
+            var clean = string.IsNullOrWhiteSpace(value)
+                ? LocalLlmService.ResolveOllamaModelsDirectory(null)
+                : value.Trim();
+            if (SetProperty(ref _ollamaModelsDirectory, clean))
+            {
+                _settings.OllamaModelsDirectory = clean;
+                SaveSettingsQuietly();
+            }
+        }
+    }
+
+    public string OllamaModelsDirectoryStatus
+    {
+        get => _ollamaModelsDirectoryStatus;
+        private set
+        {
+            if (SetProperty(ref _ollamaModelsDirectoryStatus, value ?? ""))
+            {
+                UpdateOllamaBackendDependency();
+            }
+        }
+    }
+
+}

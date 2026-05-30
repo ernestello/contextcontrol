@@ -1,0 +1,28 @@
+# Build output
+bin/
+obj/
+TestResults/
+
+# ContextControl runtime output
+.tmp/
+.ccReplace.versions/
+.ccWorkbench.browser-data/
+.ccWorkbench.generated-projects/
+.ccWorkbench.chat-history*.json
+.ccWorkbench.settings.json
+
+# ContextControl generated exports and transient patch files
+cc_code_export.md
+cc_project_dir.md
+cc_semantic_map.md
+cc_chat_export_*.md
+mainwindow_axaml.txt
+patch.txt
+
+# Editor/OS noise
+.vs/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini

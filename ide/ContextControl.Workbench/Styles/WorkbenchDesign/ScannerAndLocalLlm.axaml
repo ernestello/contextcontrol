@@ -1,0 +1,592 @@
+<Styles
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls">
+
+
+    <Style Selector="TextBox.scanner-result">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="TextWrapping" Value="NoWrap" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="MinHeight" Value="0" />
+    </Style>
+
+    <Style Selector="TextBlock.scanner-status">
+      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8.5" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="Border.scanner-page">
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+    </Style>
+
+    <Style Selector="Border.graph-page">
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+    </Style>
+
+    <Style Selector="Border.graph-surface">
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+    </Style>
+
+    <Style Selector="Border.graph-search-panel">
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+      <Setter Property="Padding" Value="6" />
+    </Style>
+
+    <Style Selector="TextBox.graph-search-input">
+      <Setter Property="Height" Value="25" />
+      <Setter Property="MinHeight" Value="25" />
+      <Setter Property="Padding" Value="7,1" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="CornerRadius" Value="4" />
+    </Style>
+
+    <Style Selector="Button.graph-color-swatch-button">
+      <Setter Property="Width" Value="20" />
+      <Setter Property="Height" Value="28" />
+      <Setter Property="MinWidth" Value="0" />
+      <Setter Property="MinHeight" Value="0" />
+      <Setter Property="Padding" Value="2,0,0,0" />
+      <Setter Property="HorizontalAlignment" Value="Left" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="4" />
+      <Setter Property="HorizontalContentAlignment" Value="Left" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="Button.graph-color-swatch-button:pointerover">
+      <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    </Style>
+
+    <Style Selector="ItemsControl.graph-search-suggestions">
+      <Setter Property="Margin" Value="0,5,0,0" />
+    </Style>
+
+    <Style Selector="Button.graph-search-suggestion">
+      <Setter Property="MinHeight" Value="0" />
+      <Setter Property="Padding" Value="7,4" />
+      <Setter Property="Margin" Value="0,0,0,2" />
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="4" />
+    </Style>
+
+    <Style Selector="Button.graph-search-suggestion:pointerover">
+      <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.graph-search-title">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource UiFontFamily}" />
+      <Setter Property="FontSize" Value="10" />
+      <Setter Property="FontWeight" Value="ExtraBold" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBlock.graph-search-meta">
+      <Setter Property="Foreground" Value="{DynamicResource MetricLocBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBlock.graph-search-detail">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8.2" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="Border.graph-tree-sidebar">
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+      <Setter Property="Padding" Value="7,6" />
+    </Style>
+
+    <Style Selector="TextBlock.graph-sidebar-title">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8.5" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBox.graph-tree-text">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="9.4" />
+      <Setter Property="TextWrapping" Value="NoWrap" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="MinHeight" Value="0" />
+      <Setter Property="MinWidth" Value="0" />
+    </Style>
+
+    <Style Selector="Border.scanner-metric-strip">
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+      <Setter Property="Padding" Value="6,5,6,1" />
+    </Style>
+
+    <Style Selector="Border.llm-collapsible-panel">
+      <Setter Property="Margin" Value="0" />
+    </Style>
+
+    <Style Selector="Border.llm-info-pill">
+      <Setter Property="Height" Value="25" />
+      <Setter Property="MaxWidth" Value="220" />
+      <Setter Property="Margin" Value="0,0,4,4" />
+      <Setter Property="Padding" Value="7,0" />
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+    </Style>
+
+    <Style Selector="Border.llm-info-pill.wide">
+      <Setter Property="MaxWidth" Value="300" />
+    </Style>
+
+    <Style Selector="Border.llm-info-pill.path">
+      <Setter Property="MaxWidth" Value="360" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-info-pill-text">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="9" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="Border.scanner-metric">
+      <Setter Property="Width" Value="104" />
+      <Setter Property="Height" Value="34" />
+      <Setter Property="Margin" Value="2,0,2,4" />
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="4" />
+      <Setter Property="Padding" Value="5,3" />
+    </Style>
+
+    <Style Selector="TextBlock.scanner-metric-key">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBlock.scanner-metric-value">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="11" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+      <Setter Property="VerticalAlignment" Value="Bottom" />
+    </Style>
+
+    <Style Selector="TextBlock.scanner-metric-detail">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontSize" Value="8.5" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="Border.scanner-panel">
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+      <Setter Property="Padding" Value="7,6,7,2" />
+    </Style>
+
+    <Style Selector="Border.scanner-panel-primary">
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.scanner-panel-title">
+      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8.5" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+      <Setter Property="Margin" Value="0,0,0,1" />
+    </Style>
+
+    <Style Selector="Border.scanner-section-card">
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1,0,0,0" />
+      <Setter Property="CornerRadius" Value="0" />
+      <Setter Property="Padding" Value="0,0,5,4" />
+      <Setter Property="Margin" Value="0,0,0,5" />
+    </Style>
+
+    <Style Selector="Border.scanner-section-card-rule">
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+    </Style>
+
+    <Style Selector="Border.scanner-section-title-tab">
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="0,0,1,1" />
+      <Setter Property="CornerRadius" Value="0,0,4,0" />
+      <Setter Property="Padding" Value="7,3,9,3" />
+      <Setter Property="Margin" Value="0,0,0,4" />
+      <Setter Property="HorizontalAlignment" Value="Stretch" />
+    </Style>
+
+    <Style Selector="TextBlock.scanner-section-title">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="9" />
+      <Setter Property="FontWeight" Value="ExtraBold" />
+      <Setter Property="TextWrapping" Value="Wrap" />
+      <Setter Property="Margin" Value="0" />
+    </Style>
+
+  <Style Selector="TextBlock.scanner-section-item">
+    <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+    <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+    <Setter Property="FontSize" Value="8.6" />
+    <Setter Property="TextWrapping" Value="Wrap" />
+    <Setter Property="Margin" Value="7,0,0,2" />
+  </Style>
+
+    <Style Selector="Border.llm-filter-bar">
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Padding" Value="5,4,2,1" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-filter-label">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="ComboBox.llm-filter-picker">
+      <Setter Property="MinHeight" Value="20" />
+      <Setter Property="MaxDropDownHeight" Value="260" />
+      <Setter Property="HorizontalAlignment" Value="Stretch" />
+      <Setter Property="FontSize" Value="9" />
+      <Setter Property="Padding" Value="4,0" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-filter-summary">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="9" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="VerticalAlignment" Value="Bottom" />
+      <Setter Property="Margin" Value="8,0,0,2" />
+      <Setter Property="MinWidth" Value="74" />
+      <Setter Property="TextAlignment" Value="Right" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="ListBox.llm-model-list">
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+      <Setter Property="Padding" Value="0" />
+    </Style>
+
+    <Style Selector="ListBox.llm-model-list ListBoxItem">
+      <Setter Property="MinHeight" Value="0" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="Margin" Value="0" />
+      <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+      <Setter Property="Focusable" Value="False" />
+      <Setter Property="Background" Value="Transparent" />
+      <Setter Property="BorderBrush" Value="Transparent" />
+      <Setter Property="BorderThickness" Value="0" />
+    </Style>
+
+    <Style Selector="ListBox.llm-model-list ListBoxItem:selected">
+      <Setter Property="Background" Value="Transparent" />
+    </Style>
+
+    <Style Selector="ListBox.llm-model-list ListBoxItem:selected:pointerover">
+      <Setter Property="Background" Value="Transparent" />
+    </Style>
+
+    <Style Selector="ListBox.llm-model-list ListBoxItem:pointerover">
+      <Setter Property="Background" Value="Transparent" />
+    </Style>
+
+    <Style Selector="ListBox.llm-model-list ListBoxItem:focus">
+      <Setter Property="Background" Value="Transparent" />
+    </Style>
+
+    <Style Selector="Border.llm-model-card">
+      <Setter Property="MinHeight" Value="72" />
+      <Setter Property="Margin" Value="0,0,0,4" />
+      <Setter Property="Background" Value="{DynamicResource EditorSurfaceBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource PanelBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Padding" Value="8,6" />
+      <Setter Property="HorizontalAlignment" Value="Stretch" />
+    </Style>
+
+    <Style Selector="Border.llm-model-card.recommended">
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+    </Style>
+
+    <Style Selector="Border.llm-model-card.installed">
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+    </Style>
+
+    <Style Selector="Border.llm-model-card.dependency-card">
+      <Setter Property="MinHeight" Value="54" />
+      <Setter Property="Padding" Value="6,4" />
+      <Setter Property="Margin" Value="0,0,0,3" />
+    </Style>
+
+    <Style Selector="Border.dependency-card TextBlock.llm-model-title">
+      <Setter Property="FontSize" Value="10.6" />
+    </Style>
+
+    <Style Selector="Border.llm-icon-shell">
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+    </Style>
+
+    <Style Selector="Border.dependency-card TextBlock.llm-model-id">
+      <Setter Property="FontSize" Value="7.8" />
+    </Style>
+
+    <Style Selector="Border.dependency-card Border.llm-metric-chip">
+      <Setter Property="MinHeight" Value="17" />
+      <Setter Property="Padding" Value="4,1" />
+      <Setter Property="Margin" Value="0,0,3,2" />
+    </Style>
+
+    <Style Selector="Border.dependency-card TextBlock.llm-metric-icon">
+      <Setter Property="FontSize" Value="7" />
+      <Setter Property="MinWidth" Value="22" />
+    </Style>
+
+    <Style Selector="Border.dependency-card TextBlock.llm-metric-text">
+      <Setter Property="FontSize" Value="8" />
+    </Style>
+
+    <Style Selector="Border.dependency-card TextBlock.llm-model-use">
+      <Setter Property="FontSize" Value="8.6" />
+      <Setter Property="LineHeight" Value="10" />
+    </Style>
+
+    <Style Selector="Border.dependency-card TextBlock.llm-fit-detail">
+      <Setter Property="FontSize" Value="7.8" />
+    </Style>
+
+    <Style Selector="Border.llm-model-icon-shell">
+      <Setter Property="Width" Value="34" />
+      <Setter Property="Height" Value="34" />
+      <Setter Property="CornerRadius" Value="6" />
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="Padding" Value="4" />
+      <Setter Property="VerticalAlignment" Value="Top" />
+      <Setter Property="ClipToBounds" Value="True" />
+    </Style>
+
+    <Style Selector="Image.llm-model-icon">
+      <Setter Property="Width" Value="24" />
+      <Setter Property="Height" Value="24" />
+      <Setter Property="Stretch" Value="Uniform" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="HorizontalAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-model-title">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontSize" Value="11.5" />
+      <Setter Property="FontWeight" Value="ExtraBold" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-model-id">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8.2" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-model-use">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontSize" Value="9.2" />
+      <Setter Property="TextWrapping" Value="NoWrap" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+      <Setter Property="LineHeight" Value="12" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-field-label">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8.5" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-field-value">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontSize" Value="9.4" />
+      <Setter Property="TextWrapping" Value="Wrap" />
+      <Setter Property="LineHeight" Value="12" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-source-budget">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8.6" />
+      <Setter Property="TextWrapping" Value="Wrap" />
+    </Style>
+
+    <Style Selector="Border.llm-metric-chip">
+      <Setter Property="MinHeight" Value="20" />
+      <Setter Property="MaxWidth" Value="190" />
+      <Setter Property="Margin" Value="0,0,4,4" />
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+      <Setter Property="Padding" Value="5,2" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-metric-icon">
+      <Setter Property="Foreground" Value="{DynamicResource AccentBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="7.5" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="MinWidth" Value="24" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="TextAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-metric-text">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontSize" Value="8.5" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-fit-detail">
+      <Setter Property="Foreground" Value="{DynamicResource TextMutedBrush}" />
+      <Setter Property="FontSize" Value="8.5" />
+      <Setter Property="TextWrapping" Value="NoWrap" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="Border.llm-pill">
+      <Setter Property="Height" Value="19" />
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="5" />
+      <Setter Property="Padding" Value="5,0" />
+    </Style>
+
+    <Style Selector="Border.llm-pill.recommended">
+      <Setter Property="Background" Value="{DynamicResource CommandPrimaryBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource AccentBorderBrush}" />
+    </Style>
+
+    <Style Selector="TextBlock.llm-pill-text">
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="8" />
+      <Setter Property="FontWeight" Value="Black" />
+      <Setter Property="VerticalAlignment" Value="Center" />
+      <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+    </Style>
+
+    <Style Selector="TextBox.rule-add">
+      <Setter Property="MinHeight" Value="21" />
+      <Setter Property="FontFamily" Value="{DynamicResource CodeFontFamily}" />
+      <Setter Property="FontSize" Value="9.5" />
+      <Setter Property="Padding" Value="5,0" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="Button.rule-mini">
+      <Setter Property="Height" Value="17" />
+      <Setter Property="MinHeight" Value="17" />
+      <Setter Property="MinWidth" Value="0" />
+      <Setter Property="Padding" Value="3,0" />
+      <Setter Property="FontSize" Value="8" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="4" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+      <Setter Property="VerticalContentAlignment" Value="Center" />
+    </Style>
+
+    <Style Selector="Button.rule-mini.primary">
+      <Setter Property="Background" Value="{DynamicResource HistoryHoverBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource TextPrimaryBrush}" />
+    </Style>
+
+    <Style Selector="Button.rule-x">
+      <Setter Property="Width" Value="17" />
+      <Setter Property="Height" Value="17" />
+      <Setter Property="MinWidth" Value="0" />
+      <Setter Property="MinHeight" Value="0" />
+      <Setter Property="Padding" Value="0" />
+      <Setter Property="FontSize" Value="8" />
+      <Setter Property="FontWeight" Value="Bold" />
+      <Setter Property="Background" Value="{DynamicResource CommandBackgroundBrush}" />
+      <Setter Property="BorderBrush" Value="{DynamicResource CommandBorderBrush}" />
+      <Setter Property="Foreground" Value="{DynamicResource BadBrush}" />
+      <Setter Property="BorderThickness" Value="1" />
+      <Setter Property="CornerRadius" Value="4" />
+      <Setter Property="HorizontalContentAlignment" Value="Center" />
+    <Setter Property="VerticalContentAlignment" Value="Center" />
+  </Style>
+</Styles>

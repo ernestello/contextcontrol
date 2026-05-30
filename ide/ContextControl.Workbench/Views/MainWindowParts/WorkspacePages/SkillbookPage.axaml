@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="ContextControl.Workbench.Views.MainWindowParts.SkillbookPage"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls"
+    xmlns:svc="clr-namespace:ContextControl.Workbench.Services"
+    xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
+>
+            <Border
+                Grid.Row="2"
+                Classes="editor-body skillbook-page"
+                Padding="8"
+                ClipToBounds="True"
+                MinHeight="0"
+                IsVisible="{Binding IsSkillbookMode}">
+              <Grid RowDefinitions="Auto,*" RowSpacing="8">
+                <Border Classes="scanner-metric-strip">
+                  <WrapPanel HorizontalAlignment="Center">
+                    <Border Classes="scanner-metric" Width="360" ToolTip.Tip="{Binding ContextControl.SkillbookProjectPath}">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Project Skillbook" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.SkillbookProjectPath}" />
+                      </Grid>
+                    </Border>
+                    <Border Classes="scanner-metric" Width="360" ToolTip.Tip="{Binding ContextControl.SkillbookGlobalPath}">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Global Skillbook" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.SkillbookGlobalPath}" />
+                      </Grid>
+                    </Border>
+                  </WrapPanel>
+                </Border>
+
+                <ScrollViewer
+                    Grid.Row="1"
+                    VerticalScrollBarVisibility="Auto"
+                    HorizontalScrollBarVisibility="Disabled"
+                    AllowAutoHide="False">
+                  <controls:SkillbookRenderControl
+                      Items="{Binding ContextControl.SkillbookEntries}"
+                      ThemeKey="{Binding ThemeKey}"
+                      UiFontFamily="{Binding UiFontFamily}"
+                      CodeFontFamily="{Binding CodeFontFamily}" />
+                </ScrollViewer>
+              </Grid>
+            </Border>
+</UserControl>

@@ -1,0 +1,275 @@
+<?xml version="1.0" encoding="utf-8"?>
+<UserControl
+    x:Class="ContextControl.Workbench.Views.ThemeSettingsWindowParts.FileRulesSettingsPage"
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:controls="clr-namespace:ContextControl.Workbench.Controls"
+    xmlns:vm="clr-namespace:ContextControl.Workbench.ViewModels"
+>
+          <Grid x:Name="FileRulesPageRoot" RowDefinitions="Auto,Auto,Auto,*,Auto" RowSpacing="8">
+            <TextBlock
+                Classes="muted"
+                Text="Project root settings decide what DIR/CC/GO target. File rules decide what the IDE tree, history, and external-update tracker ignore." />
+
+            <TextBlock
+                Grid.Row="1"
+                Classes="path-text"
+                Text="{Binding FileRulesPath}" />
+
+            <Border Grid.Row="2" Classes="rule-card">
+              <Grid RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="6">
+                <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="6">
+                  <StackPanel>
+                    <TextBlock Classes="settings-title" Text="Context Control project settings" />
+                    <TextBlock Classes="muted" Text="{Binding ProjectSettingsStatus}" />
+                  </StackPanel>
+                  <Button Grid.Column="1" Classes="rule-mini" MinHeight="24" Content="Use active" Command="{Binding UseActiveProjectRootCommand}" />
+                  <Button Grid.Column="2" Classes="rule-mini" MinHeight="24" Content="Use CC root" Command="{Binding UseContextControlProjectRootCommand}" />
+                  <Button Grid.Column="3" Classes="rule-mini primary" MinHeight="24" Content="Save" Command="{Binding SaveProjectSettingsCommand}" />
+                </Grid>
+
+                <Grid Grid.Row="1" ColumnDefinitions="140,*" ColumnSpacing="8">
+                  <TextBlock Classes="field-label" Text="Active project" VerticalAlignment="Center" />
+                  <TextBlock Grid.Column="1" Classes="path-text" Text="{Binding ProjectRulesActiveProjectRoot}" />
+                </Grid>
+                <Grid Grid.Row="2" ColumnDefinitions="140,*" ColumnSpacing="8">
+                  <TextBlock Classes="field-label" Text="CC tool root" VerticalAlignment="Center" />
+                  <TextBlock Grid.Column="1" Classes="path-text" Text="{Binding ProjectRulesContextControlRoot}" />
+                </Grid>
+                <Grid Grid.Row="3" ColumnDefinitions="140,*" ColumnSpacing="8">
+                  <TextBlock Classes="field-label" Text="Active rules" VerticalAlignment="Center" />
+                  <TextBlock Grid.Column="1" Classes="path-text" Text="{Binding ContextControl.ActiveProjectRulesPathLabel}" />
+                </Grid>
+                <Grid Grid.Row="4" ColumnDefinitions="140,*,100,*,120,*" ColumnSpacing="8">
+                  <TextBlock Classes="field-label" Text="ProjectRoot" VerticalAlignment="Center" />
+                  <TextBox Grid.Column="1" Classes="rule-add" Text="{Binding ProjectSettingsProjectRootText, Mode=TwoWay}" Watermark="auto, ., .., or absolute path" />
+                  <TextBlock Grid.Column="2" Classes="field-label" Text="OutputRoot" VerticalAlignment="Center" />
+                  <TextBox Grid.Column="3" Classes="rule-add" Text="{Binding ProjectSettingsOutputRootText, Mode=TwoWay}" Watermark="." />
+                  <TextBlock Grid.Column="4" Classes="field-label" Text="Version cache" VerticalAlignment="Center" />
+                  <TextBox Grid.Column="5" Classes="rule-add" Text="{Binding ProjectSettingsVersionCacheRootText, Mode=TwoWay}" Watermark=".ccReplace.versions" />
+                </Grid>
+                <Grid Grid.Row="5" ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                  <TextBlock Classes="path-text" Text="{Binding ProjectSettingsPath}" />
+                  <Button Grid.Column="1" Classes="rule-mini" MinHeight="22" Content="Reload" Command="{Binding ReloadProjectSettingsCommand}" />
+                </Grid>
+              </Grid>
+            </Border>
+
+            <Grid
+                Grid.Row="3"
+                ColumnDefinitions="2*,2*,2*,2*,2*"
+                ColumnSpacing="8">
+              <Border Classes="rule-card">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Classes="field-label" Text="Skipped folders" />
+                    <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="ignoredDirectories" Click="OnEditRuleListClick" />
+                  </Grid>
+                  <ScrollViewer
+                      Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12">
+                    <ItemsControl ItemsSource="{Binding IgnoredDirectoryRules}">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
+                          <Border Classes="rule-row" HorizontalAlignment="Stretch">
+                            <Grid ColumnDefinitions="*,17,15" ColumnSpacing="1">
+                              <TextBlock Classes="rule-value" Text="{Binding Value}" />
+                              <Button Grid.Column="1" Classes="rule-mini" Content="e" Tag="{Binding}" Click="OnEditRuleEntryClick" />
+                              <Button
+                                  Grid.Column="2"
+                                  Classes="rule-x"
+                                  Content="x"
+                                  Command="{Binding DataContext.RemoveFileRuleEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                  <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
+                    <TextBox Classes="rule-add" Watermark="bin, obj" Text="{Binding NewIgnoredDirectoryRuleText, Mode=TwoWay}" />
+                    <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="ignoredDirectories" />
+                  </Grid>
+                </Grid>
+              </Border>
+
+              <Border Grid.Column="1" Classes="rule-card">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Classes="field-label" Text="Skipped files" />
+                    <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="ignoredFileNames" Click="OnEditRuleListClick" />
+                  </Grid>
+                  <ScrollViewer
+                      Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12">
+                    <ItemsControl ItemsSource="{Binding IgnoredFileNameRules}">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
+                          <Border Classes="rule-row" HorizontalAlignment="Stretch">
+                            <Grid ColumnDefinitions="*,17,15" ColumnSpacing="1">
+                              <TextBlock Classes="rule-value" Text="{Binding Value}" />
+                              <Button Grid.Column="1" Classes="rule-mini" Content="e" Tag="{Binding}" Click="OnEditRuleEntryClick" />
+                              <Button
+                                  Grid.Column="2"
+                                  Classes="rule-x"
+                                  Content="x"
+                                  Command="{Binding DataContext.RemoveFileRuleEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                  <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
+                    <TextBox Classes="rule-add" Watermark=".DS_Store" Text="{Binding NewIgnoredFileNameRuleText, Mode=TwoWay}" />
+                    <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="ignoredFileNames" />
+                  </Grid>
+                </Grid>
+              </Border>
+
+              <Border Grid.Column="2" Classes="rule-card">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Classes="field-label" Text="Skipped file types" />
+                    <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="ignoredFileTypes" Click="OnEditRuleListClick" />
+                  </Grid>
+                  <ScrollViewer
+                      Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12">
+                    <ItemsControl ItemsSource="{Binding IgnoredFileTypeRules}">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
+                          <Border Classes="rule-row" HorizontalAlignment="Stretch">
+                            <Grid ColumnDefinitions="*,17,15" ColumnSpacing="1">
+                              <TextBlock Classes="rule-value" Text="{Binding Value}" />
+                              <Button Grid.Column="1" Classes="rule-mini" Content="e" Tag="{Binding}" Click="OnEditRuleEntryClick" />
+                              <Button
+                                  Grid.Column="2"
+                                  Classes="rule-x"
+                                  Content="x"
+                                  Command="{Binding DataContext.RemoveFileRuleEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                  <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
+                    <TextBox Classes="rule-add" Watermark=".dll, .tmp" Text="{Binding NewIgnoredFileTypeRuleText, Mode=TwoWay}" />
+                    <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="ignoredFileTypes" />
+                  </Grid>
+                </Grid>
+              </Border>
+
+              <Border Grid.Column="3" Classes="rule-card">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Classes="field-label" Text="Allowed file types" />
+                    <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="supportedFileTypes" Click="OnEditRuleListClick" />
+                  </Grid>
+                  <ScrollViewer
+                      Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12">
+                    <ItemsControl ItemsSource="{Binding SupportedFileTypeRules}">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
+                          <Border Classes="rule-row" HorizontalAlignment="Stretch">
+                            <Grid ColumnDefinitions="*,17,15" ColumnSpacing="1">
+                              <TextBlock Classes="rule-value" Text="{Binding Value}" />
+                              <Button Grid.Column="1" Classes="rule-mini" Content="e" Tag="{Binding}" Click="OnEditRuleEntryClick" />
+                              <Button
+                                  Grid.Column="2"
+                                  Classes="rule-x"
+                                  Content="x"
+                                  Command="{Binding DataContext.RemoveFileRuleEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                  <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
+                    <TextBox Classes="rule-add" Watermark=".cs, .cpp" Text="{Binding NewSupportedFileTypeRuleText, Mode=TwoWay}" />
+                    <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="supportedFileTypes" />
+                  </Grid>
+                </Grid>
+              </Border>
+
+              <Border Grid.Column="4" Classes="rule-card">
+                <Grid RowDefinitions="Auto,*,Auto" RowSpacing="3">
+                  <Grid ColumnDefinitions="*,Auto">
+                    <TextBlock Classes="field-label" Text="LOC file types" />
+                    <Button Grid.Column="1" Classes="rule-mini" Content="edit" Tag="locFileTypes" Click="OnEditRuleListClick" />
+                  </Grid>
+                  <ScrollViewer
+                      Grid.Row="1"
+                      VerticalScrollBarVisibility="Auto"
+                      HorizontalScrollBarVisibility="Disabled"
+                      controls:HoverScrollbarBehavior.IsEnabled="True"
+                      controls:HoverScrollbarBehavior.ReserveRight="12">
+                    <ItemsControl ItemsSource="{Binding LocFileTypeRules}">
+                      <ItemsControl.ItemTemplate>
+                        <DataTemplate DataType="{x:Type vm:FileRuleEntryViewModel}">
+                          <Border Classes="rule-row" HorizontalAlignment="Stretch">
+                            <Grid ColumnDefinitions="*,17,15" ColumnSpacing="1">
+                              <TextBlock Classes="rule-value" Text="{Binding Value}" />
+                              <Button Grid.Column="1" Classes="rule-mini" Content="e" Tag="{Binding}" Click="OnEditRuleEntryClick" />
+                              <Button
+                                  Grid.Column="2"
+                                  Classes="rule-x"
+                                  Content="x"
+                                  Command="{Binding DataContext.RemoveFileRuleEntryCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                  CommandParameter="{Binding}" />
+                            </Grid>
+                          </Border>
+                        </DataTemplate>
+                      </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                  </ScrollViewer>
+                  <Grid Grid.Row="2" ColumnDefinitions="*,Auto" ColumnSpacing="3">
+                    <TextBox Classes="rule-add" Watermark=".cs, .md" Text="{Binding NewLocFileTypeRuleText, Mode=TwoWay}" />
+                    <Button Grid.Column="1" Classes="rule-mini primary" Content="add" Command="{Binding AddFileRuleEntryCommand}" CommandParameter="locFileTypes" />
+                  </Grid>
+                </Grid>
+              </Border>
+            </Grid>
+
+            <Grid Grid.Row="4" ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+              <TextBlock
+                  Classes="muted"
+                  Text="{Binding FileRulesStatus}"
+                  VerticalAlignment="Center"
+                  TextTrimming="CharacterEllipsis" />
+
+              <Button
+                  Grid.Column="1"
+                  Classes="rule-mini"
+                  MinHeight="28"
+                  Content="Reset defaults"
+                  Command="{Binding ResetFileRulesCommand}" />
+
+              <Button
+                  Grid.Column="2"
+                  Classes="rule-mini primary"
+                  MinHeight="28"
+                  Content="Save"
+                  Command="{Binding SaveFileRulesCommand}" />
+            </Grid>
+          </Grid>
+</UserControl>
