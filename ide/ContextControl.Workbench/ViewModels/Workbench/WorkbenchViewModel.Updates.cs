@@ -1,5 +1,7 @@
 // CC-DESC: GitHub release update check and installer handoff for the Workbench shell.
 
+using Avalonia;
+using Avalonia.Controls.ApplicationLifetimes;
 using ContextControl.Workbench.Services;
 
 namespace ContextControl.Workbench.ViewModels;
@@ -113,10 +115,17 @@ public sealed partial class WorkbenchViewModel
         UpdateStatusLabel = $"Downloading ContextControl {update.LatestVersion}...";
         try
         {
-            var progress = new Progress<string>(status => UpdateStatusLabel = status);
-            var download = await _updateService.DownloadInstallerAsync(update, progress);
+            using var downloadCancellation = new CancellationTokenSource();
+            var transferProgress = ContextControl.CreateShellTransferProgress("Downloading update", downloadCancellation);
+            var progress = new Progress<LocalLlmTransferProgress>(item =>
+            {
+                transferProgress.Report(item);
+                UpdateStatusLabel = item.Status;
+            });
+            var download = await _updateService.DownloadInstallerAsync(update, progress, downloadCancellation.Token);
             if (!download.Succeeded || string.IsNullOrWhiteSpace(download.InstallerPath))
             {
+                ContextControl.CompleteShellTransferProgress(download.Status, succeeded: false, keepVisible: true);
                 UpdateStatusLabel = download.Status;
                 UpdateButtonLabel = "Check updates";
                 _availableUpdate = null;
@@ -124,25 +133,48 @@ public sealed partial class WorkbenchViewModel
             }
 
             UpdateButtonLabel = "Starting";
-            UpdateStatusLabel = "Starting the ContextControl installer. The installer may close this running app before updating files.";
-            var launch = _updateService.LaunchInstaller(download.InstallerPath, AppContext.BaseDirectory);
+            UpdateStatusLabel = "Starting the installer. ContextControl will close so files can be updated.";
+            ContextControl.CompleteShellTransferProgress("Update downloaded. Starting installer...", succeeded: true, keepVisible: true);
+            var launch = _updateService.LaunchInstaller(
+                download.InstallerPath,
+                AppContext.BaseDirectory,
+                Environment.ProcessId);
             UpdateStatusLabel = launch.Status;
             if (!launch.Succeeded)
             {
+                ContextControl.CompleteShellTransferProgress(launch.Status, succeeded: false, keepVisible: true);
                 UpdateButtonLabel = "Install update";
                 return;
             }
 
             UpdateButtonLabel = "Installer open";
+            UpdateStatusLabel = "Installer started. Closing ContextControl for the update.";
+            await Task.Delay(TimeSpan.FromMilliseconds(700));
+            ShutdownForUpdate();
+        }
+        catch (OperationCanceledException)
+        {
+            ContextControl.CompleteShellTransferProgress("Update download canceled.", succeeded: false, keepVisible: true);
+            UpdateStatusLabel = "Update download canceled.";
+            UpdateButtonLabel = "Install update";
         }
         catch (Exception ex)
         {
+            ContextControl.CompleteShellTransferProgress($"Update install failed: {ex.Message}", succeeded: false, keepVisible: true);
             UpdateStatusLabel = $"Update install failed: {ex.Message}";
             UpdateButtonLabel = "Install update";
         }
         finally
         {
             IsDownloadingUpdate = false;
+        }
+    }
+
+    private static void ShutdownForUpdate()
+    {
+        if (Application.Current?.ApplicationLifetime is IClassicDesktopStyleApplicationLifetime desktop)
+        {
+            desktop.Shutdown();
         }
     }
 }

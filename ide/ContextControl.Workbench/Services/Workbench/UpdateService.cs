@@ -59,7 +59,7 @@ public sealed class UpdateService
 
     public async Task<AppUpdateDownloadResult> DownloadInstallerAsync(
         AppUpdateInfo update,
-        IProgress<string>? progress = null,
+        IProgress<LocalLlmTransferProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(update.InstallerUrl))
@@ -93,7 +93,15 @@ public sealed class UpdateService
         await using var source = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
         await using var target = new FileStream(partialPath, FileMode.Create, FileAccess.Write, FileShare.Read, 1024 * 128, useAsync: true);
         var buffer = new byte[1024 * 128];
+        var stopwatch = Stopwatch.StartNew();
         long readBytes = 0;
+        progress?.Report(new LocalLlmTransferProgress(
+            "Downloading update",
+            $"Downloading ContextControl {update.LatestVersion}...",
+            0,
+            totalBytes,
+            null,
+            totalBytes is > 0 ? 0 : null));
         while (true)
         {
             var read = await source.ReadAsync(buffer, cancellationToken).ConfigureAwait(false);
@@ -104,9 +112,21 @@ public sealed class UpdateService
 
             await target.WriteAsync(buffer.AsMemory(0, read), cancellationToken).ConfigureAwait(false);
             readBytes += read;
-            progress?.Report(totalBytes is > 0
+            var elapsedSeconds = Math.Max(0.001d, stopwatch.Elapsed.TotalSeconds);
+            var speed = readBytes / elapsedSeconds;
+            var percent = totalBytes is > 0
+                ? Math.Clamp(readBytes / (double)totalBytes.Value * 100d, 0d, 100d)
+                : (double?)null;
+            var status = totalBytes is > 0
                 ? $"Downloading update {FormatBytes(readBytes)} / {FormatBytes(totalBytes.Value)}"
-                : $"Downloading update {FormatBytes(readBytes)}");
+                : $"Downloading update {FormatBytes(readBytes)}";
+            progress?.Report(new LocalLlmTransferProgress(
+                "Downloading update",
+                status,
+                readBytes,
+                totalBytes,
+                speed,
+                percent));
         }
 
         if (File.Exists(installerPath))
@@ -115,10 +135,17 @@ public sealed class UpdateService
         }
 
         File.Move(partialPath, installerPath);
+        progress?.Report(new LocalLlmTransferProgress(
+            "Downloading update",
+            $"Downloaded ContextControl {update.LatestVersion}.",
+            readBytes,
+            totalBytes ?? readBytes,
+            null,
+            100));
         return new AppUpdateDownloadResult(true, $"Downloaded ContextControl {update.LatestVersion}.", installerPath);
     }
 
-    public AppUpdateDownloadResult LaunchInstaller(string installerPath, string installDirectory)
+    public AppUpdateDownloadResult LaunchInstaller(string installerPath, string installDirectory, int waitForProcessId = 0)
     {
         if (string.IsNullOrWhiteSpace(installerPath) || !File.Exists(installerPath))
         {
@@ -133,6 +160,11 @@ public sealed class UpdateService
         if (!string.IsNullOrWhiteSpace(installDirectory) && Directory.Exists(installDirectory))
         {
             startInfo.ArgumentList.Add($"/installDir={installDirectory}");
+        }
+
+        if (waitForProcessId > 0)
+        {
+            startInfo.ArgumentList.Add($"/waitForProcess={waitForProcessId}");
         }
 
         Process.Start(startInfo);

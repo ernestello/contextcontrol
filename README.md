@@ -33,7 +33,7 @@ After install, run ContextControl from the Start Menu shortcut or from:
 The app is self-contained, so a separate .NET runtime install is not required.
 The installer registers a per-user Windows uninstall entry, so you can remove it from Windows **Installed apps / Apps & features** or from the Start Menu `Uninstall ContextControl` shortcut.
 
-After this version is installed, ContextControl checks GitHub releases on startup when internet is available. The header bar also has a **Check updates** button; when a newer release exists, the same button downloads the newest setup EXE and starts it against the current install folder.
+After this version is installed, ContextControl checks GitHub releases on startup when internet is available. The header bar also has a **Check updates** button; when a newer release exists, the same button downloads the newest setup EXE with the normal transfer progress bar, starts it against the current install folder, then closes the running Workbench so setup can replace the app files safely.
 
 GitHub's automatic **Source code** downloads are source snapshots, not runnable app packages. Use them only if you want to build from source.
 

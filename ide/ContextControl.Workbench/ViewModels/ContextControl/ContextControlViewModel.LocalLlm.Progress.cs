@@ -25,6 +25,26 @@ public sealed partial class ContextControlViewModel
         return new Progress<LocalLlmTransferProgress>(UpdateTransferProgress);
     }
 
+    public IProgress<LocalLlmTransferProgress> CreateShellTransferProgress(
+        string initialTitle,
+        CancellationTokenSource? cancellationSource = null,
+        bool revealTerminal = true)
+    {
+        return CreateTransferProgress(initialTitle, cancellationSource, revealTerminal);
+    }
+
+    public void CompleteShellTransferProgress(string status, bool succeeded, bool keepVisible = false)
+    {
+        if (keepVisible)
+        {
+            CompleteDependencyTransferProgress(status, succeeded);
+        }
+        else
+        {
+            CompleteTransferProgress(status, succeeded);
+        }
+    }
+
     private IProgress<string> CreateTerminalProgress()
     {
         return new Progress<string>(AppendTerminalOutput);

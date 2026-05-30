@@ -87,9 +87,11 @@ internal sealed class SetupForm : Form, ISetupWindow
     private readonly ProgressBar _progressBar = new();
     private readonly Button _installButton = new();
     private readonly Button _cancelButton = new();
+    private readonly SetupOptions _initialOptions;
 
     public SetupForm(SetupOptions initialOptions)
     {
+        _initialOptions = initialOptions;
         Text = "ContextControl Setup";
         AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(780, 540);
@@ -327,6 +329,7 @@ internal sealed class SetupForm : Form, ISetupWindow
             DesktopShortcut = _desktopShortcutBox.Checked,
             InstallWebView2Runtime = _installWebView2RuntimeBox.Checked,
             Launch = _launchBox.Checked,
+            WaitForProcessId = _initialOptions.WaitForProcessId,
         };
     }
 
@@ -584,6 +587,7 @@ internal sealed class SetupOptions
     public SetupMode Mode { get; init; }
     public bool RemoveUserData { get; init; }
     public bool UninstallRelaunched { get; init; }
+    public int? WaitForProcessId { get; init; }
 
     public static SetupOptions Parse(string[] args)
     {
@@ -616,6 +620,17 @@ internal sealed class SetupOptions
                     break;
                 case "removeuserdata":
                     options.RemoveUserData = true;
+                    break;
+                case "waitforprocess":
+                case "waitforpid":
+                case "waitpid":
+                    value ??= ReadNextValue(args, ref index, raw);
+                    if (!int.TryParse(value, out var processId) || processId <= 0)
+                    {
+                        throw new ArgumentException($"Invalid process id for setup option: {raw}");
+                    }
+
+                    options.WaitForProcessId = processId;
                     break;
                 case "installdir":
                 case "installpath":
@@ -685,6 +700,7 @@ internal sealed class SetupOptions
         public SetupMode Mode { get; set; } = SetupMode.Install;
         public bool RemoveUserData { get; set; }
         public bool UninstallRelaunched { get; set; }
+        public int? WaitForProcessId { get; set; }
         public bool InstallDirSpecified { get; set; }
 
         public string InstallDirValue
@@ -709,6 +725,7 @@ internal sealed class SetupOptions
                 Mode = Mode,
                 RemoveUserData = RemoveUserData,
                 UninstallRelaunched = UninstallRelaunched,
+                WaitForProcessId = WaitForProcessId,
             };
     }
 }
@@ -739,6 +756,7 @@ internal static class InstallerEngine
             resolvedInstallDir = PrepareInstallDir(options.InstallDir);
             Directory.CreateDirectory(resolvedInstallDir);
 
+            WaitForProcessExit(options.WaitForProcessId, Log);
             StopRunningWorkbench(resolvedInstallDir, Log);
 
             Log("Extracting ContextControl app files...");
@@ -1079,6 +1097,37 @@ internal static class InstallerEngine
                     log($"Could not stop process {process.Id}: {ex.Message}");
                 }
             }
+        }
+    }
+
+    private static void WaitForProcessExit(int? processId, Action<string> log)
+    {
+        if (processId is null or <= 0 || processId == Environment.ProcessId)
+        {
+            return;
+        }
+
+        try
+        {
+            using var process = Process.GetProcessById(processId.Value);
+            if (process.HasExited)
+            {
+                return;
+            }
+
+            log($"Waiting for ContextControl process {processId.Value} to exit...");
+            if (!process.WaitForExit(30000))
+            {
+                log($"Process {processId.Value} is still running; setup will try to close it before updating files.");
+            }
+        }
+        catch (ArgumentException)
+        {
+            // The launching process already exited.
+        }
+        catch (Exception ex)
+        {
+            log($"Could not wait for process {processId.Value}: {ex.Message}");
         }
     }
 
