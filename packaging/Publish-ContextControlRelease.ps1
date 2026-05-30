@@ -36,6 +36,44 @@ function Remove-DirectorySafely {
     Remove-Item -LiteralPath $pathFull -Recurse -Force
 }
 
+function Wait-FileReady {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [int]$TimeoutSeconds = 180
+    )
+
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $Path) {
+            try {
+                $firstLength = (Get-Item -LiteralPath $Path).Length
+                Start-Sleep -Milliseconds 500
+                $secondLength = (Get-Item -LiteralPath $Path).Length
+                if ($firstLength -ne $secondLength) {
+                    continue
+                }
+
+                $stream = [System.IO.File]::Open(
+                    $Path,
+                    [System.IO.FileMode]::Open,
+                    [System.IO.FileAccess]::Read,
+                    [System.IO.FileShare]::Read)
+                $stream.Dispose()
+                return
+            }
+            catch {
+                Start-Sleep -Milliseconds 500
+            }
+        }
+        else {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    throw "Timed out waiting for file to be ready: $Path"
+}
+
 function New-IExpressInstaller {
     param(
         [Parameter(Mandatory)]
@@ -100,13 +138,7 @@ $($fileLines -join "`r`n")
 
     Set-Content -LiteralPath $sedPath -Value $sed -Encoding ascii
     & $iexpress.Source /N /Q $sedPath
-    for ($wait = 0; $wait -lt 180 -and -not (Test-Path -LiteralPath $OutputPath); $wait++) {
-        Start-Sleep -Seconds 1
-    }
-
-    if (-not (Test-Path -LiteralPath $OutputPath)) {
-        throw "IExpress failed to create installer EXE at $OutputPath."
-    }
+    Wait-FileReady -Path $OutputPath -TimeoutSeconds 180
 
     Remove-Item -LiteralPath $sedPath -Force -ErrorAction SilentlyContinue
     Get-ChildItem -LiteralPath (Split-Path -Parent $OutputPath) -Force -File |
@@ -138,7 +170,9 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = if ([string]::IsNullOrWhiteSpace($fileVersion)) { '0.0.0-dev' } else { $fileVersion }
 }
 
-$numericVersionMatch = [regex]::Match($Version, '(\d+)\.(\d+)\.(\d+)')
+$displayVersion = $Version.Trim()
+$packageVersion = $displayVersion -replace '^v(?=\d+\.\d+\.\d+)', ''
+$numericVersionMatch = [regex]::Match($packageVersion, '(\d+)\.(\d+)\.(\d+)')
 $assemblyVersion = if ($numericVersionMatch.Success) {
     "$($numericVersionMatch.Groups[1].Value).$($numericVersionMatch.Groups[2].Value).$($numericVersionMatch.Groups[3].Value).0"
 }
@@ -176,10 +210,10 @@ dotnet publish $project `
     -p:EnableCompressionInSingleFile=true `
     -p:DebugType=none `
     -p:DebugSymbols=false `
-    -p:Version=$Version `
+    -p:Version=$packageVersion `
     -p:AssemblyVersion=$assemblyVersion `
     -p:FileVersion=$assemblyVersion `
-    -p:InformationalVersion=$Version
+    -p:InformationalVersion=$displayVersion
 
 New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
 Get-ChildItem -LiteralPath $publishDir -Force | Where-Object {
@@ -198,7 +232,8 @@ $manifest = [ordered]@{
     Name = 'ContextControl'
     RuntimeIdentifier = $RuntimeIdentifier
     Configuration = $Configuration
-    Version = $Version
+    Version = $packageVersion
+    DisplayVersion = $displayVersion
     BuiltUtc = (Get-Date).ToUniversalTime().ToString('o')
     EntryPoint = 'ContextControl.Workbench.exe'
     DotNetRuntime = 'self-contained'
@@ -222,7 +257,7 @@ if (-not $NoZip) {
 }
 
 if (-not $SkipInstallerExe) {
-    New-IExpressInstaller -StageDir $stageDir -OutputPath $installerPath -Version $Version
+    New-IExpressInstaller -StageDir $stageDir -OutputPath $installerPath -Version $displayVersion
     $installerHash = Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath
     "$($installerHash.Hash)  $([System.IO.Path]::GetFileName($installerPath))" | Set-Content -LiteralPath $installerShaPath -Encoding ascii
 }
