@@ -280,23 +280,50 @@ for model_id in sys.argv[1:]:
         var startedUtc = DateTime.UtcNow.AddSeconds(-2);
         var outputPath = Path.Combine(resolvedOutputDirectory, $"cc-image-{DateTime.Now:yyyyMMdd-HHmmss}.png");
         var script = """
-import sys, torch
-from diffusers import AutoPipelineForText2Image
+import os, sys, torch
 
 model_id, prompt, output_path = sys.argv[1], sys.argv[2], sys.argv[3]
-dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-pipe = AutoPipelineForText2Image.from_pretrained(model_id, torch_dtype=dtype, safety_checker=None)
-if torch.cuda.is_available():
-    pipe = pipe.to("cuda")
-    pipe.enable_attention_slicing()
+is_flux2_klein = "flux.2-klein" in model_id.lower() or "flux2-klein" in model_id.lower()
+if is_flux2_klein:
+    from diffusers import Flux2KleinPipeline
+
+    if torch.cuda.is_available():
+        dtype = torch.bfloat16 if getattr(torch.cuda, "is_bf16_supported", lambda: False)() else torch.float16
+    else:
+        dtype = torch.float32
+    pipe = Flux2KleinPipeline.from_pretrained(model_id, torch_dtype=dtype)
+    if torch.cuda.is_available():
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe = pipe.to("cpu")
+
+    width = int(os.environ.get("CC_IMAGE_WIDTH", "768"))
+    height = int(os.environ.get("CC_IMAGE_HEIGHT", "768"))
+    generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(0)
+    image = pipe(
+        prompt=prompt,
+        height=height,
+        width=width,
+        guidance_scale=1.0,
+        num_inference_steps=4,
+        generator=generator,
+    ).images[0]
 else:
-    pipe.enable_attention_slicing()
-try:
-    pipe.enable_model_cpu_offload()
-except Exception:
-    pass
-steps = 8 if "LCM" in model_id or "turbo" in model_id.lower() else 24
-image = pipe(prompt, num_inference_steps=steps, guidance_scale=0.0 if "turbo" in model_id.lower() else 7.0).images[0]
+    from diffusers import AutoPipelineForText2Image
+
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+    pipe = AutoPipelineForText2Image.from_pretrained(model_id, torch_dtype=dtype, safety_checker=None)
+    if torch.cuda.is_available():
+        pipe = pipe.to("cuda")
+        pipe.enable_attention_slicing()
+    else:
+        pipe.enable_attention_slicing()
+    try:
+        pipe.enable_model_cpu_offload()
+    except Exception:
+        pass
+    steps = 8 if "LCM" in model_id or "turbo" in model_id.lower() else 24
+    image = pipe(prompt, num_inference_steps=steps, guidance_scale=0.0 if "turbo" in model_id.lower() else 7.0).images[0]
 image.save(output_path)
 print("Generated image.")
 """;
@@ -331,6 +358,7 @@ print("Generated image.")
         if (result.ExitCode != 0)
         {
             var reason = FirstFailureLine(result.StandardError) ?? FirstFailureLine(result.StandardOutput) ?? $"Diffusers exited {result.ExitCode}.";
+            reason = BuildDiffusersFailureMessage(modelId, reason, result.StandardError, result.StandardOutput);
             return new LocalLlmImageGenerationResult(false, reason, images, resolvedOutputDirectory, result.StandardOutput);
         }
 
@@ -547,6 +575,38 @@ print(sys.executable)
     {
         return modelId.StartsWith("x/flux2-klein", StringComparison.OrdinalIgnoreCase)
             || modelId.StartsWith("x/z-image", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsFlux2KleinDiffusersModel(string modelId)
+    {
+        return modelId.StartsWith("black-forest-labs/FLUX.2-klein", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string BuildDiffusersFailureMessage(
+        string modelId,
+        string reason,
+        params string?[] outputs)
+    {
+        var text = string.Join("\n", outputs.Where(output => !string.IsNullOrWhiteSpace(output)));
+        var lower = text.ToLowerInvariant();
+        if (lower.Contains("cuda out of memory", StringComparison.Ordinal)
+            || lower.Contains("outofmemoryerror", StringComparison.Ordinal)
+            || lower.Contains("out of memory", StringComparison.Ordinal))
+        {
+            return IsFlux2KleinDiffusersModel(modelId)
+                ? $"{modelId} ran out of GPU memory in Diffusers. FLUX.2 Klein 4B can run on Windows through Diffusers, but 8 GB VRAM usually needs CPU offload and a smaller output size. Close other GPU apps and try CC_IMAGE_WIDTH=512 and CC_IMAGE_HEIGHT=512, or use a smaller SD/LCM image model."
+                : $"{modelId} ran out of GPU memory in Diffusers. Close other GPU apps, try a smaller image model, or lower CC_IMAGE_WIDTH and CC_IMAGE_HEIGHT.";
+        }
+
+        if (IsFlux2KleinDiffusersModel(modelId)
+            && (lower.Contains("cannot import name 'flux2kleinpipeline'", StringComparison.Ordinal)
+                || lower.Contains("importerror", StringComparison.Ordinal) && lower.Contains("flux2kleinpipeline", StringComparison.Ordinal)
+                || lower.Contains("attributeerror", StringComparison.Ordinal) && lower.Contains("flux2kleinpipeline", StringComparison.Ordinal)))
+        {
+            return "The installed Diffusers package does not include Flux2KleinPipeline yet. Force reinstall the Hugging Face Diffusers dependency in ContextControl, then download the FLUX.2 Klein Diffusers model again.";
+        }
+
+        return reason;
     }
 
     private static bool IsOllamaExperimentalImageGenerationSupported()

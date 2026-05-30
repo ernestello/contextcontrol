@@ -113,12 +113,12 @@ Catalog-wide model autosetup coverage in the current catalog:
 
 | Model route | Count |
 |---|---:|
-| Ollama local model pull | 262/301 |
-| Non-Ollama managed/backend setup | 11/301 |
-| Ollama Cloud entries, no local weight download | 28/301 |
-| Local autosetup path, excluding cloud | 273/301 |
-| Any app route, including cloud | 301/301 |
-| Windows/Linux enabled routes, excluding macOS-only Ollama image models | 298/301 |
+| Ollama local model pull | 262/302 |
+| Non-Ollama managed/backend setup | 12/302 |
+| Ollama Cloud entries, no local weight download | 28/302 |
+| Local autosetup path, excluding cloud | 274/302 |
+| Any app route, including cloud | 302/302 |
+| Windows/Linux enabled routes, excluding macOS-only Ollama image models | 299/302 |
 
 Important caveat: "autosetup" means ContextControl has a button or route for the next safe setup step. It does not mean every backend is fully hands-off after that. Large model weights, vendor drivers, CUDA/WSL setup, cloud sign-in, model licenses, and some server launch steps can still be external.
 
@@ -138,12 +138,12 @@ Autosetup pieces that are still WIP or partial:
 
 Image generation status:
 
-- 12/12 image-generation catalog entries have a route in the app.
-- 3 use experimental Ollama image models: FLUX.2 Klein 4B, FLUX.2 Klein 9B, and Z-Image Turbo. Ollama currently documents these image-generation models as macOS-only, so ContextControl disables their download/use buttons on Windows/Linux to avoid raw Ollama HTTP 500/EOF failures. Already-pulled copies can still be uninstalled.
-- 7 use Diffusers and expose a model-card **Download** action for Hugging Face weights after the Diffusers dependency is ready; first generation can still fill any missing cache files.
+- 13/13 image-generation catalog entries have a route in the app.
+- 3 use experimental Ollama image models: FLUX.2 Klein 4B, FLUX.2 Klein 9B, and Z-Image Turbo. Ollama currently documents these image-generation models as macOS-only, so ContextControl disables their Ollama download/use buttons on Windows/Linux to avoid raw Ollama HTTP 500/EOF failures. Already-pulled copies can still be uninstalled.
+- 8 use Diffusers and expose a model-card **Download** action for Hugging Face weights after the Diffusers dependency is ready; first generation can still fill any missing cache files. This includes the Windows/Linux-capable `black-forest-labs/FLUX.2-klein-4B` route for FLUX.2 Klein.
 - 2 use stable-diffusion.cpp and still need the user to point `CC_IMAGE_MODEL_PATH` at a local GGUF diffusion model file.
 
-The default image-generation selection is Tiny Stable Diffusion (`segmind/tiny-sd`) because it is small enough for fresh Windows installs and is useful for validating that Python, Torch, and Diffusers are working before downloading larger checkpoints.
+The default image-generation selection is Tiny Stable Diffusion (`segmind/tiny-sd`) because it is small enough for fresh Windows installs and is useful for validating that Python, Torch, and Diffusers are working before downloading larger checkpoints. For FLUX.2 Klein on Windows, use the Diffusers entry, not the `x/flux2-klein` Ollama entry.
 
 ## Windows Download Warnings
 

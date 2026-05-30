@@ -109,6 +109,9 @@ public sealed partial class LocalLlmModelViewModel
             "lcm_dreamshaper",
             "sd-turbo",
             "sd turbo",
+            "flux.2",
+            "flux 2",
+            "flux-2",
             "x/flux2-klein",
             "flux2-klein",
             "flux klein",
@@ -284,7 +287,7 @@ public sealed partial class LocalLlmModelViewModel
                 return "stable-diffusion.cpp";
             }
 
-            if (ContainsAny(text, "runwayml/", "stabilityai/", "segmind/", "nota-ai/", "simianluo/"))
+            if (ContainsAny(text, "runwayml/", "stabilityai/", "segmind/", "nota-ai/", "simianluo/", "black-forest-labs/"))
             {
                 return "Diffusers";
             }

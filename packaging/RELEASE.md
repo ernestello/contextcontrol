@@ -45,10 +45,10 @@ The workbench checks GitHub releases on startup and exposes a header-bar **Check
 Current app-side autosetup coverage documented in the README and packaged install guide:
 
 - 17/17 dependency cards expose an installer path
-- 262/301 catalog entries use local Ollama model pulls
-- 11/301 catalog entries use non-Ollama managed/backend setup
-- 28/301 catalog entries are Ollama Cloud entries with no local weight download
-- 12/12 image-generation catalog entries have a route; 3 experimental Ollama image entries are macOS-only and disabled on Windows/Linux
+- 262/302 catalog entries use local Ollama model pulls
+- 12/302 catalog entries use non-Ollama managed/backend setup
+- 28/302 catalog entries are Ollama Cloud entries with no local weight download
+- 13/13 image-generation catalog entries have a route; 3 experimental Ollama image entries are macOS-only and disabled on Windows/Linux, and FLUX.2 Klein 4B has a Windows-capable Diffusers route
 
 Fresh Windows Python bootstrap: managed Python dependencies ignore the Microsoft Store `python.exe` alias and install Python 3.12 through `winget` when no real interpreter is present.
 

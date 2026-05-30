@@ -134,6 +134,7 @@ try
     RequireImageDependency("nota-ai/bk-sdm-small", "diffusers");
     RequireImageDependency("SimianLuo/LCM_Dreamshaper_v7", "diffusers");
     RequireImageDependency("stabilityai/sd-turbo", "diffusers");
+    RequireImageDependency("black-forest-labs/FLUX.2-klein-4B", "diffusers");
     RequireImageDependency("x/flux1-dev-q4", "stable_diffusion_cpp");
     RequireOllamaImagePlatformGate("x/flux2-klein");
     RequireOllamaImagePlatformGate("x/flux2-klein:9b");

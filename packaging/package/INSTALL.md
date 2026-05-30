@@ -41,10 +41,10 @@ ContextControl does not bundle LLM weights or backend runtimes. Install the app 
 Current autosetup coverage:
 
 - dependencies: 17/17 app dependency cards have an installer path
-- local Ollama model pulls: 262/301 catalog entries
-- non-Ollama managed/backend setup: 11/301 catalog entries
-- Ollama Cloud entries: 28/301 catalog entries, no local weight download
-- image generation: 12/12 image-generation catalog entries have a route; 3 experimental Ollama image entries are macOS-only and disabled on Windows/Linux
+- local Ollama model pulls: 262/302 catalog entries
+- non-Ollama managed/backend setup: 12/302 catalog entries
+- Ollama Cloud entries: 28/302 catalog entries, no local weight download
+- image generation: 13/13 image-generation catalog entries have a route; 3 experimental Ollama image entries are macOS-only and disabled on Windows/Linux, and FLUX.2 Klein 4B has a Windows-capable Diffusers route
 
 On a raw Windows PC, the Microsoft Store `python.exe` app alias is ignored because it is not a real Python interpreter. Python-backed dependencies such as Diffusers automatically install Python 3.12 through `winget` when no usable Python exists, then create a ContextControl-managed virtual environment.
 
