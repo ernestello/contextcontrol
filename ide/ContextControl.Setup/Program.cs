@@ -23,11 +23,36 @@ internal static class Program
             return 1;
         }
 
+        if (options.Mode == SetupMode.Uninstall &&
+            !options.UninstallRelaunched &&
+            InstallerEngine.ShouldRelaunchUninstallFromTemp(options.InstallDir))
+        {
+            try
+            {
+                InstallerEngine.RelaunchUninstallerFromTemp(options);
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                InstallerEngine.WriteEmergencyLog(ex);
+                MessageBox.Show(ex.Message, "ContextControl Setup", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return 1;
+            }
+        }
+
         if (options.Quiet)
         {
             try
             {
-                InstallerEngine.Install(options, ProgressSink.Null);
+                if (options.Mode == SetupMode.Uninstall)
+                {
+                    InstallerEngine.Uninstall(options, ProgressSink.Null);
+                }
+                else
+                {
+                    InstallerEngine.Install(options, ProgressSink.Null);
+                }
+
                 return 0;
             }
             catch (Exception ex)
@@ -38,13 +63,20 @@ internal static class Program
         }
 
         ApplicationConfiguration.Initialize();
-        using var form = new SetupForm(options);
+        using Form form = options.Mode == SetupMode.Uninstall
+            ? new UninstallForm(options)
+            : new SetupForm(options);
         Application.Run(form);
-        return form.ExitCode;
+        return form is ISetupWindow setupWindow ? setupWindow.ExitCode : 1;
     }
 }
 
-internal sealed class SetupForm : Form
+internal interface ISetupWindow
+{
+    int ExitCode { get; }
+}
+
+internal sealed class SetupForm : Form, ISetupWindow
 {
     private readonly TextBox _installDirBox = new();
     private readonly CheckBox _startMenuShortcutBox = new();
@@ -336,6 +368,208 @@ internal sealed class SetupForm : Form
     }
 }
 
+internal sealed class UninstallForm : Form, ISetupWindow
+{
+    private readonly string _installDir;
+    private readonly CheckBox _removeUserDataBox = new();
+    private readonly Label _statusLabel = new();
+    private readonly ProgressBar _progressBar = new();
+    private readonly Button _uninstallButton = new();
+    private readonly Button _cancelButton = new();
+
+    public UninstallForm(SetupOptions initialOptions)
+    {
+        _installDir = initialOptions.InstallDir;
+        Text = "ContextControl Uninstall";
+        AutoScaleMode = AutoScaleMode.Dpi;
+        ClientSize = new Size(720, 360);
+        MinimumSize = new Size(660, 330);
+        FormBorderStyle = FormBorderStyle.Sizable;
+        MaximizeBox = true;
+        MinimizeBox = true;
+        StartPosition = FormStartPosition.CenterScreen;
+        BuildUi(initialOptions);
+    }
+
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
+    public int ExitCode { get; private set; } = 1;
+
+    private void BuildUi(SetupOptions initialOptions)
+    {
+        var shell = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            Padding = new Padding(22),
+            ColumnCount = 1,
+            RowCount = 5,
+        };
+        shell.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        shell.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        shell.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+        shell.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        shell.Controls.Add(new Label
+        {
+            AutoSize = true,
+            Font = new Font(Font.FontFamily, 16, FontStyle.Bold),
+            Text = "Uninstall ContextControl",
+            Margin = new Padding(0, 0, 0, 8),
+        }, 0, 0);
+
+        shell.Controls.Add(new Label
+        {
+            AutoSize = true,
+            Text = "Remove the installed app folder and shortcuts.",
+            Margin = new Padding(0, 0, 0, 14),
+        }, 0, 1);
+
+        var pathLabel = new Label
+        {
+            AutoSize = false,
+            Dock = DockStyle.Top,
+            Height = 44,
+            Text = $"Install folder:{Environment.NewLine}{_installDir}",
+            Margin = new Padding(0, 0, 0, 10),
+        };
+        shell.Controls.Add(pathLabel, 0, 2);
+
+        var middle = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+        };
+        middle.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        middle.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        _removeUserDataBox.AutoSize = true;
+        _removeUserDataBox.Text = "Also remove ContextControl logs and user data";
+        _removeUserDataBox.Checked = initialOptions.RemoveUserData;
+        _removeUserDataBox.Margin = new Padding(0, 0, 0, 12);
+        middle.Controls.Add(_removeUserDataBox, 0, 0);
+
+        _statusLabel.AutoSize = false;
+        _statusLabel.Dock = DockStyle.Fill;
+        _statusLabel.Text = "Ready to uninstall.";
+        _statusLabel.TextAlign = ContentAlignment.BottomLeft;
+        middle.Controls.Add(_statusLabel, 0, 1);
+        shell.Controls.Add(middle, 0, 3);
+
+        var bottom = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+        };
+        bottom.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+        bottom.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+        _progressBar.Dock = DockStyle.Top;
+        _progressBar.Style = ProgressBarStyle.Blocks;
+        _progressBar.Height = 18;
+        _progressBar.Margin = new Padding(0, 0, 0, 14);
+        bottom.Controls.Add(_progressBar, 0, 0);
+
+        var buttons = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.RightToLeft,
+            AutoSize = true,
+            WrapContents = false,
+        };
+
+        _uninstallButton.Text = "Uninstall";
+        _uninstallButton.AutoSize = true;
+        _uninstallButton.Click += async (_, _) => await UninstallAsync().ConfigureAwait(true);
+        buttons.Controls.Add(_uninstallButton);
+
+        _cancelButton.Text = "Cancel";
+        _cancelButton.AutoSize = true;
+        _cancelButton.Click += (_, _) => Close();
+        buttons.Controls.Add(_cancelButton);
+
+        bottom.Controls.Add(buttons, 0, 1);
+        shell.Controls.Add(bottom, 0, 4);
+        Controls.Add(shell);
+
+        AcceptButton = _uninstallButton;
+        CancelButton = _cancelButton;
+    }
+
+    private async Task UninstallAsync()
+    {
+        SetUninstalling(true);
+        var progress = new UiProgressSink(this);
+        var options = new SetupOptions
+        {
+            Mode = SetupMode.Uninstall,
+            InstallDir = _installDir,
+            RemoveUserData = _removeUserDataBox.Checked,
+            UninstallRelaunched = true,
+        };
+
+        try
+        {
+            var result = await Task.Run(() => InstallerEngine.Uninstall(options, progress)).ConfigureAwait(true);
+            ExitCode = 0;
+            SetStatus("ContextControl was uninstalled.");
+            MessageBox.Show(this, $"ContextControl was uninstalled.{Environment.NewLine}{Environment.NewLine}Log:{Environment.NewLine}{result.LogPath}", "ContextControl Uninstall", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Close();
+        }
+        catch (Exception ex)
+        {
+            ExitCode = 1;
+            InstallerEngine.WriteEmergencyLog(ex);
+            SetStatus("Uninstall failed. Details were written to the uninstall log.");
+            MessageBox.Show(this, ex.Message, "ContextControl Uninstall", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            SetUninstalling(false);
+        }
+    }
+
+    private void SetUninstalling(bool uninstalling)
+    {
+        _uninstallButton.Enabled = !uninstalling;
+        _cancelButton.Enabled = !uninstalling;
+        _removeUserDataBox.Enabled = !uninstalling;
+        _progressBar.Style = uninstalling ? ProgressBarStyle.Marquee : ProgressBarStyle.Blocks;
+    }
+
+    internal void SetStatus(string message)
+    {
+        _statusLabel.Text = message;
+    }
+
+    private sealed class UiProgressSink(UninstallForm form) : IInstallProgress
+    {
+        public void Report(string message)
+        {
+            if (form.IsDisposed)
+            {
+                return;
+            }
+
+            if (form.InvokeRequired)
+            {
+                form.BeginInvoke((Action)(() => form.SetStatus(message)));
+            }
+            else
+            {
+                form.SetStatus(message);
+            }
+        }
+    }
+}
+
+internal enum SetupMode
+{
+    Install,
+    Uninstall
+}
+
 internal sealed class SetupOptions
 {
     public static string DefaultInstallDir =>
@@ -347,6 +581,9 @@ internal sealed class SetupOptions
     public bool InstallWebView2Runtime { get; init; }
     public bool Launch { get; init; } = true;
     public bool Quiet { get; init; }
+    public SetupMode Mode { get; init; }
+    public bool RemoveUserData { get; init; }
+    public bool UninstallRelaunched { get; init; }
 
     public static SetupOptions Parse(string[] args)
     {
@@ -370,11 +607,21 @@ internal sealed class SetupOptions
                 case "silent":
                     options.Quiet = true;
                     break;
+                case "uninstall":
+                case "remove":
+                    options.Mode = SetupMode.Uninstall;
+                    break;
+                case "uninstallrelaunched":
+                    options.UninstallRelaunched = true;
+                    break;
+                case "removeuserdata":
+                    options.RemoveUserData = true;
+                    break;
                 case "installdir":
                 case "installpath":
                 case "dir":
                     value ??= ReadNextValue(args, ref index, raw);
-                    options.InstallDir = value;
+                    options.InstallDirValue = value;
                     break;
                 case "startmenushortcut":
                 case "startmenu":
@@ -408,6 +655,11 @@ internal sealed class SetupOptions
             }
         }
 
+        if (options.Mode == SetupMode.Uninstall && !options.InstallDirSpecified)
+        {
+            options.InstallDir = InstallerEngine.ReadRegisteredInstallLocation() ?? DefaultInstallDir;
+        }
+
         return options.ToImmutable();
     }
 
@@ -430,6 +682,20 @@ internal sealed class SetupOptions
         public bool InstallWebView2Runtime { get; set; }
         public bool Launch { get; set; } = true;
         public bool Quiet { get; set; }
+        public SetupMode Mode { get; set; } = SetupMode.Install;
+        public bool RemoveUserData { get; set; }
+        public bool UninstallRelaunched { get; set; }
+        public bool InstallDirSpecified { get; set; }
+
+        public string InstallDirValue
+        {
+            get => InstallDir;
+            set
+            {
+                InstallDir = value;
+                InstallDirSpecified = true;
+            }
+        }
 
         public SetupOptions ToImmutable() =>
             new()
@@ -440,13 +706,19 @@ internal sealed class SetupOptions
                 InstallWebView2Runtime = InstallWebView2Runtime,
                 Launch = Launch,
                 Quiet = Quiet,
+                Mode = Mode,
+                RemoveUserData = RemoveUserData,
+                UninstallRelaunched = UninstallRelaunched,
             };
     }
 }
 
 internal static class InstallerEngine
 {
+    private const string ProductName = "ContextControl";
     private const string PayloadResourceName = "ContextControlPayload.zip";
+    private const string UninstallerFileName = "ContextControl.Uninstall.exe";
+    private const string UninstallRegistrySubKey = @"Software\Microsoft\Windows\CurrentVersion\Uninstall\ContextControl";
 
     public static InstallResult Install(SetupOptions options, IInstallProgress progress)
     {
@@ -476,6 +748,9 @@ internal static class InstallerEngine
                 throw new FileNotFoundException("ContextControl.Workbench.exe was not found after extraction.", exePath);
             }
 
+            Log("Preparing uninstaller...");
+            var uninstallerPath = CopyUninstaller(resolvedInstallDir, Log);
+
             if (options.InstallWebView2Runtime)
             {
                 InstallWebView2Runtime(Log);
@@ -496,6 +771,11 @@ internal static class InstallerEngine
                     Path.Combine(startMenuFolder, "ContextControl.lnk"),
                     exePath,
                     resolvedInstallDir);
+                CreateShortcut(
+                    Path.Combine(startMenuFolder, "Uninstall ContextControl.lnk"),
+                    uninstallerPath,
+                    resolvedInstallDir,
+                    "/uninstall");
             }
 
             if (options.DesktopShortcut)
@@ -506,6 +786,9 @@ internal static class InstallerEngine
                     exePath,
                     resolvedInstallDir);
             }
+
+            Log("Registering Windows uninstall entry...");
+            RegisterUninstallEntry(resolvedInstallDir, exePath, uninstallerPath);
 
             string? launchError = null;
             if (options.Launch)
@@ -530,6 +813,130 @@ internal static class InstallerEngine
         }
     }
 
+    public static UninstallResult Uninstall(SetupOptions options, IInstallProgress progress)
+    {
+        var log = new List<string>();
+        var appDataLogPath = GetAppDataLogPath("uninstall.log");
+        var resolvedInstallDir = PrepareInstallDir(options.InstallDir);
+
+        void Log(string message)
+        {
+            var line = $"{DateTimeOffset.Now:O} {message}";
+            log.Add(line);
+            progress.Report(message);
+        }
+
+        try
+        {
+            Log($"Preparing to remove {resolvedInstallDir}...");
+            EnsureSafeUninstallTarget(resolvedInstallDir);
+
+            Log("Stopping running ContextControl windows...");
+            StopRunningWorkbench(resolvedInstallDir, Log);
+
+            Log("Removing shortcuts...");
+            RemoveShortcuts();
+
+            Log("Removing Windows uninstall entry...");
+            RemoveUninstallEntry();
+
+            Log("Removing installed app folder...");
+            Directory.Delete(resolvedInstallDir, recursive: true);
+
+            if (options.RemoveUserData)
+            {
+                Log("Removing ContextControl user data...");
+                RemoveUserData(Log);
+            }
+
+            Log("ContextControl uninstall finished.");
+            var logPath = WriteLogs(log, null, appDataLogPath);
+            return new UninstallResult(logPath);
+        }
+        catch (Exception ex)
+        {
+            log.Add($"{DateTimeOffset.Now:O} ERROR {ex}");
+            WriteLogs(log, null, appDataLogPath);
+            throw;
+        }
+    }
+
+    public static string? ReadRegisteredInstallLocation()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(UninstallRegistrySubKey);
+            return key?.GetValue("InstallLocation") as string;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static bool ShouldRelaunchUninstallFromTemp(string installDir)
+    {
+        var processPath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(processPath) || string.IsNullOrWhiteSpace(installDir))
+        {
+            return false;
+        }
+
+        try
+        {
+            var processFull = Path.GetFullPath(processPath);
+            var installFull = Path.GetFullPath(installDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            return processFull.StartsWith(installFull, StringComparison.OrdinalIgnoreCase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static void RelaunchUninstallerFromTemp(SetupOptions options)
+    {
+        var processPath = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(processPath) || !File.Exists(processPath))
+        {
+            throw new InvalidOperationException("The running setup executable could not be located for uninstall relaunch.");
+        }
+
+        var tempDir = Path.Combine(Path.GetTempPath(), "ContextControl", "Uninstall-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDir);
+        var tempExe = Path.Combine(tempDir, UninstallerFileName);
+        File.Copy(processPath, tempExe, overwrite: true);
+
+        var arguments = new List<string>
+        {
+            "/uninstall",
+            "/uninstallRelaunched",
+            $"/installDir={options.InstallDir}"
+        };
+        if (options.Quiet)
+        {
+            arguments.Add("/quiet");
+        }
+
+        if (options.RemoveUserData)
+        {
+            arguments.Add("/removeUserData");
+        }
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = tempExe,
+            WorkingDirectory = tempDir,
+            UseShellExecute = false,
+        };
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        Process.Start(startInfo);
+    }
+
     public static void WriteEmergencyLog(Exception exception)
     {
         try
@@ -544,6 +951,194 @@ internal static class InstallerEngine
         catch
         {
             // Last-resort logging must not hide the original setup failure.
+        }
+    }
+
+    private static string CopyUninstaller(string installDir, Action<string> log)
+    {
+        var source = Environment.ProcessPath;
+        if (string.IsNullOrWhiteSpace(source) || !File.Exists(source))
+        {
+            throw new InvalidOperationException("The setup executable could not be located, so the uninstaller could not be registered.");
+        }
+
+        var destination = Path.Combine(installDir, UninstallerFileName);
+        if (!string.Equals(Path.GetFullPath(source), Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase))
+        {
+            File.Copy(source, destination, overwrite: true);
+            log($"Uninstaller copied to {destination}.");
+        }
+
+        return destination;
+    }
+
+    private static void RegisterUninstallEntry(string installDir, string exePath, string uninstallerPath)
+    {
+        using var key = Registry.CurrentUser.CreateSubKey(UninstallRegistrySubKey, writable: true)
+            ?? throw new InvalidOperationException("Could not create the Windows uninstall registry entry.");
+
+        key.SetValue("DisplayName", ProductName, RegistryValueKind.String);
+        key.SetValue("DisplayVersion", Application.ProductVersion, RegistryValueKind.String);
+        key.SetValue("Publisher", "VulkanVX", RegistryValueKind.String);
+        key.SetValue("InstallLocation", installDir, RegistryValueKind.String);
+        key.SetValue("DisplayIcon", exePath, RegistryValueKind.String);
+        key.SetValue("UninstallString", $"\"{uninstallerPath}\" /uninstall", RegistryValueKind.String);
+        key.SetValue("QuietUninstallString", $"\"{uninstallerPath}\" /uninstall /quiet", RegistryValueKind.String);
+        key.SetValue("NoModify", 1, RegistryValueKind.DWord);
+        key.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+        key.SetValue("EstimatedSize", EstimateInstalledSizeKb(installDir), RegistryValueKind.DWord);
+    }
+
+    private static int EstimateInstalledSizeKb(string installDir)
+    {
+        try
+        {
+            var bytes = Directory.EnumerateFiles(installDir, "*", SearchOption.AllDirectories)
+                .Sum(path => new FileInfo(path).Length);
+            var kb = Math.Max(1, bytes / 1024);
+            return kb > int.MaxValue ? int.MaxValue : (int)kb;
+        }
+        catch
+        {
+            return 1;
+        }
+    }
+
+    private static void RemoveUninstallEntry()
+    {
+        try
+        {
+            Registry.CurrentUser.DeleteSubKeyTree(UninstallRegistrySubKey, throwOnMissingSubKey: false);
+        }
+        catch
+        {
+            // A missing or locked registry entry should not leave app files behind.
+        }
+    }
+
+    private static void EnsureSafeUninstallTarget(string installDir)
+    {
+        var full = Path.GetFullPath(installDir);
+        var root = Path.GetPathRoot(full);
+        if (string.IsNullOrWhiteSpace(full) ||
+            string.Equals(full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), root?.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar), StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"Refusing to uninstall unsafe folder: {full}");
+        }
+
+        if (!Directory.Exists(full))
+        {
+            throw new DirectoryNotFoundException($"Install folder was not found: {full}");
+        }
+
+        var workbenchExe = Path.Combine(full, "ContextControl.Workbench.exe");
+        var uninstallerExe = Path.Combine(full, UninstallerFileName);
+        if (!File.Exists(workbenchExe) && !File.Exists(uninstallerExe))
+        {
+            throw new InvalidOperationException($"The selected folder does not look like a ContextControl install: {full}");
+        }
+    }
+
+    private static void StopRunningWorkbench(string installDir, Action<string> log)
+    {
+        var installFull = Path.GetFullPath(installDir).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        foreach (var process in Process.GetProcessesByName("ContextControl.Workbench"))
+        {
+            using (process)
+            {
+                string? path = null;
+                try
+                {
+                    path = process.MainModule?.FileName;
+                }
+                catch
+                {
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(path) ||
+                    !Path.GetFullPath(path).StartsWith(installFull, StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                log($"Stopping process {process.Id}...");
+                try
+                {
+                    process.CloseMainWindow();
+                    if (!process.WaitForExit(3000))
+                    {
+                        process.Kill(entireProcessTree: true);
+                        process.WaitForExit(5000);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    log($"Could not stop process {process.Id}: {ex.Message}");
+                }
+            }
+        }
+    }
+
+    private static void RemoveShortcuts()
+    {
+        var startMenu = Environment.GetFolderPath(Environment.SpecialFolder.StartMenu);
+        DeleteFileIfExists(Path.Combine(startMenu, "Programs", "ContextControl.lnk"));
+        DeleteFileIfExists(Path.Combine(startMenu, "Programs", "ContextControl", "ContextControl.lnk"));
+        DeleteFileIfExists(Path.Combine(startMenu, "Programs", "ContextControl", "Uninstall ContextControl.lnk"));
+        DeleteDirectoryIfEmpty(Path.Combine(startMenu, "Programs", "ContextControl"));
+        DeleteFileIfExists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "ContextControl.lnk"));
+    }
+
+    private static void RemoveUserData(Action<string> log)
+    {
+        DeleteDirectoryIfExists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ContextControl"), log);
+        DeleteDirectoryIfExists(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "ContextControl"), log);
+    }
+
+    private static void DeleteFileIfExists(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
+            {
+                File.Delete(path);
+            }
+        }
+        catch
+        {
+            // Shortcut cleanup is best-effort.
+        }
+    }
+
+    private static void DeleteDirectoryIfEmpty(string path)
+    {
+        try
+        {
+            if (Directory.Exists(path) && !Directory.EnumerateFileSystemEntries(path).Any())
+            {
+                Directory.Delete(path);
+            }
+        }
+        catch
+        {
+            // Shortcut folder cleanup is best-effort.
+        }
+    }
+
+    private static void DeleteDirectoryIfExists(string path, Action<string> log)
+    {
+        try
+        {
+            if (Directory.Exists(path))
+            {
+                Directory.Delete(path, recursive: true);
+                log($"Removed {path}.");
+            }
+        }
+        catch (Exception ex)
+        {
+            log($"Could not remove {path}: {ex.Message}");
         }
     }
 
@@ -638,15 +1233,20 @@ internal static class InstallerEngine
         }
     }
 
-    private static string GetAppDataLogPath()
+    private static string GetAppDataLogPath(string fileName = "install.log")
     {
         var root = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "ContextControl");
-        return Path.Combine(root, "install.log");
+        return Path.Combine(root, fileName);
     }
 
     private static void CreateShortcut(string shortcutPath, string targetPath, string workingDirectory)
+    {
+        CreateShortcut(shortcutPath, targetPath, workingDirectory, "");
+    }
+
+    private static void CreateShortcut(string shortcutPath, string targetPath, string workingDirectory, string arguments)
     {
         var parent = Path.GetDirectoryName(shortcutPath);
         if (!string.IsNullOrWhiteSpace(parent))
@@ -672,8 +1272,9 @@ internal static class InstallerEngine
             var shortcutType = shortcut!.GetType();
             shortcutType.InvokeMember("TargetPath", BindingFlags.SetProperty, null, shortcut, [targetPath]);
             shortcutType.InvokeMember("WorkingDirectory", BindingFlags.SetProperty, null, shortcut, [workingDirectory]);
+            shortcutType.InvokeMember("Arguments", BindingFlags.SetProperty, null, shortcut, [arguments]);
             shortcutType.InvokeMember("IconLocation", BindingFlags.SetProperty, null, shortcut, [targetPath]);
-            shortcutType.InvokeMember("Description", BindingFlags.SetProperty, null, shortcut, ["ContextControl Workbench"]);
+            shortcutType.InvokeMember("Description", BindingFlags.SetProperty, null, shortcut, [string.IsNullOrWhiteSpace(arguments) ? "ContextControl Workbench" : "Uninstall ContextControl"]);
             shortcutType.InvokeMember("Save", BindingFlags.InvokeMethod, null, shortcut, null);
         }
         finally
@@ -793,6 +1394,8 @@ internal static class InstallerEngine
                 UseShellExecute = false,
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
+                StandardOutputEncoding = System.Text.Encoding.UTF8,
+                StandardErrorEncoding = System.Text.Encoding.UTF8,
                 CreateNoWindow = true,
             },
         };
@@ -818,6 +1421,7 @@ internal static class InstallerEngine
 
         return new ProcessResult(process.ExitCode, outputTask.GetAwaiter().GetResult(), errorTask.GetAwaiter().GetResult());
     }
+
 }
 
 internal interface IInstallProgress
@@ -839,5 +1443,7 @@ internal sealed class ProgressSink : IInstallProgress
 }
 
 internal sealed record InstallResult(string InstallDir, string ExePath, string LogPath, string? LaunchError);
+
+internal sealed record UninstallResult(string LogPath);
 
 internal sealed record ProcessResult(int ExitCode, string Output, string Error);

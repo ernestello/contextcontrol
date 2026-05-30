@@ -565,8 +565,11 @@ public sealed partial class ContextControlViewModel
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = DependencyProcessUtf8Encoding,
+            StandardErrorEncoding = DependencyProcessUtf8Encoding,
             CreateNoWindow = true
         };
+        ApplyReadableProcessEnvironment(process.StartInfo);
 
         foreach (var argument in arguments)
         {

@@ -31,6 +31,7 @@ After install, run ContextControl from the Start Menu shortcut or from:
 ```
 
 The app is self-contained, so a separate .NET runtime install is not required.
+The installer registers a per-user Windows uninstall entry, so you can remove it from Windows **Installed apps / Apps & features** or from the Start Menu `Uninstall ContextControl` shortcut.
 
 GitHub's automatic **Source code** downloads are source snapshots, not runnable app packages. Use them only if you want to build from source.
 
@@ -43,7 +44,7 @@ Bundled inside the installer:
 - ContextControl `lib/` modules and default `skillbook/` file
 - Release appearance defaults
 - Full Windows app folder with runtime files beside the EXE
-- Setup UI with install folder picker, shortcut options, logs, and quiet install mode
+- Setup UI with install folder picker, shortcut options, uninstall registration, logs, and quiet install mode
 
 Not bundled:
 

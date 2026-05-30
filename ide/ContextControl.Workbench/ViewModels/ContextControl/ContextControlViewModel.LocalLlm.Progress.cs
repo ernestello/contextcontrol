@@ -5,6 +5,7 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows.Input;
 using Avalonia.Collections;
 using Avalonia.Controls.Primitives;
@@ -92,10 +93,16 @@ public sealed partial class ContextControlViewModel
 
         foreach (var item in normalized)
         {
+            var cleanItem = NormalizeTerminalDisplayText(item);
+            if (string.IsNullOrWhiteSpace(cleanItem))
+            {
+                continue;
+            }
+
             _terminalOutputBuilder.Append('[');
             _terminalOutputBuilder.Append(DateTime.Now.ToString("HH:mm:ss"));
             _terminalOutputBuilder.Append("] ");
-            _terminalOutputBuilder.AppendLine(item);
+            _terminalOutputBuilder.AppendLine(cleanItem);
         }
 
         const int maxTerminalCharacters = 20000;
@@ -106,6 +113,119 @@ public sealed partial class ContextControlViewModel
 
         TerminalOutputText = _terminalOutputBuilder.ToString();
     }
+
+    private static string NormalizeTerminalDisplayText(string text)
+    {
+        var clean = AnsiControlRegex().Replace(text ?? "", "")
+            .Replace('\0', ' ')
+            .Replace('\b', ' ')
+            .Trim();
+        return RepairUtf8Mojibake(clean);
+    }
+
+    private static string RepairUtf8Mojibake(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text) ||
+            (!text.Contains('â', StringComparison.Ordinal) &&
+             !text.Contains('Ð', StringComparison.Ordinal) &&
+             !text.Contains('Ñ', StringComparison.Ordinal)))
+        {
+            return text;
+        }
+
+        var bytes = new byte[text.Length];
+        var count = 0;
+        foreach (var ch in text)
+        {
+            if (!TryMapWindows1252Byte(ch, out var value))
+            {
+                return text;
+            }
+
+            bytes[count++] = value;
+        }
+
+        try
+        {
+            var repaired = Encoding.UTF8.GetString(bytes, 0, count);
+            return ReadabilityScore(repaired) > ReadabilityScore(text) ? repaired : text;
+        }
+        catch
+        {
+            return text;
+        }
+    }
+
+    private static bool TryMapWindows1252Byte(char ch, out byte value)
+    {
+        if (ch <= 0x7F || (ch >= 0xA0 && ch <= 0xFF))
+        {
+            value = (byte)ch;
+            return true;
+        }
+
+        value = ch switch
+        {
+            '€' => 0x80,
+            '‚' => 0x82,
+            'ƒ' => 0x83,
+            '„' => 0x84,
+            '…' => 0x85,
+            '†' => 0x86,
+            '‡' => 0x87,
+            'ˆ' => 0x88,
+            '‰' => 0x89,
+            'Š' => 0x8A,
+            '‹' => 0x8B,
+            'Œ' => 0x8C,
+            'Ž' => 0x8E,
+            '‘' => 0x91,
+            '’' => 0x92,
+            '“' => 0x93,
+            '”' => 0x94,
+            '•' => 0x95,
+            '–' => 0x96,
+            '—' => 0x97,
+            '˜' => 0x98,
+            '™' => 0x99,
+            'š' => 0x9A,
+            '›' => 0x9B,
+            'œ' => 0x9C,
+            'ž' => 0x9E,
+            'Ÿ' => 0x9F,
+            _ => 0
+        };
+        return value != 0;
+    }
+
+    private static int ReadabilityScore(string text)
+    {
+        var score = 0;
+        foreach (var ch in text)
+        {
+            if (ch is >= 'А' and <= 'я' or 'ё' or 'Ё' or >= '\u2500' and <= '\u259F')
+            {
+                score += 4;
+            }
+            else if (ch == '\uFFFD')
+            {
+                score -= 10;
+            }
+            else if (ch is 'â' or 'Ð' or 'Ñ')
+            {
+                score -= 2;
+            }
+            else if (!char.IsControl(ch))
+            {
+                score++;
+            }
+        }
+
+        return score;
+    }
+
+    [GeneratedRegex(@"\x1B\[[0-?]*[ -/]*[@-~]|\x1B\][^\a]*(?:\a|\x1B\\)", RegexOptions.CultureInvariant)]
+    private static partial Regex AnsiControlRegex();
 
     private void ClearTerminalOutput()
     {

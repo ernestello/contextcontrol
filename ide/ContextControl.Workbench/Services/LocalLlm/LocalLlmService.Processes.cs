@@ -12,6 +12,8 @@ namespace ContextControl.Workbench.Services;
 
 public sealed partial class LocalLlmService
 {
+    private static readonly Encoding ProcessUtf8Encoding = new UTF8Encoding(false, false);
+
     private static HttpClient CreateHttpClient(TimeSpan timeout)
     {
         return new HttpClient
@@ -35,6 +37,8 @@ public sealed partial class LocalLlmService
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = ProcessUtf8Encoding,
+            StandardErrorEncoding = ProcessUtf8Encoding,
             CreateNoWindow = true
         };
 
@@ -101,6 +105,8 @@ public sealed partial class LocalLlmService
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = ProcessUtf8Encoding,
+            StandardErrorEncoding = ProcessUtf8Encoding,
             CreateNoWindow = true
         };
         if (!string.IsNullOrWhiteSpace(workingDirectory))

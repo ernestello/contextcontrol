@@ -15,6 +15,8 @@ namespace ContextControl.Workbench.ViewModels;
 
 public sealed partial class ContextControlViewModel
 {
+    private static readonly Encoding DependencyProcessUtf8Encoding = new UTF8Encoding(false, false);
+
     private static string? FindExecutableOnPath(string fileName)
     {
         var path = Environment.GetEnvironmentVariable("PATH");
@@ -93,8 +95,11 @@ public sealed partial class ContextControlViewModel
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
+            StandardOutputEncoding = DependencyProcessUtf8Encoding,
+            StandardErrorEncoding = DependencyProcessUtf8Encoding,
             CreateNoWindow = true
         };
+        ApplyReadableProcessEnvironment(process.StartInfo);
 
         foreach (var argument in arguments)
         {
@@ -260,6 +265,13 @@ public sealed partial class ContextControlViewModel
             IsInstallingOllama = false;
             installCancellation.Dispose();
         }
+    }
+
+    private static void ApplyReadableProcessEnvironment(ProcessStartInfo startInfo)
+    {
+        startInfo.Environment["PYTHONUTF8"] = "1";
+        startInfo.Environment["PYTHONIOENCODING"] = "utf-8";
+        startInfo.Environment["DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION"] = "1";
     }
 
     private void OpenOllamaDownloadPage()

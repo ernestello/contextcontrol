@@ -16,6 +16,7 @@ The setup window lets you:
 
 - choose the install folder
 - create Start Menu and desktop shortcuts
+- register ContextControl in Windows Installed apps / Apps & features
 - optionally install Microsoft Edge WebView2 Runtime for the Browser workspace
 - launch ContextControl when setup finishes
 
@@ -37,6 +38,22 @@ Setup writes logs to:
 <install folder>\install.log
 %LOCALAPPDATA%\ContextControl\install.log
 ```
+
+## Uninstall
+
+Use one of these:
+
+- Windows Settings -> Installed apps / Apps & features -> ContextControl -> Uninstall
+- Start Menu -> ContextControl -> Uninstall ContextControl
+- `<install folder>\ContextControl.Uninstall.exe /uninstall`
+
+Quiet uninstall:
+
+```powershell
+.\ContextControl.Uninstall.exe /uninstall /quiet
+```
+
+Add `/removeUserData` to remove ContextControl logs and user data. The final uninstall log may be recreated under `%LOCALAPPDATA%\ContextControl\uninstall.log`. Local LLM model weights and third-party runtimes such as Ollama are separate programs and are not removed by the ContextControl uninstaller.
 
 If the app fails before its window opens, it writes a crash log to:
 

@@ -192,6 +192,7 @@ $manifest = [ordered]@{
         'No .NET runtime install required.',
         'No LLM weights are bundled.',
         'ContextControl CLI scripts, lib modules, and default skillbook files are included.',
+        'The installer registers a per-user Windows uninstall entry and Start Menu uninstaller.',
         'Use the app Dependencies and Local LLM pages to install runtimes and download models.',
         'The setup EXE embeds this full app folder and extracts it to the folder selected by the user.'
     )
