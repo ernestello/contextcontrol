@@ -43,9 +43,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $ErrorActionPreference = 'Stop'
           $tag = '${{ github.ref_name }}'
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --title "ContextControl $tag" --notes "Portable Windows x64 release. Extract the zip and run ContextControl.Workbench.exe or Install-ContextControl.ps1."
+          $repo = '${{ github.repository }}'
+          $notes = 'Portable Windows x64 release. Extract the zip and run ContextControl.Workbench.exe, or run ContextControl-win-x64-Setup.exe for the installer.'
+
+          function Invoke-GhWithRetry {
+            param(
+              [Parameter(Mandatory)]
+              [string[]]$GhArgs
+            )
+
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              & gh @GhArgs
+              if ($LASTEXITCODE -eq 0) {
+                return
+              }
+
+              if ($attempt -lt 3) {
+                Start-Sleep -Seconds (10 * $attempt)
+              }
+            }
+
+            throw "gh $($GhArgs -join ' ') failed after 3 attempts."
           }
-          gh release upload $tag .tmp/release/ContextControl-win-x64.zip .tmp/release/ContextControl-win-x64.zip.sha256.txt .tmp/release/ContextControl-win-x64-Setup.exe .tmp/release/ContextControl-win-x64-Setup.exe.sha256.txt --clobber
+
+          gh release view $tag --repo $repo *> $null
+          if ($LASTEXITCODE -ne 0) {
+            Invoke-GhWithRetry -GhArgs @('release', 'create', $tag, '--repo', $repo, '--title', "ContextControl $tag", '--notes', $notes)
+          }
+
+          $assets = @(
+            '.tmp/release/ContextControl-win-x64.zip',
+            '.tmp/release/ContextControl-win-x64.zip.sha256.txt',
+            '.tmp/release/ContextControl-win-x64-Setup.exe',
+            '.tmp/release/ContextControl-win-x64-Setup.exe.sha256.txt'
+          )
+
+          foreach ($asset in $assets) {
+            Invoke-GhWithRetry -GhArgs @('release', 'upload', $tag, $asset, '--repo', $repo, '--clobber')
+          }
