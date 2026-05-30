@@ -20,6 +20,11 @@ public sealed partial class LocalLlmModelViewModel
         }
     }
 
+    public void ApplyBackendModelState(bool isBackendModelReady)
+    {
+        IsBackendModelReady = isBackendModelReady;
+    }
+
     private static bool IsCloudModelId(string id)
     {
         return id.Contains(":cloud", StringComparison.OrdinalIgnoreCase)
@@ -364,7 +369,7 @@ public sealed partial class LocalLlmModelViewModel
             "Ollama Cloud" => "Requires Ollama Desktop/API plus cloud access; the model is not stored as a local download.",
             "Ollama" => "Requires Ollama. Pull the model, then chat through the local Ollama API.",
             "Ollama image" => "Requires Ollama image generation support; currently experimental and platform-dependent.",
-            "Diffusers" => "Requires Python with diffusers, transformers, torch, accelerate, safetensors, and Pillow for Hugging Face image checkpoints.",
+            "Diffusers" => "Requires Python with diffusers, huggingface-hub, transformers, torch, accelerate, safetensors, and Pillow for Hugging Face image checkpoints.",
             "stable-diffusion.cpp" => "Requires stable-diffusion.cpp or another GGUF diffusion runner for quantized SD/FLUX files.",
             "Ollama/GGUF" => "Runs through Ollama when a tag exists, or through a GGUF backend such as llama.cpp, LM Studio, or KoboldCpp.",
             "Ollama/VLM" => "Use Ollama when the vision tag is available; otherwise use a VLM-capable Transformers/vLLM route.",

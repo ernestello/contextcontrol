@@ -41,6 +41,7 @@ public sealed partial class LocalLlmService
             StandardErrorEncoding = ProcessUtf8Encoding,
             CreateNoWindow = true
         };
+        ApplyReadableProcessEnvironment(process.StartInfo);
 
         foreach (var argument in arguments)
         {
@@ -109,6 +110,7 @@ public sealed partial class LocalLlmService
             StandardErrorEncoding = ProcessUtf8Encoding,
             CreateNoWindow = true
         };
+        ApplyReadableProcessEnvironment(process.StartInfo);
         if (!string.IsNullOrWhiteSpace(workingDirectory))
         {
             process.StartInfo.WorkingDirectory = workingDirectory;
@@ -204,6 +206,13 @@ public sealed partial class LocalLlmService
         {
             return "";
         }
+    }
+
+    private static void ApplyReadableProcessEnvironment(ProcessStartInfo startInfo)
+    {
+        startInfo.Environment["PYTHONUTF8"] = "1";
+        startInfo.Environment["PYTHONIOENCODING"] = "utf-8";
+        startInfo.Environment["DOTNET_SYSTEM_CONSOLE_ALLOW_ANSI_COLOR_REDIRECTION"] = "1";
     }
 
     private static void TryKill(Process process)

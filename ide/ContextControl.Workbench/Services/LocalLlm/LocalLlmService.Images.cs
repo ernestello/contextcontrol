@@ -12,6 +12,137 @@ namespace ContextControl.Workbench.Services;
 
 public sealed partial class LocalLlmService
 {
+    public async Task<LocalLlmChatResult> DownloadImageModelAsync(
+        string modelId,
+        IProgress<LocalLlmTransferProgress>? progress,
+        IProgress<string>? terminal,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(modelId))
+        {
+            return new LocalLlmChatResult(false, "No image model selected.");
+        }
+
+        if (!IsDiffusersImageModel(modelId))
+        {
+            return new LocalLlmChatResult(false, $"{modelId} does not have a ContextControl-managed model downloader yet.");
+        }
+
+        var pythonResolution = await ResolvePythonForModulesAsync(DiffusersPythonRequirements, cancellationToken).ConfigureAwait(false);
+        if (!pythonResolution.Succeeded || pythonResolution.Executable is null)
+        {
+            return new LocalLlmChatResult(false, pythonResolution.Status);
+        }
+
+        var python = pythonResolution.Executable;
+        var pythonEnvironment = pythonResolution.IsManaged
+            ? PythonDependencyEnvironment.ManagedProcessEnvironment
+            : null;
+        var script = """
+import sys
+from huggingface_hub import snapshot_download
+
+model_id = sys.argv[1]
+path = snapshot_download(repo_id=model_id)
+print(f"Cached model at {path}")
+""";
+
+        progress?.Report(new LocalLlmTransferProgress(
+            $"Downloading {modelId}",
+            "Downloading Hugging Face model files into the local cache.",
+            null,
+            null,
+            null,
+            null));
+        terminal?.Report($"> {Path.GetFileName(python)} -c <huggingface snapshot_download> {modelId}");
+        var result = await RunProcessStreamingAsync(
+            python,
+            ["-c", script, modelId],
+            TimeSpan.FromHours(2),
+            chunk =>
+            {
+                var clean = CleanProgressText(chunk);
+                if (!string.IsNullOrWhiteSpace(clean))
+                {
+                    terminal?.Report(clean);
+                    progress?.Report(new LocalLlmTransferProgress($"Downloading {modelId}", clean, null, null, null, null));
+                }
+            },
+            cancellationToken,
+            environmentVariables: pythonEnvironment).ConfigureAwait(false);
+
+        if (cancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(cancellationToken);
+        }
+
+        if (!result.Started)
+        {
+            return new LocalLlmChatResult(false, "Python could not be started.");
+        }
+
+        if (result.ExitCode != 0)
+        {
+            var reason = FirstFailureLine(result.StandardError) ?? FirstFailureLine(result.StandardOutput) ?? $"Hugging Face model download exited {result.ExitCode}.";
+            return new LocalLlmChatResult(false, reason);
+        }
+
+        return new LocalLlmChatResult(true, $"Downloaded and cached {modelId}.");
+    }
+
+    public async Task<IReadOnlySet<string>> DetectCachedImageModelIdsAsync(
+        IReadOnlyList<string> modelIds,
+        CancellationToken cancellationToken = default)
+    {
+        var candidates = modelIds
+            .Where(modelId => !string.IsNullOrWhiteSpace(modelId) && IsDiffusersImageModel(modelId))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+        if (candidates.Length == 0)
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var pythonResolution = await ResolvePythonForModulesAsync(DiffusersPythonRequirements, cancellationToken).ConfigureAwait(false);
+        if (!pythonResolution.Succeeded || pythonResolution.Executable is null)
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        var script = """
+import sys
+from huggingface_hub import snapshot_download
+
+for model_id in sys.argv[1:]:
+    try:
+        snapshot_download(repo_id=model_id, local_files_only=True)
+    except Exception:
+        continue
+    print("CC_MODEL_CACHED=" + model_id)
+""";
+        var args = new List<string> { "-c", script };
+        args.AddRange(candidates);
+        var result = await RunProcessAsync(
+            pythonResolution.Executable,
+            args,
+            TimeSpan.FromSeconds(45),
+            cancellationToken,
+            pythonResolution.IsManaged ? PythonDependencyEnvironment.ManagedProcessEnvironment : null).ConfigureAwait(false);
+        if (!result.Started || result.ExitCode != 0)
+        {
+            return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        }
+
+        return result.StandardOutput
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Where(line => line.StartsWith("CC_MODEL_CACHED=", StringComparison.Ordinal))
+            .Select(line => line["CC_MODEL_CACHED=".Length..])
+            .Where(modelId => !string.IsNullOrWhiteSpace(modelId))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
     public async Task<LocalLlmImageGenerationResult> GenerateImageAsync(
         string modelId,
         string prompt,
@@ -202,6 +333,7 @@ print("Generated image.")
     [
         new("torch", "torch"),
         new("diffusers", "diffusers"),
+        new("huggingface-hub", "huggingface_hub"),
         new("transformers", "transformers"),
         new("accelerate", "accelerate"),
         new("safetensors", "safetensors"),

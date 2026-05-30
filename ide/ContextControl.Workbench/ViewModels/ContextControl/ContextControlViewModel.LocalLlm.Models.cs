@@ -34,6 +34,20 @@ public sealed partial class ContextControlViewModel
             return;
         }
 
+        if (model.CanDownloadBackendModel)
+        {
+            await DownloadBackendModelAsync(model);
+            return;
+        }
+
+        if (!model.CanPull)
+        {
+            PhaseTitle = "Model download unavailable";
+            PhaseDetail = $"{model.DisplayName} does not have a direct downloader for {model.BackendRequirementLabel} yet.";
+            Log("warn", PhaseDetail);
+            return;
+        }
+
         model.IsPulling = true;
         RaiseCommandStates();
         try
@@ -112,6 +126,58 @@ public sealed partial class ContextControlViewModel
         }
     }
 
+    private async Task DownloadBackendModelAsync(LocalLlmModelViewModel model)
+    {
+        model.IsPulling = true;
+        RaiseCommandStates();
+        try
+        {
+            await RunBusyAsync($"Download {model.Id}", async () =>
+            {
+                LocalLlmStatus = $"Downloading {model.Id}...";
+                PhaseTitle = "Downloading image model";
+                PhaseDetail = $"{model.Id} through {model.BackendRequirementLabel}";
+                var pullCancellation = new CancellationTokenSource();
+                var progress = CreateTransferProgress($"Downloading {model.Id}", pullCancellation);
+                var terminal = CreateTerminalProgress();
+                try
+                {
+                    var result = await _localLlmService.DownloadImageModelAsync(model.Id, progress, terminal, pullCancellation.Token);
+                    LocalLlmStatus = result.Status;
+                    PhaseTitle = result.Succeeded ? "Image model ready" : "Model download failed";
+                    PhaseDetail = result.Status;
+                    CompleteTransferProgress(result.Status, result.Succeeded);
+                    Log(result.Succeeded ? "ok" : "warn", result.Status);
+
+                    if (result.Succeeded)
+                    {
+                        model.ApplyBackendModelState(true);
+                        RefreshInstalledLocalModels();
+                        ApplyLocalLlmFilters();
+                        RaiseCommandStates();
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    LocalLlmStatus = $"Download canceled: {model.Id}";
+                    PhaseTitle = "Download canceled";
+                    PhaseDetail = model.Id;
+                    CompleteTransferProgress($"Download canceled: {model.Id}", succeeded: false);
+                    Log("warn", $"Download canceled: {model.Id}");
+                }
+                finally
+                {
+                    pullCancellation.Dispose();
+                }
+            });
+        }
+        finally
+        {
+            model.IsPulling = false;
+            RaiseCommandStates();
+        }
+    }
+
     private async Task InstallBackendDependencyForModelAsync(LocalLlmModelViewModel model)
     {
         var dependency = LlmBackendDependencies.FirstOrDefault(item =>
@@ -175,6 +241,46 @@ public sealed partial class ContextControlViewModel
         foreach (var model in LocalLlmModels)
         {
             model.ApplyBackendDependencyState(IsModelBackendDependencyReady(model));
+        }
+
+        RefreshInstalledLocalModels();
+        ApplyLocalLlmFilters();
+        RaiseCommandStates();
+    }
+
+    private async Task ApplyBackendModelCacheStatesAsync(
+        CancellationToken cancellationToken,
+        IProgress<LocalLlmTransferProgress>? progress = null)
+    {
+        var candidates = LocalLlmModels
+            .Where(model => model.UsesDownloadableBackendModel && model.IsBackendDependencyReady)
+            .Select(model => model.Id)
+            .ToArray();
+
+        if (candidates.Length == 0)
+        {
+            foreach (var model in LocalLlmModels.Where(model => model.UsesDownloadableBackendModel))
+            {
+                model.ApplyBackendModelState(false);
+            }
+
+            return;
+        }
+
+        progress?.Report(new LocalLlmTransferProgress(
+            "Refreshing models",
+            "Checking cached Diffusers image model files.",
+            3,
+            4,
+            null,
+            92));
+
+        var cachedModelIds = await _localLlmService
+            .DetectCachedImageModelIdsAsync(candidates, cancellationToken);
+
+        foreach (var model in LocalLlmModels.Where(model => model.UsesDownloadableBackendModel))
+        {
+            model.ApplyBackendModelState(cachedModelIds.Contains(model.Id));
         }
 
         RefreshInstalledLocalModels();

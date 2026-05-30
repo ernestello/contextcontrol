@@ -130,7 +130,7 @@ Image generation status:
 
 - 12/12 image-generation catalog entries have a route in the app.
 - 3 use Ollama image models.
-- 7 use Diffusers and can fetch Hugging Face model weights on first generation after the Diffusers dependency is ready.
+- 7 use Diffusers and expose a model-card **Download** action for Hugging Face weights after the Diffusers dependency is ready; first generation can still fill any missing cache files.
 - 2 use stable-diffusion.cpp and still need the user to point `CC_IMAGE_MODEL_PATH` at a local GGUF diffusion model file.
 
 ## Windows Download Warnings

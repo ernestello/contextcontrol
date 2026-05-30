@@ -116,10 +116,19 @@ try
         || !tinySdViewModel.RequiresManualBackend
         || !tinySdViewModel.DependencyId.Equals("diffusers", StringComparison.OrdinalIgnoreCase)
         || !tinySdViewModel.CanUseManualBackend
+        || !tinySdViewModel.CanDownloadBackendModel
         || !tinySdViewModel.IsAvailable
-        || !tinySdViewModel.PullButtonLabel.Equals("Backend ready", StringComparison.OrdinalIgnoreCase))
+        || !tinySdViewModel.PullButtonLabel.Equals("Download", StringComparison.OrdinalIgnoreCase))
     {
-        throw new InvalidOperationException("Diffusers-backed image models should become usable when the Diffusers backend dependency is ready.");
+        throw new InvalidOperationException("Diffusers-backed image models should expose a model download action once the Diffusers backend dependency is ready.");
+    }
+
+    tinySdViewModel.ApplyBackendModelState(true);
+    if (!tinySdViewModel.IsBackendModelReady
+        || tinySdViewModel.CanDownloadBackendModel
+        || !tinySdViewModel.PullButtonLabel.Equals("Ready", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException("Diffusers-backed image models should become ready after their Hugging Face weights are cached.");
     }
 
     RequireImageDependency("nota-ai/bk-sdm-small", "diffusers");

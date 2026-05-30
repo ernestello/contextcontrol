@@ -26,11 +26,12 @@ internal static class PythonDependencyEnvironment
         new(
             "diffusers",
             "Hugging Face Diffusers",
-            ["torch", "diffusers", "transformers", "accelerate", "safetensors", "pillow"],
+            ["torch", "diffusers", "huggingface-hub", "transformers", "accelerate", "safetensors", "pillow"],
             new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
             {
                 ["torch"] = "torch",
                 ["diffusers"] = "diffusers",
+                ["huggingface-hub"] = "huggingface_hub",
                 ["transformers"] = "transformers",
                 ["accelerate"] = "accelerate",
                 ["safetensors"] = "safetensors",

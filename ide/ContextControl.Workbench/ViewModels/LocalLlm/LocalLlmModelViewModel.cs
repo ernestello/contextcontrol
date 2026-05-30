@@ -17,6 +17,7 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
     private bool _isRecommended;
     private bool _isPulling;
     private bool _isBackendDependencyReady;
+    private bool _isBackendModelReady;
     private bool _hasDetectedThinking;
     private readonly string _provider = ResolveProvider(model.Id, model.DisplayName);
     private readonly DateTime? _releaseDateValue = ParseReleaseDate(model.ReleaseDate);
@@ -122,13 +123,35 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
                 OnPropertyChanged(nameof(InstallLabel));
                 OnPropertyChanged(nameof(CanInstallDependency));
                 OnPropertyChanged(nameof(CanUseManualBackend));
+                OnPropertyChanged(nameof(CanDownloadBackendModel));
                 OnPropertyChanged(nameof(HasBackendOnlyReadyState));
+                OnPropertyChanged(nameof(PullButtonLabel));
+            }
+        }
+    }
+    public bool IsBackendModelReady
+    {
+        get => _isBackendModelReady;
+        private set
+        {
+            if (SetProperty(ref _isBackendModelReady, value))
+            {
+                OnPropertyChanged(nameof(InstallLabel));
+                OnPropertyChanged(nameof(CanDownloadBackendModel));
                 OnPropertyChanged(nameof(PullButtonLabel));
             }
         }
     }
     public bool CanUseManualBackend => RequiresManualBackend && IsBackendDependencyReady && IsImageGenerationModel;
     public bool CanInstallDependency => !IsInstalled && RequiresManualBackend && !IsBackendDependencyReady && !string.IsNullOrWhiteSpace(DependencyId);
+    public bool UsesDownloadableBackendModel => RequiresManualBackend
+        && IsImageGenerationModel
+        && DependencyId.Equals("diffusers", StringComparison.OrdinalIgnoreCase);
+    public bool CanDownloadBackendModel => !IsInstalled
+        && UsesDownloadableBackendModel
+        && IsBackendDependencyReady
+        && !IsBackendModelReady
+        && !IsPulling;
     public bool HasBackendOnlyReadyState => !IsInstalled && RequiresManualBackend && IsBackendDependencyReady && !CanUseManualBackend;
     public IReadOnlyList<string> PurposeTags => _purposeTags;
     public string PurposeTagsLabel => string.Join(", ", _purposeTags);
@@ -144,6 +167,7 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
                 OnPropertyChanged(nameof(CanPull));
                 OnPropertyChanged(nameof(CanUninstall));
                 OnPropertyChanged(nameof(CanInstallDependency));
+                OnPropertyChanged(nameof(CanDownloadBackendModel));
                 OnPropertyChanged(nameof(HasBackendOnlyReadyState));
                 OnPropertyChanged(nameof(PullButtonLabel));
             }
@@ -178,6 +202,7 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
             {
                 OnPropertyChanged(nameof(CanPull));
                 OnPropertyChanged(nameof(CanUninstall));
+                OnPropertyChanged(nameof(CanDownloadBackendModel));
                 OnPropertyChanged(nameof(PullButtonLabel));
             }
         }
@@ -197,6 +222,7 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
 
     public string InstallLabel => IsCloudModel
         ? IsAvailable ? "Cloud ready" : "Cloud"
+        : IsBackendModelReady ? "Model ready"
         : CanUseManualBackend ? "Backend ready"
         : HasBackendOnlyReadyState ? "Backend installed"
         : IsInstalled ? "Installed" : "Not installed";
@@ -206,7 +232,7 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
 
     public string PullButtonLabel => IsCloudModel
         ? IsAvailable ? "Cloud ready" : "Cloud"
-        : IsPulling ? "Working" : IsInstalled ? "Uninstall" : CanUseManualBackend ? "Backend ready" : HasBackendOnlyReadyState ? "Need model" : CanInstallDependency ? "Install dep" : RequiresManualBackend ? "Manual" : "Download";
+        : IsPulling ? "Working" : IsInstalled ? "Uninstall" : IsBackendModelReady ? "Ready" : CanDownloadBackendModel ? "Download" : CanUseManualBackend ? "Backend ready" : HasBackendOnlyReadyState ? "Need model" : CanInstallDependency ? "Install dep" : RequiresManualBackend ? "Manual" : "Download";
 
     public void MarkThinkingDetected()
     {
@@ -220,11 +246,17 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
         OnPropertyChanged(nameof(ThinkingLabel));
     }
 
-    public void ApplyState(bool isInstalled, bool isAvailable, LocalLlmHardwareProfile hardware, bool isBackendDependencyReady = false)
+    public void ApplyState(
+        bool isInstalled,
+        bool isAvailable,
+        LocalLlmHardwareProfile hardware,
+        bool isBackendDependencyReady = false,
+        bool isBackendModelReady = false)
     {
         IsInstalled = isInstalled;
         IsAvailable = isAvailable;
         IsBackendDependencyReady = isBackendDependencyReady;
+        IsBackendModelReady = isBackendModelReady;
         var fit = IsCloudModel
             ? new ModelFit(
                 isAvailable,

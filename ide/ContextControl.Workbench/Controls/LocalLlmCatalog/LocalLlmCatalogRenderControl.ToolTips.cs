@@ -129,7 +129,7 @@ public sealed partial class LocalLlmCatalogRenderControl
     private bool CanRunModelAction(LocalLlmModelViewModel? model)
     {
         return model is not null
-            && (model.CanPull || model.CanInstallDependency || model.CanUninstall)
+            && (model.CanPull || model.CanInstallDependency || model.CanDownloadBackendModel || model.CanUninstall)
             && (PullModelCommand?.CanExecute(model) ?? false);
     }
 

@@ -321,7 +321,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
         PullLocalModelCommand = new RelayCommand<LocalLlmModelViewModel>(
             model => _ = PullLocalModelAsync(model),
             model => model is not null
-                && (model.CanPull || model.CanInstallDependency || model.CanUninstall)
+                && (model.CanPull || model.CanInstallDependency || model.CanDownloadBackendModel || model.CanUninstall)
                 && !IsBusy
                 && !IsRefreshingLocalModels
                 && !IsInstallingOllama);

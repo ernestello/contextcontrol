@@ -45,6 +45,7 @@ public sealed partial class ContextControlViewModel
             IsOllamaInstalled = result.OllamaInstalled;
             ApplyDetectedBackendDependencyStatuses(dependencyStatuses);
             ApplyLocalModelRefresh(result);
+            await ApplyBackendModelCacheStatesAsync(cancellationToken, progress);
             ReportRefreshProgress(progress, "Refresh complete.", 100);
             CompleteTransferProgress($"Refresh complete: {result.Status}", succeeded: true);
             AppendTerminalOutput($"Hardware: {HardwareSummary}");
@@ -182,7 +183,7 @@ public sealed partial class ContextControlViewModel
             "Python library",
             "Windows, macOS, Linux",
             "Runs SD 1.5, SD 2.1, Tiny SD, BK-SDM, LCM, SD Turbo, and other low-hardware image checkpoints.",
-            "Install Python plus torch, diffusers, transformers, accelerate, safetensors, and Pillow.",
+            "Install Python plus torch, diffusers, huggingface-hub, transformers, accelerate, safetensors, and Pillow.",
             isRequired: false,
             isRecommended: true);
         yield return new LlmBackendDependencyViewModel(
