@@ -36,125 +36,46 @@ function Remove-DirectorySafely {
     Remove-Item -LiteralPath $pathFull -Recurse -Force
 }
 
-function Wait-FileReady {
+function Remove-FileIfExists {
     param(
         [Parameter(Mandatory)]
-        [string]$Path,
-        [int]$TimeoutSeconds = 180
+        [string]$Path
     )
 
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    while ([DateTime]::UtcNow -lt $deadline) {
-        if (Test-Path -LiteralPath $Path) {
-            try {
-                $firstLength = (Get-Item -LiteralPath $Path).Length
-                Start-Sleep -Milliseconds 500
-                $secondLength = (Get-Item -LiteralPath $Path).Length
-                if ($firstLength -ne $secondLength) {
-                    continue
-                }
-
-                $stream = [System.IO.File]::Open(
-                    $Path,
-                    [System.IO.FileMode]::Open,
-                    [System.IO.FileAccess]::Read,
-                    [System.IO.FileShare]::Read)
-                $stream.Dispose()
-                return
-            }
-            catch {
-                Start-Sleep -Milliseconds 500
-            }
-        }
-        else {
-            Start-Sleep -Milliseconds 500
-        }
+    if (Test-Path -LiteralPath $Path) {
+        Remove-Item -LiteralPath $Path -Force
     }
-
-    throw "Timed out waiting for file to be ready: $Path"
 }
 
-function New-IExpressInstaller {
+function New-ZipFromDirectory {
     param(
         [Parameter(Mandatory)]
-        [string]$StageDir,
+        [string]$SourceDir,
         [Parameter(Mandatory)]
-        [string]$OutputPath,
-        [Parameter(Mandatory)]
-        [string]$Version
+        [string]$OutputPath
     )
 
-    $iexpress = Get-Command iexpress.exe -ErrorAction SilentlyContinue
-    if ($null -eq $iexpress) {
-        throw 'iexpress.exe was not found. Build on Windows to create the installer EXE.'
-    }
-
-    $sedPath = Join-Path (Split-Path -Parent $OutputPath) 'ContextControl-win-x64-setup.sed'
-    if (Test-Path -LiteralPath $OutputPath) {
-        Remove-Item -LiteralPath $OutputPath -Force
-    }
-
-    $files = Get-ChildItem -LiteralPath $StageDir -File -Force | Sort-Object Name
-    $stringLines = New-Object System.Collections.Generic.List[string]
-    $fileLines = New-Object System.Collections.Generic.List[string]
-    for ($i = 0; $i -lt $files.Count; $i++) {
-        $key = "FILE$i"
-        $stringLines.Add("$key=`"$($files[$i].Name)`"")
-        $fileLines.Add("%$key%=")
-    }
-
-    $stageRoot = [System.IO.Path]::GetFullPath($StageDir).TrimEnd('\') + '\'
-    $outputFull = [System.IO.Path]::GetFullPath($OutputPath)
-    $sed = @"
-[Version]
-Class=IEXPRESS
-SEDVersion=3
-[Options]
-PackagePurpose=InstallApp
-ShowInstallProgramWindow=1
-HideExtractAnimation=1
-UseLongFileName=1
-InsideCompressed=1
-CAB_FixedSize=0
-CAB_ResvCodeSigning=0
-RebootMode=N
-InstallPrompt=
-DisplayLicense=
-FinishMessage=ContextControl $Version installed.
-TargetName=$outputFull
-FriendlyName=ContextControl $Version
-AppLaunched=powershell.exe -NoProfile -ExecutionPolicy Bypass -File Install-ContextControl.ps1
-PostInstallCmd=<None>
-AdminQuietInstCmd=powershell.exe -NoProfile -ExecutionPolicy Bypass -File Install-ContextControl.ps1 -NoLaunch
-UserQuietInstCmd=powershell.exe -NoProfile -ExecutionPolicy Bypass -File Install-ContextControl.ps1 -NoLaunch
-SourceFiles=SourceFiles
-[Strings]
-$($stringLines -join "`r`n")
-[SourceFiles]
-SourceFiles0=$stageRoot
-[SourceFiles0]
-$($fileLines -join "`r`n")
-"@
-
-    Set-Content -LiteralPath $sedPath -Value $sed -Encoding ascii
-    & $iexpress.Source /N /Q $sedPath
-    Wait-FileReady -Path $OutputPath -TimeoutSeconds 180
-
-    Remove-Item -LiteralPath $sedPath -Force -ErrorAction SilentlyContinue
-    Get-ChildItem -LiteralPath (Split-Path -Parent $OutputPath) -Force -File |
-        Where-Object { $_.Name -like "~$([System.IO.Path]::GetFileNameWithoutExtension($OutputPath)).*" } |
-        Remove-Item -Force -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    Remove-FileIfExists -Path $OutputPath
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+        $SourceDir,
+        $OutputPath,
+        [System.IO.Compression.CompressionLevel]::Optimal,
+        $false)
 }
 
 $repoRoot = Resolve-RepoRoot
 $project = Join-Path $repoRoot 'ide\ContextControl.Workbench\ContextControl.Workbench.csproj'
+$setupProject = Join-Path $repoRoot 'ide\ContextControl.Setup\ContextControl.Setup.csproj'
 $testProject = Join-Path $repoRoot 'ide\ContextControl.Workbench.Tests\ContextControl.Workbench.Tests.csproj'
 $releaseRoot = Join-Path $repoRoot '.tmp\release'
 $publishDir = Join-Path $releaseRoot "publish\$RuntimeIdentifier"
+$setupPublishDir = Join-Path $releaseRoot "setup-publish\$RuntimeIdentifier"
 $packageName = "ContextControl-$RuntimeIdentifier"
 $stageDir = Join-Path $releaseRoot $packageName
 $zipPath = Join-Path $releaseRoot "$packageName.zip"
 $shaPath = "$zipPath.sha256.txt"
+$payloadZipPath = Join-Path $releaseRoot "$packageName-payload.zip"
 $installerPath = Join-Path $releaseRoot "$packageName-Setup.exe"
 $installerShaPath = "$installerPath.sha256.txt"
 
@@ -182,19 +103,13 @@ else {
 
 New-Item -ItemType Directory -Path $releaseRoot -Force | Out-Null
 Remove-DirectorySafely -Root $releaseRoot -Path $publishDir
+Remove-DirectorySafely -Root $releaseRoot -Path $setupPublishDir
 Remove-DirectorySafely -Root $releaseRoot -Path $stageDir
-if (Test-Path -LiteralPath $zipPath) {
-    Remove-Item -LiteralPath $zipPath -Force
-}
-if (Test-Path -LiteralPath $shaPath) {
-    Remove-Item -LiteralPath $shaPath -Force
-}
-if (Test-Path -LiteralPath $installerPath) {
-    Remove-Item -LiteralPath $installerPath -Force
-}
-if (Test-Path -LiteralPath $installerShaPath) {
-    Remove-Item -LiteralPath $installerShaPath -Force
-}
+Remove-FileIfExists -Path $zipPath
+Remove-FileIfExists -Path $shaPath
+Remove-FileIfExists -Path $payloadZipPath
+Remove-FileIfExists -Path $installerPath
+Remove-FileIfExists -Path $installerShaPath
 
 if (-not $SkipTests) {
     dotnet run --project $testProject --configuration $Configuration
@@ -205,9 +120,7 @@ dotnet publish $project `
     --runtime $RuntimeIdentifier `
     --self-contained true `
     --output $publishDir `
-    -p:PublishSingleFile=true `
-    -p:IncludeNativeLibrariesForSelfExtract=true `
-    -p:EnableCompressionInSingleFile=true `
+    -p:PublishSingleFile=false `
     -p:DebugType=none `
     -p:DebugSymbols=false `
     -p:Version=$packageVersion `
@@ -236,34 +149,68 @@ $manifest = [ordered]@{
     DisplayVersion = $displayVersion
     BuiltUtc = (Get-Date).ToUniversalTime().ToString('o')
     EntryPoint = 'ContextControl.Workbench.exe'
-    DotNetRuntime = 'self-contained'
+    DotNetRuntime = 'self-contained app folder'
+    Installer = 'ContextControl.Setup WinForms installer with folder picker and shortcuts'
     Notes = @(
         'No .NET runtime install required.',
         'No LLM weights are bundled.',
-        'Use the app Dependencies and Local LLM pages to install runtimes and download models.'
+        'Use the app Dependencies and Local LLM pages to install runtimes and download models.',
+        'The setup EXE embeds this full app folder and extracts it to the folder selected by the user.'
     )
 }
 $manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $stageDir 'release-manifest.json') -Encoding utf8
 
+$payloadForSetup = $zipPath
 if (-not $NoZip) {
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
-    [System.IO.Compression.ZipFile]::CreateFromDirectory(
-        $stageDir,
-        $zipPath,
-        [System.IO.Compression.CompressionLevel]::Optimal,
-        $false)
+    New-ZipFromDirectory -SourceDir $stageDir -OutputPath $zipPath
     $hash = Get-FileHash -Algorithm SHA256 -LiteralPath $zipPath
     "$($hash.Hash)  $([System.IO.Path]::GetFileName($zipPath))" | Set-Content -LiteralPath $shaPath -Encoding ascii
 }
+elseif (-not $SkipInstallerExe) {
+    New-ZipFromDirectory -SourceDir $stageDir -OutputPath $payloadZipPath
+    $payloadForSetup = $payloadZipPath
+}
 
 if (-not $SkipInstallerExe) {
-    New-IExpressInstaller -StageDir $stageDir -OutputPath $installerPath -Version $displayVersion
+    if (-not (Test-Path -LiteralPath $payloadForSetup)) {
+        throw "Installer payload zip was not created: $payloadForSetup"
+    }
+
+    dotnet publish $setupProject `
+        --configuration Release `
+        --runtime $RuntimeIdentifier `
+        --self-contained true `
+        --output $setupPublishDir `
+        -p:PublishSingleFile=true `
+        -p:EnableCompressionInSingleFile=true `
+        -p:DebugType=none `
+        -p:DebugSymbols=false `
+        -p:Version=$packageVersion `
+        -p:AssemblyVersion=$assemblyVersion `
+        -p:FileVersion=$assemblyVersion `
+        -p:InformationalVersion=$displayVersion `
+        "-p:SetupPayloadZip=$payloadForSetup"
+
+    $setupExePath = Join-Path $setupPublishDir 'ContextControl.Setup.exe'
+    if (-not (Test-Path -LiteralPath $setupExePath)) {
+        Get-ChildItem -LiteralPath $setupPublishDir -Force | Format-Table Name,Length,LastWriteTime
+        throw "Setup executable was not created: $setupExePath"
+    }
+
+    Copy-Item -LiteralPath $setupExePath -Destination $installerPath -Force
     $installerHash = Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath
     "$($installerHash.Hash)  $([System.IO.Path]::GetFileName($installerPath))" | Set-Content -LiteralPath $installerShaPath -Encoding ascii
 }
 
 $exePath = Join-Path $stageDir 'ContextControl.Workbench.exe'
-$sizeMb = if (Test-Path -LiteralPath $exePath) {
+$folderSizeMb = if (Test-Path -LiteralPath $stageDir) {
+    $totalBytes = (Get-ChildItem -LiteralPath $stageDir -Recurse -File -Force | Measure-Object -Property Length -Sum).Sum
+    [math]::Round($totalBytes / 1MB, 1)
+}
+else {
+    0
+}
+$exeSizeMb = if (Test-Path -LiteralPath $exePath) {
     [math]::Round((Get-Item -LiteralPath $exePath).Length / 1MB, 1)
 }
 else {
@@ -279,4 +226,5 @@ if (-not $SkipInstallerExe) {
     Write-Host "Installer EXE: $installerPath"
     Write-Host "Installer SHA256: $installerShaPath"
 }
-Write-Host "Executable size: $sizeMb MB"
+Write-Host "App folder size: $folderSizeMb MB"
+Write-Host "Launcher executable size: $exeSizeMb MB"

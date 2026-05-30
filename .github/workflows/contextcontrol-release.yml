@@ -36,7 +36,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $tag = '${{ github.ref_name }}'
           $repo = '${{ github.repository }}'
-          $notes = 'Portable Windows x64 release. Extract the zip and run ContextControl.Workbench.exe, or run ContextControl-win-x64-Setup.exe for the installer.'
+          $notes = 'Windows x64 release. Run ContextControl-win-x64-Setup.exe for the installer UI with folder and shortcut options, or extract the portable zip and run ContextControl.Workbench.exe from the full app folder.'
           $apiBase = "https://api.github.com/repos/$repo"
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"

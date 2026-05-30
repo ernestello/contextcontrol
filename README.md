@@ -16,13 +16,13 @@ For a fresh Windows PC, download and run:
 ContextControl-win-x64-Setup.exe
 ```
 
-The installer copies the app to:
+The installer opens a setup window where you choose the install folder, shortcuts, optional WebView2 Runtime install, and whether to launch after setup. The default install folder is:
 
 ```text
 %LOCALAPPDATA%\Programs\ContextControl
 ```
 
-It creates a Start Menu shortcut and launches the app. The app is self-contained, so a separate .NET runtime install is not required.
+It installs a normal `ContextControl` folder with `ContextControl.Workbench.exe` plus the runtime files the EXE needs. The app is self-contained, so a separate .NET runtime install is not required.
 
 Portable zip users can extract `ContextControl-win-x64.zip` and run:
 
@@ -37,7 +37,9 @@ Bundled:
 - ContextControl Workbench native desktop app
 - PowerShell ContextControl CLI scripts
 - Release appearance defaults
-- Installer script and portable launcher
+- Full Windows app folder with runtime files beside the EXE
+- Setup EXE with install folder picker and shortcut options
+- Portable installer script and launcher
 
 Not bundled:
 
