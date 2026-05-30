@@ -70,7 +70,7 @@ Stable enough to test:
 - Dependency detection and one-click installers where safe
 - Ollama model pull/remove workflow
 - Basic local chat through supported chat-ready models
-- Image generation through Ollama image models, Diffusers models, and the stable-diffusion.cpp runner route
+- Image generation through Diffusers models and the stable-diffusion.cpp runner route on Windows; experimental Ollama image models are cataloged but macOS-only
 - Startup and manual GitHub release update checks
 - Theme and appearance settings
 
@@ -100,7 +100,7 @@ One-click dependency install currently covers **17/17** dependency cards shown b
 
 On a fresh Windows PC, ContextControl ignores the Microsoft Store `python.exe` alias in `%LOCALAPPDATA%\Microsoft\WindowsApps` because that is not a real interpreter. If no usable Python is found, installing a Python-backed dependency such as Diffusers bootstraps Python 3.12 through `winget`, then creates a ContextControl-managed virtual environment.
 
-Model autosetup coverage in the current catalog:
+Catalog-wide model autosetup coverage in the current catalog:
 
 | Model route | Count |
 |---|---:|
@@ -109,6 +109,7 @@ Model autosetup coverage in the current catalog:
 | Ollama Cloud entries, no local weight download | 28/301 |
 | Local autosetup path, excluding cloud | 273/301 |
 | Any app route, including cloud | 301/301 |
+| Windows/Linux enabled routes, excluding macOS-only Ollama image models | 298/301 |
 
 Important caveat: "autosetup" means ContextControl has a button or route for the next safe setup step. It does not mean every backend is fully hands-off after that. Large model weights, vendor drivers, CUDA/WSL setup, cloud sign-in, model licenses, and some server launch steps can still be external.
 
@@ -129,9 +130,11 @@ Autosetup pieces that are still WIP or partial:
 Image generation status:
 
 - 12/12 image-generation catalog entries have a route in the app.
-- 3 use Ollama image models.
+- 3 use experimental Ollama image models: FLUX.2 Klein 4B, FLUX.2 Klein 9B, and Z-Image Turbo. Ollama currently documents these image-generation models as macOS-only, so ContextControl disables their download/use buttons on Windows/Linux to avoid raw Ollama HTTP 500/EOF failures. Already-pulled copies can still be uninstalled.
 - 7 use Diffusers and expose a model-card **Download** action for Hugging Face weights after the Diffusers dependency is ready; first generation can still fill any missing cache files.
 - 2 use stable-diffusion.cpp and still need the user to point `CC_IMAGE_MODEL_PATH` at a local GGUF diffusion model file.
+
+The default image-generation selection is Tiny Stable Diffusion (`segmind/tiny-sd`) because it is small enough for fresh Windows installs and is useful for validating that Python, Torch, and Diffusers are working before downloading larger checkpoints.
 
 ## Windows Download Warnings
 

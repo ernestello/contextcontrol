@@ -83,7 +83,7 @@ public sealed class WorkbenchSettings
         ThemeAdaptBytesColor = themeAdaptBytesColor;
         SelectedAiRoute = string.IsNullOrWhiteSpace(selectedAiRoute) ? "Browser: ChatGPT" : selectedAiRoute.Trim();
         SelectedLocalModel = string.IsNullOrWhiteSpace(selectedLocalModel) ? "qwen2.5-coder:3b" : selectedLocalModel.Trim();
-        SelectedImageModel = string.IsNullOrWhiteSpace(selectedImageModel) ? "x/flux2-klein" : selectedImageModel.Trim();
+        SelectedImageModel = string.IsNullOrWhiteSpace(selectedImageModel) ? "segmind/tiny-sd" : selectedImageModel.Trim();
         FileRequestModel = NormalizeModelId(fileRequestModel, "qwen2.5-coder:1.5b");
         PatchWriteModel = NormalizeModelId(patchWriteModel, "qwen2.5-coder:3b");
         PatchReviewModel = NormalizeModelId(patchReviewModel, "phi4-mini");
@@ -200,7 +200,7 @@ public sealed class WorkbenchSettings
             data.ThemeAdaptBytesColor ?? false,
             data.SelectedAiRoute ?? "Browser: ChatGPT",
             data.SelectedLocalModel ?? "qwen2.5-coder:3b",
-            data.SelectedImageModel ?? "x/flux2-klein",
+            data.SelectedImageModel ?? "segmind/tiny-sd",
             data.FileRequestModel ?? "qwen2.5-coder:1.5b",
             data.PatchWriteModel ?? "qwen2.5-coder:3b",
             data.PatchReviewModel ?? "phi4-mini",
@@ -257,7 +257,7 @@ public sealed class WorkbenchSettings
             ThemeAdaptBytesColor = ThemeAdaptBytesColor,
             SelectedAiRoute = string.IsNullOrWhiteSpace(SelectedAiRoute) ? "Browser: ChatGPT" : SelectedAiRoute.Trim(),
             SelectedLocalModel = string.IsNullOrWhiteSpace(SelectedLocalModel) ? "qwen2.5-coder:3b" : SelectedLocalModel.Trim(),
-            SelectedImageModel = string.IsNullOrWhiteSpace(SelectedImageModel) ? "x/flux2-klein" : SelectedImageModel.Trim(),
+            SelectedImageModel = string.IsNullOrWhiteSpace(SelectedImageModel) ? "segmind/tiny-sd" : SelectedImageModel.Trim(),
             FileRequestModel = NormalizeModelId(FileRequestModel, "qwen2.5-coder:1.5b"),
             PatchWriteModel = NormalizeModelId(PatchWriteModel, "qwen2.5-coder:3b"),
             PatchReviewModel = NormalizeModelId(PatchReviewModel, "phi4-mini"),

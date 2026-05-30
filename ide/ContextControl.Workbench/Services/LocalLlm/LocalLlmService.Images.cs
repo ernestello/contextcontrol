@@ -166,6 +166,11 @@ for model_id in sys.argv[1:]:
             : Path.GetFullPath(outputDirectory);
         Directory.CreateDirectory(resolvedOutputDirectory);
 
+        if (IsOllamaExperimentalImageModel(modelId) && !IsOllamaExperimentalImageGenerationSupported())
+        {
+            return new LocalLlmImageGenerationResult(false, BuildUnsupportedOllamaImageMessage(modelId), [], resolvedOutputDirectory);
+        }
+
         if (IsDiffusersImageModel(modelId))
         {
             return await GenerateImageWithDiffusersAsync(
@@ -227,6 +232,11 @@ for model_id in sys.argv[1:]:
         if (result.ExitCode != 0)
         {
             var reason = FirstFailureLine(result.StandardError) ?? FirstFailureLine(result.StandardOutput) ?? $"ollama run exited {result.ExitCode}.";
+            if (LooksLikeHttpEofBackendFailure(result.StandardError, result.StandardOutput))
+            {
+                reason = BuildOllamaHttpEofImageFailureMessage(modelId);
+            }
+
             return new LocalLlmImageGenerationResult(false, reason, images, resolvedOutputDirectory, result.StandardOutput);
         }
 
@@ -531,6 +541,40 @@ print(sys.executable)
     private static bool IsDiffusersImageModel(string modelId)
     {
         return modelId.Contains('/', StringComparison.Ordinal) && !modelId.StartsWith("x/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsOllamaExperimentalImageModel(string modelId)
+    {
+        return modelId.StartsWith("x/flux2-klein", StringComparison.OrdinalIgnoreCase)
+            || modelId.StartsWith("x/z-image", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsOllamaExperimentalImageGenerationSupported()
+    {
+        return OperatingSystem.IsMacOS();
+    }
+
+    private static string BuildUnsupportedOllamaImageMessage(string modelId)
+    {
+        return $"{modelId} uses Ollama's experimental image-generation route, which currently works only on macOS. On Windows/Linux, Ollama can pull the model but generation can fail with HTTP 500/EOF. Use a Diffusers model such as Tiny Stable Diffusion, BK-SDM Small, LCM DreamShaper, or SD Turbo on this PC.";
+    }
+
+    private static string BuildOllamaHttpEofImageFailureMessage(string modelId)
+    {
+        return IsOllamaExperimentalImageModel(modelId)
+            ? $"{modelId} reached Ollama's image-generation backend, but Ollama closed the request with HTTP 500/EOF. This usually means the experimental Ollama image route is unsupported on this OS or this model size is not runnable on the current hardware. Try a Diffusers model on Windows/Linux, or update Ollama and use a smaller image model on macOS."
+            : "Ollama closed the image-generation request with HTTP 500/EOF before an image was written. Try a supported image route, update Ollama, or use a smaller model so the backend does not terminate mid-request.";
+    }
+
+    private static bool LooksLikeHttpEofBackendFailure(params string?[] outputs)
+    {
+        var text = string.Join("\n", outputs.Where(output => !string.IsNullOrWhiteSpace(output))).ToLowerInvariant();
+        return text.Contains("eof", StringComparison.Ordinal)
+            && (text.Contains("500", StringComparison.Ordinal)
+                || text.Contains("internal server error", StringComparison.Ordinal)
+                || text.Contains("/api/generate", StringComparison.Ordinal)
+                || text.Contains("/completion", StringComparison.Ordinal)
+                || text.Contains("post http", StringComparison.Ordinal));
     }
 
     private static bool IsStableDiffusionCppImageModel(string modelId)

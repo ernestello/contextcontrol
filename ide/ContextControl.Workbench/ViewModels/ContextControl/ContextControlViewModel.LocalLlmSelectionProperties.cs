@@ -87,7 +87,7 @@ public sealed partial class ContextControlViewModel
                 return;
             }
 
-            if (value is not null && !value.IsImageGenerationModel)
+            if (value is not null && (!value.IsImageGenerationModel || !value.IsBackendPlatformSupported))
             {
                 return;
             }

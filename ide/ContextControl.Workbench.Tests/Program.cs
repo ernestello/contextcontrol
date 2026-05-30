@@ -135,6 +135,9 @@ try
     RequireImageDependency("SimianLuo/LCM_Dreamshaper_v7", "diffusers");
     RequireImageDependency("stabilityai/sd-turbo", "diffusers");
     RequireImageDependency("x/flux1-dev-q4", "stable_diffusion_cpp");
+    RequireOllamaImagePlatformGate("x/flux2-klein");
+    RequireOllamaImagePlatformGate("x/flux2-klein:9b");
+    RequireOllamaImagePlatformGate("x/z-image-turbo");
     RequireOllamaDownload("qwen3:235b");
     RequireOllamaDownload("llama3.1:405b");
     RequireOllamaDownload("devstral-small-2:24b");
@@ -336,6 +339,48 @@ static void RequireOllamaDownload(string modelId)
         || !viewModel.PullButtonLabel.Equals("Download", StringComparison.OrdinalIgnoreCase))
     {
         throw new InvalidOperationException($"{modelId} should remain a one-click Ollama download.");
+    }
+}
+
+static void RequireOllamaImagePlatformGate(string modelId)
+{
+    var viewModel = ModelView(modelId);
+    if (!viewModel.IsImageGenerationModel
+        || !viewModel.IsOllamaImageRoute
+        || !viewModel.UsesOllamaPull)
+    {
+        throw new InvalidOperationException($"{modelId} should remain classified as an Ollama image-generation route.");
+    }
+
+    if (OperatingSystem.IsMacOS())
+    {
+        if (!viewModel.IsBackendPlatformSupported
+            || !viewModel.CanPull
+            || !viewModel.PullButtonLabel.Equals("Download", StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException($"{modelId} should stay downloadable on macOS where Ollama image generation is supported.");
+        }
+
+        return;
+    }
+
+    if (viewModel.IsBackendPlatformSupported
+        || viewModel.CanPull
+        || !viewModel.InstallLabel.Equals("Mac only", StringComparison.OrdinalIgnoreCase)
+        || !viewModel.PullButtonLabel.Equals("Mac only", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException($"{modelId} should be disabled on non-macOS hosts to avoid Ollama HTTP 500/EOF image-generation failures.");
+    }
+
+    viewModel.ApplyState(
+        isInstalled: true,
+        isAvailable: true,
+        new LocalLlmHardwareProfile(Array.Empty<LocalLlmGpuInfo>()),
+        isBackendDependencyReady: true);
+    if (!viewModel.CanUninstall
+        || !viewModel.PullButtonLabel.Equals("Uninstall", StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException($"{modelId} should still be removable when it was already pulled on an unsupported host.");
     }
 }
 

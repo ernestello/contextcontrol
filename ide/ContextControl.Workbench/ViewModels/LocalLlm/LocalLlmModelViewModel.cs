@@ -110,6 +110,8 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
     public string ModelBaseDetail => _modelBaseDetail;
     public string BackendRequirementLabel => _backendRequirementLabel;
     public string BackendRequirementDetail => _backendRequirementDetail;
+    public bool IsOllamaImageRoute => BackendRequirementLabel.Equals("Ollama image", StringComparison.OrdinalIgnoreCase);
+    public bool IsBackendPlatformSupported => !IsOllamaImageRoute || OperatingSystem.IsMacOS();
     public bool UsesOllamaPull => BackendRequirementLabel.StartsWith("Ollama", StringComparison.OrdinalIgnoreCase);
     public bool RequiresManualBackend => !IsCloudModel && !UsesOllamaPull;
     public string DependencyId => ResolveDependencyId(BackendRequirementLabel);
@@ -222,17 +224,18 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
 
     public string InstallLabel => IsCloudModel
         ? IsAvailable ? "Cloud ready" : "Cloud"
+        : !IsBackendPlatformSupported && !IsInstalled ? "Mac only"
         : IsBackendModelReady ? "Model ready"
         : CanUseManualBackend ? "Backend ready"
         : HasBackendOnlyReadyState ? "Backend installed"
         : IsInstalled ? "Installed" : "Not installed";
 
-    public bool CanPull => !IsCloudModel && !IsInstalled && !IsPulling && UsesOllamaPull;
+    public bool CanPull => !IsCloudModel && !IsInstalled && !IsPulling && UsesOllamaPull && IsBackendPlatformSupported;
     public bool CanUninstall => !IsCloudModel && IsInstalled && !IsPulling;
 
     public string PullButtonLabel => IsCloudModel
         ? IsAvailable ? "Cloud ready" : "Cloud"
-        : IsPulling ? "Working" : IsInstalled ? "Uninstall" : IsBackendModelReady ? "Ready" : CanDownloadBackendModel ? "Download" : CanUseManualBackend ? "Backend ready" : HasBackendOnlyReadyState ? "Need model" : CanInstallDependency ? "Install dep" : RequiresManualBackend ? "Manual" : "Download";
+        : IsPulling ? "Working" : IsInstalled ? "Uninstall" : !IsBackendPlatformSupported ? "Mac only" : IsBackendModelReady ? "Ready" : CanDownloadBackendModel ? "Download" : CanUseManualBackend ? "Backend ready" : HasBackendOnlyReadyState ? "Need model" : CanInstallDependency ? "Install dep" : RequiresManualBackend ? "Manual" : "Download";
 
     public void MarkThinkingDetected()
     {

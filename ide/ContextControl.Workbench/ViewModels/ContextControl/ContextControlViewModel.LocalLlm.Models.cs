@@ -662,7 +662,9 @@ public sealed partial class ContextControlViewModel
 
         InstalledImageGenerationModels.Clear();
         foreach (var model in LocalLlmModels
-            .Where(model => model.IsImageGenerationModel && (model.IsInstalled || model.CanUseManualBackend))
+            .Where(model => model.IsImageGenerationModel
+                && model.IsBackendPlatformSupported
+                && (model.IsInstalled || model.CanUseManualBackend))
             .OrderByDescending(model => model.IsRecommended)
             .ThenBy(model => model.DisplayName, StringComparer.OrdinalIgnoreCase))
         {
