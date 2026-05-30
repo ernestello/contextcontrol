@@ -1,2 +1,0 @@
-// GPT-DESC: Legacy TerrainEditMesher source placeholder; implementation moved to world/edit/meshing/.
-#include "world/edit/TerrainEditMesher.h"

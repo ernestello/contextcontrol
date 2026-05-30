@@ -1,5 +1,9 @@
 Context Control agent instructions
 
+Status: WIP. This document describes the intended Context Control prompting flow.
+The desktop app is still integrating this flow, so exact prompt capsule details,
+Skillbook interaction, and UI-assisted phases may change.
+
 Core purpose
 Context Control (CC) is a deterministic source-context pipeline for working with large codebases through a chat assistant.
 

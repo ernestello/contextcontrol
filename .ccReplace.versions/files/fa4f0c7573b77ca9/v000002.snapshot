@@ -1,2 +1,0 @@
-// GPT-DESC: Legacy TerrainEditRemeshScheduler source placeholder; implementation moved to world/edit/remesh/.
-#include "world/edit/TerrainEditRemeshScheduler.h"

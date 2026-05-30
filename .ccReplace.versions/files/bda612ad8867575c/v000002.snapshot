@@ -1,5 +1,0 @@
-// GPT-DESC: Legacy placeholder for the heightmap mesh converter; implementation moved to tools/heightmap_mesh/.
-//
-// The convert_heightmap_to_meshes target is now built from the domain-split
-// files under tools/heightmap_mesh/. This file is kept temporarily so stale
-// references fail softly instead of pointing at a removed path.

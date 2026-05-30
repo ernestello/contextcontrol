@@ -1,6 +1,0 @@
-test/generate-test-node-config.py
-test/tdutils/test-persistent-treap.cpp
-test/tontester/generate_tl.py
-test/validator/CMakeLists.txt
-test/validator/consensus/CMakeLists.txt
-test/validator/consensus/test-consensus.cpp

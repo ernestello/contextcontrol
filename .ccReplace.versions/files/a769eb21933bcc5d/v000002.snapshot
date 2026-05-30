@@ -1,4 +1,0 @@
-// GPT-DESC: Legacy placeholder for the World meshing dispatch split.
-#include "world/World.h"
-
-// World::updateMeshingSystem() moved to src/world/update/WorldMeshingDispatch.cpp.

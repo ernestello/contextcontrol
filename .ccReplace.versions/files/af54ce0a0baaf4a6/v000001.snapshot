@@ -1,3 +1,0 @@
-# CC-DESC: Compatibility shim for canonical replace/Cc.Replace.Pipeline.ps1.
-
-. (Join-Path (Split-Path -Parent $PSScriptRoot) "Cc.Replace.Pipeline.ps1")

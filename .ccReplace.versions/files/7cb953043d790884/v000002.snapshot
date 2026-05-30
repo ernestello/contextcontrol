@@ -1,9 +1,0 @@
-// GPT-DESC: Legacy source location intentionally emptied after moving DCCM meshing into src/world/edit/dccm/.
-#include "world/edit/TerrainEditDCCMMesher.h"
-
-// Runtime DCCM implementation now lives in:
-//   src/world/edit/dccm/TerrainEditDCCMMesher.cpp
-//   src/world/edit/dccm/DCCMHeightAnalysis.cpp
-//   src/world/edit/dccm/DCCMBoundaryRepair.cpp
-//   src/world/edit/dccm/DCCMFeatureMesh.cpp
-//   src/world/edit/dccm/DCCMWeldCleanup.cpp

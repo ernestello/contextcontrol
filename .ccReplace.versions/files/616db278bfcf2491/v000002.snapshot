@@ -1,4 +1,0 @@
-// GPT-DESC: Legacy placeholder after moving World LOD scan/update code into src/world/lod/WorldLODTransitions.cpp.
-#include "world/World.h"
-
-// World::updateLODTransitions now lives in src/world/lod/WorldLODTransitions.cpp.
