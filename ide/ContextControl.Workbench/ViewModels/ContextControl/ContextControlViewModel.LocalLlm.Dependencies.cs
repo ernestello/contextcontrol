@@ -891,39 +891,111 @@ public sealed partial class ContextControlViewModel
         IProgress<LocalLlmTransferProgress> progress,
         CancellationToken cancellationToken)
     {
-        var seedCandidates = PythonDependencyEnvironment.FindPythonSeedCandidates();
-        if (seedCandidates.Count == 0)
-        {
-            return new DependencyInstallResult(false, $"Python was not found. Install Python first; ContextControl will then create its own venv for {spec.DisplayName}.");
-        }
-
         var operation = $"Creating {spec.DisplayName} managed venv";
         var managedDirectory = PythonDependencyEnvironment.ManagedEnvironmentDirectory(spec.Id);
+        var bootstrapAttempted = false;
         var failures = new List<string>();
-        foreach (var seedPython in seedCandidates)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var args = new[] { "-m", "venv", managedDirectory };
-            terminal.Report($"> {seedPython} {string.Join(' ', args)}");
-            progress.Report(new LocalLlmTransferProgress(operation, $"Creating managed venv at {managedDirectory}", null, null, null, null));
-            var result = await RunProcessForDependencyInstallAsync(
-                seedPython,
-                args,
-                TimeSpan.FromMinutes(10),
-                terminal,
-                progress,
-                operation,
-                cancellationToken).ConfigureAwait(false);
 
-            if (result.ExitCode == 0 && File.Exists(PythonDependencyEnvironment.ManagedPythonExecutable(spec.Id)))
+        while (true)
+        {
+            failures.Clear();
+            var seedCandidates = PythonDependencyEnvironment.FindPythonSeedCandidates();
+            if (seedCandidates.Count == 0)
             {
-                return new DependencyInstallResult(true, $"{spec.DisplayName} managed venv created at {managedDirectory}.", IsManaged: true);
+                if (bootstrapAttempted)
+                {
+                    return new DependencyInstallResult(false, $"Python was installed, but no usable python.exe was found for {spec.DisplayName}. Restart ContextControl and try again.");
+                }
+
+                var bootstrap = await InstallPythonSeedAsync(spec, terminal, progress, cancellationToken).ConfigureAwait(false);
+                if (!bootstrap.Succeeded)
+                {
+                    return bootstrap;
+                }
+
+                bootstrapAttempted = true;
+                continue;
             }
 
-            failures.Add($"{seedPython}: {FirstDependencyInstallLine(result) ?? $"venv exited {result.ExitCode}"}");
+            foreach (var seedPython in seedCandidates)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                var args = new[] { "-m", "venv", managedDirectory };
+                terminal.Report($"> {seedPython} {string.Join(' ', args)}");
+                progress.Report(new LocalLlmTransferProgress(operation, $"Creating managed venv at {managedDirectory}", null, null, null, null));
+                var result = await RunProcessForDependencyInstallAsync(
+                    seedPython,
+                    args,
+                    TimeSpan.FromMinutes(10),
+                    terminal,
+                    progress,
+                    operation,
+                    cancellationToken).ConfigureAwait(false);
+
+                if (result.ExitCode == 0 && File.Exists(PythonDependencyEnvironment.ManagedPythonExecutable(spec.Id)))
+                {
+                    return new DependencyInstallResult(true, $"{spec.DisplayName} managed venv created at {managedDirectory}.", IsManaged: true);
+                }
+
+                failures.Add($"{seedPython}: {FirstDependencyInstallLine(result) ?? $"venv exited {result.ExitCode}"}");
+            }
+
+            if (bootstrapAttempted)
+            {
+                return new DependencyInstallResult(false, $"Could not create managed venv for {spec.DisplayName}. {string.Join(" | ", failures.Take(3))}");
+            }
+
+            var installPython = await InstallPythonSeedAsync(spec, terminal, progress, cancellationToken).ConfigureAwait(false);
+            if (!installPython.Succeeded)
+            {
+                failures.Add(installPython.Status);
+                return new DependencyInstallResult(false, $"Could not create managed venv for {spec.DisplayName}. {string.Join(" | ", failures.Take(3))}");
+            }
+
+            bootstrapAttempted = true;
+        }
+    }
+
+    private async Task<DependencyInstallResult> InstallPythonSeedAsync(
+        PythonDependencySpec spec,
+        IProgress<string> terminal,
+        IProgress<LocalLlmTransferProgress> progress,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!PackageManagerDependencyEnvironment.TryResolvePythonInstallCommand(out var command))
+        {
+            return new DependencyInstallResult(false, $"Python was not found. Install Python 3.12 first; ContextControl will then create its own venv for {spec.DisplayName}.");
         }
 
-        return new DependencyInstallResult(false, $"Could not create managed venv for {spec.DisplayName}. {string.Join(" | ", failures.Take(3))}");
+        const string operation = "Installing Python";
+        terminal.Report("Python was not found, or only the Microsoft Store python alias was present.");
+        terminal.Report($"> {command.FileName} {string.Join(' ', command.Arguments)}");
+        progress.Report(new LocalLlmTransferProgress(
+            operation,
+            $"Installing Python 3.12 with {command.FileName} so ContextControl can create a managed venv.",
+            null,
+            null,
+            null,
+            null));
+
+        var result = await RunProcessForDependencyInstallAsync(
+            command.FileName,
+            command.Arguments,
+            command.Timeout,
+            terminal,
+            progress,
+            operation,
+            cancellationToken).ConfigureAwait(false);
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (result.ExitCode != 0)
+        {
+            var failure = FirstDependencyInstallLine(result) ?? $"Python installer exited {result.ExitCode}.";
+            return new DependencyInstallResult(false, $"Automatic Python install failed: {failure}");
+        }
+
+        return new DependencyInstallResult(true, "Python installer completed. Creating ContextControl managed venv next.");
     }
 
 }

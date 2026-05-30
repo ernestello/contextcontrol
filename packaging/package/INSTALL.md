@@ -32,6 +32,8 @@ Run the installed app from the Start Menu shortcut or from:
 <install folder>\ContextControl.Workbench.exe
 ```
 
+After this version is installed, ContextControl checks GitHub releases on startup when internet is available. Use the **Check updates** button in the header bar to manually check, download, and start a newer setup EXE against the current install folder.
+
 ## Local LLM Autosetup
 
 ContextControl does not bundle LLM weights or backend runtimes. Install the app first, then use the **Dependencies** and **Local LLMs** pages.
@@ -43,6 +45,8 @@ Current autosetup coverage:
 - non-Ollama managed/backend setup: 11/301 catalog entries
 - Ollama Cloud entries: 28/301 catalog entries, no local weight download
 - image generation: 12/12 image-generation catalog entries have a route
+
+On a raw Windows PC, the Microsoft Store `python.exe` app alias is ignored because it is not a real Python interpreter. Python-backed dependencies such as Diffusers automatically install Python 3.12 through `winget` when no usable Python exists, then create a ContextControl-managed virtual environment.
 
 Still partial/WIP after the first install click: LM Studio server enablement, stable-diffusion.cpp GGUF model file selection through `CC_IMAGE_MODEL_PATH`, bitnet.cpp environment/model setup, RWKV model weight flow, CUDA/WSL/server validation for vLLM/SGLang/TensorRT-LLM/ExLlamaV2, and converted model artifacts for ONNX Runtime GenAI/OpenVINO GenAI.
 

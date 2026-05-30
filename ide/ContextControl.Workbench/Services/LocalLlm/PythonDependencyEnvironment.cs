@@ -364,6 +364,11 @@ internal static class PythonDependencyEnvironment
             {
                 AddCandidate(candidate, isManaged: false, "PATH");
             }
+
+            foreach (var candidate in FindKnownPythonInstallCandidates())
+            {
+                AddCandidate(candidate, isManaged: false, "known install");
+            }
         }
 
         return candidates;
@@ -387,6 +392,11 @@ internal static class PythonDependencyEnvironment
 
         AddCandidate(Environment.GetEnvironmentVariable("CC_PYTHON"));
         foreach (var candidate in FindExecutableCandidatesOnPath(["python.exe", "python", "py.exe", "py"]))
+        {
+            AddCandidate(candidate);
+        }
+
+        foreach (var candidate in FindKnownPythonInstallCandidates())
         {
             AddCandidate(candidate);
         }
@@ -485,6 +495,56 @@ print(sys.executable)
         return candidates;
     }
 
+    private static IReadOnlyList<string> FindKnownPythonInstallCandidates()
+    {
+        var candidates = new List<string>();
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        AddCandidate(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Programs",
+            "Python",
+            "Launcher",
+            OperatingSystem.IsWindows() ? "py.exe" : "py"));
+
+        AddPythonRoots(Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Programs",
+            "Python"));
+        AddPythonRoots(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles));
+        AddPythonRoots(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86));
+
+        return candidates;
+
+        void AddPythonRoots(string root)
+        {
+            if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root))
+            {
+                return;
+            }
+
+            try
+            {
+                foreach (var directory in Directory.EnumerateDirectories(root, "Python3*", SearchOption.TopDirectoryOnly))
+                {
+                    AddCandidate(Path.Combine(directory, OperatingSystem.IsWindows() ? "python.exe" : "python"));
+                }
+            }
+            catch
+            {
+                // Ignore inaccessible install roots.
+            }
+        }
+
+        void AddCandidate(string? candidate)
+        {
+            if (TryNormalizeExecutable(candidate, out var normalized) && seen.Add(normalized))
+            {
+                candidates.Add(normalized);
+            }
+        }
+    }
+
     private static bool TryNormalizeExecutable(string? candidate, out string normalized)
     {
         normalized = "";
@@ -501,6 +561,11 @@ print(sys.executable)
                 return false;
             }
 
+            if (LooksLikeWindowsStorePythonAlias(fullPath))
+            {
+                return false;
+            }
+
             normalized = fullPath;
             return true;
         }
@@ -508,6 +573,26 @@ print(sys.executable)
         {
             return false;
         }
+    }
+
+    private static bool LooksLikeWindowsStorePythonAlias(string fullPath)
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return false;
+        }
+
+        var fileName = Path.GetFileName(fullPath);
+        if (!fileName.StartsWith("python", StringComparison.OrdinalIgnoreCase)
+            && !fileName.Equals("py.exe", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var normalized = fullPath.Replace(Path.AltDirectorySeparatorChar, Path.DirectorySeparatorChar);
+        return normalized.Contains(
+            $"{Path.DirectorySeparatorChar}Microsoft{Path.DirectorySeparatorChar}WindowsApps{Path.DirectorySeparatorChar}",
+            StringComparison.OrdinalIgnoreCase);
     }
 
     private static string SanitizeDependencyId(string dependencyId)

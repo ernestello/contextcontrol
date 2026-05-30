@@ -17,6 +17,14 @@ internal sealed record PackageManagerInstallCommand(
 
 internal static class PackageManagerDependencyEnvironment
 {
+    private static readonly PackageManagerDependencySpec PythonSpec = new(
+        "python",
+        "Python 3.12",
+        ["python.exe", "python", "py.exe", "py"],
+        WindowsWingetId: "Python.Python.3.12",
+        MacBrewCask: "python@3.12",
+        LinuxInstallShell: "if command -v apt-get >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y python3 python3-venv python3-pip; elif command -v dnf >/dev/null 2>&1; then sudo dnf install -y python3 python3-pip; elif command -v pacman >/dev/null 2>&1; then sudo pacman -S --needed python python-pip; else echo 'No supported package manager found for Python.' >&2; exit 1; fi");
+
     private static readonly PackageManagerDependencySpec[] Specs =
     [
         new(
@@ -60,17 +68,25 @@ internal static class PackageManagerDependencyEnvironment
     {
         if (OperatingSystem.IsWindows() && !string.IsNullOrWhiteSpace(spec.WindowsWingetId))
         {
+            var arguments = new List<string>
+            {
+                "install",
+                "--id",
+                spec.WindowsWingetId,
+                "--exact",
+                "--silent",
+                "--accept-package-agreements",
+                "--accept-source-agreements"
+            };
+            if (spec.Id.Equals("python", StringComparison.OrdinalIgnoreCase))
+            {
+                arguments.Add("--scope");
+                arguments.Add("user");
+            }
+
             command = new PackageManagerInstallCommand(
                 "winget",
-                [
-                    "install",
-                    "--id",
-                    spec.WindowsWingetId,
-                    "--exact",
-                    "--silent",
-                    "--accept-package-agreements",
-                    "--accept-source-agreements"
-                ],
+                arguments,
                 TimeSpan.FromMinutes(45));
             return true;
         }
@@ -95,5 +111,10 @@ internal static class PackageManagerDependencyEnvironment
 
         command = null!;
         return false;
+    }
+
+    public static bool TryResolvePythonInstallCommand(out PackageManagerInstallCommand command)
+    {
+        return TryResolveInstallCommand(PythonSpec, out command);
     }
 }

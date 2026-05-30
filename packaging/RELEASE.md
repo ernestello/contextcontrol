@@ -40,6 +40,8 @@ Quiet uninstall smoke test:
 
 No LLM weights, dependency runtimes, chat history, source files, tests, or build folders are bundled. The app installs dependencies and downloads local LLMs from inside the Dependencies and Local LLM pages.
 
+The workbench checks GitHub releases on startup and exposes a header-bar **Check updates** button. If a newer release exists, the button downloads `ContextControl-win-x64-Setup.exe` and starts it with the current install folder preselected. During install, setup closes any running Workbench process in the target folder before extracting files.
+
 Current app-side autosetup coverage documented in the README and packaged install guide:
 
 - 17/17 dependency cards expose an installer path
@@ -47,6 +49,10 @@ Current app-side autosetup coverage documented in the README and packaged instal
 - 11/301 catalog entries use non-Ollama managed/backend setup
 - 28/301 catalog entries are Ollama Cloud entries with no local weight download
 - 12/12 image-generation catalog entries have a route
+
+Fresh Windows Python bootstrap: managed Python dependencies ignore the Microsoft Store `python.exe` alias and install Python 3.12 through `winget` when no real interpreter is present.
+
+SmartScreen/reputation note: the release script can Authenticode-sign the setup EXE when `CONTEXTCONTROL_SIGNING_PFX_BASE64` and `CONTEXTCONTROL_SIGNING_PFX_PASSWORD` are configured. Unsigned public builds can still show Windows reputation warnings.
 
 Skillbook is packaged only as draft data right now; the desktop Skillbook feature is not currently usable.
 

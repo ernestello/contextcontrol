@@ -739,6 +739,8 @@ internal static class InstallerEngine
             resolvedInstallDir = PrepareInstallDir(options.InstallDir);
             Directory.CreateDirectory(resolvedInstallDir);
 
+            StopRunningWorkbench(resolvedInstallDir, Log);
+
             Log("Extracting ContextControl app files...");
             ExtractPayload(resolvedInstallDir, Log);
 

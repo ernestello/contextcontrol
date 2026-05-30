@@ -9,7 +9,7 @@
 >
           <Grid RowDefinitions="30,42">
             <Border Grid.Row="0" Classes="workspace-mode-bar" Padding="6,0">
-              <Grid ColumnDefinitions="*,Auto,*" ColumnSpacing="10">
+              <Grid ColumnDefinitions="*,Auto,Auto,*" ColumnSpacing="10">
                 <ItemsControl
                     Grid.Column="1"
                     ItemsSource="{Binding WorkspaceModes}"
@@ -32,8 +32,16 @@
                   </ItemsControl.ItemTemplate>
                 </ItemsControl>
 
-                <ScrollViewer
+                <Button
                     Grid.Column="2"
+                    Classes="header-mini"
+                    Content="{Binding UpdateButtonLabel}"
+                    Command="{Binding CheckForUpdatesCommand}"
+                    ToolTip.Tip="{Binding UpdateStatusLabel}"
+                    VerticalAlignment="Center" />
+
+                <ScrollViewer
+                    Grid.Column="3"
                     HorizontalScrollBarVisibility="Auto"
                     VerticalScrollBarVisibility="Disabled"
                     controls:HoverScrollbarBehavior.IsEnabled="True"

@@ -25,6 +25,10 @@ jobs:
 
       - name: Build release artifacts
         shell: pwsh
+        env:
+          CONTEXTCONTROL_SIGNING_PFX_BASE64: ${{ secrets.CONTEXTCONTROL_SIGNING_PFX_BASE64 }}
+          CONTEXTCONTROL_SIGNING_PFX_PASSWORD: ${{ secrets.CONTEXTCONTROL_SIGNING_PFX_PASSWORD }}
+          CONTEXTCONTROL_TIMESTAMP_SERVER: ${{ secrets.CONTEXTCONTROL_TIMESTAMP_SERVER }}
         run: ./packaging/Publish-ContextControlRelease.ps1 -Configuration Release -RuntimeIdentifier win-x64 -Version "${{ github.ref_name }}"
 
       - name: Attach to GitHub Release
@@ -36,7 +40,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $tag = '${{ github.ref_name }}'
           $repo = '${{ github.repository }}'
-          $notes = 'Windows x64 release. Download ContextControl-win-x64-Setup.exe only. It is a single-file installer that contains the full app folder, lets you choose the install location and shortcuts, and launches ContextControl after setup if selected.'
+          $notes = 'Windows x64 release. Download ContextControl-win-x64-Setup.exe only. It is a single-file installer that contains the full app folder, lets you choose the install location and shortcuts, registers uninstall, and lets newer app builds update from GitHub releases.'
           $apiBase = "https://api.github.com/repos/$repo"
           $headers = @{
             Authorization = "Bearer $env:GH_TOKEN"

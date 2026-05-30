@@ -79,6 +79,45 @@ function Copy-ReleaseItem {
     Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
 }
 
+function Invoke-CodeSigningIfConfigured {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    $pfxBase64 = $env:CONTEXTCONTROL_SIGNING_PFX_BASE64
+    $pfxPassword = $env:CONTEXTCONTROL_SIGNING_PFX_PASSWORD
+    if ([string]::IsNullOrWhiteSpace($pfxBase64) -or [string]::IsNullOrWhiteSpace($pfxPassword)) {
+        Write-Host 'Code signing skipped: CONTEXTCONTROL_SIGNING_PFX_BASE64 and CONTEXTCONTROL_SIGNING_PFX_PASSWORD are not configured.'
+        return
+    }
+
+    $timestampServer = if ([string]::IsNullOrWhiteSpace($env:CONTEXTCONTROL_TIMESTAMP_SERVER)) {
+        'http://timestamp.digicert.com'
+    }
+    else {
+        $env:CONTEXTCONTROL_TIMESTAMP_SERVER
+    }
+
+    $pfxPath = Join-Path ([System.IO.Path]::GetTempPath()) "ContextControlSigning-$([guid]::NewGuid().ToString('N')).pfx"
+    try {
+        [System.IO.File]::WriteAllBytes($pfxPath, [System.Convert]::FromBase64String($pfxBase64))
+        $certificate = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new(
+            $pfxPath,
+            $pfxPassword,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::EphemeralKeySet)
+        $signature = Set-AuthenticodeSignature -FilePath $Path -Certificate $certificate -TimestampServer $timestampServer
+        if ($signature.Status -ne 'Valid') {
+            throw "Code signing failed with status $($signature.Status): $($signature.StatusMessage)"
+        }
+
+        Write-Host "Signed $Path"
+    }
+    finally {
+        Remove-FileIfExists -Path $pfxPath
+    }
+}
+
 $repoRoot = Resolve-RepoRoot
 $project = Join-Path $repoRoot 'ide\ContextControl.Workbench\ContextControl.Workbench.csproj'
 $setupProject = Join-Path $repoRoot 'ide\ContextControl.Setup\ContextControl.Setup.csproj'
@@ -194,6 +233,8 @@ $manifest = [ordered]@{
         'ContextControl CLI scripts, lib modules, and draft skillbook files are included; the desktop Skillbook feature is not currently usable.',
         'The installer registers a per-user Windows uninstall entry and Start Menu uninstaller.',
         'Use the app Dependencies and Local LLM pages to install runtimes and download models.',
+        'The Workbench checks GitHub releases on startup and can download/start the newest setup EXE.',
+        'Managed Python dependencies ignore Microsoft Store python aliases and can bootstrap Python 3.12 through winget.',
         'The setup EXE embeds this full app folder and extracts it to the folder selected by the user.'
     )
 }
@@ -237,6 +278,7 @@ if (-not $SkipInstallerExe) {
     }
 
     Copy-Item -LiteralPath $setupExePath -Destination $installerPath -Force
+    Invoke-CodeSigningIfConfigured -Path $installerPath
     $installerHash = Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath
     "$($installerHash.Hash)  $([System.IO.Path]::GetFileName($installerPath))" | Set-Content -LiteralPath $installerShaPath -Encoding ascii
 }

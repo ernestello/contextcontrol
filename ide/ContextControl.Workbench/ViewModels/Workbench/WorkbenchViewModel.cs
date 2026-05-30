@@ -25,6 +25,7 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
     private readonly Dictionary<string, ProjectWorkspaceState> _workspaceByProjectId = [];
     private readonly Dictionary<string, ExternalChangeTracker> _trackersByProjectId = [];
     private readonly WorkbenchSettings _workbenchSettings;
+    private readonly UpdateService _updateService = new();
     private readonly SynchronizationContext? _uiContext;
     private readonly Timer _externalScanTimer;
     private int _projectSwitchVersion;
@@ -114,6 +115,11 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
     private bool _isProjectScanRunning;
     private string _projectGraphLayoutMode = "graph";
     private string _projectGraphGenerationPalette = WorkbenchSettings.DefaultProjectGraphGenerationColors;
+    private AppUpdateInfo? _availableUpdate;
+    private bool _isCheckingForUpdates;
+    private bool _isDownloadingUpdate;
+    private string _updateButtonLabel = "Check updates";
+    private string _updateStatusLabel = "ContextControl update check has not run yet.";
 
     private WorkbenchViewModel(
         ObservableCollection<ProjectTabViewModel> projects,
@@ -309,6 +315,7 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
         ToggleProjectGraphTreePaneCommand = new RelayCommand<object>(_ => IsProjectGraphTreePaneOpen = !IsProjectGraphTreePaneOpen);
         ToggleProjectGraphLayoutModeCommand = new RelayCommand<object>(_ => ToggleProjectGraphLayoutMode());
         TogglePromptWindowCommand = new RelayCommand<object>(_ => ContextControl.IsPromptOpen = !ContextControl.IsPromptOpen);
+        CheckForUpdatesCommand = new RelayCommand<object>(_ => _ = CheckForUpdatesOrInstallAsync(), _ => !IsCheckingForUpdates && !IsDownloadingUpdate);
         OpenProjectGraphSearchCommand = new RelayCommand<object>(_ => OpenProjectGraphSearch());
         CloseProjectGraphSearchCommand = new RelayCommand<object>(_ => CloseProjectGraphSearch());
         OpenProjectTreeSearchCommand = new RelayCommand<object>(_ => OpenProjectTreeSearch());
@@ -345,6 +352,7 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
         // FileSystemWatcher plus the tracker's own background poll handles changes.
         // A UI-thread full-scan timer made medium projects feel frozen.
         _externalScanTimer = new Timer(_ => PostToUi(ScanExternalChangesNow), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+        _ = CheckForUpdatesOnStartupAsync();
     }
 
     public ObservableCollection<ProjectTabViewModel> Projects { get; }
@@ -392,6 +400,7 @@ public sealed partial class WorkbenchViewModel : ObservableObject, IDisposable
     public ICommand ToggleProjectGraphTreePaneCommand { get; }
     public ICommand ToggleProjectGraphLayoutModeCommand { get; }
     public ICommand TogglePromptWindowCommand { get; }
+    public RelayCommand<object> CheckForUpdatesCommand { get; }
     public ICommand OpenProjectGraphSearchCommand { get; }
     public ICommand CloseProjectGraphSearchCommand { get; }
     public ICommand OpenProjectTreeSearchCommand { get; }

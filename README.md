@@ -8,7 +8,7 @@ The current release focuses on a Windows x64 desktop app that can be opened like
 
 Latest release:
 
-https://github.com/VulkanVX/contextcontrol/releases/tag/v0.3.0
+https://github.com/VulkanVX/contextcontrol/releases/latest
 
 For a fresh Windows PC, download only the installer:
 
@@ -32,6 +32,8 @@ After install, run ContextControl from the Start Menu shortcut or from:
 
 The app is self-contained, so a separate .NET runtime install is not required.
 The installer registers a per-user Windows uninstall entry, so you can remove it from Windows **Installed apps / Apps & features** or from the Start Menu `Uninstall ContextControl` shortcut.
+
+After this version is installed, ContextControl checks GitHub releases on startup when internet is available. The header bar also has a **Check updates** button; when a newer release exists, the same button downloads the newest setup EXE and starts it against the current install folder.
 
 GitHub's automatic **Source code** downloads are source snapshots, not runnable app packages. Use them only if you want to build from source.
 
@@ -69,6 +71,7 @@ Stable enough to test:
 - Ollama model pull/remove workflow
 - Basic local chat through supported chat-ready models
 - Image generation through Ollama image models, Diffusers models, and the stable-diffusion.cpp runner route
+- Startup and manual GitHub release update checks
 - Theme and appearance settings
 
 Work in progress:
@@ -90,10 +93,12 @@ One-click dependency install currently covers **17/17** dependency cards shown b
 
 | Category | Autosetup dependencies |
 |---|---|
-| Package manager apps | Ollama, LM Studio |
+| Package manager apps | Ollama, LM Studio, Python 3.12 bootstrap for managed Python backends |
 | Managed Python environments | Diffusers, Transformers, MLX LM, MLC LLM, vLLM, SGLang, OpenVINO GenAI, ONNX Runtime GenAI, TensorRT-LLM, ExLlamaV2 / TabbyAPI |
 | Native portable downloads | llama.cpp server, KoboldCpp, stable-diffusion.cpp, RWKV Runner |
 | Source archive setup | bitnet.cpp source checkout |
+
+On a fresh Windows PC, ContextControl ignores the Microsoft Store `python.exe` alias in `%LOCALAPPDATA%\Microsoft\WindowsApps` because that is not a real interpreter. If no usable Python is found, installing a Python-backed dependency such as Diffusers bootstraps Python 3.12 through `winget`, then creates a ContextControl-managed virtual environment.
 
 Model autosetup coverage in the current catalog:
 
@@ -127,6 +132,10 @@ Image generation status:
 - 3 use Ollama image models.
 - 7 use Diffusers and can fetch Hugging Face model weights on first generation after the Diffusers dependency is ready.
 - 2 use stable-diffusion.cpp and still need the user to point `CC_IMAGE_MODEL_PATH` at a local GGUF diffusion model file.
+
+## Windows Download Warnings
+
+Windows SmartScreen may warn on new unsigned installers even when the file is clean. The technical fix is Authenticode code signing with an OV/EV certificate and enough download reputation over time. The release workflow supports optional certificate-based signing through repository secrets, but public builds remain unsigned until a signing certificate is configured.
 
 ## Main Workbench Areas
 
