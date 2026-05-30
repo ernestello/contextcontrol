@@ -40,6 +40,7 @@ Bundled inside the installer:
 
 - ContextControl Workbench native desktop app
 - PowerShell ContextControl CLI scripts
+- ContextControl `lib/` modules and default `skillbook/` file
 - Release appearance defaults
 - Full Windows app folder with runtime files beside the EXE
 - Setup UI with install folder picker, shortcut options, logs, and quiet install mode
@@ -53,6 +54,8 @@ Not bundled:
 - Chat history, project exports, patch files, or local runtime state
 
 Those are created or downloaded only after the user chooses them in the app.
+
+If the app fails before the main window opens, it writes a crash log beside the installed EXE and to `%LOCALAPPDATA%\ContextControl\workbench-crash.log`.
 
 ## Current Status
 

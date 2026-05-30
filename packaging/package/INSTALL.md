@@ -38,6 +38,13 @@ Setup writes logs to:
 %LOCALAPPDATA%\ContextControl\install.log
 ```
 
+If the app fails before its window opens, it writes a crash log to:
+
+```text
+<install folder>\ContextControl.Workbench.crash.log
+%LOCALAPPDATA%\ContextControl\workbench-crash.log
+```
+
 ## Quiet Install
 
 For automated testing:

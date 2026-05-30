@@ -64,6 +64,21 @@ function New-ZipFromDirectory {
         $false)
 }
 
+function Copy-ReleaseItem {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Source,
+        [Parameter(Mandatory)]
+        [string]$Destination
+    )
+
+    if (-not (Test-Path -LiteralPath $Source)) {
+        throw "Release source item was not found: $Source"
+    }
+
+    Copy-Item -LiteralPath $Source -Destination $Destination -Recurse -Force
+}
+
 $repoRoot = Resolve-RepoRoot
 $project = Join-Path $repoRoot 'ide\ContextControl.Workbench\ContextControl.Workbench.csproj'
 $setupProject = Join-Path $repoRoot 'ide\ContextControl.Setup\ContextControl.Setup.csproj'
@@ -141,6 +156,28 @@ Copy-Item -LiteralPath (Join-Path $packageDir 'Install-ContextControl.ps1') -Des
 Copy-Item -LiteralPath (Join-Path $packageDir 'Start-ContextControl.cmd') -Destination $stageDir -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'packaging\release-settings.template.json') -Destination (Join-Path $stageDir '.ccWorkbench.settings.json') -Force
 
+$contextControlRuntimeItems = @(
+    'cc',
+    'cc.cmd',
+    'cc.ps1',
+    'ccDir',
+    'ccDir.cmd',
+    'ccDir.ps1',
+    'ccReplace',
+    'ccReplace.cmd',
+    'ccReplace.ps1',
+    'ccStart',
+    'ccStart.cmd',
+    'ccStart.ps1',
+    'lib',
+    'skillbook',
+    'Context-Control-Coding-Flow.txt',
+    'LICENSE.txt'
+)
+foreach ($item in $contextControlRuntimeItems) {
+    Copy-ReleaseItem -Source (Join-Path $repoRoot $item) -Destination $stageDir
+}
+
 $manifest = [ordered]@{
     Name = 'ContextControl'
     RuntimeIdentifier = $RuntimeIdentifier
@@ -154,6 +191,7 @@ $manifest = [ordered]@{
     Notes = @(
         'No .NET runtime install required.',
         'No LLM weights are bundled.',
+        'ContextControl CLI scripts, lib modules, and default skillbook files are included.',
         'Use the app Dependencies and Local LLM pages to install runtimes and download models.',
         'The setup EXE embeds this full app folder and extracts it to the folder selected by the user.'
     )
