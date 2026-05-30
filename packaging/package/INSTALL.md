@@ -32,6 +32,20 @@ Run the installed app from the Start Menu shortcut or from:
 <install folder>\ContextControl.Workbench.exe
 ```
 
+## Local LLM Autosetup
+
+ContextControl does not bundle LLM weights or backend runtimes. Install the app first, then use the **Dependencies** and **Local LLMs** pages.
+
+Current autosetup coverage:
+
+- dependencies: 17/17 app dependency cards have an installer path
+- local Ollama model pulls: 262/301 catalog entries
+- non-Ollama managed/backend setup: 11/301 catalog entries
+- Ollama Cloud entries: 28/301 catalog entries, no local weight download
+- image generation: 12/12 image-generation catalog entries have a route
+
+Still partial/WIP after the first install click: LM Studio server enablement, stable-diffusion.cpp GGUF model file selection through `CC_IMAGE_MODEL_PATH`, bitnet.cpp environment/model setup, RWKV model weight flow, CUDA/WSL/server validation for vLLM/SGLang/TensorRT-LLM/ExLlamaV2, and converted model artifacts for ONNX Runtime GenAI/OpenVINO GenAI.
+
 Setup writes logs to:
 
 ```text

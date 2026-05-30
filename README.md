@@ -68,13 +68,13 @@ Stable enough to test:
 - Dependency detection and one-click installers where safe
 - Ollama model pull/remove workflow
 - Basic local chat through supported chat-ready models
+- Image generation through Ollama image models, Diffusers models, and the stable-diffusion.cpp runner route
 - Theme and appearance settings
 
 Work in progress:
 
 - Context Control prompting flow in the desktop app
-- Skillbook behavior, defaults, and long-term format
-- Image generation routes
+- Skillbook UI and behavior; it currently does not work as a usable feature
 - Non-Windows packaged releases
 - Some advanced GPU/server model backends
 
@@ -86,16 +86,47 @@ The app separates dependencies from model weights.
 
 Dependencies are runtimes and libraries such as Ollama, llama.cpp, Python packages, or backend servers. Models are the actual weights, usually much larger. ContextControl does not download large model weights during app install.
 
-One-click dependency install currently covers these categories when the platform has a safe path:
+One-click dependency install currently covers **17/17** dependency cards shown by the app. These are installer buttons for runtimes/backends, not model weights:
 
-| Category | Examples |
+| Category | Autosetup dependencies |
 |---|---|
 | Package manager apps | Ollama, LM Studio |
 | Managed Python environments | Diffusers, Transformers, MLX LM, MLC LLM, vLLM, SGLang, OpenVINO GenAI, ONNX Runtime GenAI, TensorRT-LLM, ExLlamaV2 / TabbyAPI |
 | Native portable downloads | llama.cpp server, KoboldCpp, stable-diffusion.cpp, RWKV Runner |
 | Source archive setup | bitnet.cpp source checkout |
 
-Some entries are still manual or partially manual because they depend on drivers, CUDA, platform-specific builds, external accounts, or model licenses. The UI should show those as manual instead of pretending a one-click install is safe.
+Model autosetup coverage in the current catalog:
+
+| Model route | Count |
+|---|---:|
+| Ollama local model pull | 262/301 |
+| Non-Ollama managed/backend setup | 11/301 |
+| Ollama Cloud entries, no local weight download | 28/301 |
+| Local autosetup path, excluding cloud | 273/301 |
+| Any app route, including cloud | 301/301 |
+
+Important caveat: "autosetup" means ContextControl has a button or route for the next safe setup step. It does not mean every backend is fully hands-off after that. Large model weights, vendor drivers, CUDA/WSL setup, cloud sign-in, model licenses, and some server launch steps can still be external.
+
+Autosetup pieces that are still WIP or partial:
+
+| Dependency | Current state |
+|---|---|
+| LM Studio | App install can be started through the OS package manager; enabling and managing its local server is still manual. |
+| stable-diffusion.cpp | Runner install is automatic; GGUF diffusion model file selection/download is still manual through `CC_IMAGE_MODEL_PATH`. |
+| bitnet.cpp | Source checkout is automatic; full environment setup and BitNet model weight flow are still WIP. |
+| RWKV Runner | Runner download is automatic; RWKV model weights and launch integration are still WIP. |
+| MLX LM | Python package setup exists, but it is useful only on Apple Silicon/macOS. |
+| MLC LLM | Package setup exists; compiled model artifacts and target-specific runtime flow are still WIP. |
+| vLLM, SGLang | Python package setup exists; CUDA/WSL/server validation and model serving flow are still WIP. |
+| ONNX Runtime GenAI, OpenVINO GenAI | Package setup exists; converted model artifacts and runtime wiring are still WIP. |
+| TensorRT-LLM, ExLlamaV2 / TabbyAPI | Package setup exists; NVIDIA/CUDA environment, model artifacts, and server workflow are still WIP. |
+
+Image generation status:
+
+- 12/12 image-generation catalog entries have a route in the app.
+- 3 use Ollama image models.
+- 7 use Diffusers and can fetch Hugging Face model weights on first generation after the Diffusers dependency is ready.
+- 2 use stable-diffusion.cpp and still need the user to point `CC_IMAGE_MODEL_PATH` at a local GGUF diffusion model file.
 
 ## Main Workbench Areas
 
@@ -119,7 +150,7 @@ The desktop app is being built around the same idea, but the prompting flow is s
 
 ## Skillbook
 
-`skillbook/` contains draft local-model instruction material. It is useful for experimentation, but it is not a stable public skill format yet. Names, defaults, and activation behavior may change.
+`skillbook/` contains draft local-model instruction material, but the desktop Skillbook feature is currently not working as a usable feature. Treat it as bundled draft data only until the UI behavior, defaults, activation, and long-term format are rebuilt.
 
 ## Build From Source
 

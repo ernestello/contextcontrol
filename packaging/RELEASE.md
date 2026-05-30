@@ -40,4 +40,14 @@ Quiet uninstall smoke test:
 
 No LLM weights, dependency runtimes, chat history, source files, tests, or build folders are bundled. The app installs dependencies and downloads local LLMs from inside the Dependencies and Local LLM pages.
 
+Current app-side autosetup coverage documented in the README and packaged install guide:
+
+- 17/17 dependency cards expose an installer path
+- 262/301 catalog entries use local Ollama model pulls
+- 11/301 catalog entries use non-Ollama managed/backend setup
+- 28/301 catalog entries are Ollama Cloud entries with no local weight download
+- 12/12 image-generation catalog entries have a route
+
+Skillbook is packaged only as draft data right now; the desktop Skillbook feature is not currently usable.
+
 The GitHub Actions workflow `.github/workflows/contextcontrol-release.yml` builds the installer on `workflow_dispatch` and attaches the setup EXE plus checksum to releases when a `v*` tag is pushed. The zip is not required for end-user install.
