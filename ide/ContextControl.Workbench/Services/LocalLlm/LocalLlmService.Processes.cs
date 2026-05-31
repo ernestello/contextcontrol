@@ -258,6 +258,12 @@ public sealed partial class LocalLlmService
             return null;
         }
 
+        var explicitFailure = lines.FirstOrDefault(line => line.StartsWith("CC_ERROR ", StringComparison.Ordinal));
+        if (!string.IsNullOrWhiteSpace(explicitFailure))
+        {
+            return explicitFailure["CC_ERROR ".Length..];
+        }
+
         for (var i = lines.Length - 1; i >= 0; i--)
         {
             var line = lines[i];

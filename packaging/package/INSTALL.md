@@ -52,7 +52,7 @@ When no HF token is configured, Diffusers model cards show an HF token warning a
 
 HF token warnings currently apply to these Diffusers routes: `runwayml/stable-diffusion-v1-5`, `stabilityai/stable-diffusion-2-1-base`, `segmind/tiny-sd`, `nota-ai/bk-sdm-small`, `SimianLuo/LCM_Dreamshaper_v7`, `stabilityai/sd-turbo`, `segmind/SSD-1B`, and `black-forest-labs/FLUX.2-klein-4B`.
 
-If a fresh Python environment is slow to import Torch/Diffusers, ContextControl waits longer during generation/download validation and reports an explicit import timeout instead of the old `exited -1` message. If that timeout repeats, reinstall **Hugging Face Diffusers** from the Dependencies page to rebuild the managed environment.
+ContextControl's preflight checks whether Diffusers modules exist without importing heavy packages first. Actual generation then imports PyTorch and Diffusers with visible terminal status and heartbeat lines. If an import stalls, the app reports the exact stage, such as importing PyTorch or importing the FLUX.2 Klein pipeline, instead of the old `exited -1` message. If that timeout repeats, reinstall **Hugging Face Diffusers** from the Dependencies page to rebuild the managed environment.
 
 On a raw Windows PC, the Microsoft Store `python.exe` app alias is ignored because it is not a real Python interpreter. Python-backed dependencies such as Diffusers automatically install Python 3.12 through `winget` when no usable Python exists, then create a ContextControl-managed virtual environment.
 

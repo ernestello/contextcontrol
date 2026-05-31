@@ -12,8 +12,8 @@ namespace ContextControl.Workbench.Services;
 
 public sealed partial class LocalLlmService
 {
-    private static readonly TimeSpan DiffusersPythonImportValidationTimeout = TimeSpan.FromSeconds(120);
-    private static readonly TimeSpan DiffusersPythonCacheProbeImportTimeout = TimeSpan.FromSeconds(45);
+    private static readonly TimeSpan DiffusersPythonProbeValidationTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan DiffusersPythonCacheProbeValidationTimeout = TimeSpan.FromSeconds(15);
 
     public async Task<LocalLlmChatResult> DownloadImageModelAsync(
         string modelId,
@@ -42,17 +42,23 @@ public sealed partial class LocalLlmService
             ? PythonDependencyEnvironment.ManagedProcessEnvironment
             : null;
         var script = """
-import sys, time, threading
-from huggingface_hub import snapshot_download
+import sys, time, threading, os
 
 model_id = sys.argv[1]
 
 stop_heartbeat = False
 stage = "starting"
 started = time.time()
+stage_deadline = None
 
 def status(message):
     print("CC_STATUS " + message, flush=True)
+
+def set_stage(message, timeout_seconds=None):
+    global stage, stage_deadline
+    stage = message
+    stage_deadline = time.time() + timeout_seconds if timeout_seconds else None
+    status(message)
 
 def heartbeat():
     while not stop_heartbeat:
@@ -60,6 +66,13 @@ def heartbeat():
         if not stop_heartbeat:
             elapsed = int((time.time() - started) // 60)
             status(f"Still {stage} after {elapsed} min. Large Hugging Face shards can keep the file counter on the same percentage.")
+
+def watchdog():
+    while not stop_heartbeat:
+        time.sleep(5)
+        if stage_deadline and time.time() > stage_deadline:
+            print(f"CC_ERROR Timed out while {stage}. Reinstall Hugging Face Diffusers from Dependencies if this repeats.", flush=True)
+            os._exit(124)
 
 def flux2_klein_allow_patterns():
     return [
@@ -73,18 +86,23 @@ def flux2_klein_allow_patterns():
 
 is_flux2_klein = "flux.2-klein" in model_id.lower() or "flux2-klein" in model_id.lower()
 thread = threading.Thread(target=heartbeat, daemon=True)
+watchdog_thread = threading.Thread(target=watchdog, daemon=True)
 thread.start()
+watchdog_thread.start()
 try:
-    stage = "downloading Diffusers model files"
+    set_stage("Importing Hugging Face Hub downloader.", 180)
+    from huggingface_hub import snapshot_download
+
     if is_flux2_klein:
-        status("Downloading FLUX.2 Klein Diffusers pipeline files only. First run is large and may sit on one shard for a long time.")
+        set_stage("Downloading FLUX.2 Klein Diffusers pipeline files. First run is large and may sit on one shard for a long time.")
         path = snapshot_download(repo_id=model_id, allow_patterns=flux2_klein_allow_patterns())
     else:
-        status("Downloading Hugging Face Diffusers model files.")
+        set_stage("Downloading Hugging Face Diffusers model files.")
         path = snapshot_download(repo_id=model_id)
 finally:
     stop_heartbeat = True
     thread.join(timeout=1)
+    watchdog_thread.join(timeout=1)
 
 print(f"Cached model at {path}")
 """;
@@ -149,7 +167,7 @@ print(f"Cached model at {path}")
         var pythonResolution = await ResolvePythonForModulesAsync(
             DiffusersPythonRequirements,
             cancellationToken,
-            DiffusersPythonCacheProbeImportTimeout).ConfigureAwait(false);
+            DiffusersPythonCacheProbeValidationTimeout).ConfigureAwait(false);
         if (!pythonResolution.Succeeded || pythonResolution.Executable is null)
         {
             return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -326,8 +344,7 @@ for model_id in sys.argv[1:]:
         var startedUtc = DateTime.UtcNow.AddSeconds(-2);
         var outputPath = Path.Combine(resolvedOutputDirectory, $"cc-image-{DateTime.Now:yyyyMMdd-HHmmss}.png");
         var script = """
-import os, sys, time, threading, torch
-from huggingface_hub import snapshot_download
+import os, sys, time, threading
 
 model_id, prompt, output_path = sys.argv[1], sys.argv[2], sys.argv[3]
 is_flux2_klein = "flux.2-klein" in model_id.lower() or "flux2-klein" in model_id.lower()
@@ -335,9 +352,16 @@ is_flux2_klein = "flux.2-klein" in model_id.lower() or "flux2-klein" in model_id
 stop_heartbeat = False
 stage = "starting"
 started = time.time()
+stage_deadline = None
 
 def status(message):
     print("CC_STATUS " + message, flush=True)
+
+def set_stage(message, timeout_seconds=None):
+    global stage, stage_deadline
+    stage = message
+    stage_deadline = time.time() + timeout_seconds if timeout_seconds else None
+    status(message)
 
 def heartbeat():
     while not stop_heartbeat:
@@ -345,6 +369,13 @@ def heartbeat():
         if not stop_heartbeat:
             elapsed = int((time.time() - started) // 60)
             status(f"Still {stage} after {elapsed} min. First-run model downloads and CPU offload loads can be quiet for a while.")
+
+def watchdog():
+    while not stop_heartbeat:
+        time.sleep(5)
+        if stage_deadline and time.time() > stage_deadline:
+            print(f"CC_ERROR Timed out while {stage}. Reinstall Hugging Face Diffusers from Dependencies if this repeats.", flush=True)
+            os._exit(124)
 
 def flux2_klein_allow_patterns():
     return [
@@ -357,23 +388,31 @@ def flux2_klein_allow_patterns():
     ]
 
 thread = threading.Thread(target=heartbeat, daemon=True)
+watchdog_thread = threading.Thread(target=watchdog, daemon=True)
 thread.start()
+watchdog_thread.start()
 try:
+    set_stage("Importing PyTorch.", 600)
+    import torch
+
+    set_stage("Importing Hugging Face Hub downloader.", 180)
+    from huggingface_hub import snapshot_download
+
     model_source = model_id
     if is_flux2_klein:
+        set_stage("Importing FLUX.2 Klein Diffusers pipeline.", 600)
         from diffusers import Flux2KleinPipeline
 
         if torch.cuda.is_available():
             dtype = torch.bfloat16 if getattr(torch.cuda, "is_bf16_supported", lambda: False)() else torch.float16
         else:
             dtype = torch.float32
-        stage = "downloading FLUX.2 Klein Diffusers files"
-        status("FLUX.2 Klein first run downloads large Diffusers pipeline shards. The percentage can pause while one multi-GB shard downloads.")
+        set_stage("Downloading FLUX.2 Klein Diffusers files. The percentage can pause while one multi-GB shard downloads.")
         model_source = snapshot_download(repo_id=model_id, allow_patterns=flux2_klein_allow_patterns())
-        stage = "loading FLUX.2 Klein pipeline"
+        set_stage("Loading FLUX.2 Klein pipeline.")
         pipe = Flux2KleinPipeline.from_pretrained(model_source, torch_dtype=dtype)
         if torch.cuda.is_available():
-            stage = "enabling CPU offload"
+            set_stage("Enabling CPU offload.")
             pipe.enable_model_cpu_offload()
         else:
             pipe = pipe.to("cpu")
@@ -381,8 +420,7 @@ try:
         width = int(os.environ.get("CC_IMAGE_WIDTH", "768"))
         height = int(os.environ.get("CC_IMAGE_HEIGHT", "768"))
         generator = torch.Generator(device="cuda" if torch.cuda.is_available() else "cpu").manual_seed(0)
-        stage = f"generating {width}x{height} image"
-        status(f"Generating FLUX.2 Klein image at {width}x{height} with CPU offload when CUDA is available.")
+        set_stage(f"Generating FLUX.2 Klein image at {width}x{height} with CPU offload when CUDA is available.")
         image = pipe(
             prompt=prompt,
             height=height,
@@ -392,14 +430,14 @@ try:
             generator=generator,
         ).images[0]
     else:
+        set_stage("Importing Diffusers text-to-image pipeline.", 600)
         from diffusers import AutoPipelineForText2Image
 
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-        stage = "downloading/loading Diffusers pipeline"
-        status("Loading Diffusers pipeline. First run may download model files into the Hugging Face cache.")
+        set_stage("Loading Diffusers pipeline. First run may download model files into the Hugging Face cache.")
         pipe = AutoPipelineForText2Image.from_pretrained(model_id, torch_dtype=dtype, safety_checker=None)
         if torch.cuda.is_available():
-            stage = "moving pipeline to CUDA"
+            set_stage("Moving pipeline to CUDA.")
             pipe = pipe.to("cuda")
             pipe.enable_attention_slicing()
         else:
@@ -409,14 +447,15 @@ try:
         except Exception:
             pass
         steps = 8 if "LCM" in model_id or "turbo" in model_id.lower() else 24
-        stage = "generating image"
+        set_stage("Generating image.")
         image = pipe(prompt, num_inference_steps=steps, guidance_scale=0.0 if "turbo" in model_id.lower() else 7.0).images[0]
-    stage = "saving image"
+    set_stage("Saving image.")
     image.save(output_path)
     print("Generated image.", flush=True)
 finally:
     stop_heartbeat = True
     thread.join(timeout=1)
+    watchdog_thread.join(timeout=1)
 """;
 
         progress?.Report(new LocalLlmGenerationProgress("Preparing Diffusers image generation...", null, null, null, null, null, null, null, false));
@@ -474,7 +513,7 @@ finally:
     private static async Task<PythonExecutableResolution> ResolvePythonForModulesAsync(
         IReadOnlyList<PythonModuleRequirement> requirements,
         CancellationToken cancellationToken,
-        TimeSpan? importValidationTimeout = null)
+        TimeSpan? validationTimeout = null)
     {
         var candidates = PythonDependencyEnvironment.FindPythonCandidatesForDetection("diffusers");
         if (candidates.Count == 0)
@@ -483,9 +522,9 @@ finally:
         }
 
         var failures = new List<string>();
-        var script = PythonDependencyEnvironment.BuildPythonModuleImportScript(
+        var script = PythonDependencyEnvironment.BuildPythonModuleProbeScript(
             requirements.ToDictionary(requirement => requirement.DisplayName, requirement => requirement.ModuleName, StringComparer.OrdinalIgnoreCase));
-        var timeout = importValidationTimeout ?? DiffusersPythonImportValidationTimeout;
+        var timeout = validationTimeout ?? DiffusersPythonProbeValidationTimeout;
         foreach (var candidate in candidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -508,7 +547,7 @@ finally:
             }
 
             var reason = result.TimedOut
-                ? $"timed out after {timeout.TotalSeconds:0}s while importing Diffusers dependencies. First Torch/Diffusers import can be slow on a fresh Windows install; retry once, or reinstall Hugging Face Diffusers from Dependencies if it repeats."
+                ? $"timed out after {timeout.TotalSeconds:0}s while checking for Diffusers dependency modules. Reinstall Hugging Face Diffusers from Dependencies if this repeats."
                 : FirstFailureLine(result.StandardError) ?? FirstFailureLine(result.StandardOutput) ?? $"exited {result.ExitCode}";
             failures.Add($"{candidate.Executable}: {reason}");
         }
@@ -518,85 +557,6 @@ finally:
             ? "Python was found, but Diffusers dependencies could not be validated."
             : $"No Python environment could import Diffusers dependencies. First failure: {firstFailure}";
         return PythonExecutableResolution.Failed(status);
-    }
-
-    private static IReadOnlyList<string> FindPythonExecutableCandidates()
-    {
-        var candidates = new List<string>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        AddCandidate(Environment.GetEnvironmentVariable("CC_PYTHON"));
-
-        var path = Environment.GetEnvironmentVariable("PATH");
-        if (!string.IsNullOrWhiteSpace(path))
-        {
-            foreach (var directory in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
-            {
-                foreach (var executableName in new[] { "python.exe", "python", "py.exe", "py" })
-                {
-                    AddCandidate(Path.Combine(directory, executableName));
-                }
-            }
-        }
-
-        return candidates;
-
-        void AddCandidate(string? candidate)
-        {
-            if (string.IsNullOrWhiteSpace(candidate))
-            {
-                return;
-            }
-
-            try
-            {
-                var fullPath = Path.GetFullPath(Environment.ExpandEnvironmentVariables(candidate.Trim('"')));
-                if (File.Exists(fullPath) && seen.Add(fullPath))
-                {
-                    candidates.Add(fullPath);
-                }
-            }
-            catch
-            {
-                // Ignore malformed PATH or CC_PYTHON entries.
-            }
-        }
-    }
-
-    private static string BuildPythonModuleImportScript(IReadOnlyList<PythonModuleRequirement> requirements)
-    {
-        var packageLines = string.Join(
-            "\n",
-            requirements.Select(requirement => $"    ({EscapePythonString(requirement.DisplayName)}, {EscapePythonString(requirement.ModuleName)}),"));
-
-        return $$"""
-import importlib
-import sys
-
-packages = [
-{{packageLines}}
-]
-errors = []
-for name, module in packages:
-    try:
-        importlib.import_module(module)
-    except ModuleNotFoundError as exc:
-        if exc.name == module or module.startswith(exc.name + "."):
-            errors.append(f"Missing {name}")
-        else:
-            errors.append(f"{name}: {type(exc).__name__}: {exc}")
-    except Exception as exc:
-        errors.append(f"{name}: {type(exc).__name__}: {exc}")
-if errors:
-    print("; ".join(errors))
-    sys.exit(1)
-print(sys.executable)
-""";
-    }
-
-    private static string EscapePythonString(string value)
-    {
-        return "\"" + value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
     }
 
     private static async Task<LocalLlmImageGenerationResult> GenerateImageWithStableDiffusionCppAsync(
