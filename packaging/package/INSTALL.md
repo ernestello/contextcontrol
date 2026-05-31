@@ -48,7 +48,7 @@ Current autosetup coverage:
 
 FLUX.2 Klein Diffusers is much larger than Tiny Stable Diffusion. Its first run downloads roughly 15-16 GB of Diffusers pipeline files and can pause on the same Hugging Face percentage while one large shard downloads. The terminal shows the exact prompt, reports whether Hugging Face downloads are authenticated, and prints keepalive status while the download/load step is quiet. For large Hugging Face models, paste a personal token in View -> Settings -> LLMs to avoid anonymous Hub rate limits.
 
-When no HF token is configured, Diffusers model cards show an HF token warning and repeat it before download/generation. Open View -> Settings -> LLMs -> Tutorial for the guided Hugging Face token steps, then paste the token in the HF token field. A Read token or fine-grained token with read access is enough for model downloads.
+When no HF token is configured, Diffusers model cards show an HF token warning and repeat it before download/generation. Open View -> Settings -> LLMs -> Tutorial for the guided Hugging Face token steps, then paste the token in the visible HF token field. A Read token or fine-grained token with read access is enough for model downloads.
 
 HF token warnings currently apply to these Diffusers routes: `runwayml/stable-diffusion-v1-5`, `stabilityai/stable-diffusion-2-1-base`, `segmind/tiny-sd`, `nota-ai/bk-sdm-small`, `SimianLuo/LCM_Dreamshaper_v7`, `stabilityai/sd-turbo`, `segmind/SSD-1B`, and `black-forest-labs/FLUX.2-klein-4B`.
 

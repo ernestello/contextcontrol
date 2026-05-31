@@ -67,7 +67,6 @@
                       <TextBox
                           Grid.Column="1"
                           Classes="rule-add"
-                          PasswordChar="*"
                           Text="{Binding ContextControl.HuggingFaceToken, Mode=TwoWay}"
                           Watermark="hf_..." />
                     </Grid>

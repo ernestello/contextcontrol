@@ -143,7 +143,7 @@ Image generation status:
 - 8 use Diffusers and expose a model-card **Download** action for Hugging Face weights after the Diffusers dependency is ready; first generation can still fill any missing cache files. This includes the Windows/Linux-capable `black-forest-labs/FLUX.2-klein-4B` route for FLUX.2 Klein. Its first run is large: ContextControl now downloads only the Diffusers pipeline files, but that is still roughly 15-16 GB and the Hugging Face file counter can sit on one percentage while a multi-GB shard downloads. Add a personal Hugging Face token in **View -> Settings -> LLMs** to avoid anonymous Hub rate limits during large downloads.
 - 2 use stable-diffusion.cpp and still need the user to point `CC_IMAGE_MODEL_PATH` at a local GGUF diffusion model file.
 
-When no HF token is configured, ContextControl warns on each Hugging Face-backed Diffusers model card, logs a warning when one becomes the selected image-generation model, and repeats the warning before model download/generation. **View -> Settings -> LLMs** contains the token field and a **Tutorial** button with the exact steps for creating a Read or fine-grained read token from the Hugging Face Access Tokens page.
+When no HF token is configured, ContextControl warns on each Hugging Face-backed Diffusers model card, logs a warning when one becomes the selected image-generation model, and repeats the warning before model download/generation. **View -> Settings -> LLMs** contains a visible token field and a **Tutorial** button with the exact steps for creating a Read or fine-grained read token from the Hugging Face Access Tokens page.
 
 HF token warnings currently apply to these Diffusers routes:
 
