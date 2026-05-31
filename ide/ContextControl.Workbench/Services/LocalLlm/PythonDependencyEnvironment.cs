@@ -38,7 +38,8 @@ internal static class PythonDependencyEnvironment
                 ["accelerate"] = "accelerate",
                 ["safetensors"] = "safetensors",
                 ["Pillow"] = "PIL"
-            }),
+            },
+            ["torch", "diffusers>=0.38.0", "huggingface-hub", "transformers", "accelerate", "safetensors", "pillow"]),
         new(
             "transformers",
             "Hugging Face Transformers",
@@ -472,6 +473,11 @@ print(sys.executable)
             : BuildPythonModuleImportScript(packagesToModules);
     }
 
+    public static string BuildFlux2KleinHealthScript(IReadOnlyDictionary<string, string> packagesToModules)
+    {
+        return BuildDiffusersHealthScript(packagesToModules, requireFlux2KleinPipeline: true);
+    }
+
     public static string BuildPythonModuleProbeScript(IReadOnlyDictionary<string, string> packagesToModules)
     {
         var packageLines = string.Join(
@@ -500,11 +506,21 @@ print(sys.executable)
 """;
     }
 
-    private static string BuildDiffusersHealthScript(IReadOnlyDictionary<string, string> packagesToModules)
+    private static string BuildDiffusersHealthScript(
+        IReadOnlyDictionary<string, string> packagesToModules,
+        bool requireFlux2KleinPipeline = false)
     {
         var packageLines = string.Join(
             "\n",
             packagesToModules.Select(pair => $"    ({EscapePythonString(pair.Key)}, {EscapePythonString(pair.Value)}),"));
+        var flux2KleinCheck = requireFlux2KleinPipeline
+            ? """
+
+diffusers = loaded.get("diffusers")
+if diffusers is not None and not hasattr(diffusers, "Flux2KleinPipeline"):
+    errors.append("Missing Flux2KleinPipeline in diffusers; reinstall Hugging Face Diffusers from ContextControl Dependencies.")
+"""
+            : "";
 
         return $$"""
 import importlib
@@ -533,10 +549,7 @@ if torch is not None:
         _ = torch.cuda.is_available()
     except Exception as exc:
         errors.append(f"PyTorch runtime check failed: {type(exc).__name__}: {exc}")
-
-diffusers = loaded.get("diffusers")
-if diffusers is not None and not hasattr(diffusers, "Flux2KleinPipeline"):
-    errors.append("Missing Flux2KleinPipeline in diffusers; reinstall Hugging Face Diffusers from ContextControl Dependencies.")
+{{flux2KleinCheck}}
 
 if errors:
     print("; ".join(errors))

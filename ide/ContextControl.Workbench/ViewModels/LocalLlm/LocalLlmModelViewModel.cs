@@ -283,4 +283,10 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
         FitDetail = fit.Detail;
     }
 
+    public void MarkUninstalled()
+    {
+        IsInstalled = false;
+        IsAvailable = RequiresManualBackend ? CanUseManualBackend : false;
+    }
+
 }

@@ -115,7 +115,11 @@ public sealed partial class ContextControlViewModel
 
                 if (result.Succeeded)
                 {
-                    await RefreshLocalModelsAsync();
+                    model.MarkUninstalled();
+                    RefreshInstalledLocalModels();
+                    ApplyLocalLlmFilters();
+                    RaiseCommandStates();
+                    await RefreshLocalModelInstallStateAsync();
                 }
             });
         }
@@ -198,7 +202,7 @@ public sealed partial class ContextControlViewModel
         await InstallBackendDependencyAsync(dependency);
     }
 
-    private void ApplyLocalModelRefresh(LocalLlmRefreshResult result)
+    private void ApplyLocalModelRefresh(LocalLlmRefreshResult result, bool preserveBackendModelStates = false)
     {
         foreach (var unknownModelId in result.UnknownInstalledModelIds)
         {
@@ -218,10 +222,13 @@ public sealed partial class ContextControlViewModel
         {
             var isInstalled = result.InstalledModelIds.Contains(model.Id);
             var isBackendDependencyReady = IsModelBackendDependencyReady(model);
+            var isBackendModelReady = preserveBackendModelStates && model.UsesDownloadableBackendModel
+                ? model.IsBackendModelReady
+                : false;
             var isAvailable = isInstalled
                 || (model.IsCloudModel && result.OllamaReachable)
                 || (model.IsImageGenerationModel && model.RequiresManualBackend && isBackendDependencyReady);
-            model.ApplyState(isInstalled, isAvailable, result.Hardware, isBackendDependencyReady);
+            model.ApplyState(isInstalled, isAvailable, result.Hardware, isBackendDependencyReady, isBackendModelReady);
         }
 
         RefreshLocalLlmProviderFilters();

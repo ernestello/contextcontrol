@@ -35,10 +35,10 @@ public sealed partial class ContextControlViewModel
             await Task.Yield();
             var refreshTask = _localLlmService.RefreshAsync(progress, cancellationToken);
             var dependencyStatusTask = DetectBackendDependencyStatusesAsync(cancellationToken, progress);
-            await Task.WhenAll(refreshTask, dependencyStatusTask);
-            cancellationToken.ThrowIfCancellationRequested();
             var result = await refreshTask;
+            ReportRefreshProgress(progress, "Validating dependency runtimes.", 62);
             var dependencyStatuses = await dependencyStatusTask;
+            cancellationToken.ThrowIfCancellationRequested();
             ReportRefreshProgress(progress, "Applying local role delegation.", 88);
             HardwareSummary = result.Hardware.Summary;
             LocalLlmStatus = result.Status;
@@ -70,6 +70,28 @@ public sealed partial class ContextControlViewModel
         {
             IsRefreshingLocalModels = false;
             refreshCancellation.Dispose();
+        }
+    }
+
+    private async Task RefreshLocalModelInstallStateAsync()
+    {
+        using var refreshTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(12));
+        try
+        {
+            var result = await _localLlmService.RefreshAsync(refreshTimeout.Token);
+            HardwareSummary = result.Hardware.Summary;
+            LocalLlmStatus = result.Status;
+            IsOllamaInstalled = result.OllamaInstalled;
+            ApplyLocalModelRefresh(result, preserveBackendModelStates: true);
+            AppendTerminalOutput($"Installed model IDs: {string.Join(", ", result.InstalledModelIds.OrderBy(id => id, StringComparer.OrdinalIgnoreCase))}");
+        }
+        catch (OperationCanceledException)
+        {
+            AppendTerminalOutput("Model install-state refresh timed out after uninstall. Press Refresh to scan again.");
+        }
+        catch (Exception ex)
+        {
+            AppendTerminalOutput($"Model install-state refresh failed after uninstall: {ex.Message}");
         }
     }
 

@@ -97,14 +97,32 @@ public sealed partial class LocalLlmService
             throw new OperationCanceledException(cancellationToken);
         }
 
-        return result.ExitCode == 0
-            ? new LocalLlmChatResult(true, $"Uninstalled {modelId}.")
-            : new LocalLlmChatResult(false, FirstLine(result.StandardError) ?? FirstLine(result.StandardOutput) ?? $"ollama rm exited {result.ExitCode}.");
+        if (result.ExitCode == 0)
+        {
+            return new LocalLlmChatResult(true, $"Uninstalled {modelId}.");
+        }
+
+        var failureText = $"{result.StandardError}\n{result.StandardOutput}";
+        if (LooksLikeModelAlreadyRemoved(failureText))
+        {
+            return new LocalLlmChatResult(true, $"{modelId} was already removed.");
+        }
+
+        return new LocalLlmChatResult(false, FirstLine(result.StandardError) ?? FirstLine(result.StandardOutput) ?? $"ollama rm exited {result.ExitCode}.");
     }
 
     public Task<LocalLlmChatResult> InstallOllamaAsync(CancellationToken cancellationToken = default)
     {
         return InstallOllamaAsync(null, null, cancellationToken);
+    }
+
+    private static bool LooksLikeModelAlreadyRemoved(string text)
+    {
+        var clean = text.ToLowerInvariant();
+        return clean.Contains("not found", StringComparison.Ordinal)
+            || clean.Contains("no such model", StringComparison.Ordinal)
+            || clean.Contains("does not exist", StringComparison.Ordinal)
+            || clean.Contains("model not installed", StringComparison.Ordinal);
     }
 
     public async Task<LocalLlmChatResult> InstallOllamaAsync(

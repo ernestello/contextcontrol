@@ -31,7 +31,10 @@ public sealed partial class LocalLlmService
             return new LocalLlmChatResult(false, $"{modelId} does not have a ContextControl-managed model downloader yet.");
         }
 
-        var pythonResolution = await ResolvePythonForModulesAsync(DiffusersPythonRequirements, cancellationToken).ConfigureAwait(false);
+        var pythonResolution = await ResolvePythonForModulesAsync(
+            DiffusersPythonRequirements,
+            cancellationToken,
+            requireFlux2KleinPipeline: IsFlux2KleinDiffusersModel(modelId)).ConfigureAwait(false);
         if (!pythonResolution.Succeeded || pythonResolution.Executable is null)
         {
             return new LocalLlmChatResult(false, pythonResolution.Status);
@@ -177,6 +180,10 @@ print(f"Cached model at {path}")
 import sys
 from huggingface_hub import snapshot_download
 
+def is_flux2_klein(model_id):
+    clean = model_id.lower()
+    return "flux.2-klein" in clean or "flux2-klein" in clean
+
 def flux2_klein_allow_patterns():
     return [
         "model_index.json",
@@ -188,13 +195,14 @@ def flux2_klein_allow_patterns():
     ]
 
 def allow_patterns_for(model_id):
-    clean = model_id.lower()
-    if "flux.2-klein" in clean or "flux2-klein" in clean:
+    if is_flux2_klein(model_id):
         return flux2_klein_allow_patterns()
     return None
 
 for model_id in sys.argv[1:]:
     try:
+        if is_flux2_klein(model_id):
+            from diffusers import Flux2KleinPipeline
         snapshot_download(repo_id=model_id, local_files_only=True, allow_patterns=allow_patterns_for(model_id))
     except Exception:
         continue
@@ -346,7 +354,10 @@ for model_id in sys.argv[1:]:
         IProgress<string>? terminal,
         CancellationToken cancellationToken)
     {
-        var pythonResolution = await ResolvePythonForModulesAsync(DiffusersPythonRequirements, cancellationToken).ConfigureAwait(false);
+        var pythonResolution = await ResolvePythonForModulesAsync(
+            DiffusersPythonRequirements,
+            cancellationToken,
+            requireFlux2KleinPipeline: IsFlux2KleinDiffusersModel(modelId)).ConfigureAwait(false);
         if (!pythonResolution.Succeeded || pythonResolution.Executable is null)
         {
             return new LocalLlmImageGenerationResult(false, pythonResolution.Status, [], resolvedOutputDirectory);
@@ -529,7 +540,8 @@ finally:
     private static async Task<PythonExecutableResolution> ResolvePythonForModulesAsync(
         IReadOnlyList<PythonModuleRequirement> requirements,
         CancellationToken cancellationToken,
-        TimeSpan? validationTimeout = null)
+        TimeSpan? validationTimeout = null,
+        bool requireFlux2KleinPipeline = false)
     {
         var candidates = PythonDependencyEnvironment
             .FindPythonCandidatesForDetection("diffusers", includePathCandidates: false)
@@ -541,9 +553,13 @@ finally:
         }
 
         var failures = new List<string>();
-        var script = PythonDependencyEnvironment.BuildPythonDependencyHealthScript(
-            "diffusers",
-            requirements.ToDictionary(requirement => requirement.DisplayName, requirement => requirement.ModuleName, StringComparer.OrdinalIgnoreCase));
+        var packagesToModules = requirements.ToDictionary(
+            requirement => requirement.DisplayName,
+            requirement => requirement.ModuleName,
+            StringComparer.OrdinalIgnoreCase);
+        var script = requireFlux2KleinPipeline
+            ? PythonDependencyEnvironment.BuildFlux2KleinHealthScript(packagesToModules)
+            : PythonDependencyEnvironment.BuildPythonDependencyHealthScript("diffusers", packagesToModules);
         var timeout = validationTimeout ?? DiffusersPythonProbeValidationTimeout;
         foreach (var candidate in candidates)
         {
@@ -573,9 +589,12 @@ finally:
         }
 
         var firstFailure = failures.FirstOrDefault();
+        var runtimeName = requireFlux2KleinPipeline
+            ? "ContextControl's managed Diffusers runtime for FLUX.2 Klein"
+            : "ContextControl's managed Diffusers runtime";
         var status = firstFailure is null
-            ? "ContextControl's managed Diffusers runtime could not be validated."
-            : $"ContextControl's managed Diffusers runtime is not ready. First failure: {firstFailure}";
+            ? $"{runtimeName} could not be validated."
+            : $"{runtimeName} is not ready. First failure: {firstFailure}";
         return PythonExecutableResolution.Failed(status);
     }
 
@@ -718,7 +737,7 @@ finally:
                 || lower.Contains("importerror", StringComparison.Ordinal) && lower.Contains("flux2kleinpipeline", StringComparison.Ordinal)
                 || lower.Contains("attributeerror", StringComparison.Ordinal) && lower.Contains("flux2kleinpipeline", StringComparison.Ordinal)))
         {
-            return "The installed Diffusers package does not include Flux2KleinPipeline yet. Force reinstall the Hugging Face Diffusers dependency in ContextControl, then download the FLUX.2 Klein Diffusers model again.";
+            return "The installed Diffusers package does not include Flux2KleinPipeline yet. Reinstall Hugging Face Diffusers from ContextControl Dependencies so the managed venv upgrades to a Klein-capable Diffusers version, then download the FLUX.2 Klein Diffusers model again.";
         }
 
         return reason;

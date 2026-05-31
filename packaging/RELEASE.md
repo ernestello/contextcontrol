@@ -29,13 +29,13 @@ The zip is kept as a local portable payload and smoke-test artifact. It includes
 Quiet install smoke test:
 
 ```powershell
-.\.tmp\release\ContextControl-win-x64-Setup.exe /quiet /installDir="$env:TEMP\ContextControlSetupTest" /noLaunch /noStartMenu
+Start-Process -FilePath .\.tmp\release\ContextControl-win-x64-Setup.exe -ArgumentList @('/quiet', "/installDir=$env:TEMP\ContextControlSetupTest", '/noLaunch', '/noStartMenu') -Wait
 ```
 
 Quiet uninstall smoke test:
 
 ```powershell
-& "$env:TEMP\ContextControlSetupTest\ContextControl.Uninstall.exe" /uninstall /quiet
+Start-Process -FilePath "$env:TEMP\ContextControlSetupTest\ContextControl.Uninstall.exe" -ArgumentList @('/uninstall','/quiet') -Wait
 ```
 
 No LLM weights, dependency runtimes, chat history, source files, tests, or build folders are bundled. The app installs dependencies and downloads local LLMs from inside the Dependencies and Local LLM pages.
@@ -52,11 +52,13 @@ Current app-side autosetup coverage documented in the README and packaged instal
 - 28/302 catalog entries are Ollama Cloud entries with no local weight download
 - 13/13 image-generation catalog entries have a route; 3 experimental Ollama image entries are macOS-only and disabled on Windows/Linux, and FLUX.2 Klein 4B has a Windows-capable Diffusers route
 
-FLUX.2 Klein Diffusers first-run downloads are large. The app downloads only the Diffusers pipeline files instead of the duplicate single-file checkpoint, echoes the exact image prompt in the terminal, reports whether Hugging Face downloads are authenticated, prints keepalive status while Hugging Face is quiet on a multi-GB shard, and gives FLUX.2 a longer first-run timeout. Users can paste a personal Hugging Face token in View -> Settings -> LLMs; ContextControl passes it as `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN` to Diffusers subprocesses.
+FLUX.2 Klein Diffusers first-run downloads are large. The app downloads only the Diffusers pipeline files instead of the duplicate single-file checkpoint, fresh Diffusers installs request `diffusers>=0.38.0`, the terminal echoes the exact image prompt, authenticated Hugging Face download state is shown, keepalive status is printed while Hugging Face is quiet on a multi-GB shard, and FLUX.2 gets a longer first-run timeout. Users can paste a personal Hugging Face token in View -> Settings -> LLMs; ContextControl passes it as `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN` to Diffusers subprocesses.
 
 HF token guidance is visible in the app. Diffusers model cards show an HF token warning while no token is configured, selecting a Hugging Face-backed image model logs the warning, and View -> Settings -> LLMs includes a visible token field plus a Tutorial button that opens a step-by-step token window. The warning applies to the 8 Hugging Face-backed Diffusers routes: `runwayml/stable-diffusion-v1-5`, `stabilityai/stable-diffusion-2-1-base`, `segmind/tiny-sd`, `nota-ai/bk-sdm-small`, `SimianLuo/LCM_Dreamshaper_v7`, `stabilityai/sd-turbo`, `segmind/SSD-1B`, and `black-forest-labs/FLUX.2-klein-4B`.
 
-Diffusers runtime validation is now strict and managed-only. ContextControl ignores external Python environments for Diffusers generation, validates the managed venv by importing PyTorch, Diffusers, and the FLUX.2 Klein pipeline before model download/cache detection/generation, and keeps Diffusers image models out of the prompt selector until the dependency and model cache both validate. Repair deletes only `%LOCALAPPDATA%\ContextControl\dependencies\python\diffusers` and recreates the managed venv.
+Diffusers runtime validation is managed-only and split by capability. ContextControl ignores external Python environments for Diffusers generation, validates the shared managed venv by importing PyTorch and common Diffusers packages, then checks `Flux2KleinPipeline` only for the FLUX.2 Klein Diffusers model. A Klein-only pipeline issue no longer hides Tiny Stable Diffusion or other SD/LCM Diffusers entries. Repair deletes only `%LOCALAPPDATA%\ContextControl\dependencies\python\diffusers` and recreates the managed venv.
+
+Ollama model uninstall no longer waits on the full dependency scan after `ollama rm`. The app marks the model removed, runs a short install-state refresh, preserves cached Diffusers readiness, and treats "already removed" Ollama responses as successful cleanup.
 
 Fresh Windows Python bootstrap: managed Python dependencies ignore the Microsoft Store `python.exe` alias and install Python 3.12 through `winget` when no real interpreter is present.
 
