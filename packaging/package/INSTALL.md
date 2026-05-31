@@ -46,6 +46,8 @@ Current autosetup coverage:
 - Ollama Cloud entries: 28/302 catalog entries, no local weight download
 - image generation: 13/13 image-generation catalog entries have a route; 3 experimental Ollama image entries are macOS-only and disabled on Windows/Linux, and FLUX.2 Klein 4B has a Windows-capable Diffusers route
 
+FLUX.2 Klein Diffusers is much larger than Tiny Stable Diffusion. Its first run downloads roughly 15-16 GB of Diffusers pipeline files and can pause on the same Hugging Face percentage while one large shard downloads. The terminal shows the exact prompt, reports whether Hugging Face downloads are authenticated, and prints keepalive status while the download/load step is quiet. For large Hugging Face models, paste a personal token in Settings -> LLMs to avoid anonymous Hub rate limits.
+
 On a raw Windows PC, the Microsoft Store `python.exe` app alias is ignored because it is not a real Python interpreter. Python-backed dependencies such as Diffusers automatically install Python 3.12 through `winget` when no usable Python exists, then create a ContextControl-managed virtual environment.
 
 Still partial/WIP after the first install click: LM Studio server enablement, stable-diffusion.cpp GGUF model file selection through `CC_IMAGE_MODEL_PATH`, bitnet.cpp environment/model setup, RWKV model weight flow, CUDA/WSL/server validation for vLLM/SGLang/TensorRT-LLM/ExLlamaV2, and converted model artifacts for ONNX Runtime GenAI/OpenVINO GenAI.

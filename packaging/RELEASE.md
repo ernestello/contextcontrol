@@ -50,6 +50,8 @@ Current app-side autosetup coverage documented in the README and packaged instal
 - 28/302 catalog entries are Ollama Cloud entries with no local weight download
 - 13/13 image-generation catalog entries have a route; 3 experimental Ollama image entries are macOS-only and disabled on Windows/Linux, and FLUX.2 Klein 4B has a Windows-capable Diffusers route
 
+FLUX.2 Klein Diffusers first-run downloads are large. The app downloads only the Diffusers pipeline files instead of the duplicate single-file checkpoint, echoes the exact image prompt in the terminal, reports whether Hugging Face downloads are authenticated, prints keepalive status while Hugging Face is quiet on a multi-GB shard, and gives FLUX.2 a longer first-run timeout. Users can paste a personal Hugging Face token in Settings -> LLMs; ContextControl passes it as `HF_TOKEN` and `HUGGINGFACE_HUB_TOKEN` to Diffusers subprocesses.
+
 Fresh Windows Python bootstrap: managed Python dependencies ignore the Microsoft Store `python.exe` alias and install Python 3.12 through `winget` when no real interpreter is present.
 
 SmartScreen/reputation note: the release script can Authenticode-sign the setup EXE when `CONTEXTCONTROL_SIGNING_PFX_BASE64` and `CONTEXTCONTROL_SIGNING_PFX_PASSWORD` are configured. Unsigned public builds can still show Windows reputation warnings.

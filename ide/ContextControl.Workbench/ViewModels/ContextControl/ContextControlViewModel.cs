@@ -136,6 +136,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
     private string _chatModelId;
     private string _ollamaModelsDirectory;
     private string _ollamaModelsDirectoryStatus;
+    private string _huggingFaceToken;
     private string _selectedLocalLlmSortOption = LlmSortNewest;
     private string _selectedLocalLlmProviderFilter = LlmProviderAll;
     private string _selectedLocalLlmSourceFilter = LlmSourceAll;
@@ -189,6 +190,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
         _chatModelId = settings.ChatModel;
         _ollamaModelsDirectory = LocalLlmService.ResolveOllamaModelsDirectory(settings.OllamaModelsDirectory);
         _ollamaModelsDirectoryStatus = $"Ollama model storage: {_ollamaModelsDirectory}";
+        _huggingFaceToken = settings.HuggingFaceToken;
         _selectedLocalLlmSortOption = NormalizeLocalLlmSortOption(settings.LocalLlmSortOption);
         _selectedLocalLlmProviderFilter = CleanLocalLlmFilter(settings.LocalLlmProviderFilter, LlmProviderAll);
         _selectedLocalLlmSourceFilter = NormalizeLocalLlmSourceFilter(settings.LocalLlmSourceFilter);
@@ -197,6 +199,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
         _selectedLocalLlmContextFilter = NormalizeLocalLlmContextFilter(settings.LocalLlmContextFilter);
         _selectedLocalLlmRequirementFilter = NormalizeLocalLlmRequirementFilter(settings.LocalLlmRequirementFilter);
         LocalLlmService.ApplyOllamaModelsDirectoryToProcess(_ollamaModelsDirectory);
+        LocalLlmService.ApplyHuggingFaceTokenToProcess(_huggingFaceToken);
 
         RouteOptions =
         [

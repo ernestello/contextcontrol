@@ -12,6 +12,10 @@ namespace ContextControl.Workbench.Services;
 
 public sealed partial class LocalLlmService
 {
+    private const string HuggingFaceTokenEnvironmentVariable = "HF_TOKEN";
+    private const string HuggingFaceHubTokenEnvironmentVariable = "HUGGINGFACE_HUB_TOKEN";
+    private const string ContextControlHuggingFaceTokenEnvironmentVariable = "CC_HF_TOKEN";
+
     public static string DefaultOllamaModelsDirectory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ollama", "models");
 
@@ -63,6 +67,55 @@ public sealed partial class LocalLlmService
     {
         var resolved = ResolveOllamaModelsDirectory(directory);
         Environment.SetEnvironmentVariable(OllamaModelsEnvironmentVariable, resolved, EnvironmentVariableTarget.Process);
+    }
+
+    public static void ApplyHuggingFaceTokenToProcess(string? configuredToken)
+    {
+        var token = ResolveHuggingFaceToken(configuredToken);
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            return;
+        }
+
+        Environment.SetEnvironmentVariable(HuggingFaceTokenEnvironmentVariable, token, EnvironmentVariableTarget.Process);
+        Environment.SetEnvironmentVariable(HuggingFaceHubTokenEnvironmentVariable, token, EnvironmentVariableTarget.Process);
+    }
+
+    public static string ResolveHuggingFaceTokenStatus(string? configuredToken)
+    {
+        if (!string.IsNullOrWhiteSpace(NormalizeHuggingFaceToken(configuredToken)))
+        {
+            return "Hugging Face token saved locally; Diffusers downloads use authenticated requests.";
+        }
+
+        return string.IsNullOrWhiteSpace(ResolveHuggingFaceToken(null))
+            ? "No Hugging Face token set; large Diffusers downloads use anonymous rate limits."
+            : "Using Hugging Face token from environment for Diffusers downloads.";
+    }
+
+    private static string ResolveHuggingFaceToken(string? configuredToken)
+    {
+        var configured = NormalizeHuggingFaceToken(configuredToken);
+        if (!string.IsNullOrWhiteSpace(configured))
+        {
+            return configured;
+        }
+
+        foreach (var name in new[]
+                 {
+                     HuggingFaceTokenEnvironmentVariable,
+                     HuggingFaceHubTokenEnvironmentVariable,
+                     ContextControlHuggingFaceTokenEnvironmentVariable
+                 })
+        {
+            var token = NormalizeHuggingFaceToken(Environment.GetEnvironmentVariable(name));
+            if (!string.IsNullOrWhiteSpace(token))
+            {
+                return token;
+            }
+        }
+
+        return "";
     }
 
     private static LocalLlmCatalogModel CatalogModel(
@@ -117,6 +170,13 @@ public sealed partial class LocalLlmService
         {
             return expanded;
         }
+    }
+
+    private static string NormalizeHuggingFaceToken(string? token)
+    {
+        return string.IsNullOrWhiteSpace(token)
+            ? ""
+            : token.Trim();
     }
 
 }

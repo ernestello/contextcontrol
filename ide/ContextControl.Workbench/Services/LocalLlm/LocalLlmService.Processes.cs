@@ -297,6 +297,7 @@ public sealed partial class LocalLlmService
     private static string CleanProgressText(string text)
     {
         return AnsiRegex.Replace(text ?? "", "")
+            .Replace('\r', '\n')
             .Replace('\b', ' ')
             .Trim();
     }

@@ -346,4 +346,22 @@ public sealed partial class ContextControlViewModel
         }
     }
 
+    public string HuggingFaceToken
+    {
+        get => _huggingFaceToken;
+        set
+        {
+            var clean = string.IsNullOrWhiteSpace(value) ? "" : value.Trim();
+            if (SetProperty(ref _huggingFaceToken, clean))
+            {
+                _settings.HuggingFaceToken = clean;
+                LocalLlmService.ApplyHuggingFaceTokenToProcess(clean);
+                OnPropertyChanged(nameof(HuggingFaceTokenStatus));
+                SaveSettingsQuietly();
+            }
+        }
+    }
+
+    public string HuggingFaceTokenStatus => LocalLlmService.ResolveHuggingFaceTokenStatus(_huggingFaceToken);
+
 }

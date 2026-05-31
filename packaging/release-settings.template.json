@@ -26,6 +26,7 @@
   "PatchReviewModel": "phi4-mini",
   "ChatModel": "qwen2.5-coder:3b",
   "OllamaModelsDirectory": "",
+  "HuggingFaceToken": "",
   "LocalLlmSortOption": "Newest",
   "LocalLlmProviderFilter": "All providers",
   "LocalLlmSourceFilter": "Local",

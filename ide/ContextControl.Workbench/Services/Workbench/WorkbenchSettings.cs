@@ -41,6 +41,7 @@ public sealed class WorkbenchSettings
         string patchReviewModel,
         string chatModel,
         string ollamaModelsDirectory,
+        string huggingFaceToken,
         string localLlmSortOption,
         string localLlmProviderFilter,
         string localLlmSourceFilter,
@@ -89,6 +90,7 @@ public sealed class WorkbenchSettings
         PatchReviewModel = NormalizeModelId(patchReviewModel, "phi4-mini");
         ChatModel = NormalizeModelId(chatModel, "qwen2.5-coder:3b");
         OllamaModelsDirectory = NormalizeDirectoryPath(ollamaModelsDirectory);
+        HuggingFaceToken = NormalizeToken(huggingFaceToken);
         LocalLlmSortOption = NormalizeLocalLlmFilter(localLlmSortOption, "Newest");
         LocalLlmProviderFilter = NormalizeLocalLlmFilter(localLlmProviderFilter, "All providers");
         LocalLlmSourceFilter = NormalizeLocalLlmFilter(localLlmSourceFilter, "All");
@@ -138,6 +140,7 @@ public sealed class WorkbenchSettings
     public string PatchReviewModel { get; set; }
     public string ChatModel { get; set; }
     public string OllamaModelsDirectory { get; set; }
+    public string HuggingFaceToken { get; set; }
     public string LocalLlmSortOption { get; set; }
     public string LocalLlmProviderFilter { get; set; }
     public string LocalLlmSourceFilter { get; set; }
@@ -206,6 +209,7 @@ public sealed class WorkbenchSettings
             data.PatchReviewModel ?? "phi4-mini",
             data.ChatModel ?? "qwen2.5-coder:3b",
             data.OllamaModelsDirectory ?? ResolveDefaultOllamaModelsDirectory(),
+            data.HuggingFaceToken ?? "",
             data.LocalLlmSortOption ?? "Newest",
             data.LocalLlmProviderFilter ?? "All providers",
             data.LocalLlmSourceFilter ?? "All",
@@ -263,6 +267,7 @@ public sealed class WorkbenchSettings
             PatchReviewModel = NormalizeModelId(PatchReviewModel, "phi4-mini"),
             ChatModel = NormalizeModelId(ChatModel, "qwen2.5-coder:3b"),
             OllamaModelsDirectory = NormalizeDirectoryPath(OllamaModelsDirectory),
+            HuggingFaceToken = string.IsNullOrWhiteSpace(HuggingFaceToken) ? null : NormalizeToken(HuggingFaceToken),
             LocalLlmSortOption = NormalizeLocalLlmFilter(LocalLlmSortOption, "Newest"),
             LocalLlmProviderFilter = NormalizeLocalLlmFilter(LocalLlmProviderFilter, "All providers"),
             LocalLlmSourceFilter = NormalizeLocalLlmFilter(LocalLlmSourceFilter, "All"),
@@ -389,6 +394,11 @@ public sealed class WorkbenchSettings
     private static string NormalizeModelId(string? modelId, string fallback)
     {
         return string.IsNullOrWhiteSpace(modelId) ? fallback : modelId.Trim();
+    }
+
+    private static string NormalizeToken(string? token)
+    {
+        return string.IsNullOrWhiteSpace(token) ? "" : token.Trim();
     }
 
     private static string NormalizeLocalLlmFilter(string? value, string fallback)
@@ -522,6 +532,7 @@ public sealed class WorkbenchSettings
         public string? PatchReviewModel { get; set; }
         public string? ChatModel { get; set; }
         public string? OllamaModelsDirectory { get; set; }
+        public string? HuggingFaceToken { get; set; }
         public string? LocalLlmSortOption { get; set; }
         public string? LocalLlmProviderFilter { get; set; }
         public string? LocalLlmSourceFilter { get; set; }

@@ -155,7 +155,7 @@ public sealed partial class LocalLlmService
             "FLUX.2 Klein 4B Diffusers",
             "Jan 2026",
             BlackForestIconSource,
-            "~13 GB FP16/BF16 files",
+            "~15-16 GB Diffusers cache; 13 GB VRAM target",
             "Apache 2.0",
             "8 GB VRAM with CPU offload; 13 GB VRAM recommended",
             "-",

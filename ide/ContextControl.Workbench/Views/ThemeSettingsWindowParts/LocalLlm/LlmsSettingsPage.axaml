@@ -48,6 +48,28 @@
                 </Border>
 
                 <Border Classes="rule-card">
+                  <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="7">
+                    <StackPanel>
+                      <TextBlock Classes="settings-title" Text="Hugging Face token" />
+                      <TextBlock Classes="muted" Text="{Binding ContextControl.HuggingFaceTokenStatus}" />
+                    </StackPanel>
+                    <Grid Grid.Row="1" ColumnDefinitions="180,*" ColumnSpacing="10">
+                      <TextBlock Classes="field-label" Text="HF token" VerticalAlignment="Center" />
+                      <TextBox
+                          Grid.Column="1"
+                          Classes="rule-add"
+                          PasswordChar="*"
+                          Text="{Binding ContextControl.HuggingFaceToken, Mode=TwoWay}"
+                          Watermark="hf_..." />
+                    </Grid>
+                    <TextBlock
+                        Grid.Row="2"
+                        Classes="path-text"
+                        Text="Used as HF_TOKEN/HUGGINGFACE_HUB_TOKEN for Diffusers model downloads and first-run generation." />
+                  </Grid>
+                </Border>
+
+                <Border Classes="rule-card">
                   <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="8">
                     <Grid ColumnDefinitions="180,*" ColumnSpacing="10">
                       <TextBlock Classes="field-label" Text="File request model" VerticalAlignment="Center" />
