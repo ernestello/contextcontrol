@@ -17,6 +17,24 @@
               <Grid RowDefinitions="Auto,*" RowSpacing="8">
                 <Border Classes="scanner-metric-strip">
                   <WrapPanel HorizontalAlignment="Center">
+                    <Border Classes="scanner-metric" Width="220">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Codex Instructions" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.SkillbookCodexSummary}" />
+                      </Grid>
+                    </Border>
+                    <Border Classes="scanner-metric" Width="220">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Skillflow" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.SkillbookSkillflowSummary}" />
+                      </Grid>
+                    </Border>
+                    <Border Classes="scanner-metric" Width="260">
+                      <Grid RowDefinitions="Auto,*" RowSpacing="0">
+                        <TextBlock Classes="scanner-metric-key" Text="Project + Global" />
+                        <TextBlock Grid.Row="1" Classes="scanner-metric-value" Text="{Binding ContextControl.SkillbookUserSummary}" />
+                      </Grid>
+                    </Border>
                     <Border Classes="scanner-metric" Width="360" ToolTip.Tip="{Binding ContextControl.SkillbookProjectPath}">
                       <Grid RowDefinitions="Auto,*" RowSpacing="0">
                         <TextBlock Classes="scanner-metric-key" Text="Project Skillbook" />

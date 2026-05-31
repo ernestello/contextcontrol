@@ -11,6 +11,7 @@ public sealed partial class LocalLlmChatMessageViewModel : ObservableObject
 {
     private readonly string _rawText;
     private bool _isThinkingExpanded;
+    private bool _isDiagnosticExpanded;
 
     public LocalLlmChatMessageViewModel(
         string role,
@@ -104,9 +105,20 @@ public sealed partial class LocalLlmChatMessageViewModel : ObservableObject
         set => SetProperty(ref _isThinkingExpanded, value);
     }
 
+    public bool IsDiagnosticExpanded
+    {
+        get => _isDiagnosticExpanded;
+        set => SetProperty(ref _isDiagnosticExpanded, value);
+    }
+
     public void ToggleThinking()
     {
         IsThinkingExpanded = !IsThinkingExpanded;
+    }
+
+    public void ToggleDiagnostic()
+    {
+        IsDiagnosticExpanded = !IsDiagnosticExpanded;
     }
 
     private static ParsedMessage ParseMessage(string text)

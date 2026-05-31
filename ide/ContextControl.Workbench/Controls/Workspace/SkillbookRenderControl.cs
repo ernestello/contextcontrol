@@ -31,6 +31,8 @@ public sealed class SkillbookRenderControl : Control
     private const double HorizontalInset = 2.0;
     private const double EstimatedEntryHeight = 190.0;
     private const double EntryGap = 7.0;
+    private const double SectionHeaderHeight = 28.0;
+    private const double SectionHeaderGap = 5.0;
     private const double CardPaddingX = 8.0;
     private const double CardPaddingY = 7.0;
     private const double HeaderHeight = 32.0;
@@ -196,13 +198,13 @@ public sealed class SkillbookRenderControl : Control
             return layout;
         }
 
-        layout = BuildLayout(items[index]);
+        layout = BuildLayout(index, items[index]);
         _layouts[index] = layout;
         SetMeasuredHeight(index, layout.Height);
         return layout;
     }
 
-    private EntryLayout BuildLayout(SkillbookEntryViewModel entry)
+    private EntryLayout BuildLayout(int index, SkillbookEntryViewModel entry)
     {
         var width = Math.Max(1.0, _layoutWidth);
         var cardWidth = Math.Max(0.0, width - HorizontalInset * 2.0 - 2.0);
@@ -210,19 +212,26 @@ public sealed class SkillbookRenderControl : Control
         var codeFont = ResolveFontFamily(CodeFontFamily, Resource("CodeFontFamily", DefaultCodeFontFamily));
         var bodyLines = WrapLines(NormalizeText(entry.Text), contentWidth, codeFont, FontWeight.Normal, FontStyle.Normal, BodyFontSize);
         var bodyHeight = Math.Max(BodyLineHeight, bodyLines.Count * BodyLineHeight);
+        var sectionTitle = ResolveSectionTitle(index, entry);
+        var sectionHeight = string.IsNullOrWhiteSpace(sectionTitle) ? 0.0 : SectionHeaderHeight + SectionHeaderGap;
         var cardHeight = CardPaddingY + HeaderHeight + bodyHeight + CardPaddingY;
         return new EntryLayout(
             entry,
-            new Rect(HorizontalInset, 0, cardWidth, cardHeight),
-            new Rect(HorizontalInset + CardPaddingX, CardPaddingY + HeaderHeight, contentWidth, bodyHeight),
+            sectionTitle,
+            string.IsNullOrWhiteSpace(sectionTitle)
+                ? new Rect()
+                : new Rect(HorizontalInset, 0, cardWidth, SectionHeaderHeight),
+            new Rect(HorizontalInset, sectionHeight, cardWidth, cardHeight),
+            new Rect(HorizontalInset + CardPaddingX, sectionHeight + CardPaddingY + HeaderHeight, contentWidth, bodyHeight),
             bodyLines,
-            cardHeight + EntryGap);
+            sectionHeight + cardHeight + EntryGap);
     }
 
     private void DrawEntry(DrawingContext context, EntryLayout layout, double rowTop, double viewportTop, double viewportBottom)
     {
         var uiFont = ResolveFontFamily(UiFontFamily, Resource("UiFontFamily", DefaultUiFontFamily));
         var codeFont = ResolveFontFamily(CodeFontFamily, Resource("CodeFontFamily", DefaultCodeFontFamily));
+        DrawSectionHeader(context, layout, rowTop, viewportTop, viewportBottom);
         var card = OffsetY(layout.CardRect, rowTop);
         context.DrawRectangle(Resource("CommandBackgroundBrush", CommandBackgroundFallbackBrush), new Pen(Resource("PanelBorderBrush", PanelBorderFallbackBrush), 1), card, 5, 5);
 
@@ -235,6 +244,27 @@ public sealed class SkillbookRenderControl : Control
         DrawCenteredText(context, layout.Entry.SourceLabel, sourceRect, codeFont, 8.0, FontWeight.Black, Resource("AccentBrush", AccentFallbackBrush), 16);
 
         DrawBody(context, layout, rowTop, viewportTop, viewportBottom);
+    }
+
+    private void DrawSectionHeader(DrawingContext context, EntryLayout layout, double rowTop, double viewportTop, double viewportBottom)
+    {
+        if (string.IsNullOrWhiteSpace(layout.SectionTitle))
+        {
+            return;
+        }
+
+        var rect = OffsetY(layout.SectionRect, rowTop);
+        if (rect.Bottom < viewportTop || rect.Y > viewportBottom)
+        {
+            return;
+        }
+
+        var uiFont = ResolveFontFamily(UiFontFamily, Resource("UiFontFamily", DefaultUiFontFamily));
+        var codeFont = ResolveFontFamily(CodeFontFamily, Resource("CodeFontFamily", DefaultCodeFontFamily));
+        var title = GetFormattedText(layout.SectionTitle, Resource("TextPrimaryBrush", TextPrimaryFallbackBrush), uiFont, FontWeight.ExtraBold, FontStyle.Normal, 13.0);
+        var summary = GetFormattedText(ResolveSectionSummary(layout.Entry.Source), Resource("TextMutedBrush", TextMutedFallbackBrush), codeFont, FontWeight.SemiBold, FontStyle.Normal, 8.8);
+        DrawClippedText(context, title, rect, new Point(rect.X + 2.0, rect.Y + 2.0));
+        DrawClippedText(context, summary, new Rect(rect.X + 2.0, rect.Y + 17.0, rect.Width - 4.0, 10.0), new Point(rect.X + 2.0, rect.Y + 17.0));
     }
 
     private void DrawBody(DrawingContext context, EntryLayout layout, double rowTop, double viewportTop, double viewportBottom)
@@ -609,7 +639,40 @@ public sealed class SkillbookRenderControl : Control
         return clean.Length <= maxLength ? clean : clean[..Math.Max(0, maxLength - 1)] + "...";
     }
 
-    private sealed record EntryLayout(SkillbookEntryViewModel Entry, Rect CardRect, Rect BodyRect, IReadOnlyList<string> BodyLines, double Height);
+    private string ResolveSectionTitle(int index, SkillbookEntryViewModel entry)
+    {
+        var items = Items;
+        if (index <= 0 || items is null || index >= items.Count)
+        {
+            return entry.SectionTitle;
+        }
+
+        var previous = items[index - 1];
+        return string.Equals(previous.SourceLabel, entry.SourceLabel, StringComparison.OrdinalIgnoreCase)
+            ? ""
+            : entry.SectionTitle;
+    }
+
+    private static string ResolveSectionSummary(string source)
+    {
+        return source.ToLowerInvariant() switch
+        {
+            "codex" => "Every built-in instruction injected into the Codex harness.",
+            "skillflow" => "The visible user action, expected output, and Codex duty for each development phase.",
+            "project" => "Project-local instructions that override matching global entries.",
+            "global" => "Reusable instructions from the user profile Skillbook.",
+            _ => "ContextControl instruction entries."
+        };
+    }
+
+    private sealed record EntryLayout(
+        SkillbookEntryViewModel Entry,
+        string SectionTitle,
+        Rect SectionRect,
+        Rect CardRect,
+        Rect BodyRect,
+        IReadOnlyList<string> BodyLines,
+        double Height);
 
     private readonly record struct TextCacheKey(string Text, int BrushId, string FontFamily, FontWeight Weight, FontStyle Style, double FontSize);
 

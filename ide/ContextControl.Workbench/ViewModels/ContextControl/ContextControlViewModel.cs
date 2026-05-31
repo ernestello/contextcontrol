@@ -78,6 +78,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
     private readonly IAiConnectionService _browserConnection;
     private readonly LocalLlmService _localLlmService;
     private readonly SkillbookService _skillbookService;
+    private readonly CodexHarnessService _codexHarnessService;
     private readonly ContextCapsuleBuilder _capsuleBuilder;
     private readonly ContextSemanticMapBuilder _semanticMapBuilder;
     private readonly ContextFileResolverService _fileResolver;
@@ -99,6 +100,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
     private bool _isTransferProgressIndeterminate = true;
     private bool _isCcTimelineExpanded = true;
     private bool _isAutopilotEnabled;
+    private bool _isCodexRequestRunning;
     private int _currentCcTimelineStageIndex = CcStageRequest;
     private double _transferProgressValue;
     private string _dockPanelKey = "log";
@@ -128,6 +130,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
     private string _providerStatus = "Browser route selected";
     private string _hardwareSummary = "Detecting GPU...";
     private string _localLlmStatus = "Local model scan pending.";
+    private string _codexStatus = "Codex CLI read-only CC capsule";
     private string _lastAssistantPatchBlocks = "";
     private string _lastUserRequest = "";
     private string _fileRequestModelId;
@@ -168,6 +171,8 @@ public sealed partial class ContextControlViewModel : ObservableObject
     private ContextSemanticIndex? _semanticIndex;
     private string _legacyPromptText = "";
     private IReadOnlyList<ChatHistoryAttachmentData> _legacyPendingAttachments = [];
+    private CancellationTokenSource? _codexCancellation;
+    private ChatRequestProgressViewModel? _codexProgressItem;
 
     public ContextControlViewModel(WorkbenchSettings settings)
     {
@@ -178,6 +183,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
         _browserConnection = new BrowserAiConnectionService();
         _localLlmService = new LocalLlmService();
         _skillbookService = new SkillbookService(settings.ContextControlRoot);
+        _codexHarnessService = new CodexHarnessService();
         _capsuleBuilder = new ContextCapsuleBuilder();
         _semanticMapBuilder = new ContextSemanticMapBuilder();
         _fileResolver = new ContextFileResolverService();
@@ -214,9 +220,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
         _selectedRoute = RouteOptions.Contains(settings.SelectedAiRoute)
             ? settings.SelectedAiRoute
             : RouteOptions[0];
-        _promptModeKey = string.Equals(settings.PromptModeKey, "terminal", StringComparison.OrdinalIgnoreCase)
-            ? "terminal"
-            : "context";
+        _promptModeKey = NormalizePromptModeKey(settings.PromptModeKey);
 
         IsPromptOpen = settings.PromptBarOpenByDefault;
         LocalLlmModels = new ObservableCollection<LocalLlmModelViewModel>(
@@ -330,11 +334,15 @@ public sealed partial class ContextControlViewModel : ObservableObject
                 && !IsInstallingOllama);
         SwitchPromptToContextCommand = new RelayCommand<object>(_ => PromptModeKey = "context");
         SwitchPromptToChatCommand = new RelayCommand<object>(_ => PromptModeKey = "context");
+        SwitchPromptToCodexCommand = new RelayCommand<object>(_ => PromptModeKey = "codex");
         SwitchPromptToTerminalCommand = new RelayCommand<object>(_ => PromptModeKey = "terminal");
         ClearTerminalCommand = new RelayCommand<object>(_ => ClearTerminalOutput());
         PreviousTransferStatusCommand = new RelayCommand<object>(_ => MoveTransferProgressHistory(-1), _ => CanMoveTransferProgressHistory(-1));
         NextTransferStatusCommand = new RelayCommand<object>(_ => MoveTransferProgressHistory(1), _ => CanMoveTransferProgressHistory(1));
         CloseTransferProgressCommand = new RelayCommand<object>(_ => CloseTransferProgress(), _ => CanCloseTransferProgress);
+        CancelCodexRequestCommand = new RelayCommand<ChatRequestProgressViewModel>(
+            CancelCodexRequest,
+            item => CanCancelCodexRequest(item));
         CopyRoutingLogCommand = new RelayCommand<object>(_ => _ = CopyRoutingLogAsync());
         CopySnippetCommand = new RelayCommand<ChatSnippetViewModel>(snippet => _ = CopySnippetAsync(snippet));
         SaveSnippetAsCommand = new RelayCommand<ChatSnippetViewModel>(
@@ -349,6 +357,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
         PreviewSnippetCommand = new RelayCommand<ChatSnippetViewModel>(snippet => _ = PreviewSnippetAsync(snippet), snippet => snippet?.IsPatch == true);
         ToggleAttachmentIncludeCommand = new RelayCommand<ContextControlAttachmentViewModel>(ToggleAttachmentInclude);
         ToggleThinkingCommand = new RelayCommand<LocalLlmChatMessageViewModel>(message => message?.ToggleThinking());
+        ToggleDiagnosticCommand = new RelayCommand<LocalLlmChatMessageViewModel>(message => message?.ToggleDiagnostic());
         ToggleSnippetCommand = new RelayCommand<ChatSnippetViewModel>(snippet => snippet?.ToggleExpanded());
         NewChatSessionCommand = new RelayCommand<object>(_ => CreateNewChatSession());
         SelectChatSessionCommand = new RelayCommand<ChatSessionViewModel>(SelectChatSession);
@@ -370,6 +379,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
 
         Log("info", $"Context root: {_processService.ContextRoot}");
         LoadChatHistory();
+        _ = RefreshCodexStatusAsync();
         _ = RefreshLocalModelsAsync();
     }
 
@@ -492,11 +502,13 @@ public sealed partial class ContextControlViewModel : ObservableObject
     public ICommand PullLocalModelCommand { get; }
     public ICommand SwitchPromptToContextCommand { get; }
     public ICommand SwitchPromptToChatCommand { get; }
+    public ICommand SwitchPromptToCodexCommand { get; }
     public ICommand SwitchPromptToTerminalCommand { get; }
     public ICommand ClearTerminalCommand { get; }
     public ICommand PreviousTransferStatusCommand { get; }
     public ICommand NextTransferStatusCommand { get; }
     public ICommand CloseTransferProgressCommand { get; }
+    public ICommand CancelCodexRequestCommand { get; }
     public ICommand CopyRoutingLogCommand { get; }
     public ICommand CopySnippetCommand { get; }
     public ICommand SaveSnippetAsCommand { get; }
@@ -507,6 +519,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
     public ICommand PreviewSnippetCommand { get; }
     public ICommand ToggleAttachmentIncludeCommand { get; }
     public ICommand ToggleThinkingCommand { get; }
+    public ICommand ToggleDiagnosticCommand { get; }
     public ICommand ToggleSnippetCommand { get; }
     public ICommand NewChatSessionCommand { get; }
     public ICommand SelectChatSessionCommand { get; }

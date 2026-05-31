@@ -112,7 +112,8 @@
                       SaveSnippetAsCommand="{Binding ContextControl.SaveSnippetAsCommand}"
                       UseSnippetForCcCommand="{Binding ContextControl.UseSnippetForCcCommand}"
                       PreviewSnippetCommand="{Binding ContextControl.PreviewSnippetCommand}"
-                      ToggleThinkingCommand="{Binding ContextControl.ToggleThinkingCommand}" />
+                      ToggleThinkingCommand="{Binding ContextControl.ToggleThinkingCommand}"
+                      ToggleDiagnosticCommand="{Binding ContextControl.ToggleDiagnosticCommand}" />
                 </ScrollViewer>
               </Grid>
             </Border>

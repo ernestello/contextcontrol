@@ -34,6 +34,9 @@ public sealed class SkillbookService
     {
         EnsureSeedFiles();
 
+        var entries = new List<SkillbookEntry>();
+        entries.AddRange(CodexInstructionCatalog.SkillbookEntries);
+
         var byKey = new Dictionary<string, SkillbookEntry>(StringComparer.OrdinalIgnoreCase);
         foreach (var entry in ReadDirectory(GlobalRoot, "global"))
         {
@@ -45,8 +48,10 @@ public sealed class SkillbookService
             byKey[entry.Key] = entry;
         }
 
-        return byKey.Values
-            .OrderBy(entry => entry.Source.Equals("project", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+        entries.AddRange(byKey.Values);
+
+        return entries
+            .OrderBy(entry => SourceRank(entry.Source))
             .ThenBy(entry => entry.Title, StringComparer.OrdinalIgnoreCase)
             .ToArray();
     }
@@ -54,7 +59,9 @@ public sealed class SkillbookService
     public string BuildEnabledInstructionText()
     {
         var entries = LoadEntries()
-            .Where(entry => entry.Enabled && !string.IsNullOrWhiteSpace(entry.Text))
+            .Where(entry => entry.Enabled
+                && !IsBuiltInCodexEntry(entry)
+                && !string.IsNullOrWhiteSpace(entry.Text))
             .ToArray();
 
         if (entries.Length == 0)
@@ -71,6 +78,11 @@ public sealed class SkillbookService
         }
 
         return builder.ToString().TrimEnd();
+    }
+
+    public string BuildCodexInstructionText(ContextCapsulePhase phase)
+    {
+        return CodexInstructionCatalog.BuildCodexInstructionText(phase);
     }
 
     private void EnsureSeedFiles()
@@ -141,5 +153,23 @@ public sealed class SkillbookService
             .Replace('_', ' ')
             .Trim();
         return string.IsNullOrWhiteSpace(clean) ? "Instruction" : clean;
+    }
+
+    private static int SourceRank(string source)
+    {
+        return source.ToLowerInvariant() switch
+        {
+            "codex" => 0,
+            "skillflow" => 1,
+            "project" => 2,
+            "global" => 3,
+            _ => 4
+        };
+    }
+
+    private static bool IsBuiltInCodexEntry(SkillbookEntry entry)
+    {
+        return entry.Source.Equals("codex", StringComparison.OrdinalIgnoreCase)
+            || entry.Source.Equals("skillflow", StringComparison.OrdinalIgnoreCase);
     }
 }

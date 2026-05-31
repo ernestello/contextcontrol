@@ -38,6 +38,26 @@ public sealed partial class ContextControlViewModel
             return;
         }
 
+        if (IsCodexPromptMode)
+        {
+            var codexMessage = currentMessage;
+            if (string.IsNullOrWhiteSpace(codexMessage))
+            {
+                codexMessage = IsAutopilotEnabled ? BuildEmptyLocalSendMessage() : "";
+                if (string.IsNullOrWhiteSpace(codexMessage))
+                {
+                    PhaseTitle = "Nothing to send";
+                    PhaseDetail = IsAutopilotEnabled
+                        ? "Write a prompt, run DIR, or attach CC context before sending to Codex."
+                        : "Write a prompt first.";
+                    return;
+                }
+            }
+
+            await SendCodexChatAsync(codexMessage);
+            return;
+        }
+
         if (IsChatPromptMode || SelectedRoute.StartsWith("Local:", StringComparison.OrdinalIgnoreCase))
         {
             var localMessage = currentMessage;
@@ -206,6 +226,209 @@ public sealed partial class ContextControlViewModel
         }
 
         return "";
+    }
+
+    private async Task SendCodexChatAsync(string message)
+    {
+        if (IsBusy)
+        {
+            return;
+        }
+
+        var codexCancellation = new CancellationTokenSource();
+        _codexCancellation = codexCancellation;
+        IsBusy = true;
+        IsCodexRequestRunning = true;
+        CodexStatus = "Preparing Codex capsule...";
+        ChatRequestProgressViewModel? progressItem = null;
+        try
+        {
+            var targetSession = EnsureSelectedChatSession();
+            var phase = ResolveCapsulePhase(message);
+            var capsuleMessage = phase is ContextCapsulePhase.PatchWrite or ContextCapsulePhase.PatchReview
+                ? ResolvePatchTaskMessage(message)
+                : message;
+            if (phase == ContextCapsulePhase.FileRequest && IsMeaningfulTaskPrompt(message))
+            {
+                _lastUserRequest = message;
+            }
+
+            MoveToCcStage(phase switch
+            {
+                ContextCapsulePhase.FileRequest => CcStageResolve,
+                ContextCapsulePhase.SourceAudit or ContextCapsulePhase.PatchWrite or ContextCapsulePhase.PatchReview => CcStagePatch,
+                _ => CcStageRequest
+            });
+
+            var capsuleAttachments = await BuildCapsuleAttachmentsAsync(phase);
+            var codexRequest = new CodexHarnessRequest(
+                capsuleMessage,
+                phase,
+                _processService.ContextRoot,
+                capsuleAttachments,
+                _skillbookService.BuildCodexInstructionText(phase),
+                _skillbookService.BuildEnabledInstructionText());
+            var diagnosticPrompt = CodexHarnessService.BuildPrompt(codexRequest);
+            var attachmentSnapshot = BuildSentAttachmentSnapshot(capsuleAttachments);
+
+            AppendChatMessageToSession(targetSession, new LocalLlmChatMessageViewModel(
+                "user",
+                capsuleMessage,
+                "Codex CLI",
+                FormatCodexPhase(phase),
+                BuildCodexCapsuleSummary(diagnosticPrompt, capsuleAttachments),
+                attachments: attachmentSnapshot,
+                diagnosticPrompt: diagnosticPrompt));
+            ConsumeSentAttachments(attachmentSnapshot);
+            PromptText = "";
+            PhaseTitle = "Codex CC chat";
+            PhaseDetail = $"{FormatCodexPhase(phase)} through read-only Codex harness.";
+            ProviderStatus = "Codex CLI read-only harness";
+            CodexStatus = $"Running {FormatCodexPhase(phase)}...";
+
+            var generationProgress = CreateGenerationProgress(targetSession, "Codex CLI", FormatCodexPhase(phase), isCancellable: true);
+            progressItem = generationProgress.Item;
+            _codexProgressItem = progressItem;
+            var terminal = CreateTerminalProgress();
+            terminal.Report($"Sending {FormatCodexPhase(phase)} capsule to Codex CLI...");
+            terminal.Report("Codex is instructed to use CC attachments only and avoid repo navigation/actions.");
+            ReportCapsuleAttachments(terminal, capsuleAttachments);
+            var codexProgress = new Progress<LocalLlmGenerationProgress>(progress =>
+            {
+                if (!string.IsNullOrWhiteSpace(progress.Status))
+                {
+                    CodexStatus = progress.Status;
+                }
+
+                generationProgress.Progress.Report(progress);
+            });
+
+            var result = await _codexHarnessService.SendAsync(
+                codexRequest,
+                codexProgress,
+                terminal,
+                codexCancellation.Token);
+            var audit = string.IsNullOrWhiteSpace(result.Message)
+                ? null
+                : CodexPhaseAuditor.Audit(phase, result.Message, _promptBuilder);
+            if (audit is not null)
+            {
+                ReportCodexPhaseAudit(audit);
+            }
+
+            var assistantText = BuildCodexAssistantText(result, audit);
+            var phaseHandled = false;
+            if (!string.IsNullOrWhiteSpace(assistantText))
+            {
+                var assistant = new LocalLlmChatMessageViewModel(
+                    "assistant",
+                    assistantText,
+                    "Codex CLI",
+                    FormatCodexPhase(phase),
+                    result.EventTrace);
+                AppendChatMessageToSession(targetSession, assistant);
+                var latestPatch = assistant.Snippets.LastOrDefault(snippet => snippet.IsPatch);
+                if (latestPatch is not null && ReferenceEquals(SelectedChatSession, targetSession))
+                {
+                    _lastAssistantPatchBlocks = latestPatch.Text;
+                }
+
+                if (phase == ContextCapsulePhase.FileRequest)
+                {
+                    HandleFileRequestAnswer(targetSession, assistant);
+                    phaseHandled = true;
+                }
+                else if (phase == ContextCapsulePhase.PatchWrite && LooksLikeWrongPatchWriteAnswer(assistant))
+                {
+                    PhaseTitle = "Patch answer missing";
+                    PhaseDetail = "Codex answered like DIR/file-request phase even though CC source context was attached.";
+                    AppendTerminalOutput("Codex patch write warning: no CC-REPLACE patch blocks were returned.");
+                    phaseHandled = true;
+                }
+            }
+
+            ProviderStatus = result.Status;
+            CodexStatus = result.Status;
+            if (!phaseHandled)
+            {
+                PhaseTitle = result.Succeeded
+                    ? audit is { Passed: false }
+                        ? "Codex phase mismatch"
+                        : audit is { HasWarnings: true }
+                            ? "Codex answer needs review"
+                            : "Codex answer ready"
+                    : result.Status.Contains("stopped", StringComparison.OrdinalIgnoreCase) ? "Codex stopped" : "Codex failed";
+                PhaseDetail = audit?.Summary ?? result.Status;
+            }
+
+            Log(result.Succeeded ? "ok" : "warn", result.Status);
+        }
+        catch (OperationCanceledException)
+        {
+            CodexStatus = "Codex stopped by user.";
+            ProviderStatus = CodexStatus;
+            PhaseTitle = "Codex stopped";
+            PhaseDetail = CodexStatus;
+            Log("warn", CodexStatus);
+        }
+        catch (Exception ex)
+        {
+            CodexStatus = ex.Message;
+            ProviderStatus = ex.Message;
+            PhaseTitle = "Codex failed";
+            PhaseDetail = ex.Message;
+            Log("error", ex.Message);
+        }
+        finally
+        {
+            if (progressItem is not null)
+            {
+                CompleteGenerationProgress(progressItem);
+            }
+
+            _codexProgressItem = null;
+            _codexCancellation = null;
+            codexCancellation.Dispose();
+            IsCodexRequestRunning = false;
+            IsBusy = false;
+        }
+    }
+
+    private bool CanCancelCodexRequest(ChatRequestProgressViewModel? item)
+    {
+        return IsCodexRequestRunning
+            && _codexCancellation is { IsCancellationRequested: false }
+            && (item is null || ReferenceEquals(item, _codexProgressItem));
+    }
+
+    private void CancelCodexRequest(ChatRequestProgressViewModel? item)
+    {
+        if (!CanCancelCodexRequest(item))
+        {
+            return;
+        }
+
+        CodexStatus = "Stopping Codex...";
+        PhaseTitle = "Stopping Codex";
+        PhaseDetail = "Cancelling the Codex CLI process.";
+        AppendTerminalOutput("Codex cancellation requested.");
+        _codexCancellation?.Cancel();
+        (CancelCodexRequestCommand as RelayCommand<ChatRequestProgressViewModel>)?.RaiseCanExecuteChanged();
+    }
+
+    private async Task RefreshCodexStatusAsync()
+    {
+        var result = await _codexHarnessService.CheckAvailabilityAsync();
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        {
+            if (IsCodexRequestRunning)
+            {
+                return;
+            }
+
+            CodexStatus = result.Status;
+            Log(result.Available ? "ok" : "warn", result.Status);
+        });
     }
 
     private async Task SendLocalChatAsync(string message)
@@ -652,6 +875,68 @@ public sealed partial class ContextControlViewModel
         return text.StartsWith("DIR", StringComparison.OrdinalIgnoreCase)
             || text.StartsWith("FIND:", StringComparison.OrdinalIgnoreCase)
             || text.Equals("END", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string BuildCodexAssistantText(CodexHarnessResult result, CodexPhaseAuditResult? audit)
+    {
+        var builder = new StringBuilder();
+        var thinking = BuildCodexThinkingText(result, audit);
+        if (!string.IsNullOrWhiteSpace(thinking))
+        {
+            builder.AppendLine("<think>");
+            builder.AppendLine(thinking.Trim());
+            builder.AppendLine("</think>");
+            builder.AppendLine();
+        }
+
+        builder.AppendLine(!string.IsNullOrWhiteSpace(result.Message)
+            ? result.Message.Trim()
+            : result.Status);
+        return builder.ToString().TrimEnd();
+    }
+
+    private static string BuildCodexThinkingText(CodexHarnessResult result, CodexPhaseAuditResult? audit)
+    {
+        var parts = new List<string>();
+        if (audit is not null)
+        {
+            parts.Add(audit.ToDiagnosticText());
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.Thinking))
+        {
+            parts.Add(result.Thinking.Trim());
+        }
+
+        if (!string.IsNullOrWhiteSpace(result.EventTrace))
+        {
+            parts.Add("Codex event trace:" + Environment.NewLine + result.EventTrace.Trim());
+        }
+
+        return string.Join(Environment.NewLine + Environment.NewLine, parts);
+    }
+
+    private void ReportCodexPhaseAudit(CodexPhaseAuditResult audit)
+    {
+        AppendTerminalOutput(audit.Summary);
+        foreach (var detail in audit.Details.Take(6))
+        {
+            AppendTerminalOutput($"  - {detail}");
+        }
+    }
+
+    private static string FormatCodexPhase(ContextCapsulePhase phase)
+    {
+        return $"codex {FormatCapsulePhase(phase)}";
+    }
+
+    private static string BuildCodexCapsuleSummary(string diagnosticPrompt, IReadOnlyList<ContextCapsuleAttachment> attachments)
+    {
+        var promptTokens = ContextCapsuleBuilder.EstimateTokens(diagnosticPrompt);
+        var attachmentTokens = attachments
+            .Where(attachment => attachment.Included)
+            .Sum(attachment => ContextCapsuleBuilder.EstimateTokens(attachment.Text));
+        return $"{promptTokens:N0} prompt tok; {attachmentTokens:N0} attachment tok; read-only harness";
     }
 
     private void HandleFileRequestAnswer(ChatSessionViewModel targetSession, LocalLlmChatMessageViewModel assistant)

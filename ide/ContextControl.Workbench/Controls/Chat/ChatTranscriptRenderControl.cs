@@ -31,7 +31,8 @@ public enum ChatTranscriptHitKind
     SaveSnippet,
     UseSnippet,
     PreviewSnippet,
-    ToggleThinking
+    ToggleThinking,
+    ToggleDiagnostic
 }
 
 public sealed class ChatTranscriptRenderControl : Control
@@ -65,6 +66,9 @@ public sealed class ChatTranscriptRenderControl : Control
 
     public static readonly StyledProperty<ICommand?> ToggleThinkingCommandProperty =
         AvaloniaProperty.Register<ChatTranscriptRenderControl, ICommand?>(nameof(ToggleThinkingCommand));
+
+    public static readonly StyledProperty<ICommand?> ToggleDiagnosticCommandProperty =
+        AvaloniaProperty.Register<ChatTranscriptRenderControl, ICommand?>(nameof(ToggleDiagnosticCommand));
 
     public static readonly StyledProperty<string> ThemeKeyProperty =
         AvaloniaProperty.Register<ChatTranscriptRenderControl, string>(nameof(ThemeKey), "empty");
@@ -195,6 +199,12 @@ public sealed class ChatTranscriptRenderControl : Control
         set => SetValue(ToggleThinkingCommandProperty, value);
     }
 
+    public ICommand? ToggleDiagnosticCommand
+    {
+        get => GetValue(ToggleDiagnosticCommandProperty);
+        set => SetValue(ToggleDiagnosticCommandProperty, value);
+    }
+
     public string ThemeKey
     {
         get => GetValue(ThemeKeyProperty);
@@ -261,7 +271,8 @@ public sealed class ChatTranscriptRenderControl : Control
             || change.Property == SaveSnippetAsCommandProperty
             || change.Property == UseSnippetForCcCommandProperty
             || change.Property == PreviewSnippetCommandProperty
-            || change.Property == ToggleThinkingCommandProperty)
+            || change.Property == ToggleThinkingCommandProperty
+            || change.Property == ToggleDiagnosticCommandProperty)
         {
             InvalidateVisual();
         }
@@ -789,6 +800,11 @@ public sealed class ChatTranscriptRenderControl : Control
             y = BuildThinking(layout, message, contentLeft, y, contentWidth);
         }
 
+        if (message.HasDiagnosticPrompt)
+        {
+            y = BuildDiagnostic(layout, message, contentLeft, y, contentWidth);
+        }
+
         layout.CardRect = new Rect(card.X, 0, card.Width, Math.Max(34.0, y + CardPaddingY));
         layout.Height = layout.CardRect.Height + MessageGap;
         return layout;
@@ -965,6 +981,35 @@ public sealed class ChatTranscriptRenderControl : Control
         return y;
     }
 
+    private double BuildDiagnostic(MessageLayout layout, LocalLlmChatMessageViewModel message, double x, double y, double contentWidth)
+    {
+        var buttonRect = new Rect(x, y, 78.0, ButtonHeight);
+        var hit = new HitRegion(buttonRect, ChatTranscriptHitKind.ToggleDiagnostic, message);
+        layout.Hits.Add(hit);
+        var diagnostic = new DiagnosticLayout(buttonRect, hit);
+        y += ButtonHeight + 5.0;
+
+        if (message.IsDiagnosticExpanded)
+        {
+            var codeFontFamily = ResolveFontFamily(CodeFontFamily, Resource("CodeFontFamily", DefaultCodeFontFamily));
+            var lines = WrapLines(NormalizeText(message.DiagnosticPrompt), contentWidth - 12.0, codeFontFamily, FontWeight.Normal, FontStyle.Normal, CodeFontSize);
+            var height = Math.Clamp(12.0 + lines.Count * CodeLineHeight, 96.0, 320.0);
+            diagnostic.TextBlock = new TextBlockLayout(
+                new Rect(x, y, contentWidth, height),
+                lines,
+                CodeFontSize,
+                CodeLineHeight,
+                FontWeight.Normal,
+                FontStyle.Normal,
+                true,
+                Resource("TextPrimaryBrush", TextPrimaryFallbackBrush));
+            y += height + 6.0;
+        }
+
+        layout.Diagnostic = diagnostic;
+        return y;
+    }
+
     private void DrawMessage(
         DrawingContext context,
         MessageLayout layout,
@@ -1005,6 +1050,11 @@ public sealed class ChatTranscriptRenderControl : Control
         if (layout.Thinking is not null)
         {
             DrawThinking(context, layout.Thinking, rowTop, viewportTop, viewportBottom);
+        }
+
+        if (layout.Diagnostic is not null)
+        {
+            DrawDiagnostic(context, layout.Diagnostic, rowTop, viewportTop, viewportBottom);
         }
     }
 
@@ -1166,6 +1216,27 @@ public sealed class ChatTranscriptRenderControl : Control
         DrawTextBlock(context, thinking.TextBlock with
         {
             Rect = new Rect(thinking.TextBlock.Rect.X + 6.0, thinking.TextBlock.Rect.Y + 6.0, Math.Max(0.0, thinking.TextBlock.Rect.Width - 12.0), Math.Max(0.0, thinking.TextBlock.Rect.Height - 12.0))
+        }, rowTop, viewportTop, viewportBottom);
+    }
+
+    private void DrawDiagnostic(DrawingContext context, DiagnosticLayout diagnostic, double rowTop, double viewportTop, double viewportBottom)
+    {
+        DrawButton(context, OffsetY(diagnostic.ButtonRect, rowTop), "Harness", CanExecuteHit(diagnostic.Hit), ReferenceEquals(diagnostic.Hit, _hoveredHit));
+        if (diagnostic.TextBlock is null)
+        {
+            return;
+        }
+
+        var rect = OffsetY(diagnostic.TextBlock.Rect, rowTop);
+        context.DrawRectangle(
+            Resource("CommandBackgroundBrush", CommandBackgroundFallbackBrush),
+            new Pen(Resource("PanelBorderBrush", PanelBorderFallbackBrush), 1),
+            rect,
+            5,
+            5);
+        DrawTextBlock(context, diagnostic.TextBlock with
+        {
+            Rect = new Rect(diagnostic.TextBlock.Rect.X + 6.0, diagnostic.TextBlock.Rect.Y + 6.0, Math.Max(0.0, diagnostic.TextBlock.Rect.Width - 12.0), Math.Max(0.0, diagnostic.TextBlock.Rect.Height - 12.0))
         }, rowTop, viewportTop, viewportBottom);
     }
 
@@ -1626,6 +1697,7 @@ public sealed class ChatTranscriptRenderControl : Control
             ChatTranscriptHitKind.UseSnippet => UseSnippetForCcCommand,
             ChatTranscriptHitKind.PreviewSnippet => PreviewSnippetCommand,
             ChatTranscriptHitKind.ToggleThinking => ToggleThinkingCommand,
+            ChatTranscriptHitKind.ToggleDiagnostic => ToggleDiagnosticCommand,
             _ => null
         };
     }
@@ -2200,6 +2272,7 @@ public sealed class ChatTranscriptRenderControl : Control
         public List<AttachmentLayout> Attachments { get; } = [];
         public List<SnippetLayout> Snippets { get; } = [];
         public ThinkingLayout? Thinking { get; set; }
+        public DiagnosticLayout? Diagnostic { get; set; }
         public List<HitRegion> Hits { get; } = [];
     }
 
@@ -2230,6 +2303,13 @@ public sealed class ChatTranscriptRenderControl : Control
     private sealed record ButtonLayout(Rect Rect, string Label, bool IsEnabled, HitRegion Hit);
 
     private sealed class ThinkingLayout(Rect buttonRect, HitRegion hit)
+    {
+        public Rect ButtonRect { get; } = buttonRect;
+        public HitRegion Hit { get; } = hit;
+        public TextBlockLayout? TextBlock { get; set; }
+    }
+
+    private sealed class DiagnosticLayout(Rect buttonRect, HitRegion hit)
     {
         public Rect ButtonRect { get; } = buttonRect;
         public HitRegion Hit { get; } = hit;

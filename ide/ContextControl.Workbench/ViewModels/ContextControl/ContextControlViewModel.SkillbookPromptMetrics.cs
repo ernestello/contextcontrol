@@ -16,7 +16,31 @@ namespace ContextControl.Workbench.ViewModels;
 
 public sealed partial class ContextControlViewModel
 {
-    public string SkillbookSummary => $"{SkillbookEntries.Count} instruction(s); project overrides global entries";
+    public string SkillbookSummary
+    {
+        get
+        {
+            var codex = SkillbookEntries.Count(entry => entry.Source.Equals("codex", StringComparison.OrdinalIgnoreCase));
+            var skillflow = SkillbookEntries.Count(entry => entry.Source.Equals("skillflow", StringComparison.OrdinalIgnoreCase));
+            return $"{SkillbookEntries.Count} instruction(s); {codex} Codex, {skillflow} Skillflow; project overrides global entries";
+        }
+    }
+
+    public string SkillbookCodexSummary =>
+        $"{SkillbookEntries.Count(entry => entry.Source.Equals("codex", StringComparison.OrdinalIgnoreCase)):N0} harness instruction(s)";
+
+    public string SkillbookSkillflowSummary =>
+        $"{SkillbookEntries.Count(entry => entry.Source.Equals("skillflow", StringComparison.OrdinalIgnoreCase)):N0} development phase(s)";
+
+    public string SkillbookUserSummary
+    {
+        get
+        {
+            var project = SkillbookEntries.Count(entry => entry.Source.Equals("project", StringComparison.OrdinalIgnoreCase));
+            var global = SkillbookEntries.Count(entry => entry.Source.Equals("global", StringComparison.OrdinalIgnoreCase));
+            return $"{project:N0} project / {global:N0} global instruction(s)";
+        }
+    }
 
     public string SkillbookProjectPath => _skillbookService.ProjectRoot;
 
@@ -30,6 +54,15 @@ public sealed partial class ContextControlViewModel
             {
                 var promptTokensOnly = ContextCapsuleBuilder.EstimateTokens(PromptText);
                 return $"{promptTokensOnly:N0} prompt tok; no CC context";
+            }
+
+            if (IsCodexPromptMode)
+            {
+                var codexPromptTokens = ContextCapsuleBuilder.EstimateTokens(PromptText);
+                var codexAttachments = EstimateAttachmentBudget();
+                return codexAttachments.IsClipped
+                    ? $"{codexPromptTokens:N0} prompt tok; {codexAttachments.SentTokens:N0} sent attachment tok ({codexAttachments.FullTokens:N0} full); Codex"
+                    : $"{codexPromptTokens:N0} prompt tok; {codexAttachments.SentTokens:N0} attachment tok; Codex";
             }
 
             var promptTokens = ContextCapsuleBuilder.EstimateTokens(PromptText);
@@ -48,6 +81,16 @@ public sealed partial class ContextControlViewModel
             {
                 var imageGenerationModelLabel = SelectedImageGenerationModel?.DisplayName ?? "No image gen model";
                 return $"{imageGenerationModelLabel}: prompt-only image generation";
+            }
+
+            if (IsCodexPromptMode)
+            {
+                var codexAttachmentBudget = EstimateAttachmentBudget();
+                var codexTotal = ContextCapsuleBuilder.EstimateTokens(PromptText)
+                    + codexAttachmentBudget.SentTokens
+                    + ContextCapsuleBuilder.EstimateTokens(_skillbookService.BuildCodexInstructionText(ResolveCapsulePhase(PromptText)));
+                var codexSuffix = codexAttachmentBudget.IsClipped ? "; clipped" : "";
+                return $"Codex CLI: {codexTotal:N0} tok est; read-only harness; no repo browsing{codexSuffix}";
             }
 
             var phase = ResolveCapsulePhase(PromptText);
@@ -128,6 +171,8 @@ public sealed partial class ContextControlViewModel
         ? $"{AttachmentSummary} - large prompt mode - {PromptTokenomicsLabel}"
         : IsImageGenWorkspaceActive
         ? $"{AttachmentSummary} - {SelectedLocalModelLabel}"
+        : IsCodexPromptMode
+        ? $"{AttachmentSummary} - Codex CC flow - {PromptTokenomicsLabel}"
         : $"{AttachmentSummary} - {PromptTokenomicsLabel}";
 
     public string ContextRootPath => _processService.ContextRoot;

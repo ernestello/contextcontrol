@@ -98,13 +98,14 @@
             <Border Grid.Row="1" Classes="pane-header" Padding="12,0" IsVisible="{Binding IsChatMode}">
               <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="8">
                 <StackPanel VerticalAlignment="Center">
-                  <TextBlock Text="CC Chat" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
+                  <TextBlock Text="{Binding ContextControl.ChatWorkspaceTitle}" FontSize="12" FontWeight="ExtraBold" Foreground="{DynamicResource TextPrimaryBrush}" />
                   <TextBlock Text="{Binding ContextControl.PromptContextPressureLabel}" Classes="editor-meta" Margin="0,2,0,0" />
                   <TextBlock Text="{Binding ContextControl.PromptTokenomicsLabel}" Classes="scanner-status" />
                 </StackPanel>
                 <ComboBox
                     Grid.Column="1"
                     Classes="cc-local-model-picker"
+                    IsVisible="{Binding ContextControl.IsContextPromptMode}"
                     ItemsSource="{Binding ContextControl.InstalledLocalModels}"
                     SelectedItem="{Binding ContextControl.SelectedLocalModel, Mode=TwoWay}"
                     MaxDropDownHeight="180">
@@ -114,10 +115,18 @@
                     </DataTemplate>
                   </ComboBox.ItemTemplate>
                 </ComboBox>
+                <TextBlock
+                    Grid.Column="1"
+                    Classes="editor-meta type"
+                    Text="Codex CLI"
+                    VerticalAlignment="Center"
+                    FontWeight="Bold"
+                    IsVisible="{Binding ContextControl.IsCodexPromptMode}" />
                 <Button
                     Grid.Column="2"
                     Classes="browser-open-button"
                     Content="Refresh"
+                    IsVisible="{Binding ContextControl.IsContextPromptMode}"
                     Command="{Binding ContextControl.RefreshLocalModelsCommand}" />
                 <Button
                     Grid.Column="3"

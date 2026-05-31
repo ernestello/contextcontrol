@@ -386,9 +386,12 @@ public sealed class WorkbenchSettings
 
     private static string NormalizePromptModeKey(string? key)
     {
-        return string.Equals(key?.Trim(), "terminal", StringComparison.OrdinalIgnoreCase)
-            ? "terminal"
-            : "context";
+        return key?.Trim().ToLowerInvariant() switch
+        {
+            "codex" => "codex",
+            "terminal" => "terminal",
+            _ => "context"
+        };
     }
 
     private static string NormalizeModelId(string? modelId, string fallback)

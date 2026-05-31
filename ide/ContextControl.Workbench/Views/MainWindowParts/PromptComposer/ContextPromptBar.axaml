@@ -37,11 +37,18 @@
                   <ItemsControl.ItemTemplate>
                     <DataTemplate DataType="{x:Type vm:ChatRequestProgressViewModel}">
                       <Border Classes="cc-transfer-progress" Margin="0,0,0,4">
-                        <Grid RowDefinitions="Auto,Auto" RowSpacing="5">
-                          <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="10">
+                        <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="5">
+                          <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="10">
                             <TextBlock Classes="cc-transfer-title" Text="{Binding Title}" />
                             <TextBlock Grid.Column="1" Classes="cc-transfer-meta" Text="{Binding SizeLabel}" />
                             <TextBlock Grid.Column="2" Classes="cc-transfer-meta" Text="{Binding SpeedLabel}" />
+                            <Button
+                                Grid.Column="3"
+                                Classes="cc-prompt-chip"
+                                Content="Stop"
+                                IsVisible="{Binding IsCancellable}"
+                                Command="{Binding DataContext.ContextControl.CancelCodexRequestCommand, RelativeSource={RelativeSource AncestorType=Window}}"
+                                CommandParameter="{Binding}" />
                           </Grid>
                           <Grid Grid.Row="1" ColumnDefinitions="*,Auto" ColumnSpacing="10">
                             <ProgressBar
@@ -52,6 +59,7 @@
                                 IsIndeterminate="{Binding IsIndeterminate}" />
                             <TextBlock Grid.Column="1" Classes="cc-transfer-percent" Text="{Binding ElapsedLabel}" />
                           </Grid>
+                          <TextBlock Grid.Row="2" Classes="cc-prompt-meta" Text="{Binding Status}" TextWrapping="NoWrap" />
                         </Grid>
                       </Border>
                     </DataTemplate>
@@ -114,6 +122,12 @@
                             Content="{Binding ContextControl.PromptPrimaryModeButtonLabel}"
                             ToolTip.Tip="{Binding ContextControl.PromptPrimaryModeButtonToolTip}"
                             Command="{Binding ContextControl.SwitchPromptToContextCommand}" />
+                        <Button
+                            Classes="cc-prompt-mode"
+                            Classes.active="{Binding ContextControl.IsCodexPromptMode}"
+                            Content="Codex"
+                            ToolTip.Tip="Codex CLI through the ContextControl flow"
+                            Command="{Binding ContextControl.SwitchPromptToCodexCommand}" />
                         <Button
                             Classes="cc-prompt-mode"
                             Classes.active="{Binding ContextControl.IsTerminalPromptMode}"

@@ -66,6 +66,175 @@ try
         throw new InvalidOperationException("Low-confidence request should fall back to FIND terms.");
     }
 
+    var codexCatalogEntries = CodexInstructionCatalog.SkillbookEntries;
+    if (!codexCatalogEntries.Any(entry => entry.Source.Equals("codex", StringComparison.OrdinalIgnoreCase))
+        || !codexCatalogEntries.Any(entry => entry.Source.Equals("skillflow", StringComparison.OrdinalIgnoreCase)))
+    {
+        throw new InvalidOperationException("Skillbook should expose both Codex harness instructions and Skillflow phase entries.");
+    }
+
+    var skillbook = new SkillbookService(root);
+    var skillbookEntries = skillbook.LoadEntries();
+    if (!skillbookEntries.Any(entry => entry.Key.Equals("codex-no-repo-navigation", StringComparison.OrdinalIgnoreCase))
+        || !skillbookEntries.Any(entry => entry.Key.Equals("skillflow-03-resolve", StringComparison.OrdinalIgnoreCase)))
+    {
+        throw new InvalidOperationException("Skillbook entries should include visible Codex instructions and Skillflow phases.");
+    }
+
+    var codexEntryView = new SkillbookEntryViewModel(skillbookEntries.First(entry => entry.Source.Equals("codex", StringComparison.OrdinalIgnoreCase)));
+    var skillflowEntryView = new SkillbookEntryViewModel(skillbookEntries.First(entry => entry.Source.Equals("skillflow", StringComparison.OrdinalIgnoreCase)));
+    if (!codexEntryView.SectionTitle.Equals("Codex Instructions", StringComparison.Ordinal)
+        || !skillflowEntryView.SectionTitle.Equals("Skillflow", StringComparison.Ordinal)
+        || codexEntryView.SourceRank >= skillflowEntryView.SourceRank)
+    {
+        throw new InvalidOperationException("Skillbook view models should expose separate Codex and Skillflow sections in order.");
+    }
+
+    var localSkillbookText = skillbook.BuildEnabledInstructionText();
+    if (localSkillbookText.Contains("Codex is the reasoning engine inside ContextControl", StringComparison.Ordinal))
+    {
+        throw new InvalidOperationException("Local LLM Skillbook text should not silently absorb Codex-only harness instructions.");
+    }
+
+    var codexPrompt = CodexHarnessService.BuildPrompt(new CodexHarnessRequest(
+        "find the smallest files for this edit",
+        ContextCapsulePhase.FileRequest,
+        root,
+        [
+            new ContextCapsuleAttachment(
+                "cc_project_dir.md",
+                "dir",
+                Path.Combine(root, "cc_project_dir.md"),
+                "Views/MainWindow.axaml\nStyles/WorkbenchDesign.axaml",
+                true)
+        ],
+        skillbook.BuildCodexInstructionText(ContextCapsulePhase.FileRequest),
+        localSkillbookText));
+    RequireTextContains(codexPrompt, "Your working directory is an empty harness folder by design.");
+    RequireTextContains(codexPrompt, "Codex no repo navigation");
+    RequireTextContains(codexPrompt, "Skillflow phase");
+    RequireTextContains(codexPrompt, "Views/MainWindow.axaml");
+
+    var codexPlan = CodexHarnessService.BuildExecutionPlan(root);
+    if (!codexPlan.HarnessRoot.EndsWith(Path.Combine(".tmp", "codex-harness"), StringComparison.OrdinalIgnoreCase)
+        || !codexPlan.Arguments.Contains("--json", StringComparer.Ordinal)
+        || !codexPlan.Arguments.Contains("--ephemeral", StringComparer.Ordinal)
+        || !codexPlan.Arguments.Contains("--ignore-rules", StringComparer.Ordinal)
+        || !HasAdjacentArguments(codexPlan.Arguments, "--sandbox", "read-only")
+        || !HasAdjacentArguments(codexPlan.Arguments, "--ask-for-approval", "never")
+        || !HasAdjacentArguments(codexPlan.Arguments, "-C", codexPlan.HarnessRoot))
+    {
+        throw new InvalidOperationException("Codex harness execution plan should force the optimized read-only CC capsule route.");
+    }
+
+    var cancellableProgress = new ChatRequestProgressViewModel("session", "codex file request", isCancellable: true);
+    if (!cancellableProgress.IsCancellable)
+    {
+        throw new InvalidOperationException("Codex chat progress rows should expose cancellation affordances.");
+    }
+
+    var diagnosticMessage = new LocalLlmChatMessageViewModel(
+        "user",
+        "Please use Codex mode.",
+        "Codex CLI",
+        "codex file request",
+        diagnosticPrompt: codexPrompt);
+    if (!diagnosticMessage.HasDiagnosticPrompt || diagnosticMessage.IsDiagnosticExpanded)
+    {
+        throw new InvalidOperationException("Codex chat messages should keep the harness capsule available but collapsed by default.");
+    }
+
+    diagnosticMessage.ToggleDiagnostic();
+    if (!diagnosticMessage.IsDiagnosticExpanded)
+    {
+        throw new InvalidOperationException("Codex harness diagnostics should be expandable from chat.");
+    }
+
+    var validCodexFileAudit = CodexPhaseAuditor.Audit(
+        ContextCapsulePhase.FileRequest,
+        """
+        Research scope: prompt send button style
+        Views/MainWindow.axaml
+        Styles/WorkbenchDesign.axaml
+        END
+        """);
+    if (!validCodexFileAudit.Passed
+        || validCodexFileAudit.Level != CodexPhaseAuditLevel.Pass
+        || validCodexFileAudit.RequestLines.Count != 2)
+    {
+        throw new InvalidOperationException("Codex file-request audit should pass clean CC request lists ending with END.");
+    }
+
+    var warningCodexFileAudit = CodexPhaseAuditor.Audit(
+        ContextCapsulePhase.FileRequest,
+        """
+        Here are the files:
+        Views/MainWindow.axaml
+        """);
+    if (!warningCodexFileAudit.Passed || warningCodexFileAudit.Level != CodexPhaseAuditLevel.Warning)
+    {
+        throw new InvalidOperationException("Codex file-request audit should warn when usable request lines include prose or omit END.");
+    }
+
+    var invalidCodexFileAudit = CodexPhaseAuditor.Audit(ContextCapsulePhase.FileRequest, "I need to inspect the repo first.");
+    if (invalidCodexFileAudit.Passed || invalidCodexFileAudit.Level != CodexPhaseAuditLevel.Error)
+    {
+        throw new InvalidOperationException("Codex file-request audit should fail responses without usable CC request lines.");
+    }
+
+    var validCodexPatchAudit = CodexPhaseAuditor.Audit(
+        ContextCapsulePhase.PatchWrite,
+        """
+        BEGIN CC-REPLACE
+        FILE: Views/MainWindow.axaml
+        MODE: replace_region
+        NAME: send-button
+        ---
+        <Button Classes="cc-prompt-send red" />
+        END CC-REPLACE
+        """);
+    if (!validCodexPatchAudit.Passed
+        || validCodexPatchAudit.Level != CodexPhaseAuditLevel.Pass
+        || validCodexPatchAudit.PatchBlockCount != 1)
+    {
+        throw new InvalidOperationException("Codex patch-write audit should pass valid CC-REPLACE blocks.");
+    }
+
+    var needMoreCodexAudit = CodexPhaseAuditor.Audit(
+        ContextCapsulePhase.PatchWrite,
+        """
+        NEED_MORE_CONTEXT
+        FUNCTION ViewModels/ContextControlViewModel.cs :: SendAsync
+        END
+        """);
+    if (!needMoreCodexAudit.Passed
+        || needMoreCodexAudit.Level != CodexPhaseAuditLevel.Pass
+        || needMoreCodexAudit.RequestLines.Count != 1)
+    {
+        throw new InvalidOperationException("Codex patch-write audit should allow NEED_MORE_CONTEXT plus valid CC request lines.");
+    }
+
+    var invalidCodexPatchAudit = CodexPhaseAuditor.Audit(
+        ContextCapsulePhase.PatchWrite,
+        """
+        BEGIN CC-REPLACE
+        Views/MainWindow.axaml
+        MODE: whole_file
+        ---
+        <Window />
+        END CC-REPLACE
+        """);
+    if (invalidCodexPatchAudit.Passed || invalidCodexPatchAudit.Level != CodexPhaseAuditLevel.Error)
+    {
+        throw new InvalidOperationException("Codex patch-write audit should fail malformed CC-REPLACE blocks.");
+    }
+
+    var actionClaimAudit = CodexPhaseAuditor.Audit(ContextCapsulePhase.Chat, "I ran rg and edited the file.");
+    if (!actionClaimAudit.Passed || actionClaimAudit.Level != CodexPhaseAuditLevel.Warning)
+    {
+        throw new InvalidOperationException("Codex audit should warn when read-only harness output claims direct repo actions.");
+    }
+
     var fenced = new LocalLlmChatMessageViewModel(
         "assistant",
         """
@@ -296,6 +465,20 @@ static void RequireTextContains(string text, string expected)
     {
         throw new InvalidOperationException($"Expected text to contain '{expected}'. Actual: {text}");
     }
+}
+
+static bool HasAdjacentArguments(IReadOnlyList<string> arguments, string name, string value)
+{
+    for (var index = 0; index < arguments.Count - 1; index++)
+    {
+        if (arguments[index].Equals(name, StringComparison.Ordinal)
+            && arguments[index + 1].Equals(value, StringComparison.Ordinal))
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static double NodeNumberByPath(IReadOnlyList<JsonObject> nodes, string path, string propertyName)

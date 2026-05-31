@@ -53,10 +53,11 @@ public sealed partial class ContextControlViewModel
     private (ChatRequestProgressViewModel Item, IProgress<LocalLlmGenerationProgress> Progress) CreateGenerationProgress(
         ChatSessionViewModel session,
         string modelName,
-        string phase)
+        string phase,
+        bool isCancellable = false)
     {
         IsPromptOpen = true;
-        var item = new ChatRequestProgressViewModel(session.Id, $"{phase} with {modelName}");
+        var item = new ChatRequestProgressViewModel(session.Id, $"{phase} with {modelName}", isCancellable);
         ChatRequestProgressItems.Add(item);
 
         return (item, new Progress<LocalLlmGenerationProgress>(progress =>

@@ -56,7 +56,7 @@ public sealed partial class ContextControlViewModel
             + (ShowBusyPromptProgress ? BusyPromptProgressHeight : 0)
             + (IsCcTimelinePanelVisible ? 70 : 0)
             + (IsTransferProgressActive ? 72 : 0)
-            + (ChatRequestProgressItems.Count * 54)
+            + (ChatRequestProgressItems.Count * 68)
         : 0;
 
     public double PromptBarOpacity => IsPromptOpen ? 1 : 0;
@@ -351,21 +351,25 @@ public sealed partial class ContextControlViewModel
         get => _promptModeKey;
         private set
         {
-            var clean = value?.Trim().ToLowerInvariant() switch
-            {
-                "terminal" => "terminal",
-                _ => "context"
-            };
+            var clean = NormalizePromptModeKey(value);
 
             if (SetProperty(ref _promptModeKey, clean))
             {
                 OnPropertyChanged(nameof(IsContextPromptMode));
                 OnPropertyChanged(nameof(IsChatPromptMode));
+                OnPropertyChanged(nameof(IsCodexPromptMode));
                 OnPropertyChanged(nameof(IsTerminalPromptMode));
                 OnPropertyChanged(nameof(IsMessagePromptMode));
                 OnPropertyChanged(nameof(PromptWatermark));
                 OnPropertyChanged(nameof(PromptSendButtonLabel));
+                OnPropertyChanged(nameof(PromptModelCapabilityHint));
+                OnPropertyChanged(nameof(HasPromptModelCapabilityHint));
+                OnPropertyChanged(nameof(CodexStatus));
                 OnPropertyChanged(nameof(IsCcPromptActionRowVisible));
+                OnPropertyChanged(nameof(ChatWorkspaceTitle));
+                OnPropertyChanged(nameof(PromptContextPressureLabel));
+                OnPropertyChanged(nameof(PromptTokenomicsLabel));
+                OnPropertyChanged(nameof(PromptFooterSummary));
                 _settings.PromptModeKey = clean;
 
                 SaveSettingsQuietly();
@@ -377,6 +381,8 @@ public sealed partial class ContextControlViewModel
     public bool IsContextPromptMode => string.Equals(PromptModeKey, "context", StringComparison.OrdinalIgnoreCase);
 
     public bool IsChatPromptMode => IsContextPromptMode;
+
+    public bool IsCodexPromptMode => string.Equals(PromptModeKey, "codex", StringComparison.OrdinalIgnoreCase);
 
     public bool IsTerminalPromptMode => string.Equals(PromptModeKey, "terminal", StringComparison.OrdinalIgnoreCase);
 
@@ -416,15 +422,23 @@ public sealed partial class ContextControlViewModel
         ? IsImageGenWorkspaceActive
             ? "Describe the image you want to generate..."
             : "Ask the selected local model, or paste CC request/patch text..."
+        : IsCodexPromptMode ? "Ask Codex through the ContextControl DIR -> CC -> GO flow..."
         : IsTerminalPromptMode ? "Terminal output"
         : "Message Context Control...";
 
-    public string PromptSendButtonLabel => IsImageGenWorkspaceActive ? "Generate" : "Send";
+    public string PromptSendButtonLabel => IsImageGenWorkspaceActive
+        ? "Generate"
+        : IsCodexPromptMode ? "Send to Codex" : "Send";
 
     public string PromptModelCapabilityHint
     {
         get
         {
+            if (IsCodexPromptMode)
+            {
+                return CodexStatus;
+            }
+
             if (IsImageGenWorkspaceActive)
             {
                 return SelectedImageGenerationModel is null
@@ -452,12 +466,52 @@ public sealed partial class ContextControlViewModel
 
     public bool IsCcTimelinePanelVisible => IsCcPromptChromeVisible && IsCcTimelineExpanded;
 
-    public bool IsCcPromptActionRowVisible => IsCcPromptChromeVisible && IsContextPromptMode;
+    public bool IsCcPromptActionRowVisible => IsCcPromptChromeVisible && (IsContextPromptMode || IsCodexPromptMode);
+
+    public string ChatWorkspaceTitle => IsCodexPromptMode ? "Codex Chat" : "CC Chat";
+
+    public bool IsCodexRequestRunning
+    {
+        get => _isCodexRequestRunning;
+        private set
+        {
+            if (SetProperty(ref _isCodexRequestRunning, value))
+            {
+                OnPropertyChanged(nameof(CodexStatus));
+                OnPropertyChanged(nameof(PromptModelCapabilityHint));
+                OnPropertyChanged(nameof(HasPromptModelCapabilityHint));
+                (CancelCodexRequestCommand as RelayCommand<ChatRequestProgressViewModel>)?.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public string CodexStatus
+    {
+        get => _codexStatus;
+        private set
+        {
+            if (SetProperty(ref _codexStatus, string.IsNullOrWhiteSpace(value) ? "Codex CLI read-only CC capsule" : value))
+            {
+                OnPropertyChanged(nameof(PromptModelCapabilityHint));
+                OnPropertyChanged(nameof(HasPromptModelCapabilityHint));
+            }
+        }
+    }
 
     public string TerminalOutputText
     {
         get => _terminalOutputText;
         private set => SetProperty(ref _terminalOutputText, value ?? "");
+    }
+
+    private static string NormalizePromptModeKey(string? value)
+    {
+        return value?.Trim().ToLowerInvariant() switch
+        {
+            "codex" => "codex",
+            "terminal" => "terminal",
+            _ => "context"
+        };
     }
 
 }

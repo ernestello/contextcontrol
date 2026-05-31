@@ -299,6 +299,7 @@ public sealed partial class ContextControlViewModel
         (UninstallBackendDependencyCommand as RelayCommand<LlmBackendDependencyViewModel>)?.RaiseCanExecuteChanged();
         (ConfirmExternalDependencyDeleteCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
         (PullLocalModelCommand as RelayCommand<LocalLlmModelViewModel>)?.RaiseCanExecuteChanged();
+        (CancelCodexRequestCommand as RelayCommand<ChatRequestProgressViewModel>)?.RaiseCanExecuteChanged();
     }
 
     private void SaveSettingsQuietly()

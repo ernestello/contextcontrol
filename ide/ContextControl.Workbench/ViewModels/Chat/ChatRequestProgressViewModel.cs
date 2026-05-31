@@ -15,10 +15,11 @@ public sealed class ChatRequestProgressViewModel : ObservableObject
     private double _value;
     private bool _isIndeterminate = true;
 
-    public ChatRequestProgressViewModel(string sessionId, string title)
+    public ChatRequestProgressViewModel(string sessionId, string title, bool isCancellable = false)
     {
         SessionId = sessionId ?? "";
         Title = title ?? "";
+        IsCancellable = isCancellable;
         _elapsedTimer = new DispatcherTimer
         {
             Interval = TimeSpan.FromMilliseconds(500)
@@ -31,6 +32,8 @@ public sealed class ChatRequestProgressViewModel : ObservableObject
     public string SessionId { get; }
 
     public string Title { get; }
+
+    public bool IsCancellable { get; }
 
     public double ElapsedSeconds => Math.Max(0, (DateTime.UtcNow - _startedUtc).TotalSeconds);
 
