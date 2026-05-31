@@ -248,6 +248,18 @@
                         </ComboBox.ItemTemplate>
                       </ComboBox>
                       <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="6" IsVisible="{Binding ContextControl.IsMessagePromptMode}">
+                        <Button
+                            Classes="cc-prompt-chip"
+                            Content="{Binding ContextControl.CodexLoginButtonLabel}"
+                            IsVisible="{Binding ContextControl.IsCodexPromptMode}"
+                            ToolTip.Tip="Open Codex CLI login"
+                            Command="{Binding ContextControl.OpenCodexLoginCommand}" />
+                        <Button
+                            Classes="cc-prompt-chip"
+                            Content="Refresh"
+                            IsVisible="{Binding ContextControl.IsCodexPromptMode}"
+                            ToolTip.Tip="Refresh Codex CLI login status"
+                            Command="{Binding ContextControl.RefreshCodexStatusCommand}" />
                         <Border Classes="cc-prompt-status-pill" IsVisible="{Binding ContextControl.HasPromptModelCapabilityHint}">
                           <TextBlock Text="{Binding ContextControl.PromptModelCapabilityHint}" Classes="cc-prompt-status" />
                         </Border>

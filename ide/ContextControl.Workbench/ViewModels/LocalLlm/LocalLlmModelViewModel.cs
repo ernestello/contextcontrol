@@ -140,11 +140,16 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
             {
                 OnPropertyChanged(nameof(InstallLabel));
                 OnPropertyChanged(nameof(CanDownloadBackendModel));
+                OnPropertyChanged(nameof(CanUseManualBackend));
                 OnPropertyChanged(nameof(PullButtonLabel));
+                OnPropertyChanged(nameof(HasBackendOnlyReadyState));
             }
         }
     }
-    public bool CanUseManualBackend => RequiresManualBackend && IsBackendDependencyReady && IsImageGenerationModel;
+    public bool CanUseManualBackend => RequiresManualBackend
+        && IsBackendDependencyReady
+        && IsImageGenerationModel
+        && (!UsesDownloadableBackendModel || IsBackendModelReady);
     public bool CanInstallDependency => !IsInstalled && RequiresManualBackend && !IsBackendDependencyReady && !string.IsNullOrWhiteSpace(DependencyId);
     public bool UsesDownloadableBackendModel => RequiresManualBackend
         && IsImageGenerationModel
@@ -260,9 +265,11 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
         bool isBackendModelReady = false)
     {
         IsInstalled = isInstalled;
-        IsAvailable = isAvailable;
         IsBackendDependencyReady = isBackendDependencyReady;
         IsBackendModelReady = isBackendModelReady;
+        IsAvailable = RequiresManualBackend
+            ? IsInstalled || CanUseManualBackend
+            : isAvailable;
         var fit = IsCloudModel
             ? new ModelFit(
                 isAvailable,

@@ -31,7 +31,13 @@ public sealed record CodexHarnessExecutionPlan(
 public sealed record CodexAvailabilityResult(
     bool Available,
     string Status,
-    string Version);
+    string Version,
+    bool IsAuthenticated = false,
+    bool RequiresLogin = false);
+
+public sealed record CodexLoginLaunchResult(
+    bool Succeeded,
+    string Status);
 
 public sealed class CodexHarnessService
 {
@@ -41,36 +47,48 @@ public sealed class CodexHarnessService
 
     public async Task<CodexAvailabilityResult> CheckAvailabilityAsync(CancellationToken cancellationToken = default)
     {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = "codex",
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            StandardOutputEncoding = Utf8NoBom,
-            StandardErrorEncoding = Utf8NoBom,
-            CreateNoWindow = true
-        };
-        startInfo.ArgumentList.Add("--version");
-
         try
         {
-            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromSeconds(5));
-            using var process = new Process { StartInfo = startInfo };
-            process.Start();
-            var outputTask = process.StandardOutput.ReadToEndAsync(timeout.Token);
-            var errorTask = process.StandardError.ReadToEndAsync(timeout.Token);
-            await process.WaitForExitAsync(timeout.Token);
-            var output = (await outputTask).Trim();
-            var error = (await errorTask).Trim();
-            if (process.ExitCode == 0 && !string.IsNullOrWhiteSpace(output))
+            var versionResult = await RunCodexCommandAsync(["--version"], TimeSpan.FromSeconds(5), cancellationToken);
+            var version = versionResult.StandardOutput.Trim();
+            if (versionResult.ExitCode != 0 || string.IsNullOrWhiteSpace(version))
             {
-                return new CodexAvailabilityResult(true, $"Codex CLI ready: {output}", output);
+                var detail = FirstInterestingLine(versionResult.StandardError)
+                    ?? FirstInterestingLine(versionResult.StandardOutput)
+                    ?? $"codex --version exited {versionResult.ExitCode}";
+                return new CodexAvailabilityResult(false, $"Codex CLI unavailable: {detail}", "");
             }
 
-            var detail = string.IsNullOrWhiteSpace(error) ? $"codex --version exited {process.ExitCode}" : error;
-            return new CodexAvailabilityResult(false, $"Codex CLI unavailable: {detail}", "");
+            var loginResult = await RunCodexCommandAsync(["login", "status"], TimeSpan.FromSeconds(5), cancellationToken);
+            var loginText = $"{loginResult.StandardOutput}{Environment.NewLine}{loginResult.StandardError}".Trim();
+            if (loginResult.ExitCode == 0 && IsLoggedInStatus(loginText))
+            {
+                var loginLine = FirstInterestingLine(loginText) ?? "logged in";
+                return new CodexAvailabilityResult(
+                    true,
+                    $"Codex CLI ready: {version}; {loginLine}",
+                    version,
+                    IsAuthenticated: true,
+                    RequiresLogin: false);
+            }
+
+            var loginDetail = FirstInterestingLine(loginText) ?? "not logged in";
+            if (IsLoginRequiredText(loginText) || loginResult.ExitCode != 0)
+            {
+                return new CodexAvailabilityResult(
+                    true,
+                    $"Codex CLI installed ({version}), but login is required. Click Login Codex, complete auth, then Refresh Codex. Detail: {loginDetail}",
+                    version,
+                    IsAuthenticated: false,
+                    RequiresLogin: true);
+            }
+
+            return new CodexAvailabilityResult(
+                true,
+                $"Codex CLI installed ({version}), but authentication status is unclear. Click Refresh Codex or run Codex Doctor.",
+                version,
+                IsAuthenticated: false,
+                RequiresLogin: true);
         }
         catch (OperationCanceledException)
         {
@@ -79,6 +97,100 @@ public sealed class CodexHarnessService
         catch (Exception ex)
         {
             return new CodexAvailabilityResult(false, $"Codex CLI unavailable: {ex.Message}", "");
+        }
+    }
+
+    public CodexLoginLaunchResult LaunchInteractiveLogin()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var powershellCommand = "$Host.UI.RawUI.WindowTitle='ContextControl Codex Login'; "
+                + "codex login; "
+                + "Write-Host ''; "
+                + "Write-Host 'Return to ContextControl and click Refresh Codex.'; "
+                + "Read-Host 'Press Enter to close'";
+
+            if (TryStartProcess(
+                    "wt.exe",
+                    ["new-tab", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", powershellCommand],
+                    out _))
+            {
+                return new CodexLoginLaunchResult(true, "Opened Codex login in Windows Terminal. Complete the browser/device auth, then click Refresh Codex.");
+            }
+
+            if (TryStartProcess(
+                    "powershell.exe",
+                    ["-NoExit", "-ExecutionPolicy", "Bypass", "-Command", powershellCommand],
+                    out _))
+            {
+                return new CodexLoginLaunchResult(true, "Opened Codex login in PowerShell. Complete the browser/device auth, then click Refresh Codex.");
+            }
+
+            if (TryStartProcess(
+                    "cmd.exe",
+                    ["/k", "codex login && echo. && echo Return to ContextControl and click Refresh Codex."],
+                    out var cmdError))
+            {
+                return new CodexLoginLaunchResult(true, "Opened Codex login in Command Prompt. Complete auth, then click Refresh Codex.");
+            }
+
+            return new CodexLoginLaunchResult(false, $"Could not open a terminal for Codex login: {cmdError}. Open a terminal and run: codex login");
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            var script = "tell application \"Terminal\" to do script \"codex login; echo ''; echo Return to ContextControl and click Refresh Codex.; read -r -p 'Press Enter to close' _\"";
+            if (TryStartProcess("osascript", ["-e", script], out var macError))
+            {
+                return new CodexLoginLaunchResult(true, "Opened Codex login in Terminal. Complete auth, then click Refresh Codex.");
+            }
+
+            return new CodexLoginLaunchResult(false, $"Could not open Terminal for Codex login: {macError}. Open a terminal and run: codex login");
+        }
+
+        var shellCommand = "codex login; echo; echo 'Return to ContextControl and click Refresh Codex.'; read -r -p 'Press Enter to close' _";
+        string[][] linuxLaunchers =
+        [
+            ["x-terminal-emulator", "-e", "bash", "-lc", shellCommand],
+            ["gnome-terminal", "--", "bash", "-lc", shellCommand],
+            ["konsole", "-e", "bash", "-lc", shellCommand],
+            ["xterm", "-e", "bash", "-lc", shellCommand]
+        ];
+
+        var lastError = "";
+        foreach (var launcher in linuxLaunchers)
+        {
+            if (TryStartProcess(launcher[0], launcher.Skip(1).ToArray(), out lastError))
+            {
+                return new CodexLoginLaunchResult(true, "Opened Codex login in a terminal. Complete auth, then click Refresh Codex.");
+            }
+        }
+
+        return new CodexLoginLaunchResult(false, $"Could not open a terminal for Codex login: {lastError}. Open a terminal and run: codex login");
+    }
+
+    public async Task<CodexLoginLaunchResult> RunDoctorAsync(
+        IProgress<string>? terminal = null,
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await RunCodexCommandAsync(["doctor"], TimeSpan.FromSeconds(30), cancellationToken);
+            foreach (var line in InterestingLines(result.StandardOutput).Concat(InterestingLines(result.StandardError)).Take(80))
+            {
+                terminal?.Report(line);
+            }
+
+            var detail = FirstInterestingLine(result.StandardError)
+                ?? FirstInterestingLine(result.StandardOutput)
+                ?? $"codex doctor exited {result.ExitCode}";
+            return result.ExitCode == 0
+                ? new CodexLoginLaunchResult(true, $"Codex doctor passed: {detail}")
+                : new CodexLoginLaunchResult(false, $"Codex doctor found an issue: {detail}");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new CodexLoginLaunchResult(false, $"Codex doctor failed: {ex.Message}");
         }
     }
 
@@ -233,7 +345,9 @@ public sealed class CodexHarnessService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            var status = $"Codex CLI failed: {ex.Message}";
+            var status = IsLoginRequiredText(ex.Message)
+                ? "Codex login required. Click Login Codex, complete auth, then Refresh Codex."
+                : $"Codex CLI failed: {ex.Message}";
             progress?.Report(new LocalLlmGenerationProgress(status, null, null, null, null, null, null, null, true));
             return new CodexHarnessResult(false, status, "", "", string.Join(Environment.NewLine, eventTrace), -1);
         }
@@ -359,6 +473,12 @@ public sealed class CodexHarnessService
 
     private static string BuildFailureStatus(int exitCode, string error, string output)
     {
+        var combined = $"{error}{Environment.NewLine}{output}";
+        if (IsLoginRequiredText(combined))
+        {
+            return "Codex login required. Click Login Codex, complete auth, then Refresh Codex.";
+        }
+
         var detail = FirstInterestingLine(error) ?? FirstInterestingLine(output);
         return string.IsNullOrWhiteSpace(detail)
             ? $"Codex exited with code {exitCode} and no final message."
@@ -372,6 +492,98 @@ public sealed class CodexHarnessService
             .Replace('\r', '\n')
             .Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
             .FirstOrDefault(line => !line.StartsWith("{", StringComparison.Ordinal));
+    }
+
+    public static bool IsLoginRequiredText(string text)
+    {
+        var clean = text ?? "";
+        return clean.Contains("not logged in", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains("login required", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains("please login", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains("please log in", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains("authenticate", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains("authentication", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains("access token", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains("refresh token", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains("auth token", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains("api key", StringComparison.OrdinalIgnoreCase)
+            || clean.Contains("credential", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsLoggedInStatus(string text)
+    {
+        var clean = text ?? "";
+        return clean.Contains("logged in", StringComparison.OrdinalIgnoreCase)
+            && !clean.Contains("not logged in", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<CodexCommandResult> RunCodexCommandAsync(
+        IReadOnlyList<string> arguments,
+        TimeSpan timeout,
+        CancellationToken cancellationToken)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "codex",
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Utf8NoBom,
+            StandardErrorEncoding = Utf8NoBom,
+            CreateNoWindow = true
+        };
+
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var linkedToken = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        linkedToken.CancelAfter(timeout);
+        using var process = new Process { StartInfo = startInfo };
+        process.Start();
+        var outputTask = process.StandardOutput.ReadToEndAsync(linkedToken.Token);
+        var errorTask = process.StandardError.ReadToEndAsync(linkedToken.Token);
+        await process.WaitForExitAsync(linkedToken.Token);
+        return new CodexCommandResult(
+            process.ExitCode,
+            await outputTask,
+            await errorTask);
+    }
+
+    private static bool TryStartProcess(string fileName, IReadOnlyList<string> arguments, out string error)
+    {
+        error = "";
+        try
+        {
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = fileName,
+                UseShellExecute = false,
+                CreateNoWindow = false
+            };
+            foreach (var argument in arguments)
+            {
+                startInfo.ArgumentList.Add(argument);
+            }
+
+            Process.Start(startInfo);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+    }
+
+    private static IEnumerable<string> InterestingLines(string text)
+    {
+        return (text ?? "")
+            .Replace("\r\n", "\n", StringComparison.Ordinal)
+            .Replace('\r', '\n')
+            .Split('\n', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Where(line => line.Length <= 240);
     }
 
     private static ParsedCodexEvent ParseJsonEvent(string line)
@@ -546,4 +758,6 @@ public sealed class CodexHarnessService
     }
 
     private sealed record ParsedCodexEvent(string Message, string Thinking, string TraceLine);
+
+    private sealed record CodexCommandResult(int ExitCode, string StandardOutput, string StandardError);
 }

@@ -142,16 +142,17 @@ public sealed partial class ContextControlViewModel
         }
         catch (OperationCanceledException)
         {
+            var timedOut = !cancellationToken.IsCancellationRequested;
             TryKillDependencyProcess(process);
             await Task.WhenAll(SafeDependencyWaitAsync(stdoutTask), SafeDependencyWaitAsync(stderrTask));
             progress.Report(new LocalLlmTransferProgress(
                 operation,
-                cancellationToken.IsCancellationRequested ? "Stopped by user." : "Timed out; process was stopped.",
+                timedOut ? "Timed out; process was stopped." : "Stopped by user.",
                 null,
                 null,
                 null,
                 null));
-            return new DependencyProcessResult(true, -1, stdout.ToString(), stderr.ToString());
+            return new DependencyProcessResult(true, -1, stdout.ToString(), stderr.ToString(), timedOut);
         }
 
         await Task.WhenAll(SafeDependencyWaitAsync(stdoutTask), SafeDependencyWaitAsync(stderrTask));
@@ -206,6 +207,11 @@ public sealed partial class ContextControlViewModel
 
     private static string? FirstDependencyInstallLine(DependencyProcessResult result)
     {
+        if (result.TimedOut)
+        {
+            return "timed out; process was stopped";
+        }
+
         return InterestingLines(result.StandardError).FirstOrDefault()
             ?? InterestingLines(result.StandardOutput).FirstOrDefault();
     }
@@ -584,6 +590,7 @@ public sealed partial class ContextControlViewModel
         if (!string.IsNullOrWhiteSpace(remembered))
         {
             var rememberedStatus = await ProbePythonModulesAsync(
+                spec.Id,
                 spec.DisplayName,
                 new PythonEnvironmentCandidate(remembered, IsManaged: false, SourceLabel: "ContextControl remembered")
                 {
@@ -803,13 +810,17 @@ public sealed partial class ContextControlViewModel
         bool forceManaged = false)
     {
         var operation = $"Installing {spec.DisplayName}";
-        if (!forceManaged)
+        var managedPython = PythonDependencyEnvironment.ManagedPythonExecutable(spec.Id);
+        var managedDependencyDirectory = PythonDependencyEnvironment.ManagedDependencyDirectory(spec.Id);
+        var managedDirectory = PythonDependencyEnvironment.ManagedEnvironmentDirectory(spec.Id);
+
+        if (!forceManaged && File.Exists(managedPython))
         {
             var existing = await DetectPythonModulesAsync(
                 spec.Id,
                 spec.DisplayName,
                 spec.PackagesToModules,
-                includeExternalCandidates: true,
+                includeExternalCandidates: false,
                 importModules: true,
                 cancellationToken).ConfigureAwait(false);
             if (existing.IsReady)
@@ -820,10 +831,20 @@ public sealed partial class ContextControlViewModel
                     $"{spec.DisplayName} already validates: {existing.Detail}; no user environment was modified.",
                     existing.IsManaged);
             }
+
+            terminal.Report($"{spec.DisplayName} managed venv is not healthy: {existing.Detail}");
+            terminal.Report($"Removing only ContextControl-managed dependency files: {managedDependencyDirectory}");
+            progress.Report(new LocalLlmTransferProgress(
+                operation,
+                $"Repairing managed ContextControl venv at {managedDirectory}.",
+                null,
+                null,
+                null,
+                null));
+            PythonDependencyEnvironment.ClearManagedEnvironmentVariables(spec.Id);
+            PythonDependencyEnvironment.RemoveManagedDependency(spec.Id);
         }
 
-        var managedPython = PythonDependencyEnvironment.ManagedPythonExecutable(spec.Id);
-        var managedDirectory = PythonDependencyEnvironment.ManagedEnvironmentDirectory(spec.Id);
         Directory.CreateDirectory(Path.GetDirectoryName(managedDirectory) ?? PythonDependencyEnvironment.ManagedRoot);
 
         if (!File.Exists(managedPython))
@@ -835,7 +856,7 @@ public sealed partial class ContextControlViewModel
             }
         }
 
-        var pipArgs = new List<string> { "-m", "pip", "install", "--upgrade" };
+        var pipArgs = new List<string> { "-m", "pip", "install", "--upgrade", "--upgrade-strategy", "eager" };
         pipArgs.AddRange(spec.InstallArguments);
         terminal.Report($"> {managedPython} {string.Join(' ', pipArgs)}");
         progress.Report(new LocalLlmTransferProgress(
@@ -863,6 +884,7 @@ public sealed partial class ContextControlViewModel
         }
 
         var validation = await ProbePythonModulesAsync(
+            spec.Id,
             spec.DisplayName,
             new PythonEnvironmentCandidate(managedPython, IsManaged: true, SourceLabel: "ContextControl managed"),
             spec.PackagesToModules,
@@ -870,6 +892,7 @@ public sealed partial class ContextControlViewModel
             cancellationToken).ConfigureAwait(false);
         if (!validation.IsReady)
         {
+            PythonDependencyEnvironment.ClearManagedReady(spec.Id);
             return new DependencyInstallResult(false, $"{spec.DisplayName} installed into managed venv, but validation failed: {validation.Detail}");
         }
 

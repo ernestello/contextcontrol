@@ -213,7 +213,7 @@ public sealed partial class ContextControlViewModel
 
     private sealed record DependencyInstallResult(bool Succeeded, string Status, bool IsManaged = false);
 
-    private sealed record DependencyProcessResult(bool Started, int ExitCode, string StandardOutput, string StandardError);
+    private sealed record DependencyProcessResult(bool Started, int ExitCode, string StandardOutput, string StandardError, bool TimedOut = false);
 
     private void LogResult(ContextControlCommandResult result)
     {
@@ -299,6 +299,9 @@ public sealed partial class ContextControlViewModel
         (UninstallBackendDependencyCommand as RelayCommand<LlmBackendDependencyViewModel>)?.RaiseCanExecuteChanged();
         (ConfirmExternalDependencyDeleteCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
         (PullLocalModelCommand as RelayCommand<LocalLlmModelViewModel>)?.RaiseCanExecuteChanged();
+        (OpenCodexLoginCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
+        (RefreshCodexStatusCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
+        (RunCodexDoctorCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
         (CancelCodexRequestCommand as RelayCommand<ChatRequestProgressViewModel>)?.RaiseCanExecuteChanged();
     }
 

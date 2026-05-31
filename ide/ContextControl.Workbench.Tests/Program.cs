@@ -127,6 +127,25 @@ try
         throw new InvalidOperationException("Codex harness execution plan should force the optimized read-only CC capsule route.");
     }
 
+    var codexReadyStatus = new CodexAvailabilityResult(true, "Codex CLI ready", "codex-cli test", IsAuthenticated: true);
+    if (!codexReadyStatus.Available || !codexReadyStatus.IsAuthenticated || codexReadyStatus.RequiresLogin)
+    {
+        throw new InvalidOperationException("Codex availability should distinguish installed/authenticated from login-required states.");
+    }
+
+    var codexLoginStatus = new CodexAvailabilityResult(true, "Codex login required", "codex-cli test", RequiresLogin: true);
+    if (!codexLoginStatus.Available || codexLoginStatus.IsAuthenticated || !codexLoginStatus.RequiresLogin)
+    {
+        throw new InvalidOperationException("Codex availability should expose login-required setup state for fresh machines.");
+    }
+
+    if (!CodexHarnessService.IsLoginRequiredText("an error occurred trying to access token")
+        || !CodexHarnessService.IsLoginRequiredText("not logged in")
+        || CodexHarnessService.IsLoginRequiredText("max output tokens reached"))
+    {
+        throw new InvalidOperationException("Codex login error detection should catch auth/token failures without treating ordinary token counts as auth setup.");
+    }
+
     var cancellableProgress = new ChatRequestProgressViewModel("session", "codex file request", isCancellable: true);
     if (!cancellableProgress.IsCancellable)
     {
@@ -284,17 +303,19 @@ try
     if (!tinySdViewModel.IsImageGenerationModel
         || !tinySdViewModel.RequiresManualBackend
         || !tinySdViewModel.DependencyId.Equals("diffusers", StringComparison.OrdinalIgnoreCase)
-        || !tinySdViewModel.CanUseManualBackend
         || !tinySdViewModel.CanDownloadBackendModel
-        || !tinySdViewModel.IsAvailable
+        || tinySdViewModel.CanUseManualBackend
+        || tinySdViewModel.IsAvailable
         || !tinySdViewModel.PullButtonLabel.Equals("Download", StringComparison.OrdinalIgnoreCase))
     {
-        throw new InvalidOperationException("Diffusers-backed image models should expose a model download action once the Diffusers backend dependency is ready.");
+        throw new InvalidOperationException("Diffusers-backed image models should expose a model download action, but should not be selectable until weights are cached.");
     }
 
     tinySdViewModel.ApplyBackendModelState(true);
     if (!tinySdViewModel.IsBackendModelReady
         || tinySdViewModel.CanDownloadBackendModel
+        || !tinySdViewModel.CanUseManualBackend
+        || !tinySdViewModel.IsAvailable
         || !tinySdViewModel.PullButtonLabel.Equals("Ready", StringComparison.OrdinalIgnoreCase))
     {
         throw new InvalidOperationException("Diffusers-backed image models should become ready after their Hugging Face weights are cached.");
@@ -326,11 +347,11 @@ try
         isRequired: false,
         isRecommended: true);
     diffusersDependency.ApplyStatus(true, "Ready", "External Python", isManaged: false);
-    if (!diffusersDependency.CanForceInstall
+    if (diffusersDependency.CanForceInstall
         || diffusersDependency.CanUninstall
-        || !diffusersDependency.InstallActionLabel.Equals("Force install", StringComparison.OrdinalIgnoreCase))
+        || !diffusersDependency.InstallActionLabel.Equals("External", StringComparison.OrdinalIgnoreCase))
     {
-        throw new InvalidOperationException("External Python dependencies should expose a confirmed force-install action instead of a dead External action.");
+        throw new InvalidOperationException("External Python dependencies should not expose destructive repair actions.");
     }
 
     diffusersDependency.ApplyStatus(true, "Ready", "Managed Python", isManaged: true);

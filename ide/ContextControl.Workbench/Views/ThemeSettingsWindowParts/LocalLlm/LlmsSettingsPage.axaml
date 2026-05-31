@@ -78,6 +78,40 @@
                 </Border>
 
                 <Border Classes="rule-card">
+                  <Grid RowDefinitions="Auto,Auto" RowSpacing="7">
+                    <Grid ColumnDefinitions="*,Auto,Auto,Auto" ColumnSpacing="6">
+                      <StackPanel>
+                        <TextBlock Classes="settings-title" Text="Codex CLI" />
+                        <TextBlock Classes="muted" Text="{Binding ContextControl.CodexSetupSummary}" />
+                      </StackPanel>
+                      <Button
+                          Grid.Column="1"
+                          Classes="rule-mini primary"
+                          MinHeight="24"
+                          MinWidth="64"
+                          Content="{Binding ContextControl.CodexLoginButtonLabel}"
+                          Command="{Binding ContextControl.OpenCodexLoginCommand}" />
+                      <Button
+                          Grid.Column="2"
+                          Classes="rule-mini"
+                          MinHeight="24"
+                          Content="Refresh"
+                          Command="{Binding ContextControl.RefreshCodexStatusCommand}" />
+                      <Button
+                          Grid.Column="3"
+                          Classes="rule-mini"
+                          MinHeight="24"
+                          Content="Doctor"
+                          Command="{Binding ContextControl.RunCodexDoctorCommand}" />
+                    </Grid>
+                    <TextBlock
+                        Grid.Row="1"
+                        Classes="path-text"
+                        Text="{Binding ContextControl.CodexStatus}" />
+                  </Grid>
+                </Border>
+
+                <Border Classes="rule-card">
                   <Grid RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="8">
                     <Grid ColumnDefinitions="180,*" ColumnSpacing="10">
                       <TextBlock Classes="field-label" Text="File request model" VerticalAlignment="Center" />

@@ -480,10 +480,67 @@ public sealed partial class ContextControlViewModel
                 OnPropertyChanged(nameof(CodexStatus));
                 OnPropertyChanged(nameof(PromptModelCapabilityHint));
                 OnPropertyChanged(nameof(HasPromptModelCapabilityHint));
+                (OpenCodexLoginCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
+                (RefreshCodexStatusCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
+                (RunCodexDoctorCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
                 (CancelCodexRequestCommand as RelayCommand<ChatRequestProgressViewModel>)?.RaiseCanExecuteChanged();
             }
         }
     }
+
+    public bool IsCodexAuthenticated
+    {
+        get => _isCodexAuthenticated;
+        private set
+        {
+            if (SetProperty(ref _isCodexAuthenticated, value))
+            {
+                OnPropertyChanged(nameof(CodexLoginButtonLabel));
+                OnPropertyChanged(nameof(CodexSetupSummary));
+                OnPropertyChanged(nameof(CodexSetupStatusKind));
+            }
+        }
+    }
+
+    public bool IsCodexLoginRequired
+    {
+        get => _isCodexLoginRequired;
+        private set
+        {
+            if (SetProperty(ref _isCodexLoginRequired, value))
+            {
+                OnPropertyChanged(nameof(CodexLoginButtonLabel));
+                OnPropertyChanged(nameof(CodexSetupSummary));
+                OnPropertyChanged(nameof(CodexSetupStatusKind));
+            }
+        }
+    }
+
+    public bool IsRefreshingCodexStatus
+    {
+        get => _isRefreshingCodexStatus;
+        private set
+        {
+            if (SetProperty(ref _isRefreshingCodexStatus, value))
+            {
+                OnPropertyChanged(nameof(CodexSetupSummary));
+                (RefreshCodexStatusCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
+                (RunCodexDoctorCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
+            }
+        }
+    }
+
+    public string CodexLoginButtonLabel => IsCodexAuthenticated ? "Relogin" : "Login";
+
+    public string CodexSetupSummary => IsRefreshingCodexStatus
+        ? "Checking Codex CLI login..."
+        : IsCodexAuthenticated
+            ? "Codex login ready"
+            : IsCodexLoginRequired
+                ? "Codex login required"
+                : "Codex setup pending";
+
+    public string CodexSetupStatusKind => IsCodexAuthenticated ? "ready" : IsCodexLoginRequired ? "login" : "pending";
 
     public string CodexStatus
     {

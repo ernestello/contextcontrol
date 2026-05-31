@@ -235,6 +235,19 @@ public sealed partial class ContextControlViewModel
             return;
         }
 
+        var availability = await _codexHarnessService.CheckAvailabilityAsync();
+        ApplyCodexAvailability(availability);
+        if (!availability.Available || !availability.IsAuthenticated)
+        {
+            IsPromptOpen = true;
+            PromptModeKey = "codex";
+            PhaseTitle = availability.RequiresLogin ? "Codex login required" : "Codex unavailable";
+            PhaseDetail = availability.Status;
+            ProviderStatus = availability.Status;
+            AppendTerminalOutput(availability.Status);
+            return;
+        }
+
         var codexCancellation = new CancellationTokenSource();
         _codexCancellation = codexCancellation;
         IsBusy = true;
@@ -349,6 +362,13 @@ public sealed partial class ContextControlViewModel
 
             ProviderStatus = result.Status;
             CodexStatus = result.Status;
+            if (!result.Succeeded && CodexHarnessService.IsLoginRequiredText(result.Status))
+            {
+                IsCodexAuthenticated = false;
+                IsCodexLoginRequired = true;
+                CodexStatus = "Codex login required. Click Login Codex, complete auth, then Refresh Codex.";
+            }
+
             if (!phaseHandled)
             {
                 PhaseTitle = result.Succeeded
@@ -357,8 +377,11 @@ public sealed partial class ContextControlViewModel
                         : audit is { HasWarnings: true }
                             ? "Codex answer needs review"
                             : "Codex answer ready"
+                    : CodexHarnessService.IsLoginRequiredText(result.Status) ? "Codex login required"
                     : result.Status.Contains("stopped", StringComparison.OrdinalIgnoreCase) ? "Codex stopped" : "Codex failed";
-                PhaseDetail = audit?.Summary ?? result.Status;
+                PhaseDetail = CodexHarnessService.IsLoginRequiredText(result.Status)
+                    ? CodexStatus
+                    : audit?.Summary ?? result.Status;
             }
 
             Log(result.Succeeded ? "ok" : "warn", result.Status);
@@ -418,17 +441,92 @@ public sealed partial class ContextControlViewModel
 
     private async Task RefreshCodexStatusAsync()
     {
-        var result = await _codexHarnessService.CheckAvailabilityAsync();
-        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        if (IsRefreshingCodexStatus)
         {
-            if (IsCodexRequestRunning)
-            {
-                return;
-            }
+            return;
+        }
 
+        IsRefreshingCodexStatus = true;
+        try
+        {
+            var result = await _codexHarnessService.CheckAvailabilityAsync();
+            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                IsRefreshingCodexStatus = false;
+                ApplyCodexAvailability(result);
+            });
+        }
+        catch (Exception ex)
+        {
+            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                IsRefreshingCodexStatus = false;
+                var status = $"Codex CLI status check failed: {ex.Message}";
+                CodexStatus = status;
+                IsCodexAuthenticated = false;
+                IsCodexLoginRequired = true;
+                Log("warn", status);
+            });
+        }
+    }
+
+    private void ApplyCodexAvailability(CodexAvailabilityResult result)
+    {
+        if (IsCodexRequestRunning)
+        {
+            return;
+        }
+
+        CodexStatus = result.Status;
+        IsCodexAuthenticated = result.IsAuthenticated;
+        IsCodexLoginRequired = result.RequiresLogin || (result.Available && !result.IsAuthenticated);
+        Log(result.Available && result.IsAuthenticated ? "ok" : "warn", result.Status);
+    }
+
+    private void OpenCodexLogin()
+    {
+        IsPromptOpen = true;
+        PromptModeKey = "codex";
+        var result = _codexHarnessService.LaunchInteractiveLogin();
+        CodexStatus = result.Status;
+        IsCodexAuthenticated = false;
+        IsCodexLoginRequired = true;
+        PhaseTitle = result.Succeeded ? "Codex login opened" : "Codex login setup";
+        PhaseDetail = result.Status;
+        ProviderStatus = result.Status;
+        AppendTerminalOutput(result.Status);
+        Log(result.Succeeded ? "info" : "warn", result.Status);
+    }
+
+    private async Task RunCodexDoctorAsync()
+    {
+        if (IsBusy)
+        {
+            return;
+        }
+
+        IsBusy = true;
+        IsPromptOpen = true;
+        PromptModeKey = "terminal";
+        PhaseTitle = "Codex doctor";
+        PhaseDetail = "Running codex doctor for install/auth/runtime diagnostics.";
+        ProviderStatus = "Codex doctor running";
+        var terminal = CreateTerminalProgress();
+        try
+        {
+            var result = await _codexHarnessService.RunDoctorAsync(terminal);
+            PhaseTitle = result.Succeeded ? "Codex doctor ready" : "Codex doctor issue";
+            PhaseDetail = result.Status;
+            ProviderStatus = result.Status;
             CodexStatus = result.Status;
-            Log(result.Available ? "ok" : "warn", result.Status);
-        });
+            AppendTerminalOutput(result.Status);
+            Log(result.Succeeded ? "ok" : "warn", result.Status);
+        }
+        finally
+        {
+            IsBusy = false;
+            _ = RefreshCodexStatusAsync();
+        }
     }
 
     private async Task SendLocalChatAsync(string message)

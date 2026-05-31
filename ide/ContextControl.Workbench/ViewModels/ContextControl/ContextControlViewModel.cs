@@ -101,6 +101,9 @@ public sealed partial class ContextControlViewModel : ObservableObject
     private bool _isCcTimelineExpanded = true;
     private bool _isAutopilotEnabled;
     private bool _isCodexRequestRunning;
+    private bool _isCodexAuthenticated;
+    private bool _isCodexLoginRequired;
+    private bool _isRefreshingCodexStatus;
     private int _currentCcTimelineStageIndex = CcStageRequest;
     private double _transferProgressValue;
     private string _dockPanelKey = "log";
@@ -340,6 +343,15 @@ public sealed partial class ContextControlViewModel : ObservableObject
         PreviousTransferStatusCommand = new RelayCommand<object>(_ => MoveTransferProgressHistory(-1), _ => CanMoveTransferProgressHistory(-1));
         NextTransferStatusCommand = new RelayCommand<object>(_ => MoveTransferProgressHistory(1), _ => CanMoveTransferProgressHistory(1));
         CloseTransferProgressCommand = new RelayCommand<object>(_ => CloseTransferProgress(), _ => CanCloseTransferProgress);
+        OpenCodexLoginCommand = new RelayCommand<object>(
+            _ => OpenCodexLogin(),
+            _ => !IsBusy && !IsCodexRequestRunning);
+        RefreshCodexStatusCommand = new RelayCommand<object>(
+            _ => _ = RefreshCodexStatusAsync(),
+            _ => !IsCodexRequestRunning && !IsRefreshingCodexStatus);
+        RunCodexDoctorCommand = new RelayCommand<object>(
+            _ => _ = RunCodexDoctorAsync(),
+            _ => !IsBusy && !IsCodexRequestRunning && !IsRefreshingCodexStatus);
         CancelCodexRequestCommand = new RelayCommand<ChatRequestProgressViewModel>(
             CancelCodexRequest,
             item => CanCancelCodexRequest(item));
@@ -508,6 +520,9 @@ public sealed partial class ContextControlViewModel : ObservableObject
     public ICommand PreviousTransferStatusCommand { get; }
     public ICommand NextTransferStatusCommand { get; }
     public ICommand CloseTransferProgressCommand { get; }
+    public ICommand OpenCodexLoginCommand { get; }
+    public ICommand RefreshCodexStatusCommand { get; }
+    public ICommand RunCodexDoctorCommand { get; }
     public ICommand CancelCodexRequestCommand { get; }
     public ICommand CopyRoutingLogCommand { get; }
     public ICommand CopySnippetCommand { get; }

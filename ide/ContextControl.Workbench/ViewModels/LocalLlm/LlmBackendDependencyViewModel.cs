@@ -64,7 +64,7 @@ public sealed class LlmBackendDependencyViewModel(
         : HasSafeAutomaticInstaller ? "Install" : "Manual";
     public bool CanInstall => !IsReady;
     public bool CanUninstall => IsReady && IsManaged && !Id.Equals("ollama", StringComparison.OrdinalIgnoreCase);
-    public bool CanForceInstall => IsReady && !IsManaged && PythonDependencyEnvironment.HasManagedInstaller(Id);
+    public bool CanForceInstall => false;
 
     public bool IsReady
     {

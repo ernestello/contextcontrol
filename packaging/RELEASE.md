@@ -54,7 +54,7 @@ FLUX.2 Klein Diffusers first-run downloads are large. The app downloads only the
 
 HF token guidance is visible in the app. Diffusers model cards show an HF token warning while no token is configured, selecting a Hugging Face-backed image model logs the warning, and View -> Settings -> LLMs includes a visible token field plus a Tutorial button that opens a step-by-step token window. The warning applies to the 8 Hugging Face-backed Diffusers routes: `runwayml/stable-diffusion-v1-5`, `stabilityai/stable-diffusion-2-1-base`, `segmind/tiny-sd`, `nota-ai/bk-sdm-small`, `SimianLuo/LCM_Dreamshaper_v7`, `stabilityai/sd-turbo`, `segmind/SSD-1B`, and `black-forest-labs/FLUX.2-klein-4B`.
 
-Diffusers runtime validation no longer imports heavy Torch/Diffusers packages before generation. Preflight checks module presence only, while the generation/download subprocess imports PyTorch, Hugging Face Hub, and Diffusers with visible terminal stages, heartbeat lines, and explicit import timeout messages.
+Diffusers runtime validation is now strict and managed-only. ContextControl ignores external Python environments for Diffusers generation, validates the managed venv by importing PyTorch, Diffusers, and the FLUX.2 Klein pipeline before model download/cache detection/generation, and keeps Diffusers image models out of the prompt selector until the dependency and model cache both validate. Repair deletes only `%LOCALAPPDATA%\ContextControl\dependencies\python\diffusers` and recreates the managed venv.
 
 Fresh Windows Python bootstrap: managed Python dependencies ignore the Microsoft Store `python.exe` alias and install Python 3.12 through `winget` when no real interpreter is present.
 

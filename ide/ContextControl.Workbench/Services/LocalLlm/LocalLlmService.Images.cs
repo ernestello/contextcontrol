@@ -12,8 +12,8 @@ namespace ContextControl.Workbench.Services;
 
 public sealed partial class LocalLlmService
 {
-    private static readonly TimeSpan DiffusersPythonProbeValidationTimeout = TimeSpan.FromSeconds(15);
-    private static readonly TimeSpan DiffusersPythonCacheProbeValidationTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan DiffusersPythonProbeValidationTimeout = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan DiffusersPythonCacheProbeValidationTimeout = TimeSpan.FromSeconds(120);
 
     public async Task<LocalLlmChatResult> DownloadImageModelAsync(
         string modelId,
@@ -177,9 +177,25 @@ print(f"Cached model at {path}")
 import sys
 from huggingface_hub import snapshot_download
 
+def flux2_klein_allow_patterns():
+    return [
+        "model_index.json",
+        "scheduler/*",
+        "text_encoder/*",
+        "tokenizer/*",
+        "transformer/*",
+        "vae/*",
+    ]
+
+def allow_patterns_for(model_id):
+    clean = model_id.lower()
+    if "flux.2-klein" in clean or "flux2-klein" in clean:
+        return flux2_klein_allow_patterns()
+    return None
+
 for model_id in sys.argv[1:]:
     try:
-        snapshot_download(repo_id=model_id, local_files_only=True)
+        snapshot_download(repo_id=model_id, local_files_only=True, allow_patterns=allow_patterns_for(model_id))
     except Exception:
         continue
     print("CC_MODEL_CACHED=" + model_id)
@@ -515,14 +531,18 @@ finally:
         CancellationToken cancellationToken,
         TimeSpan? validationTimeout = null)
     {
-        var candidates = PythonDependencyEnvironment.FindPythonCandidatesForDetection("diffusers");
-        if (candidates.Count == 0)
+        var candidates = PythonDependencyEnvironment
+            .FindPythonCandidatesForDetection("diffusers", includePathCandidates: false)
+            .Where(candidate => candidate.IsManaged)
+            .ToArray();
+        if (candidates.Length == 0)
         {
-            return PythonExecutableResolution.Failed("Python was not found. Install Python, then install Diffusers from the Dependencies page to create a managed ContextControl venv.");
+            return PythonExecutableResolution.Failed("Hugging Face Diffusers is not installed in ContextControl's managed venv. Install it from Dependencies before using Diffusers image models.");
         }
 
         var failures = new List<string>();
-        var script = PythonDependencyEnvironment.BuildPythonModuleProbeScript(
+        var script = PythonDependencyEnvironment.BuildPythonDependencyHealthScript(
+            "diffusers",
             requirements.ToDictionary(requirement => requirement.DisplayName, requirement => requirement.ModuleName, StringComparer.OrdinalIgnoreCase));
         var timeout = validationTimeout ?? DiffusersPythonProbeValidationTimeout;
         foreach (var candidate in candidates)
@@ -547,15 +567,15 @@ finally:
             }
 
             var reason = result.TimedOut
-                ? $"timed out after {timeout.TotalSeconds:0}s while checking for Diffusers dependency modules. Reinstall Hugging Face Diffusers from Dependencies if this repeats."
+                ? $"timed out after {timeout.TotalSeconds:0}s while validating the ContextControl-managed Diffusers runtime. Reinstall Hugging Face Diffusers from Dependencies to repair the managed venv."
                 : FirstFailureLine(result.StandardError) ?? FirstFailureLine(result.StandardOutput) ?? $"exited {result.ExitCode}";
             failures.Add($"{candidate.Executable}: {reason}");
         }
 
         var firstFailure = failures.FirstOrDefault();
         var status = firstFailure is null
-            ? "Python was found, but Diffusers dependencies could not be validated."
-            : $"No Python environment could import Diffusers dependencies. First failure: {firstFailure}";
+            ? "ContextControl's managed Diffusers runtime could not be validated."
+            : $"ContextControl's managed Diffusers runtime is not ready. First failure: {firstFailure}";
         return PythonExecutableResolution.Failed(status);
     }
 

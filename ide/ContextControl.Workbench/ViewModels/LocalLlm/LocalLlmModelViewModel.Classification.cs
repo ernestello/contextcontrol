@@ -16,13 +16,17 @@ public sealed partial class LocalLlmModelViewModel
         IsBackendDependencyReady = isBackendDependencyReady;
         if (RequiresManualBackend)
         {
-            IsAvailable = IsInstalled || (IsImageGenerationModel && isBackendDependencyReady);
+            IsAvailable = IsInstalled || CanUseManualBackend;
         }
     }
 
     public void ApplyBackendModelState(bool isBackendModelReady)
     {
         IsBackendModelReady = isBackendModelReady;
+        if (RequiresManualBackend)
+        {
+            IsAvailable = IsInstalled || CanUseManualBackend;
+        }
     }
 
     private static bool IsCloudModelId(string id)

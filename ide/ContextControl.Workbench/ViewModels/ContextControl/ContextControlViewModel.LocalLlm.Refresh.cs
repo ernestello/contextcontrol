@@ -376,7 +376,8 @@ public sealed partial class ContextControlViewModel
         PythonDependencySpec spec,
         CancellationToken cancellationToken)
     {
-        if (PythonDependencyEnvironment.HasManagedReadyStamp(spec))
+        var requiresRuntimeHealthProbe = spec.Id.Equals("diffusers", StringComparison.OrdinalIgnoreCase);
+        if (!requiresRuntimeHealthProbe && PythonDependencyEnvironment.HasManagedReadyStamp(spec))
         {
             var managedPython = PythonDependencyEnvironment.ManagedPythonExecutable(spec.Id);
             return new DependencyRuntimeStatus(
@@ -391,19 +392,8 @@ public sealed partial class ContextControlViewModel
             spec.DisplayName,
             spec.PackagesToModules,
             includeExternalCandidates: false,
-            importModules: false,
+            importModules: requiresRuntimeHealthProbe,
             cancellationToken).ConfigureAwait(false);
-
-        if (!status.IsReady)
-        {
-            status = await DetectPythonModulesAsync(
-                spec.Id,
-                spec.DisplayName,
-                spec.PackagesToModules,
-                includeExternalCandidates: true,
-                importModules: false,
-                cancellationToken).ConfigureAwait(false);
-        }
 
         RememberPythonDependencyRuntime(spec, status);
         return status;
@@ -490,7 +480,7 @@ public sealed partial class ContextControlViewModel
     {
         var pythonCandidates = PythonDependencyEnvironment
             .FindPythonCandidatesForDetection(dependencyId, includePathCandidates: includeExternalCandidates)
-            .Where(candidate => includeExternalCandidates || candidate.IsManaged || candidate.IsRememberedExternal)
+            .Where(candidate => includeExternalCandidates || candidate.IsManaged)
             .ToArray();
         if (pythonCandidates.Length == 0)
         {
@@ -503,7 +493,7 @@ public sealed partial class ContextControlViewModel
         foreach (var python in pythonCandidates)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            var status = await ProbePythonModulesAsync(displayName, python, packagesToModules, importModules, cancellationToken).ConfigureAwait(false);
+            var status = await ProbePythonModulesAsync(dependencyId, displayName, python, packagesToModules, importModules, cancellationToken).ConfigureAwait(false);
             if (status.IsReady)
             {
                 return status;
@@ -521,18 +511,24 @@ public sealed partial class ContextControlViewModel
     }
 
     private static async Task<DependencyRuntimeStatus> ProbePythonModulesAsync(
+        string dependencyId,
         string displayName,
         PythonEnvironmentCandidate python,
         IReadOnlyDictionary<string, string> packagesToModules,
         bool importModules,
         CancellationToken cancellationToken)
     {
+        var timeout = importModules
+            ? dependencyId.Equals("diffusers", StringComparison.OrdinalIgnoreCase)
+                ? TimeSpan.FromSeconds(120)
+                : TimeSpan.FromSeconds(45)
+            : TimeSpan.FromSeconds(6);
         var result = await RunProcessForDependencyDetectionAsync(
             python.Executable,
             ["-c", importModules
-                ? PythonDependencyEnvironment.BuildPythonModuleImportScript(packagesToModules)
+                ? PythonDependencyEnvironment.BuildPythonDependencyHealthScript(dependencyId, packagesToModules)
                 : PythonDependencyEnvironment.BuildPythonModuleProbeScript(packagesToModules)],
-            importModules ? TimeSpan.FromSeconds(45) : TimeSpan.FromSeconds(6),
+            timeout,
             cancellationToken,
             python.IsManaged ? PythonDependencyEnvironment.ManagedProcessEnvironment : null).ConfigureAwait(false);
         if (!result.Started)
@@ -545,6 +541,11 @@ public sealed partial class ContextControlViewModel
             var executable = FirstInterestingLine(result.StandardOutput) ?? python.Executable;
             var source = python.IsManaged ? "managed ContextControl venv" : python.SourceLabel;
             return new DependencyRuntimeStatus(true, $"{displayName} ready in {executable} ({source}).", executable, python.IsManaged);
+        }
+
+        if (result.TimedOut)
+        {
+            return new DependencyRuntimeStatus(false, $"runtime import check timed out after {timeout.TotalSeconds:0}s");
         }
 
         var reason = FirstDependencyInstallLine(result) ?? $"exited {result.ExitCode}";
@@ -607,8 +608,14 @@ public sealed partial class ContextControlViewModel
         }
         catch (OperationCanceledException)
         {
+            var timedOut = !cancellationToken.IsCancellationRequested;
             TryKillDependencyProcess(process);
-            return new DependencyProcessResult(true, -1, await stdoutTask.ConfigureAwait(false), await stderrTask.ConfigureAwait(false));
+            return new DependencyProcessResult(
+                true,
+                -1,
+                await stdoutTask.ConfigureAwait(false),
+                await stderrTask.ConfigureAwait(false),
+                timedOut);
         }
 
         return new DependencyProcessResult(

@@ -21,6 +21,8 @@ internal sealed record PythonEnvironmentCandidate(string Executable, bool IsMana
 
 internal static class PythonDependencyEnvironment
 {
+    private const string ReadyStampHeader = "ContextControlPythonDependencyReady=2";
+
     private static readonly PythonDependencySpec[] Specs =
     [
         new(
@@ -215,7 +217,8 @@ internal static class PythonDependencyEnvironment
             }
 
             var stamp = File.ReadAllText(stampPath);
-            return spec.Packages.All(package => stamp.Contains(package, StringComparison.OrdinalIgnoreCase));
+            return stamp.Contains(ReadyStampHeader, StringComparison.OrdinalIgnoreCase)
+                && spec.Packages.All(package => stamp.Contains(package, StringComparison.OrdinalIgnoreCase));
         }
         catch
         {
@@ -231,11 +234,27 @@ internal static class PythonDependencyEnvironment
             Directory.CreateDirectory(Path.GetDirectoryName(stampPath) ?? ManagedEnvironmentDirectory(spec.Id));
             File.WriteAllText(
                 stampPath,
-                string.Join(Environment.NewLine, spec.Packages.Prepend(DateTimeOffset.UtcNow.ToString("O"))));
+                string.Join(Environment.NewLine, spec.Packages.Prepend(DateTimeOffset.UtcNow.ToString("O")).Prepend(ReadyStampHeader)));
         }
         catch
         {
             // The stamp is an optimization; runtime validation remains the source of truth.
+        }
+    }
+
+    public static void ClearManagedReady(string dependencyId)
+    {
+        try
+        {
+            var stampPath = ManagedReadyStampPath(dependencyId);
+            if (File.Exists(stampPath))
+            {
+                File.Delete(stampPath);
+            }
+        }
+        catch
+        {
+            // Missing or locked ready stamps should not block repair.
         }
     }
 
@@ -444,6 +463,15 @@ print(sys.executable)
 """;
     }
 
+    public static string BuildPythonDependencyHealthScript(
+        string dependencyId,
+        IReadOnlyDictionary<string, string> packagesToModules)
+    {
+        return dependencyId.Equals("diffusers", StringComparison.OrdinalIgnoreCase)
+            ? BuildDiffusersHealthScript(packagesToModules)
+            : BuildPythonModuleImportScript(packagesToModules);
+    }
+
     public static string BuildPythonModuleProbeScript(IReadOnlyDictionary<string, string> packagesToModules)
     {
         var packageLines = string.Join(
@@ -465,6 +493,51 @@ for name, module in packages:
         found = None
     if found is None:
         errors.append(f"Missing {name}")
+if errors:
+    print("; ".join(errors))
+    sys.exit(1)
+print(sys.executable)
+""";
+    }
+
+    private static string BuildDiffusersHealthScript(IReadOnlyDictionary<string, string> packagesToModules)
+    {
+        var packageLines = string.Join(
+            "\n",
+            packagesToModules.Select(pair => $"    ({EscapePythonString(pair.Key)}, {EscapePythonString(pair.Value)}),"));
+
+        return $$"""
+import importlib
+import sys
+
+packages = [
+{{packageLines}}
+]
+errors = []
+loaded = {}
+for name, module in packages:
+    try:
+        loaded[module] = importlib.import_module(module)
+    except ModuleNotFoundError as exc:
+        if exc.name == module or module.startswith(exc.name + "."):
+            errors.append(f"Missing {name}")
+        else:
+            errors.append(f"{name}: {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        errors.append(f"{name}: {type(exc).__name__}: {exc}")
+
+torch = loaded.get("torch")
+if torch is not None:
+    try:
+        _ = torch.__version__
+        _ = torch.cuda.is_available()
+    except Exception as exc:
+        errors.append(f"PyTorch runtime check failed: {type(exc).__name__}: {exc}")
+
+diffusers = loaded.get("diffusers")
+if diffusers is not None and not hasattr(diffusers, "Flux2KleinPipeline"):
+    errors.append("Missing Flux2KleinPipeline in diffusers; reinstall Hugging Face Diffusers from ContextControl Dependencies.")
+
 if errors:
     print("; ".join(errors))
     sys.exit(1)
