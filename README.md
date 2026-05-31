@@ -160,6 +160,8 @@ black-forest-labs/FLUX.2-klein-4B
 
 The default image-generation selection is Tiny Stable Diffusion (`segmind/tiny-sd`) because it is small enough for fresh Windows installs and is useful for validating that Python, Torch, and Diffusers are working before downloading larger checkpoints. For FLUX.2 Klein on Windows, use the Diffusers entry, not the `x/flux2-klein` Ollama entry. The terminal echoes the exact prompt being generated, reports whether Hugging Face downloads are authenticated, and prints keepalive status while first-run Diffusers downloads or CPU-offload loading are quiet.
 
+If a fresh Python environment is slow to import Torch/Diffusers, ContextControl waits longer during generation/download validation and reports an explicit import timeout instead of the old `exited -1` message. If that timeout repeats, reinstall **Hugging Face Diffusers** from the Dependencies page to rebuild the managed environment.
+
 ## Windows Download Warnings
 
 Windows SmartScreen may warn on new unsigned installers even when the file is clean. The technical fix is Authenticode code signing with an OV/EV certificate and enough download reputation over time. The release workflow supports optional certificate-based signing through repository secrets, but public builds remain unsigned until a signing certificate is configured.

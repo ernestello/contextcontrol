@@ -80,7 +80,12 @@ public sealed partial class LocalLlmService
         catch (OperationCanceledException)
         {
             TryKill(process);
-            return new ProcessResult(true, -1, await SafeReadAsync(stdoutTask).ConfigureAwait(false), await SafeReadAsync(stderrTask).ConfigureAwait(false));
+            return new ProcessResult(
+                true,
+                -1,
+                await SafeReadAsync(stdoutTask).ConfigureAwait(false),
+                await SafeReadAsync(stderrTask).ConfigureAwait(false),
+                TimedOut: !cancellationToken.IsCancellationRequested);
         }
 
         return new ProcessResult(
@@ -156,7 +161,7 @@ public sealed partial class LocalLlmService
         {
             TryKill(process);
             await Task.WhenAll(SafeWaitAsync(stdoutTask), SafeWaitAsync(stderrTask)).ConfigureAwait(false);
-            return new ProcessResult(true, -1, stdout.ToString(), stderr.ToString());
+            return new ProcessResult(true, -1, stdout.ToString(), stderr.ToString(), TimedOut: !cancellationToken.IsCancellationRequested);
         }
 
         await Task.WhenAll(SafeWaitAsync(stdoutTask), SafeWaitAsync(stderrTask)).ConfigureAwait(false);

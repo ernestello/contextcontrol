@@ -19,7 +19,7 @@ public sealed partial class LocalLlmService
         string? ExecutablePath,
         string Status);
 
-    private sealed record ProcessResult(bool Started, int ExitCode, string StandardOutput, string StandardError)
+    private sealed record ProcessResult(bool Started, int ExitCode, string StandardOutput, string StandardError, bool TimedOut = false)
     {
         public static ProcessResult NotStarted() => new(false, -1, "", "");
     }

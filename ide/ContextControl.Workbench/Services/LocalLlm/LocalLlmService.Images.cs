@@ -12,6 +12,9 @@ namespace ContextControl.Workbench.Services;
 
 public sealed partial class LocalLlmService
 {
+    private static readonly TimeSpan DiffusersPythonImportValidationTimeout = TimeSpan.FromSeconds(120);
+    private static readonly TimeSpan DiffusersPythonCacheProbeImportTimeout = TimeSpan.FromSeconds(45);
+
     public async Task<LocalLlmChatResult> DownloadImageModelAsync(
         string modelId,
         IProgress<LocalLlmTransferProgress>? progress,
@@ -143,7 +146,10 @@ print(f"Cached model at {path}")
             return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         }
 
-        var pythonResolution = await ResolvePythonForModulesAsync(DiffusersPythonRequirements, cancellationToken).ConfigureAwait(false);
+        var pythonResolution = await ResolvePythonForModulesAsync(
+            DiffusersPythonRequirements,
+            cancellationToken,
+            DiffusersPythonCacheProbeImportTimeout).ConfigureAwait(false);
         if (!pythonResolution.Succeeded || pythonResolution.Executable is null)
         {
             return new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -467,7 +473,8 @@ finally:
 
     private static async Task<PythonExecutableResolution> ResolvePythonForModulesAsync(
         IReadOnlyList<PythonModuleRequirement> requirements,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        TimeSpan? importValidationTimeout = null)
     {
         var candidates = PythonDependencyEnvironment.FindPythonCandidatesForDetection("diffusers");
         if (candidates.Count == 0)
@@ -478,12 +485,14 @@ finally:
         var failures = new List<string>();
         var script = PythonDependencyEnvironment.BuildPythonModuleImportScript(
             requirements.ToDictionary(requirement => requirement.DisplayName, requirement => requirement.ModuleName, StringComparer.OrdinalIgnoreCase));
+        var timeout = importValidationTimeout ?? DiffusersPythonImportValidationTimeout;
         foreach (var candidate in candidates)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var result = await RunProcessAsync(
                 candidate.Executable,
                 ["-c", script],
-                TimeSpan.FromSeconds(15),
+                timeout,
                 cancellationToken,
                 candidate.IsManaged ? PythonDependencyEnvironment.ManagedProcessEnvironment : null).ConfigureAwait(false);
 
@@ -498,7 +507,9 @@ finally:
                 return PythonExecutableResolution.Ready(candidate.Executable, FirstLine(result.StandardOutput) ?? candidate.Executable, candidate.IsManaged);
             }
 
-            var reason = FirstFailureLine(result.StandardError) ?? FirstFailureLine(result.StandardOutput) ?? $"exited {result.ExitCode}";
+            var reason = result.TimedOut
+                ? $"timed out after {timeout.TotalSeconds:0}s while importing Diffusers dependencies. First Torch/Diffusers import can be slow on a fresh Windows install; retry once, or reinstall Hugging Face Diffusers from Dependencies if it repeats."
+                : FirstFailureLine(result.StandardError) ?? FirstFailureLine(result.StandardOutput) ?? $"exited {result.ExitCode}";
             failures.Add($"{candidate.Executable}: {reason}");
         }
 
