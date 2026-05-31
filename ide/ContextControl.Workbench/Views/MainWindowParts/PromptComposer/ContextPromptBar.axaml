@@ -161,34 +161,57 @@
                           Command="{Binding ContextControl.ClosePromptCommand}" />
                     </Grid>
 
-                    <Border Grid.Row="1" Classes="cc-timeline-panel" IsVisible="{Binding ContextControl.IsCcTimelinePanelVisible}">
-                      <ItemsControl
-                          HorizontalAlignment="Center"
-                          ItemsSource="{Binding ContextControl.CcTimelineStages}">
-                        <ItemsControl.ItemsPanel>
-                          <ItemsPanelTemplate>
-                            <StackPanel Orientation="Horizontal" />
-                          </ItemsPanelTemplate>
-                        </ItemsControl.ItemsPanel>
-                        <ItemsControl.ItemTemplate>
-                          <DataTemplate DataType="{x:Type vm:CcTimelineStageViewModel}">
-                            <Border
-                                Classes="cc-timeline-stop"
-                                Classes.current="{Binding IsCurrent}"
-                                Classes.complete="{Binding IsComplete}"
-                                ToolTip.Tip="{Binding Detail}">
-                              <Grid ColumnDefinitions="Auto,*" ColumnSpacing="4" VerticalAlignment="Center">
-                                <TextBlock Classes="cc-timeline-marker" Text="{Binding Marker}" />
-                                <Grid Grid.Column="1" RowDefinitions="Auto,Auto" RowSpacing="0">
-                                  <TextBlock Classes="cc-timeline-title" Text="{Binding Title}" />
-                                  <TextBlock Grid.Row="1" Classes="cc-timeline-state" Text="{Binding StateLabel}" />
+                    <StackPanel Grid.Row="1" Spacing="5">
+                      <Border Classes="cc-transfer-progress" IsVisible="{Binding ContextControl.IsCodexPromptAuthBlocked}">
+                        <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="8">
+                          <StackPanel>
+                            <TextBlock Classes="cc-transfer-title" Text="{Binding ContextControl.CodexPromptAuthTitle}" />
+                            <TextBlock Classes="cc-prompt-meta" Text="{Binding ContextControl.CodexPromptAuthMessage}" />
+                          </StackPanel>
+                          <Button
+                              Grid.Column="1"
+                              Classes="cc-prompt-chip"
+                              Content="Login"
+                              ToolTip.Tip="Open Codex CLI login"
+                              Command="{Binding ContextControl.OpenCodexLoginCommand}" />
+                          <Button
+                              Grid.Column="2"
+                              Classes="cc-prompt-chip"
+                              Content="Refresh"
+                              ToolTip.Tip="Refresh Codex CLI login status"
+                              Command="{Binding ContextControl.RefreshCodexStatusCommand}" />
+                        </Grid>
+                      </Border>
+
+                      <Border Classes="cc-timeline-panel" IsVisible="{Binding ContextControl.IsCcTimelinePanelVisible}">
+                        <ItemsControl
+                            HorizontalAlignment="Center"
+                            ItemsSource="{Binding ContextControl.CcTimelineStages}">
+                          <ItemsControl.ItemsPanel>
+                            <ItemsPanelTemplate>
+                              <StackPanel Orientation="Horizontal" />
+                            </ItemsPanelTemplate>
+                          </ItemsControl.ItemsPanel>
+                          <ItemsControl.ItemTemplate>
+                            <DataTemplate DataType="{x:Type vm:CcTimelineStageViewModel}">
+                              <Border
+                                  Classes="cc-timeline-stop"
+                                  Classes.current="{Binding IsCurrent}"
+                                  Classes.complete="{Binding IsComplete}"
+                                  ToolTip.Tip="{Binding Detail}">
+                                <Grid ColumnDefinitions="Auto,*" ColumnSpacing="4" VerticalAlignment="Center">
+                                  <TextBlock Classes="cc-timeline-marker" Text="{Binding Marker}" />
+                                  <Grid Grid.Column="1" RowDefinitions="Auto,Auto" RowSpacing="0">
+                                    <TextBlock Classes="cc-timeline-title" Text="{Binding Title}" />
+                                    <TextBlock Grid.Row="1" Classes="cc-timeline-state" Text="{Binding StateLabel}" />
+                                  </Grid>
                                 </Grid>
-                              </Grid>
-                            </Border>
-                          </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                      </ItemsControl>
-                    </Border>
+                              </Border>
+                            </DataTemplate>
+                          </ItemsControl.ItemTemplate>
+                        </ItemsControl>
+                      </Border>
+                    </StackPanel>
 
                     <TextBox
                         x:Name="ContextPromptTextBox"
@@ -197,6 +220,7 @@
                         MinHeight="0"
                         IsVisible="{Binding ContextControl.IsMessagePromptMode}"
                         AcceptsReturn="True"
+                        IsReadOnly="{Binding ContextControl.IsPromptInputReadOnly}"
                         TextWrapping="{Binding ContextControl.PromptTextWrapping}"
                         Watermark="{Binding ContextControl.PromptWatermark}"
                         GotFocus="OnPromptTextBoxGotFocus"

@@ -104,6 +104,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
     private bool _isCodexAuthenticated;
     private bool _isCodexLoginRequired;
     private bool _isRefreshingCodexStatus;
+    private CancellationTokenSource? _codexAuthWatchCancellation;
     private int _currentCcTimelineStageIndex = CcStageRequest;
     private double _transferProgressValue;
     private string _dockPanelKey = "log";
@@ -307,7 +308,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
         RunGoCommand = new RelayCommand<object>(_ => _ = RunGoPreviewAsync(), _ => !IsBusy);
         ApplyPatchCommand = new RelayCommand<object>(_ => _ = ApplyPatchAsync(), _ => !IsBusy && IsPatchPlanReady);
         ApplyAllPatchCommand = new RelayCommand<object>(_ => _ = ApplyPatchAsync("all"), _ => !IsBusy && IsPatchPlanReady);
-        SendCommand = new RelayCommand<object>(_ => _ = SendAsync(), _ => !IsBusy);
+        SendCommand = new RelayCommand<object>(_ => _ = SendAsync(), _ => !IsBusy && !IsCodexPromptAuthBlocked);
         ToggleLogPanelCommand = new RelayCommand<object>(_ => SelectDockPanel("log"));
         SelectLogPanelCommand = new RelayCommand<object>(_ => SelectDockPanel("log"));
         SelectChatPanelCommand = new RelayCommand<object>(_ => SelectDockPanel("chat"));
@@ -337,7 +338,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
                 && !IsInstallingOllama);
         SwitchPromptToContextCommand = new RelayCommand<object>(_ => PromptModeKey = "context");
         SwitchPromptToChatCommand = new RelayCommand<object>(_ => PromptModeKey = "context");
-        SwitchPromptToCodexCommand = new RelayCommand<object>(_ => PromptModeKey = "codex");
+        SwitchPromptToCodexCommand = new RelayCommand<object>(_ => ActivateCodexPromptMode());
         SwitchPromptToTerminalCommand = new RelayCommand<object>(_ => PromptModeKey = "terminal");
         ClearTerminalCommand = new RelayCommand<object>(_ => ClearTerminalOutput());
         PreviousTransferStatusCommand = new RelayCommand<object>(_ => MoveTransferProgressHistory(-1), _ => CanMoveTransferProgressHistory(-1));
@@ -346,6 +347,9 @@ public sealed partial class ContextControlViewModel : ObservableObject
         OpenCodexLoginCommand = new RelayCommand<object>(
             _ => OpenCodexLogin(),
             _ => !IsBusy && !IsCodexRequestRunning);
+        LogoutCodexCommand = new RelayCommand<object>(
+            _ => _ = LogoutCodexAsync(),
+            _ => IsCodexAuthenticated && !IsBusy && !IsCodexRequestRunning && !IsRefreshingCodexStatus);
         RefreshCodexStatusCommand = new RelayCommand<object>(
             _ => _ = RefreshCodexStatusAsync(),
             _ => !IsCodexRequestRunning && !IsRefreshingCodexStatus);
@@ -521,6 +525,7 @@ public sealed partial class ContextControlViewModel : ObservableObject
     public ICommand NextTransferStatusCommand { get; }
     public ICommand CloseTransferProgressCommand { get; }
     public ICommand OpenCodexLoginCommand { get; }
+    public ICommand LogoutCodexCommand { get; }
     public ICommand RefreshCodexStatusCommand { get; }
     public ICommand RunCodexDoctorCommand { get; }
     public ICommand CancelCodexRequestCommand { get; }

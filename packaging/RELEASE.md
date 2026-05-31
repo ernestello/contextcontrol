@@ -42,6 +42,8 @@ No LLM weights, dependency runtimes, chat history, source files, tests, or build
 
 The workbench checks GitHub releases on startup and exposes a header-bar **Check updates** button. If a newer release exists, the button downloads `ContextControl-win-x64-Setup.exe` and starts it with the current install folder preselected. The updater reuses an already downloaded installer for the same release, cleans stale temp update folders when possible, hands setup off only after the running Workbench process exits, and setup skips unchanged files while extracting.
 
+Codex prompt mode is gated on Codex CLI authentication. The prompt is read-only while Codex is selected but not logged in, shows **Please login into codex to use it**, and settings expose Login, Refresh, Doctor, and Logout actions. Login launches Windows PowerShell by full path inside Windows Terminal when available, avoiding `wt.exe` child-command error 2147942402 on machines where `powershell` is not resolvable by name.
+
 Current app-side autosetup coverage documented in the README and packaged install guide:
 
 - 17/17 dependency cards expose an installer path

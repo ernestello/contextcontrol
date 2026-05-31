@@ -102,33 +102,41 @@ public sealed class CodexHarnessService
 
     public CodexLoginLaunchResult LaunchInteractiveLogin()
     {
+        var codexExecutable = ResolveCodexExecutable();
+        if (string.IsNullOrWhiteSpace(codexExecutable))
+        {
+            return new CodexLoginLaunchResult(false, "Codex CLI was not found. Install Codex CLI, then click Refresh Codex.");
+        }
+
         if (OperatingSystem.IsWindows())
         {
+            var powershell = ResolveWindowsPowerShellExecutable();
             var powershellCommand = "$Host.UI.RawUI.WindowTitle='ContextControl Codex Login'; "
-                + "codex login; "
+                + $"& '{EscapePowerShellSingleQuotedString(codexExecutable)}' login; "
                 + "Write-Host ''; "
                 + "Write-Host 'Return to ContextControl and click Refresh Codex.'; "
                 + "Read-Host 'Press Enter to close'";
 
             if (TryStartProcess(
                     "wt.exe",
-                    ["new-tab", "powershell", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", powershellCommand],
+                    ["new-tab", "--title", "ContextControl Codex Login", powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", powershellCommand],
                     out _))
             {
                 return new CodexLoginLaunchResult(true, "Opened Codex login in Windows Terminal. Complete the browser/device auth, then click Refresh Codex.");
             }
 
             if (TryStartProcess(
-                    "powershell.exe",
-                    ["-NoExit", "-ExecutionPolicy", "Bypass", "-Command", powershellCommand],
+                    powershell,
+                    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", powershellCommand],
                     out _))
             {
                 return new CodexLoginLaunchResult(true, "Opened Codex login in PowerShell. Complete the browser/device auth, then click Refresh Codex.");
             }
 
+            var cmdCommand = $"\"{codexExecutable}\" login & echo. & echo Return to ContextControl and click Refresh Codex. & pause";
             if (TryStartProcess(
                     "cmd.exe",
-                    ["/k", "codex login && echo. && echo Return to ContextControl and click Refresh Codex."],
+                    ["/c", cmdCommand],
                     out var cmdError))
             {
                 return new CodexLoginLaunchResult(true, "Opened Codex login in Command Prompt. Complete auth, then click Refresh Codex.");
@@ -139,7 +147,7 @@ public sealed class CodexHarnessService
 
         if (OperatingSystem.IsMacOS())
         {
-            var script = "tell application \"Terminal\" to do script \"codex login; echo ''; echo Return to ContextControl and click Refresh Codex.; read -r -p 'Press Enter to close' _\"";
+            var script = $"tell application \"Terminal\" to do script \"'{EscapeShellSingleQuotedString(codexExecutable)}' login; echo ''; echo Return to ContextControl and click Refresh Codex.; read -r -p 'Press Enter to close' _\"";
             if (TryStartProcess("osascript", ["-e", script], out var macError))
             {
                 return new CodexLoginLaunchResult(true, "Opened Codex login in Terminal. Complete auth, then click Refresh Codex.");
@@ -148,7 +156,7 @@ public sealed class CodexHarnessService
             return new CodexLoginLaunchResult(false, $"Could not open Terminal for Codex login: {macError}. Open a terminal and run: codex login");
         }
 
-        var shellCommand = "codex login; echo; echo 'Return to ContextControl and click Refresh Codex.'; read -r -p 'Press Enter to close' _";
+        var shellCommand = $"'{EscapeShellSingleQuotedString(codexExecutable)}' login; echo; echo 'Return to ContextControl and click Refresh Codex.'; read -r -p 'Press Enter to close' _";
         string[][] linuxLaunchers =
         [
             ["x-terminal-emulator", "-e", "bash", "-lc", shellCommand],
@@ -167,6 +175,24 @@ public sealed class CodexHarnessService
         }
 
         return new CodexLoginLaunchResult(false, $"Could not open a terminal for Codex login: {lastError}. Open a terminal and run: codex login");
+    }
+
+    public async Task<CodexLoginLaunchResult> LogoutAsync(CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            var result = await RunCodexCommandAsync(["logout"], TimeSpan.FromSeconds(15), cancellationToken);
+            var detail = FirstInterestingLine(result.StandardOutput)
+                ?? FirstInterestingLine(result.StandardError)
+                ?? $"codex logout exited {result.ExitCode}";
+            return result.ExitCode == 0
+                ? new CodexLoginLaunchResult(true, $"Codex logged out: {detail}")
+                : new CodexLoginLaunchResult(false, $"Codex logout failed: {detail}");
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return new CodexLoginLaunchResult(false, $"Codex logout failed: {ex.Message}");
+        }
     }
 
     public async Task<CodexLoginLaunchResult> RunDoctorAsync(
@@ -216,7 +242,7 @@ public sealed class CodexHarnessService
 
         var startInfo = new ProcessStartInfo
         {
-            FileName = "codex",
+            FileName = ResolveCodexExecutable() ?? "codex",
             WorkingDirectory = plan.HarnessRoot,
             UseShellExecute = false,
             RedirectStandardInput = true,
@@ -522,9 +548,15 @@ public sealed class CodexHarnessService
         TimeSpan timeout,
         CancellationToken cancellationToken)
     {
+        var executable = ResolveCodexExecutable();
+        if (string.IsNullOrWhiteSpace(executable))
+        {
+            return new CodexCommandResult(-1, "", "Codex CLI executable was not found on PATH.");
+        }
+
         var startInfo = new ProcessStartInfo
         {
-            FileName = "codex",
+            FileName = executable,
             UseShellExecute = false,
             RedirectStandardOutput = true,
             RedirectStandardError = true,
@@ -549,6 +581,56 @@ public sealed class CodexHarnessService
             process.ExitCode,
             await outputTask,
             await errorTask);
+    }
+
+    private static string? ResolveCodexExecutable()
+    {
+        var path = Environment.GetEnvironmentVariable("PATH");
+        var fileNames = OperatingSystem.IsWindows()
+            ? new[] { "codex.exe", "codex.cmd", "codex.bat", "codex" }
+            : ["codex"];
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            return null;
+        }
+
+        foreach (var directory in path.Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            foreach (var fileName in fileNames)
+            {
+                try
+                {
+                    var candidate = Path.GetFullPath(Path.Combine(directory, fileName));
+                    if (File.Exists(candidate))
+                    {
+                        return candidate;
+                    }
+                }
+                catch
+                {
+                    // Ignore broken PATH entries.
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private static string ResolveWindowsPowerShellExecutable()
+    {
+        var systemRoot = Environment.GetFolderPath(Environment.SpecialFolder.Windows);
+        var candidate = Path.Combine(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+        return File.Exists(candidate) ? candidate : "powershell.exe";
+    }
+
+    private static string EscapePowerShellSingleQuotedString(string value)
+    {
+        return (value ?? "").Replace("'", "''", StringComparison.Ordinal);
+    }
+
+    private static string EscapeShellSingleQuotedString(string value)
+    {
+        return (value ?? "").Replace("'", "'\"'\"'", StringComparison.Ordinal);
     }
 
     private static bool TryStartProcess(string fileName, IReadOnlyList<string> arguments, out string error)

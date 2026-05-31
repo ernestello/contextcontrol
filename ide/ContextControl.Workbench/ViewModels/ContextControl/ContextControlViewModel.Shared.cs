@@ -300,6 +300,7 @@ public sealed partial class ContextControlViewModel
         (ConfirmExternalDependencyDeleteCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
         (PullLocalModelCommand as RelayCommand<LocalLlmModelViewModel>)?.RaiseCanExecuteChanged();
         (OpenCodexLoginCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
+        (LogoutCodexCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
         (RefreshCodexStatusCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
         (RunCodexDoctorCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
         (CancelCodexRequestCommand as RelayCommand<ChatRequestProgressViewModel>)?.RaiseCanExecuteChanged();

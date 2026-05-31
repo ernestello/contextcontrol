@@ -242,7 +242,7 @@ public sealed partial class ContextControlViewModel
             IsPromptOpen = true;
             PromptModeKey = "codex";
             PhaseTitle = availability.RequiresLogin ? "Codex login required" : "Codex unavailable";
-            PhaseDetail = availability.Status;
+            PhaseDetail = availability.RequiresLogin ? CodexPromptLoginMessage : availability.Status;
             ProviderStatus = availability.Status;
             AppendTerminalOutput(availability.Status);
             return;
@@ -480,7 +480,31 @@ public sealed partial class ContextControlViewModel
         CodexStatus = result.Status;
         IsCodexAuthenticated = result.IsAuthenticated;
         IsCodexLoginRequired = result.RequiresLogin || (result.Available && !result.IsAuthenticated);
+        if (IsCodexPromptAuthBlocked)
+        {
+            ShowCodexPromptAuthRequired();
+        }
+
         Log(result.Available && result.IsAuthenticated ? "ok" : "warn", result.Status);
+    }
+
+    private void ActivateCodexPromptMode()
+    {
+        PromptModeKey = "codex";
+        if (IsCodexPromptAuthBlocked)
+        {
+            ShowCodexPromptAuthRequired();
+            _ = RefreshCodexStatusAsync();
+        }
+    }
+
+    private void ShowCodexPromptAuthRequired()
+    {
+        PhaseTitle = "Codex login required";
+        PhaseDetail = CodexPromptAuthorizeMessage;
+        CodexStatus = CodexPromptLoginMessage;
+        ProviderStatus = CodexPromptLoginMessage;
+        IsCodexLoginRequired = true;
     }
 
     private void OpenCodexLogin()
@@ -492,10 +516,119 @@ public sealed partial class ContextControlViewModel
         IsCodexAuthenticated = false;
         IsCodexLoginRequired = true;
         PhaseTitle = result.Succeeded ? "Codex login opened" : "Codex login setup";
-        PhaseDetail = result.Status;
+        PhaseDetail = result.Succeeded ? CodexPromptAuthorizeMessage : result.Status;
         ProviderStatus = result.Status;
         AppendTerminalOutput(result.Status);
         Log(result.Succeeded ? "info" : "warn", result.Status);
+        if (result.Succeeded)
+        {
+            StartCodexLoginWatcher();
+        }
+    }
+
+    private async Task LogoutCodexAsync()
+    {
+        if (IsBusy || IsRefreshingCodexStatus)
+        {
+            return;
+        }
+
+        StopCodexLoginWatcher();
+        IsRefreshingCodexStatus = true;
+        PhaseTitle = "Codex logout";
+        PhaseDetail = "Removing Codex CLI authentication.";
+        ProviderStatus = "Codex logout running";
+        try
+        {
+            var result = await _codexHarnessService.LogoutAsync();
+            IsCodexAuthenticated = false;
+            IsCodexLoginRequired = true;
+            CodexStatus = result.Succeeded
+                ? CodexPromptLoginMessage
+                : result.Status;
+            PhaseTitle = result.Succeeded ? "Codex logged out" : "Codex logout failed";
+            PhaseDetail = result.Succeeded ? CodexPromptLoginMessage : result.Status;
+            ProviderStatus = CodexStatus;
+            AppendTerminalOutput(result.Status);
+            Log(result.Succeeded ? "info" : "warn", result.Status);
+        }
+        finally
+        {
+            IsRefreshingCodexStatus = false;
+            if (IsCodexPromptAuthBlocked)
+            {
+                ShowCodexPromptAuthRequired();
+            }
+        }
+    }
+
+    private void StartCodexLoginWatcher()
+    {
+        StopCodexLoginWatcher();
+        var watcher = new CancellationTokenSource();
+        _codexAuthWatchCancellation = watcher;
+        _ = WatchCodexLoginAsync(watcher);
+    }
+
+    private void StopCodexLoginWatcher()
+    {
+        try
+        {
+            _codexAuthWatchCancellation?.Cancel();
+        }
+        catch
+        {
+            // Auth polling is best-effort.
+        }
+        finally
+        {
+            _codexAuthWatchCancellation = null;
+        }
+    }
+
+    private async Task WatchCodexLoginAsync(CancellationTokenSource watcher)
+    {
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(watcher.Token);
+            timeout.CancelAfter(TimeSpan.FromMinutes(10));
+            while (!timeout.IsCancellationRequested)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(4), timeout.Token);
+                var availability = await _codexHarnessService.CheckAvailabilityAsync(timeout.Token);
+                await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+                {
+                    ApplyCodexAvailability(availability);
+                    if (availability.IsAuthenticated)
+                    {
+                        PhaseTitle = "Codex login ready";
+                        PhaseDetail = "Codex mode is ready.";
+                        ProviderStatus = availability.Status;
+                    }
+                });
+
+                if (availability.IsAuthenticated)
+                {
+                    break;
+                }
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Normal when the user logs out, starts a new login, or the watch timeout expires.
+        }
+        finally
+        {
+            await Avalonia.Threading.Dispatcher.UIThread.InvokeAsync(() =>
+            {
+                if (ReferenceEquals(_codexAuthWatchCancellation, watcher))
+                {
+                    _codexAuthWatchCancellation = null;
+                }
+
+                watcher.Dispose();
+            });
+        }
     }
 
     private async Task RunCodexDoctorAsync()

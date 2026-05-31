@@ -80,6 +80,7 @@ Stable enough to test:
 - Ollama model pull/remove workflow
 - Basic local chat through supported chat-ready models
 - Image generation through Diffusers models and the stable-diffusion.cpp runner route on Windows; experimental Ollama image models are cataloged but macOS-only
+- Codex prompt mode through Codex CLI after the user logs in from **View -> Settings -> LLMs**
 - Startup and manual GitHub release update checks
 - Theme and appearance settings
 
@@ -91,6 +92,8 @@ Work in progress:
 - Some advanced GPU/server model backends
 
 The CLI scripts remain the conservative path for the original DIR/CC/GO patch pipeline while the desktop prompting flow matures.
+
+Codex mode requires an authenticated Codex CLI. If Codex mode is selected before login, the prompt is locked and shows **Please login into codex to use it**. Use **View -> Settings -> LLMs -> Codex CLI** to Login, Refresh, Doctor, or Logout. Codex credentials are owned by the Codex CLI; ContextControl only checks status and opens the login/logout commands.
 
 ## Local LLM And Dependency Install
 

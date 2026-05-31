@@ -16,6 +16,9 @@ namespace ContextControl.Workbench.ViewModels;
 
 public sealed partial class ContextControlViewModel
 {
+    private const string CodexPromptLoginMessage = "Please login into codex to use it";
+    private const string CodexPromptAuthorizeMessage = "Authorize to codex to use codex mode";
+
     public bool IsBusy
     {
         get => _isBusy;
@@ -362,6 +365,10 @@ public sealed partial class ContextControlViewModel
                 OnPropertyChanged(nameof(IsMessagePromptMode));
                 OnPropertyChanged(nameof(PromptWatermark));
                 OnPropertyChanged(nameof(PromptSendButtonLabel));
+                OnPropertyChanged(nameof(IsCodexPromptAuthBlocked));
+                OnPropertyChanged(nameof(IsPromptInputReadOnly));
+                OnPropertyChanged(nameof(CodexPromptAuthTitle));
+                OnPropertyChanged(nameof(CodexPromptAuthMessage));
                 OnPropertyChanged(nameof(PromptModelCapabilityHint));
                 OnPropertyChanged(nameof(HasPromptModelCapabilityHint));
                 OnPropertyChanged(nameof(CodexStatus));
@@ -372,6 +379,12 @@ public sealed partial class ContextControlViewModel
                 OnPropertyChanged(nameof(PromptFooterSummary));
                 _settings.PromptModeKey = clean;
 
+                if (IsCodexPromptAuthBlocked)
+                {
+                    ShowCodexPromptAuthRequired();
+                }
+
+                RaiseCommandStates();
                 SaveSettingsQuietly();
                 SaveChatHistory();
             }
@@ -387,6 +400,14 @@ public sealed partial class ContextControlViewModel
     public bool IsTerminalPromptMode => string.Equals(PromptModeKey, "terminal", StringComparison.OrdinalIgnoreCase);
 
     public bool IsMessagePromptMode => !IsTerminalPromptMode;
+
+    public bool IsCodexPromptAuthBlocked => IsCodexPromptMode && !IsCodexAuthenticated;
+
+    public bool IsPromptInputReadOnly => IsCodexPromptAuthBlocked;
+
+    public string CodexPromptAuthTitle => CodexPromptAuthorizeMessage;
+
+    public string CodexPromptAuthMessage => CodexPromptLoginMessage;
 
     public bool IsImageGenWorkspaceActive
     {
@@ -418,7 +439,9 @@ public sealed partial class ContextControlViewModel
         }
     }
 
-    public string PromptWatermark => IsChatPromptMode
+    public string PromptWatermark => IsCodexPromptAuthBlocked
+        ? CodexPromptLoginMessage
+        : IsChatPromptMode
         ? IsImageGenWorkspaceActive
             ? "Describe the image you want to generate..."
             : "Ask the selected local model, or paste CC request/patch text..."
@@ -428,6 +451,7 @@ public sealed partial class ContextControlViewModel
 
     public string PromptSendButtonLabel => IsImageGenWorkspaceActive
         ? "Generate"
+        : IsCodexPromptAuthBlocked ? "Login required"
         : IsCodexPromptMode ? "Send to Codex" : "Send";
 
     public string PromptModelCapabilityHint
@@ -478,9 +502,12 @@ public sealed partial class ContextControlViewModel
             if (SetProperty(ref _isCodexRequestRunning, value))
             {
                 OnPropertyChanged(nameof(CodexStatus));
+                OnPropertyChanged(nameof(IsCodexPromptAuthBlocked));
+                OnPropertyChanged(nameof(IsPromptInputReadOnly));
                 OnPropertyChanged(nameof(PromptModelCapabilityHint));
                 OnPropertyChanged(nameof(HasPromptModelCapabilityHint));
                 (OpenCodexLoginCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
+                (LogoutCodexCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
                 (RefreshCodexStatusCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
                 (RunCodexDoctorCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
                 (CancelCodexRequestCommand as RelayCommand<ChatRequestProgressViewModel>)?.RaiseCanExecuteChanged();
@@ -498,6 +525,18 @@ public sealed partial class ContextControlViewModel
                 OnPropertyChanged(nameof(CodexLoginButtonLabel));
                 OnPropertyChanged(nameof(CodexSetupSummary));
                 OnPropertyChanged(nameof(CodexSetupStatusKind));
+                OnPropertyChanged(nameof(IsCodexPromptAuthBlocked));
+                OnPropertyChanged(nameof(IsPromptInputReadOnly));
+                OnPropertyChanged(nameof(PromptWatermark));
+                OnPropertyChanged(nameof(PromptSendButtonLabel));
+                OnPropertyChanged(nameof(PromptModelCapabilityHint));
+                OnPropertyChanged(nameof(HasPromptModelCapabilityHint));
+                if (IsCodexPromptAuthBlocked)
+                {
+                    ShowCodexPromptAuthRequired();
+                }
+
+                RaiseCommandStates();
             }
         }
     }
@@ -512,6 +551,11 @@ public sealed partial class ContextControlViewModel
                 OnPropertyChanged(nameof(CodexLoginButtonLabel));
                 OnPropertyChanged(nameof(CodexSetupSummary));
                 OnPropertyChanged(nameof(CodexSetupStatusKind));
+                OnPropertyChanged(nameof(IsCodexPromptAuthBlocked));
+                OnPropertyChanged(nameof(IsPromptInputReadOnly));
+                OnPropertyChanged(nameof(PromptWatermark));
+                OnPropertyChanged(nameof(PromptSendButtonLabel));
+                RaiseCommandStates();
             }
         }
     }
@@ -524,8 +568,10 @@ public sealed partial class ContextControlViewModel
             if (SetProperty(ref _isRefreshingCodexStatus, value))
             {
                 OnPropertyChanged(nameof(CodexSetupSummary));
+                OnPropertyChanged(nameof(PromptModelCapabilityHint));
                 (RefreshCodexStatusCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
                 (RunCodexDoctorCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
+                (LogoutCodexCommand as RelayCommand<object>)?.RaiseCanExecuteChanged();
             }
         }
     }
