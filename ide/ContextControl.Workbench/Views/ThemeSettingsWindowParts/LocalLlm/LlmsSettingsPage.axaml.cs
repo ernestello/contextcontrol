@@ -14,4 +14,6 @@ public sealed partial class LlmsSettingsPage : UserControl
     private ThemeSettingsWindow? OwnerWindow => this.FindAncestorOfType<ThemeSettingsWindow>();
 
     private void OnOllamaModelsBrowseClick(object? sender, RoutedEventArgs e) => OwnerWindow?.OnOllamaModelsBrowseClick(sender, e);
+
+    private void OnHuggingFaceTokenTutorialClick(object? sender, RoutedEventArgs e) => OwnerWindow?.OnHuggingFaceTokenTutorialClick(sender, e);
 }

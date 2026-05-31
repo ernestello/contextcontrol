@@ -49,10 +49,19 @@
 
                 <Border Classes="rule-card">
                   <Grid RowDefinitions="Auto,Auto,Auto" RowSpacing="7">
-                    <StackPanel>
-                      <TextBlock Classes="settings-title" Text="Hugging Face token" />
-                      <TextBlock Classes="muted" Text="{Binding ContextControl.HuggingFaceTokenStatus}" />
-                    </StackPanel>
+                    <Grid ColumnDefinitions="*,Auto" ColumnSpacing="8">
+                      <StackPanel>
+                        <TextBlock Classes="settings-title" Text="Hugging Face token" />
+                        <TextBlock Classes="muted" Text="{Binding ContextControl.HuggingFaceTokenStatus}" />
+                      </StackPanel>
+                      <Button
+                          Grid.Column="1"
+                          Classes="rule-mini primary"
+                          MinHeight="24"
+                          MinWidth="64"
+                          Content="Tutorial"
+                          Click="OnHuggingFaceTokenTutorialClick" />
+                    </Grid>
                     <Grid Grid.Row="1" ColumnDefinitions="180,*" ColumnSpacing="10">
                       <TextBlock Classes="field-label" Text="HF token" VerticalAlignment="Center" />
                       <TextBox

@@ -46,7 +46,11 @@ Current autosetup coverage:
 - Ollama Cloud entries: 28/302 catalog entries, no local weight download
 - image generation: 13/13 image-generation catalog entries have a route; 3 experimental Ollama image entries are macOS-only and disabled on Windows/Linux, and FLUX.2 Klein 4B has a Windows-capable Diffusers route
 
-FLUX.2 Klein Diffusers is much larger than Tiny Stable Diffusion. Its first run downloads roughly 15-16 GB of Diffusers pipeline files and can pause on the same Hugging Face percentage while one large shard downloads. The terminal shows the exact prompt, reports whether Hugging Face downloads are authenticated, and prints keepalive status while the download/load step is quiet. For large Hugging Face models, paste a personal token in Settings -> LLMs to avoid anonymous Hub rate limits.
+FLUX.2 Klein Diffusers is much larger than Tiny Stable Diffusion. Its first run downloads roughly 15-16 GB of Diffusers pipeline files and can pause on the same Hugging Face percentage while one large shard downloads. The terminal shows the exact prompt, reports whether Hugging Face downloads are authenticated, and prints keepalive status while the download/load step is quiet. For large Hugging Face models, paste a personal token in View -> Settings -> LLMs to avoid anonymous Hub rate limits.
+
+When no HF token is configured, Diffusers model cards show an HF token warning and repeat it before download/generation. Open View -> Settings -> LLMs -> Tutorial for the guided Hugging Face token steps, then paste the token in the HF token field. A Read token or fine-grained token with read access is enough for model downloads.
+
+HF token warnings currently apply to these Diffusers routes: `runwayml/stable-diffusion-v1-5`, `stabilityai/stable-diffusion-2-1-base`, `segmind/tiny-sd`, `nota-ai/bk-sdm-small`, `SimianLuo/LCM_Dreamshaper_v7`, `stabilityai/sd-turbo`, `segmind/SSD-1B`, and `black-forest-labs/FLUX.2-klein-4B`.
 
 On a raw Windows PC, the Microsoft Store `python.exe` app alias is ignored because it is not a real Python interpreter. Python-backed dependencies such as Diffusers automatically install Python 3.12 through `winget` when no usable Python exists, then create a ContextControl-managed virtual environment.
 

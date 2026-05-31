@@ -472,6 +472,11 @@ public sealed partial class ContextControlViewModel
         {
             outputDirectory = ResolveImageGenerationOutputDirectory();
             terminal.Report($"Generating image with {model.DisplayName} ({model.Id})...");
+            if (model.UsesHuggingFaceHubDownload && !HasHuggingFaceToken)
+            {
+                terminal.Report(model.HuggingFaceTokenWarning);
+            }
+
             var result = await _localLlmService.GenerateImageAsync(
                 model.Id,
                 prompt,

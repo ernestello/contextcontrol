@@ -149,6 +149,9 @@ public sealed partial class LocalLlmModelViewModel(LocalLlmCatalogModel model) :
     public bool UsesDownloadableBackendModel => RequiresManualBackend
         && IsImageGenerationModel
         && DependencyId.Equals("diffusers", StringComparison.OrdinalIgnoreCase);
+    public bool UsesHuggingFaceHubDownload => UsesDownloadableBackendModel;
+    public string HuggingFaceTokenWarning =>
+        "Please add a HF access token to not get rate-limited while downloading this model. In View -> Settings -> LLMs you will find both: a tutorial and a way to add your token.";
     public bool CanDownloadBackendModel => !IsInstalled
         && UsesDownloadableBackendModel
         && IsBackendDependencyReady

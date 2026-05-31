@@ -99,6 +99,7 @@ public sealed partial class ContextControlViewModel
                     _settings.SelectedImageModel = value.Id;
                     SaveSettingsQuietly();
                     SaveChatHistory();
+                    WarnIfHuggingFaceTokenMissing(value);
                 }
 
                 OnPropertyChanged(nameof(SelectedLocalModelLabel));
@@ -357,11 +358,26 @@ public sealed partial class ContextControlViewModel
                 _settings.HuggingFaceToken = clean;
                 LocalLlmService.ApplyHuggingFaceTokenToProcess(clean);
                 OnPropertyChanged(nameof(HuggingFaceTokenStatus));
+                OnPropertyChanged(nameof(HasHuggingFaceToken));
                 SaveSettingsQuietly();
             }
         }
     }
 
     public string HuggingFaceTokenStatus => LocalLlmService.ResolveHuggingFaceTokenStatus(_huggingFaceToken);
+
+    public bool HasHuggingFaceToken => LocalLlmService.HasHuggingFaceToken(_huggingFaceToken);
+
+    private void WarnIfHuggingFaceTokenMissing(LocalLlmModelViewModel model)
+    {
+        if (!model.UsesHuggingFaceHubDownload || HasHuggingFaceToken)
+        {
+            return;
+        }
+
+        PhaseTitle = "HF token recommended";
+        PhaseDetail = model.HuggingFaceTokenWarning;
+        Log("warn", $"{model.DisplayName}: {model.HuggingFaceTokenWarning}");
+    }
 
 }

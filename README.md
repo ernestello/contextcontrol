@@ -140,8 +140,23 @@ Image generation status:
 
 - 13/13 image-generation catalog entries have a route in the app.
 - 3 use experimental Ollama image models: FLUX.2 Klein 4B, FLUX.2 Klein 9B, and Z-Image Turbo. Ollama currently documents these image-generation models as macOS-only, so ContextControl disables their Ollama download/use buttons on Windows/Linux to avoid raw Ollama HTTP 500/EOF failures. Already-pulled copies can still be uninstalled.
-- 8 use Diffusers and expose a model-card **Download** action for Hugging Face weights after the Diffusers dependency is ready; first generation can still fill any missing cache files. This includes the Windows/Linux-capable `black-forest-labs/FLUX.2-klein-4B` route for FLUX.2 Klein. Its first run is large: ContextControl now downloads only the Diffusers pipeline files, but that is still roughly 15-16 GB and the Hugging Face file counter can sit on one percentage while a multi-GB shard downloads. Add a personal Hugging Face token in **Settings -> LLMs** to avoid anonymous Hub rate limits during large downloads.
+- 8 use Diffusers and expose a model-card **Download** action for Hugging Face weights after the Diffusers dependency is ready; first generation can still fill any missing cache files. This includes the Windows/Linux-capable `black-forest-labs/FLUX.2-klein-4B` route for FLUX.2 Klein. Its first run is large: ContextControl now downloads only the Diffusers pipeline files, but that is still roughly 15-16 GB and the Hugging Face file counter can sit on one percentage while a multi-GB shard downloads. Add a personal Hugging Face token in **View -> Settings -> LLMs** to avoid anonymous Hub rate limits during large downloads.
 - 2 use stable-diffusion.cpp and still need the user to point `CC_IMAGE_MODEL_PATH` at a local GGUF diffusion model file.
+
+When no HF token is configured, ContextControl warns on each Hugging Face-backed Diffusers model card, logs a warning when one becomes the selected image-generation model, and repeats the warning before model download/generation. **View -> Settings -> LLMs** contains the token field and a **Tutorial** button with the exact steps for creating a Read or fine-grained read token from the Hugging Face Access Tokens page.
+
+HF token warnings currently apply to these Diffusers routes:
+
+```text
+runwayml/stable-diffusion-v1-5
+stabilityai/stable-diffusion-2-1-base
+segmind/tiny-sd
+nota-ai/bk-sdm-small
+SimianLuo/LCM_Dreamshaper_v7
+stabilityai/sd-turbo
+segmind/SSD-1B
+black-forest-labs/FLUX.2-klein-4B
+```
 
 The default image-generation selection is Tiny Stable Diffusion (`segmind/tiny-sd`) because it is small enough for fresh Windows installs and is useful for validating that Python, Torch, and Diffusers are working before downloading larger checkpoints. For FLUX.2 Klein on Windows, use the Diffusers entry, not the `x/flux2-klein` Ollama entry. The terminal echoes the exact prompt being generated, reports whether Hugging Face downloads are authenticated, and prints keepalive status while first-run Diffusers downloads or CPU-offload loading are quiet.
 

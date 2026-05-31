@@ -229,6 +229,23 @@ public sealed partial class ThemeSettingsWindow : Window
         ViewModel?.ContextControl.SelectOllamaModelsDirectory(folder);
     }
 
+    internal async void OnHuggingFaceTokenTutorialClick(object? sender, RoutedEventArgs e)
+    {
+        var tutorial = new HuggingFaceTokenTutorialWindow();
+        if (ViewModel is { } viewModel)
+        {
+            tutorial.ApplyTheme(
+                viewModel.ThemeKey,
+                viewModel.UiFontFamily,
+                viewModel.CodeFontFamily,
+                viewModel.SkinKey,
+                viewModel.UiFontColorModeKey,
+                viewModel.CustomUiFontColorHex);
+        }
+
+        await tutorial.ShowDialog(this);
+    }
+
     private void ShowAppearancePage()
     {
         AppearancePage.IsVisible = true;

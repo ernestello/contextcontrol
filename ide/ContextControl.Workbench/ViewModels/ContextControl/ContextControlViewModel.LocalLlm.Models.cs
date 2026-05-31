@@ -140,6 +140,11 @@ public sealed partial class ContextControlViewModel
                 var pullCancellation = new CancellationTokenSource();
                 var progress = CreateTransferProgress($"Downloading {model.Id}", pullCancellation);
                 var terminal = CreateTerminalProgress();
+                if (model.UsesHuggingFaceHubDownload && !HasHuggingFaceToken)
+                {
+                    terminal.Report(model.HuggingFaceTokenWarning);
+                }
+
                 try
                 {
                     var result = await _localLlmService.DownloadImageModelAsync(model.Id, progress, terminal, pullCancellation.Token);

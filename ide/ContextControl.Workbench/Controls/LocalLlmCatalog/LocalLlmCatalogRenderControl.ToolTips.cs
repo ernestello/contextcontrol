@@ -54,6 +54,27 @@ public sealed partial class LocalLlmCatalogRenderControl
     private Control BuildModelDetailToolTip(LocalLlmModelViewModel model)
     {
         var panel = new StackPanel { Spacing = 3, MaxWidth = 360 };
+        if (ShouldWarnAboutMissingHuggingFaceToken(model))
+        {
+            var warning = new Border
+            {
+                Padding = new Thickness(5),
+                BorderThickness = new Thickness(1),
+                CornerRadius = new CornerRadius(4),
+                BorderBrush = Resource("AccentBorderBrush", AccentBorderFallbackBrush),
+                Background = Resource("CommandPrimaryBackgroundBrush", CommandPrimaryBackgroundFallbackBrush),
+                Child = new TextBlock
+                {
+                    Text = model.HuggingFaceTokenWarning,
+                    FontSize = 9,
+                    FontWeight = FontWeight.ExtraBold,
+                    Foreground = Resource("AccentBrush", AccentFallbackBrush),
+                    TextWrapping = TextWrapping.Wrap
+                }
+            };
+            panel.Children.Add(warning);
+        }
+
         panel.Children.Add(new TextBlock
         {
             Text = $"{model.DisplayName} ({model.Id})",

@@ -100,7 +100,8 @@
                       PullModelCommand="{Binding ContextControl.PullLocalModelCommand}"
                       ThemeKey="{Binding ThemeKey}"
                       UiFontFamily="{Binding UiFontFamily}"
-                      CodeFontFamily="{Binding CodeFontFamily}" />
+                      CodeFontFamily="{Binding CodeFontFamily}"
+                      HasHuggingFaceToken="{Binding ContextControl.HasHuggingFaceToken}" />
                   </ScrollViewer>
                   <Border
                       HorizontalAlignment="Center"

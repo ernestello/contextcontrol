@@ -231,7 +231,14 @@ public sealed partial class LocalLlmCatalogRenderControl
         var requirement = GetFormattedText(Clean($"{cpu} | {model.VramSummary} | {model.DownloadSize}", 120), Resource("AccentBrush", AccentFallbackBrush), codeFontFamily, FontWeight.Black, FontStyle.Normal, 6.6 + scale * 0.35);
         DrawClippedText(context, requirement, new Rect(titleX, rect.Y + 22.0, titleWidth, 9.0), new Point(titleX, rect.Y + 22.0));
 
-        var use = GetFormattedText(Clean(model.PracticalUse, 180), Resource("TextPrimaryBrush", TextPrimaryFallbackBrush), uiFontFamily, FontWeight.Normal, FontStyle.Normal, 7.6 + scale * 0.9);
+        var shouldWarnForHfToken = ShouldWarnAboutMissingHuggingFaceToken(model);
+        var useText = shouldWarnForHfToken
+            ? "HF token recommended before download. Open View -> Settings -> LLMs for tutorial."
+            : model.PracticalUse;
+        var useBrush = shouldWarnForHfToken
+            ? Resource("AccentBrush", AccentFallbackBrush)
+            : Resource("TextPrimaryBrush", TextPrimaryFallbackBrush);
+        var use = GetFormattedText(Clean(useText, 180), useBrush, uiFontFamily, shouldWarnForHfToken ? FontWeight.ExtraBold : FontWeight.Normal, FontStyle.Normal, 7.6 + scale * 0.9);
         DrawClippedText(context, use, new Rect(rect.X, rect.Y + 33.0, rect.Width, 10.0), new Point(rect.X, rect.Y + 32.0));
 
         DrawPurposeTags(context, model.PurposeTags, new Rect(rect.X, rect.Y + SummaryTagsY, rect.Width, 27.0), uiFontFamily, scale);
@@ -470,14 +477,23 @@ public sealed partial class LocalLlmCatalogRenderControl
 
     private void DrawRightMeta(DrawingContext context, LocalLlmModelViewModel model, Rect rect, FontFamily codeFontFamily)
     {
-        var tags = model.IsRecommended
-            ? new[] { model.FitLabel, model.InstallLabel }
-            : new[] { model.InstallLabel };
+        var tags = ShouldWarnAboutMissingHuggingFaceToken(model)
+            ? model.IsRecommended
+                ? new[] { model.FitLabel, "HF token", model.InstallLabel }
+                : new[] { "HF token", model.InstallLabel }
+            : model.IsRecommended
+                ? new[] { model.FitLabel, model.InstallLabel }
+                : new[] { model.InstallLabel };
         var right = rect.Right;
         foreach (var tag in tags.Reverse())
         {
-            right = DrawPill(context, tag, rect.Y, right, Math.Max(0.0, right - rect.X), tag == model.FitLabel, codeFontFamily);
+            right = DrawPill(context, tag, rect.Y, right, Math.Max(0.0, right - rect.X), tag == model.FitLabel || tag == "HF token", codeFontFamily);
         }
+    }
+
+    private bool ShouldWarnAboutMissingHuggingFaceToken(LocalLlmModelViewModel model)
+    {
+        return model.UsesHuggingFaceHubDownload && !HasHuggingFaceToken;
     }
 
     private double DrawPill(

@@ -15,6 +15,10 @@ public sealed partial class LocalLlmService
     private const string HuggingFaceTokenEnvironmentVariable = "HF_TOKEN";
     private const string HuggingFaceHubTokenEnvironmentVariable = "HUGGINGFACE_HUB_TOKEN";
     private const string ContextControlHuggingFaceTokenEnvironmentVariable = "CC_HF_TOKEN";
+    private static readonly object HuggingFaceTokenEnvironmentGate = new();
+    private static bool _capturedOriginalHuggingFaceTokenEnvironment;
+    private static string? _originalHuggingFaceToken;
+    private static string? _originalHuggingFaceHubToken;
 
     public static string DefaultOllamaModelsDirectory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".ollama", "models");
@@ -71,14 +75,25 @@ public sealed partial class LocalLlmService
 
     public static void ApplyHuggingFaceTokenToProcess(string? configuredToken)
     {
-        var token = ResolveHuggingFaceToken(configuredToken);
-        if (string.IsNullOrWhiteSpace(token))
+        var configured = NormalizeHuggingFaceToken(configuredToken);
+        lock (HuggingFaceTokenEnvironmentGate)
         {
-            return;
-        }
+            CaptureOriginalHuggingFaceTokenEnvironment();
+            if (string.IsNullOrWhiteSpace(configured))
+            {
+                Environment.SetEnvironmentVariable(HuggingFaceTokenEnvironmentVariable, _originalHuggingFaceToken, EnvironmentVariableTarget.Process);
+                Environment.SetEnvironmentVariable(HuggingFaceHubTokenEnvironmentVariable, _originalHuggingFaceHubToken, EnvironmentVariableTarget.Process);
+                return;
+            }
 
-        Environment.SetEnvironmentVariable(HuggingFaceTokenEnvironmentVariable, token, EnvironmentVariableTarget.Process);
-        Environment.SetEnvironmentVariable(HuggingFaceHubTokenEnvironmentVariable, token, EnvironmentVariableTarget.Process);
+            Environment.SetEnvironmentVariable(HuggingFaceTokenEnvironmentVariable, configured, EnvironmentVariableTarget.Process);
+            Environment.SetEnvironmentVariable(HuggingFaceHubTokenEnvironmentVariable, configured, EnvironmentVariableTarget.Process);
+        }
+    }
+
+    public static bool HasHuggingFaceToken(string? configuredToken)
+    {
+        return !string.IsNullOrWhiteSpace(ResolveHuggingFaceToken(configuredToken));
     }
 
     public static string ResolveHuggingFaceTokenStatus(string? configuredToken)
@@ -89,7 +104,7 @@ public sealed partial class LocalLlmService
         }
 
         return string.IsNullOrWhiteSpace(ResolveHuggingFaceToken(null))
-            ? "No Hugging Face token set; large Diffusers downloads use anonymous rate limits."
+            ? "No Hugging Face token set; large Diffusers downloads use anonymous rate limits. Please add a Hugging Face access token to not get rate-limited while downloading larger models."
             : "Using Hugging Face token from environment for Diffusers downloads.";
     }
 
@@ -116,6 +131,18 @@ public sealed partial class LocalLlmService
         }
 
         return "";
+    }
+
+    private static void CaptureOriginalHuggingFaceTokenEnvironment()
+    {
+        if (_capturedOriginalHuggingFaceTokenEnvironment)
+        {
+            return;
+        }
+
+        _originalHuggingFaceToken = Environment.GetEnvironmentVariable(HuggingFaceTokenEnvironmentVariable, EnvironmentVariableTarget.Process);
+        _originalHuggingFaceHubToken = Environment.GetEnvironmentVariable(HuggingFaceHubTokenEnvironmentVariable, EnvironmentVariableTarget.Process);
+        _capturedOriginalHuggingFaceTokenEnvironment = true;
     }
 
     private static LocalLlmCatalogModel CatalogModel(

@@ -46,6 +46,9 @@ public sealed partial class LocalLlmCatalogRenderControl : Control
     public static readonly StyledProperty<string> CodeFontFamilyProperty =
         AvaloniaProperty.Register<LocalLlmCatalogRenderControl, string>(nameof(CodeFontFamily), "avares://ContextControl.Workbench/Assets/Fonts#Cascadia Code, Consolas");
 
+    public static readonly StyledProperty<bool> HasHuggingFaceTokenProperty =
+        AvaloniaProperty.Register<LocalLlmCatalogRenderControl, bool>(nameof(HasHuggingFaceToken));
+
     private const double ContentTop = 2.0;
     private const double ContentBottom = 6.0;
     private const double HorizontalInset = 3.0;
@@ -123,6 +126,12 @@ public sealed partial class LocalLlmCatalogRenderControl : Control
         set => SetValue(CodeFontFamilyProperty, value);
     }
 
+    public bool HasHuggingFaceToken
+    {
+        get => GetValue(HasHuggingFaceTokenProperty);
+        set => SetValue(HasHuggingFaceTokenProperty, value);
+    }
+
     public LocalLlmCatalogRenderControl()
     {
         Focusable = false;
@@ -164,6 +173,10 @@ public sealed partial class LocalLlmCatalogRenderControl : Control
             || change.Property == CodeFontFamilyProperty)
         {
             _textCache.Clear();
+            InvalidateVisual();
+        }
+        else if (change.Property == HasHuggingFaceTokenProperty)
+        {
             InvalidateVisual();
         }
     }
